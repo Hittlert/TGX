@@ -523,7 +523,10 @@
             '<div class="target-identity"><div class="target-name">' + escape_html(target_display_name(row)) + '</div>' +
             '<div class="target-meta">' + escape_html(target_meta(row)) + '</div>' +
             target_scan_html(row) + '</div>' +
-            '<button type="button" class="target-config-toggle" title="Configure priority, cursor and filter" aria-label="Configure priority, cursor and filter" aria-expanded="' + (row.config_open ? 'true' : 'false') + '"><i class="layui-icon layui-icon-set"></i><span class="target-config-text">Config</span></button>' +
+            '<div class="target-actions">' +
+            '<button type="button" class="target-context-toggle" title="View message context around ID" aria-label="View message context"><i class="layui-icon layui-icon-dialogue"></i><span class="target-action-text">Context</span></button>' +
+            '<button type="button" class="target-config-toggle" title="Configure priority, cursor and filter" aria-label="Configure priority, cursor and filter" aria-expanded="' + (row.config_open ? 'true' : 'false') + '"><i class="layui-icon layui-icon-set"></i><span class="target-action-text">Config</span></button>' +
+            '</div>' +
             '</div>' +
             target_progress_html(row) +
             '<div class="target-controls">' +
@@ -737,6 +740,142 @@
         } else if ($(this).hasClass('target-filter')) {
           row._filter_dirty = true;
         }
+      });
+
+      function format_timestamp(ts) {
+        if (!ts) return '';
+        var date = new Date(ts * 1000);
+        return date.getFullYear() + '-' +
+          ('0' + (date.getMonth() + 1)).slice(-2) + '-' +
+          ('0' + date.getDate()).slice(-2) + ' ' +
+          ('0' + date.getHours()).slice(-2) + ':' +
+          ('0' + date.getMinutes()).slice(-2) + ':' +
+          ('0' + date.getSeconds()).slice(-2);
+      }
+
+      function open_context_viewer(chat_id, target_title, initial_message_id) {
+        var default_id = parseInt(initial_message_id || 0, 10) || 1;
+        var modal_html = '<div class="context-viewer-wrap">' +
+          '<div class="context-viewer-bar">' +
+          '  <div class="context-input-box">' +
+          '    <span>Message ID:</span>' +
+          '    <input id="context_msg_id_input" type="number" min="1" step="1" value="' + default_id + '">' +
+          '    <button id="context_fetch_btn" type="button" class="layui-btn layui-btn-normal layui-btn-sm"><i class="layui-icon layui-icon-search"></i> Search</button>' +
+          '  </div>' +
+          '  <div class="context-nav-box">' +
+          '    <button id="context_prev_btn" type="button" class="layui-btn layui-btn-primary layui-btn-sm"><i class="layui-icon layui-icon-prev"></i> Prev 15</button>' +
+          '    <button id="context_next_btn" type="button" class="layui-btn layui-btn-primary layui-btn-sm">Next 15 <i class="layui-icon layui-icon-next"></i></button>' +
+          '  </div>' +
+          '</div>' +
+          '<div id="context_message_list" class="context-message-list">' +
+          '  <div class="context-loading"><i class="layui-icon layui-icon-loading layui-anim layui-anim-rotate layui-anim-loop"></i> Loading context messages...</div>' +
+          '</div>' +
+          '</div>';
+
+        layer.open({
+          type: 1,
+          title: '💬 Message Context - ' + escape_html(target_title || chat_id) + ' (' + escape_html(chat_id) + ')',
+          area: ['860px', '75%'],
+          maxmin: true,
+          content: modal_html,
+          success: function (layero, index) {
+            function load_context(mid) {
+              var target_mid = parseInt(mid, 10) || 1;
+              $('#context_msg_id_input').val(target_mid);
+              $('#context_message_list').html('<div class="context-loading"><i class="layui-icon layui-icon-loading layui-anim layui-anim-rotate layui-anim-loop"></i> Loading context for message #' + target_mid + '...</div>');
+              $.ajax({
+                url: 'api/chat_context?chat_id=' + encodeURIComponent(chat_id) + '&message_id=' + target_mid + '&limit_before=15&limit_after=15',
+                type: 'get',
+                dataType: 'json',
+                success: function (res) {
+                  if (!res.ok) {
+                    $('#context_message_list').html('<div class="context-empty">Error: ' + escape_html(res.error || 'Failed to load context') + '</div>');
+                    return;
+                  }
+                  var msgs = res.messages || [];
+                  if (!msgs.length) {
+                    $('#context_message_list').html('<div class="context-empty">No messages found around ID #' + target_mid + '</div>');
+                    return;
+                  }
+                  var list_html = '';
+                  for (var i = 0; i < msgs.length; i++) {
+                    var m = msgs[i];
+                    var is_target = (parseInt(m.message_id, 10) === target_mid);
+                    var sender = escape_html(m.sender_name || m.sender_id || 'Unknown');
+                    var date_str = format_timestamp(m.date || m.created_at);
+                    var media_type = m.media_type && m.media_type !== 'text' ? '<span class="context-media-tag">[' + escape_html(m.media_type) + ']</span> ' : '';
+                    var text_content = escape_html(m.text || '').replace(/\n/g, '<br>');
+                    var reply_html = m.reply_to_message_id ? '<span class="context-reply-tag" data-mid="' + m.reply_to_message_id + '">↳ Reply to #' + m.reply_to_message_id + '</span>' : '';
+                    var target_badge = is_target ? '<span class="context-target-badge"><i class="layui-icon layui-icon-star-fill"></i> Target Message</span>' : '';
+
+                    list_html += '<div class="context-msg-item' + (is_target ? ' is-target' : '') + '" id="ctx_msg_' + m.message_id + '">' +
+                      '<div class="context-msg-meta">' +
+                      '  <span class="context-mid-badge" data-mid="' + m.message_id + '">#' + m.message_id + '</span>' +
+                      '  <span class="context-sender">' + sender + '</span>' +
+                      '  <span class="context-time">' + date_str + '</span>' +
+                      reply_html +
+                      target_badge +
+                      '</div>' +
+                      '<div class="context-msg-body">' + media_type + (text_content || '<i class="context-no-text">&lt;Empty Text / Media Only&gt;</i>') + '</div>' +
+                      '</div>';
+                  }
+                  $('#context_message_list').html(list_html);
+                  var target_el = document.getElementById('ctx_msg_' + target_mid);
+                  if (target_el) {
+                    target_el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                  }
+                },
+                error: function (err) {
+                  var message = 'Failed to load context';
+                  if (err.responseJSON && err.responseJSON.error) {
+                    message = err.responseJSON.error;
+                  }
+                  $('#context_message_list').html('<div class="context-empty">' + escape_html(message) + '</div>');
+                }
+              });
+            }
+
+            load_context(default_id);
+
+            $('#context_fetch_btn').on('click', function () {
+              var val = $('#context_msg_id_input').val();
+              load_context(val);
+            });
+
+            $('#context_msg_id_input').on('keydown', function (e) {
+              if (e.keyCode === 13) {
+                load_context($(this).val());
+              }
+            });
+
+            $('#context_prev_btn').on('click', function () {
+              var cur = parseInt($('#context_msg_id_input').val(), 10) || 1;
+              load_context(Math.max(1, cur - 15));
+            });
+
+            $('#context_next_btn').on('click', function () {
+              var cur = parseInt($('#context_msg_id_input').val(), 10) || 1;
+              load_context(cur + 15);
+            });
+
+            $('#context_message_list').on('click', '.context-mid-badge, .context-reply-tag', function () {
+              var mid = $(this).attr('data-mid');
+              if (mid) {
+                load_context(mid);
+              }
+            });
+          }
+        });
+      }
+
+      $('#target_list').on('click', '.target-context-toggle', function () {
+        var row_el = $(this).closest('.target-item');
+        var row = find_target_row(row_el.attr('data-chat-key'));
+        if (!row) {
+          return;
+        }
+        var initial_id = row.last_read_message_id || row.top_message_id || 1;
+        open_context_viewer(row.chat_id, target_display_name(row), initial_id);
       });
 
       $('#target_list').on('click', '.target-config-toggle', function () {

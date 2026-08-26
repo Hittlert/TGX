@@ -195,5 +195,49 @@ class AddTargetRouteTestCase(unittest.TestCase):
             web_app.set_dialog_cache.assert_called_once()
 
 
+class ChatContextRouteTestCase(unittest.TestCase):
+    def setUp(self):
+        self.original_web_app = web._web_app
+        self.original_client = web._telegram_client
+        self.client = web.get_flask_app().test_client()
+        web.get_flask_app().config["LOGIN_DISABLED"] = True
+
+    def tearDown(self):
+        web._web_app = self.original_web_app
+        web._telegram_client = self.original_client
+
+    def test_chat_context_requires_chat_id_and_message_id(self):
+        web._web_app = SimpleNamespace()
+        response = self.client.get("/api/chat_context")
+        self.assertEqual(400, response.status_code)
+        self.assertEqual(False, response.get_json()["ok"])
+
+    def test_chat_context_returns_stored_messages(self):
+        web_app = SimpleNamespace(
+            get_chat_message_context=mock.Mock(
+                return_value=[
+                    {
+                        "chat_id": "-1001",
+                        "message_id": 10,
+                        "text": "Hello context",
+                        "sender_name": "Alice",
+                        "media_type": "text",
+                        "date": 1700000010,
+                    }
+                ]
+            )
+        )
+        web._web_app = web_app
+        web._telegram_client = None
+
+        response = self.client.get("/api/chat_context?chat_id=-1001&message_id=10")
+        self.assertEqual(200, response.status_code)
+        json_data = response.get_json()
+        self.assertEqual(True, json_data["ok"])
+        self.assertEqual(10, json_data["target_message_id"])
+        self.assertEqual(1, len(json_data["messages"]))
+        self.assertEqual("Hello context", json_data["messages"][0]["text"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -955,6 +955,143 @@ def add_target():
         return jsonify({"ok": False, "error": str(err)}), 400
 
 
+def _extract_message_record(message) -> dict:
+    """Extract text and metadata from a pyrogram Message for database ingestion."""
+    text = getattr(message, "text", None) or getattr(message, "caption", None) or ""
+    sender_id = ""
+    sender_name = ""
+    from_user = getattr(message, "from_user", None)
+    sender_chat = getattr(message, "sender_chat", None)
+    if from_user:
+        sender_id = str(getattr(from_user, "id", "") or "")
+        name_parts = [
+            getattr(from_user, "first_name", None),
+            getattr(from_user, "last_name", None),
+        ]
+        full_name = " ".join([p for p in name_parts if p])
+        sender_name = full_name or getattr(from_user, "username", None) or sender_id
+    elif sender_chat:
+        sender_id = str(getattr(sender_chat, "id", "") or "")
+        sender_name = (
+            getattr(sender_chat, "title", None)
+            or getattr(sender_chat, "username", None)
+            or sender_id
+        )
+
+    media_type = "text"
+    for _m in ("audio", "document", "photo", "video", "video_note", "voice", "sticker", "animation"):
+        if getattr(message, _m, None) is not None:
+            media_type = _m
+            break
+
+    date_ts = 0
+    msg_date = getattr(message, "date", None)
+    if msg_date:
+        try:
+            date_ts = int(msg_date.timestamp())
+        except Exception:
+            pass
+
+    reply_to = 0
+    if getattr(message, "reply_to_message_id", None):
+        reply_to = int(message.reply_to_message_id)
+    elif getattr(message, "reply_to_message", None):
+        reply_to = int(getattr(message.reply_to_message, "id", 0) or 0)
+
+    return {
+        "text": text,
+        "sender_id": sender_id,
+        "sender_name": sender_name,
+        "media_type": media_type,
+        "reply_to_message_id": reply_to,
+        "date": date_ts,
+    }
+
+
+@_flask_app.route("/api/chat_context")
+@login_required
+def chat_context():
+    """Retrieve message context for a given chat and message ID."""
+    if not _web_app:
+        return jsonify({"ok": False, "error": "web application is not ready"}), 503
+
+    chat_id = request.args.get("chat_id", "").strip()
+    message_id_str = request.args.get("message_id", "").strip()
+    try:
+        limit_before = max(1, min(int(request.args.get("limit_before", 15) or 15), 100))
+    except (ValueError, TypeError):
+        limit_before = 15
+    try:
+        limit_after = max(1, min(int(request.args.get("limit_after", 15) or 15), 100))
+    except (ValueError, TypeError):
+        limit_after = 15
+
+    if not chat_id or not message_id_str:
+        return jsonify({"ok": False, "error": "chat_id and message_id are required"}), 400
+
+    try:
+        target_message_id = int(message_id_str)
+    except ValueError:
+        return jsonify({"ok": False, "error": "message_id must be an integer"}), 400
+
+    db_messages = _web_app.get_chat_message_context(
+        chat_id, target_message_id, limit_before=limit_before, limit_after=limit_after
+    )
+
+    if _telegram_client:
+        async def fetch_tg_context():
+            resolved_chat = chat_id
+            try:
+                if str(chat_id).startswith("-") and str(chat_id)[1:].isdigit():
+                    resolved_chat = int(chat_id)
+                elif str(chat_id).isdigit():
+                    resolved_chat = int(f"-100{chat_id}")
+            except Exception:
+                pass
+
+            target_ids = list(
+                range(max(1, target_message_id - limit_before), target_message_id + limit_after + 1)
+            )
+            try:
+                tg_messages = await _telegram_client.get_messages(resolved_chat, message_ids=target_ids)
+            except Exception as e:
+                log.warning("Could not fetch messages from Telegram for %s: %s", chat_id, e)
+                return
+
+            if not isinstance(tg_messages, list):
+                tg_messages = [tg_messages] if tg_messages else []
+
+            for msg in tg_messages:
+                if not msg or getattr(msg, "empty", False) or getattr(msg, "service", False):
+                    continue
+                info = _extract_message_record(msg)
+                _web_app.record_chat_message(
+                    chat_id,
+                    msg.id,
+                    text=info["text"],
+                    sender_id=info["sender_id"],
+                    sender_name=info["sender_name"],
+                    media_type=info["media_type"],
+                    reply_to_message_id=info["reply_to_message_id"],
+                    date=info["date"],
+                )
+
+        try:
+            _run_on_app_loop(fetch_tg_context(), timeout=20)
+            db_messages = _web_app.get_chat_message_context(
+                chat_id, target_message_id, limit_before=limit_before, limit_after=limit_after
+            )
+        except Exception as err:
+            log.warning("Error during Telegram context backfill: %s", err)
+
+    return jsonify({
+        "ok": True,
+        "chat_id": chat_id,
+        "target_message_id": target_message_id,
+        "messages": db_messages,
+    })
+
+
 @_flask_app.route("/api/listen_targets", methods=["GET", "POST"])
 @login_required
 def listen_targets():

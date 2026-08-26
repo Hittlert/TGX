@@ -99,6 +99,35 @@ class DownloadRecordStore:
                 )
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS chat_messages (
+                    chat_id TEXT NOT NULL,
+                    message_id INTEGER NOT NULL,
+                    sender_id TEXT,
+                    sender_name TEXT,
+                    text TEXT,
+                    media_type TEXT,
+                    reply_to_message_id INTEGER,
+                    date INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY (chat_id, message_id)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_chat_messages_lookup
+                ON chat_messages(chat_id, message_id)
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_chat_messages_date
+                ON chat_messages(chat_id, date)
+                """
+            )
 
     def upsert(
         self,
@@ -587,3 +616,112 @@ class DownloadRecordStore:
             ).fetchall()
 
         return {str(row["status"]): int(row["total"]) for row in rows}
+
+    def record_message(
+        self,
+        chat_id: Union[int, str],
+        message_id: int,
+        text: Optional[str] = None,
+        *,
+        sender_id: Optional[Union[int, str]] = None,
+        sender_name: Optional[str] = None,
+        media_type: Optional[str] = None,
+        reply_to_message_id: Optional[int] = None,
+        date: Optional[int] = None,
+    ):
+        """Insert or update a collected text/media message in SQLite."""
+        now = int(time.time())
+        msg_date = int(date) if date is not None else now
+        msg_id = self.message_key(message_id)
+        if not msg_id:
+            return
+
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO chat_messages (
+                    chat_id,
+                    message_id,
+                    sender_id,
+                    sender_name,
+                    text,
+                    media_type,
+                    reply_to_message_id,
+                    date,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(chat_id, message_id) DO UPDATE SET
+                    sender_id = COALESCE(excluded.sender_id, chat_messages.sender_id),
+                    sender_name = COALESCE(excluded.sender_name, chat_messages.sender_name),
+                    text = COALESCE(excluded.text, chat_messages.text),
+                    media_type = COALESCE(excluded.media_type, chat_messages.media_type),
+                    reply_to_message_id = COALESCE(excluded.reply_to_message_id, chat_messages.reply_to_message_id),
+                    date = CASE WHEN excluded.date > 0 THEN excluded.date ELSE chat_messages.date END,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    self.chat_key(chat_id),
+                    msg_id,
+                    str(sender_id) if sender_id is not None else None,
+                    str(sender_name) if sender_name is not None else None,
+                    str(text) if text is not None else "",
+                    str(media_type) if media_type is not None else "text",
+                    int(reply_to_message_id) if reply_to_message_id is not None else 0,
+                    msg_date,
+                    now,
+                    now,
+                ),
+            )
+
+    def get_message_context(
+        self,
+        chat_id: Union[int, str],
+        target_message_id: int,
+        limit_before: int = 15,
+        limit_after: int = 15,
+    ) -> List[Dict[str, Any]]:
+        """Retrieve stored messages surrounding a specific message ID."""
+        target_id = self.message_key(target_message_id)
+        chat_k = self.chat_key(chat_id)
+        chat_keys = [chat_k]
+        if chat_k.startswith("-100") and len(chat_k) > 4:
+            chat_keys.append(chat_k[4:])
+        elif chat_k.isdigit():
+            chat_keys.append(f"-100{chat_k}")
+
+        placeholders = ",".join("?" for _ in chat_keys)
+
+        with self._lock, self._connect() as connection:
+            before_rows = connection.execute(
+                f"""
+                SELECT chat_id, message_id, sender_id, sender_name, text,
+                       media_type, reply_to_message_id, date, created_at, updated_at
+                FROM chat_messages
+                WHERE chat_id IN ({placeholders}) AND message_id <= ?
+                ORDER BY message_id DESC
+                LIMIT ?
+                """,
+                (*chat_keys, target_id, limit_before + 1),
+            ).fetchall()
+
+            after_rows = connection.execute(
+                f"""
+                SELECT chat_id, message_id, sender_id, sender_name, text,
+                       media_type, reply_to_message_id, date, created_at, updated_at
+                FROM chat_messages
+                WHERE chat_id IN ({placeholders}) AND message_id > ?
+                ORDER BY message_id ASC
+                LIMIT ?
+                """,
+                (*chat_keys, target_id, limit_after),
+            ).fetchall()
+
+        rows_dict = {}
+        for row in reversed(before_rows):
+            rows_dict[int(row["message_id"])] = dict(row)
+        for row in after_rows:
+            rows_dict[int(row["message_id"])] = dict(row)
+
+        return [rows_dict[mid] for mid in sorted(rows_dict.keys())]

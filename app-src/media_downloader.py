@@ -995,6 +995,59 @@ async def worker(client: pyrogram.client.Client):
             _request_restart_for_connection_error(e)
 
 
+def _extract_message_record(message: pyrogram.types.Message) -> dict:
+    """Extract text and metadata from a pyrogram Message for database ingestion."""
+    text = getattr(message, "text", None) or getattr(message, "caption", None) or ""
+    sender_id = ""
+    sender_name = ""
+    from_user = getattr(message, "from_user", None)
+    sender_chat = getattr(message, "sender_chat", None)
+    if from_user:
+        sender_id = str(getattr(from_user, "id", "") or "")
+        name_parts = [
+            getattr(from_user, "first_name", None),
+            getattr(from_user, "last_name", None),
+        ]
+        full_name = " ".join([p for p in name_parts if p])
+        sender_name = full_name or getattr(from_user, "username", None) or sender_id
+    elif sender_chat:
+        sender_id = str(getattr(sender_chat, "id", "") or "")
+        sender_name = (
+            getattr(sender_chat, "title", None)
+            or getattr(sender_chat, "username", None)
+            or sender_id
+        )
+
+    media_type = "text"
+    for _m in ("audio", "document", "photo", "video", "video_note", "voice", "sticker", "animation"):
+        if getattr(message, _m, None) is not None:
+            media_type = _m
+            break
+
+    date_ts = 0
+    msg_date = getattr(message, "date", None)
+    if msg_date:
+        try:
+            date_ts = int(msg_date.timestamp())
+        except Exception:
+            pass
+
+    reply_to = 0
+    if getattr(message, "reply_to_message_id", None):
+        reply_to = int(message.reply_to_message_id)
+    elif getattr(message, "reply_to_message", None):
+        reply_to = int(getattr(message.reply_to_message, "id", 0) or 0)
+
+    return {
+        "text": text,
+        "sender_id": sender_id,
+        "sender_name": sender_name,
+        "media_type": media_type,
+        "reply_to_message_id": reply_to,
+        "date": date_ts,
+    }
+
+
 async def download_chat_task(
     client: pyrogram.Client,
     chat_download_config: ChatDownloadConfig,
@@ -1014,6 +1067,17 @@ async def download_chat_task(
 
     if not node.bot:
         async for message in messages_iter:  # type: ignore
+            record = _extract_message_record(message)
+            app.record_chat_message(
+                node.chat_id,
+                message.id,
+                text=record["text"],
+                sender_id=record["sender_id"],
+                sender_name=record["sender_name"],
+                media_type=record["media_type"],
+                reply_to_message_id=record["reply_to_message_id"],
+                date=record["date"],
+            )
             app.record_scanned_message(node.chat_id, message.id)
             node.total_task += 1
             app.update_config_if_due()
@@ -1025,6 +1089,17 @@ async def download_chat_task(
         return
 
     async for message in messages_iter:  # type: ignore
+        record = _extract_message_record(message)
+        app.record_chat_message(
+            node.chat_id,
+            message.id,
+            text=record["text"],
+            sender_id=record["sender_id"],
+            sender_name=record["sender_name"],
+            media_type=record["media_type"],
+            reply_to_message_id=record["reply_to_message_id"],
+            date=record["date"],
+        )
         meta_data = _set_message_metadata(message, node)
 
         if app.exec_filter(chat_download_config, meta_data):

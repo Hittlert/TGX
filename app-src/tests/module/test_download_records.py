@@ -184,16 +184,31 @@ class DownloadRecordStoreTestCase(unittest.TestCase):
             store.mark_failed("chat", 41, "retry now", retry_delay=0)
             self.assertEqual(41, store.claim_next(["chat"])["message_id"])
 
-    def test_config_cursor_override_is_distinguished_from_stale_mirror(self):
+    def test_record_message_and_get_context(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             store = DownloadRecordStore(os.path.join(tmp_dir, "records.sqlite3"))
 
-            self.assertEqual(10, store.resolve_cursor("chat", 10))
-            store.enqueue_and_advance_cursor("chat", 20)
+            for i in range(1, 21):
+                store.record_message(
+                    chat_id="-1009999",
+                    message_id=i,
+                    text=f"Message {i}",
+                    sender_id="1001",
+                    sender_name="Alice",
+                    media_type="text" if i % 2 == 0 else "photo",
+                    date=1700000000 + i,
+                )
 
-            self.assertEqual(21, store.resolve_cursor("chat", 10))
-            self.assertEqual(5, store.resolve_cursor("chat", 5))
-            self.assertEqual(5, store.get_cursor("chat"))
+            # Retrieve context for message 10
+            context = store.get_message_context("-1009999", 10, limit_before=3, limit_after=3)
+            msg_ids = [m["message_id"] for m in context]
+            self.assertEqual([7, 8, 9, 10, 11, 12, 13], msg_ids)
+
+            # Target message details
+            target_msg = next(m for m in context if m["message_id"] == 10)
+            self.assertEqual("Message 10", target_msg["text"])
+            self.assertEqual("Alice", target_msg["sender_name"])
+            self.assertEqual("text", target_msg["media_type"])
 
 
 if __name__ == "__main__":

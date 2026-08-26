@@ -1806,6 +1806,47 @@ class Application:
 
         return next_cursor
 
+    def record_chat_message(
+        self,
+        chat_id: Union[int, str],
+        message_id: int,
+        text: Optional[str] = None,
+        *,
+        sender_id: Optional[Union[int, str]] = None,
+        sender_name: Optional[str] = None,
+        media_type: Optional[str] = None,
+        reply_to_message_id: Optional[int] = None,
+        date: Optional[int] = None,
+    ):
+        """Record a collected chat message directly into SQLite database."""
+        store = self.ensure_download_records()
+        store.record_message(
+            chat_id,
+            message_id,
+            text=text,
+            sender_id=sender_id,
+            sender_name=sender_name,
+            media_type=media_type,
+            reply_to_message_id=reply_to_message_id,
+            date=date,
+        )
+
+    def get_chat_message_context(
+        self,
+        chat_id: Union[int, str],
+        message_id: int,
+        limit_before: int = 15,
+        limit_after: int = 15,
+    ) -> List[Dict[str, Any]]:
+        """Retrieve stored chat message context surrounding target message ID."""
+        store = self.ensure_download_records()
+        return store.get_message_context(
+            chat_id,
+            message_id,
+            limit_before=limit_before,
+            limit_after=limit_after,
+        )
+
     def claim_download_record(self) -> Optional[Dict[str, Any]]:
         """Claim one database job while rotating fairly across active chats."""
         with self.consumer_claim_lock:
