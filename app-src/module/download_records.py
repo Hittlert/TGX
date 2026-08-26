@@ -128,6 +128,7 @@ class DownloadRecordStore:
                 ON chat_messages(chat_id, date)
                 """
             )
+        self.clean_invalid_failed_records()
 
     def upsert(
         self,
@@ -239,6 +240,20 @@ class DownloadRecordStore:
         retry_delay: int = 0,
     ):
         now = int(time.time())
+        error_text = str(error or "").lower()
+        is_invalid_message = any(
+            marker in error_text
+            for marker in (
+                "invalid message",
+                "message deleted",
+                "message_deleted",
+                "message does not exist",
+                "message empty",
+                "messageempty",
+                "not found",
+                "message not found",
+            )
+        )
         with self._lock, self._connect() as connection:
             connection.execute(
                 """
@@ -249,19 +264,29 @@ class DownloadRecordStore:
                     error,
                     created_at,
                     updated_at,
-                    next_retry_at
+                    next_retry_at,
+                    attempts
                 )
-                VALUES (?, ?, 'failed', ?, ?, ?, ?)
+                VALUES (?, ?, 'failed', ?, ?, ?, ?, 1)
                 ON CONFLICT(chat_id, message_id) DO UPDATE SET
                     status = CASE
                         WHEN download_records.status = 'success'
                             THEN download_records.status
+                        WHEN ? AND (download_records.attempts >= 9)
+                            THEN 'skipped'
                         ELSE 'failed'
                     END,
                     error = CASE
                         WHEN download_records.status = 'success'
                             THEN download_records.error
+                        WHEN ? AND (download_records.attempts >= 9)
+                            THEN 'skipped: message does not exist or deleted (10+ retries)'
                         ELSE excluded.error
+                    END,
+                    attempts = CASE
+                        WHEN download_records.status = 'success'
+                            THEN download_records.attempts
+                        ELSE download_records.attempts + 1
                     END,
                     updated_at = CASE
                         WHEN download_records.status = 'success'
@@ -276,6 +301,8 @@ class DownloadRecordStore:
                     next_retry_at = CASE
                         WHEN download_records.status = 'success'
                             THEN download_records.next_retry_at
+                        WHEN ? AND (download_records.attempts >= 9)
+                            THEN 0
                         ELSE excluded.next_retry_at
                     END
                 """,
@@ -286,8 +313,71 @@ class DownloadRecordStore:
                     now,
                     now,
                     now + max(int(retry_delay or 0), 0),
+                    is_invalid_message,
+                    is_invalid_message,
+                    is_invalid_message,
                 ),
             )
+
+    def advance_cursor_only(
+        self, chat_id: Union[int, str], message_id: int
+    ) -> int:
+        """Advance cursor and record non-file message as skipped without queuing download."""
+        chat_key = self.chat_key(chat_id)
+        message_key = self.message_key(message_id)
+        next_cursor = message_key + 1
+        now = int(time.time())
+
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                INSERT INTO download_records (
+                    chat_id, message_id, status, error, created_at, updated_at
+                )
+                VALUES (?, ?, 'skipped', 'non-file message', ?, ?)
+                ON CONFLICT(chat_id, message_id) DO NOTHING
+                """,
+                (chat_key, message_key, now, now),
+            )
+            connection.execute(
+                """
+                INSERT INTO chat_scan_cursors (
+                    chat_id, cursor, mirrored_cursor, updated_at
+                )
+                VALUES (?, ?, 0, ?)
+                ON CONFLICT(chat_id) DO UPDATE SET
+                    cursor = MAX(chat_scan_cursors.cursor, excluded.cursor),
+                    updated_at = excluded.updated_at
+                """,
+                (chat_key, next_cursor, now),
+            )
+        return next_cursor
+
+    def clean_invalid_failed_records(self) -> int:
+        """Clean dead-loop failed records where message does not exist or has failed repeatedly."""
+        now = int(time.time())
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE download_records
+                SET status = 'skipped',
+                    error = 'skipped: message does not exist or deleted',
+                    updated_at = ?,
+                    processing_started_at = NULL,
+                    next_retry_at = 0
+                WHERE status = 'failed'
+                  AND (
+                    attempts >= 10
+                    OR error LIKE '%invalid message%'
+                    OR error LIKE '%message deleted%'
+                    OR error LIKE '%message empty%'
+                    OR error LIKE '%not found%'
+                  )
+                """,
+                (now,),
+            )
+            return int(cursor.rowcount)
 
     def mark_skipped(self, chat_id: Union[int, str], message_id: int):
         if not self.has_success(chat_id, message_id):

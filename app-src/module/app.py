@@ -1806,6 +1806,19 @@ class Application:
 
         return next_cursor
 
+    def advance_scan_cursor(self, chat_id: Union[int, str], message_id: int) -> int:
+        """Advance cursor for non-file messages without creating pending download jobs."""
+        next_cursor = self.ensure_download_records().advance_cursor_only(
+            chat_id, message_id
+        )
+        with self.config_lock:
+            chat_download_config = self._get_chat_download_config(chat_id)
+            if chat_download_config:
+                chat_download_config.last_read_message_id = next_cursor
+                self.config_dirty = True
+
+        return next_cursor
+
     def record_chat_message(
         self,
         chat_id: Union[int, str],

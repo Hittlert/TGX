@@ -1048,6 +1048,26 @@ def _extract_message_record(message: pyrogram.types.Message) -> dict:
     }
 
 
+def _has_downloadable_file(message: pyrogram.types.Message) -> bool:
+    """Check if the message contains any downloadable file attachment (document, photo, video, audio, etc.)."""
+    if not message or getattr(message, "empty", False) or getattr(message, "service", False):
+        return False
+
+    for attr in (
+        "document",
+        "photo",
+        "video",
+        "audio",
+        "voice",
+        "video_note",
+        "animation",
+        "sticker",
+    ):
+        if getattr(message, attr, None) is not None:
+            return True
+    return False
+
+
 async def download_chat_task(
     client: pyrogram.Client,
     chat_download_config: ChatDownloadConfig,
@@ -1078,8 +1098,11 @@ async def download_chat_task(
                 reply_to_message_id=record["reply_to_message_id"],
                 date=record["date"],
             )
-            app.record_scanned_message(node.chat_id, message.id)
-            node.total_task += 1
+            if _has_downloadable_file(message):
+                app.record_scanned_message(node.chat_id, message.id)
+                node.total_task += 1
+            else:
+                app.advance_scan_cursor(node.chat_id, message.id)
             app.update_config_if_due()
 
         chat_download_config.need_check = True
@@ -1100,6 +1123,10 @@ async def download_chat_task(
             reply_to_message_id=record["reply_to_message_id"],
             date=record["date"],
         )
+        if not _has_downloadable_file(message):
+            node.download_status[message.id] = DownloadStatus.SkipDownload
+            continue
+
         meta_data = _set_message_metadata(message, node)
 
         if app.exec_filter(chat_download_config, meta_data):

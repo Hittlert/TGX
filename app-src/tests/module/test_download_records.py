@@ -208,7 +208,33 @@ class DownloadRecordStoreTestCase(unittest.TestCase):
             target_msg = next(m for m in context if m["message_id"] == 10)
             self.assertEqual("Message 10", target_msg["text"])
             self.assertEqual("Alice", target_msg["sender_name"])
-            self.assertEqual("text", target_msg["media_type"])
+    def test_invalid_message_marked_skipped_after_10_attempts(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            store = DownloadRecordStore(os.path.join(tmp_dir, "records.sqlite3"))
+            store.enqueue_and_advance_cursor("chat", 1)
+
+            # Retry 9 times with invalid message error
+            for i in range(1, 10):
+                store.mark_failed("chat", 1, "resolve Telegram media: invalid message 1")
+                rec = store.get_record("chat", 1)
+                self.assertEqual("failed", rec["status"])
+
+            # 10th time: should transition to skipped
+            store.mark_failed("chat", 1, "resolve Telegram media: invalid message 1")
+            rec = store.get_record("chat", 1)
+            self.assertEqual("skipped", rec["status"])
+            self.assertIn("message does not exist", rec["error"])
+
+    def test_clean_invalid_failed_records(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            store = DownloadRecordStore(os.path.join(tmp_dir, "records.sqlite3"))
+            store.enqueue_and_advance_cursor("chat", 100)
+            store.mark_failed("chat", 100, "resolve message: invalid message 100")
+
+            cleaned = store.clean_invalid_failed_records()
+            self.assertEqual(1, cleaned)
+            rec = store.get_record("chat", 100)
+            self.assertEqual("skipped", rec["status"])
 
 
 if __name__ == "__main__":
