@@ -1049,7 +1049,7 @@ def _extract_message_record(message: pyrogram.types.Message) -> dict:
 
 
 def _has_downloadable_file(message: pyrogram.types.Message) -> bool:
-    """Check if the message contains any downloadable file attachment (document, photo, video, audio, etc.)."""
+    """Check if the message contains any downloadable file attachment (document, photo, video, audio, etc.). Excludes stickers and animations."""
     if not message or getattr(message, "empty", False) or getattr(message, "service", False):
         return False
 
@@ -1060,8 +1060,6 @@ def _has_downloadable_file(message: pyrogram.types.Message) -> bool:
         "audio",
         "voice",
         "video_note",
-        "animation",
-        "sticker",
     ):
         if getattr(message, attr, None) is not None:
             return True

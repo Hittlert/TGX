@@ -34,8 +34,6 @@ DOWNLOADABLE_FILE_TYPES = (
     "video",
     "voice",
     "video_note",
-    "animation",
-    "sticker",
 )
 # pylint: disable = R0902
 
