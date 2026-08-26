@@ -1,0 +1,6 @@
+FROM telegram_media_downloader_base:kurigram-2.2.24
+
+WORKDIR /app
+COPY . /app
+
+CMD ["python", "media_downloader.py"]

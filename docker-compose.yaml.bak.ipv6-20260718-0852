@@ -1,0 +1,79 @@
+services:
+  tdl-daemon:
+    image: telegram-tdl-daemon:v0.20.3-daemon.4
+    command:
+      - --storage
+      - type=bolt,path=/data
+      - --ns
+      - production
+      - --proxy
+      - http://192.168.79.22:6152
+      - --reconnect-timeout
+      - "0"
+      - daemon
+      - --listen
+      - 0.0.0.0:18080
+      - --dir
+      - /app/downloads
+      - --temp-dir
+      - /app/temp/tdl
+      - --queue-capacity
+      - "1000"
+      - --terminal-limit
+      - "2000"
+      - --file-concurrency
+      - "5"
+      - --download-threads
+      - "8"
+      - --dc-pool-size
+      - "8"
+      - --start-paused=false
+      - --daemon-reconnect-timeout
+      - "0"
+      - --peer-sync-timeout
+      - 3m
+    volumes:
+      - "./tdl-state:/data"
+      - "./temp/tdl:/app/temp/tdl"
+      - "/home/hittler/SpecialMedias/06-碎片整理区/碎片媒体/TG2/:/app/downloads/"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:18080/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
+    restart: "unless-stopped"
+
+  telegram_media_downloader_us:
+    image: telegram_media_downloader_us:cdn-b90b276
+    build:
+      context: ./app-src
+      dockerfile: Dockerfile.local
+    command: ["python", "/app-live/media_downloader.py"]
+    ports:
+      - "5875:5000"
+    environment:
+      - http_proxy=http://192.168.79.22:6152
+      - https_proxy=http://192.168.79.22:6152
+    depends_on:
+      tdl-daemon:
+        condition: service_healthy
+    volumes:
+      - "./app-src/:/app-live/:ro"
+      # Here is what you need to edit
+      - "/home/hittler/SpecialMedias/06-碎片整理区/碎片媒体/TG2/:/app/downloads/"
+
+      # Rclone
+      - "./rclone/:/.config/rclone/"
+
+      # The following is what you don't need to edit
+      - "./config.yaml:/app/config.yaml"
+      - "./data.yaml:/app/data.yaml"
+      - "./log/:/app/log/"
+      - "./sessions/:/app/sessions"
+      - "./state/:/app/state"
+      - "./temp/:/app/temp"
+    restart: "unless-stopped"
+# volumes:
+#   sessions:
+#   temp:

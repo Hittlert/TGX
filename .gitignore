@@ -1,0 +1,41 @@
+# Runtime data & temp
+temp/
+downloads/
+sessions/
+state/
+tdl-state/
+log/
+backups/
+evidence/
+staging/
+canary-output/
+tdl-canary-*/
+tdl-runtime-*/
+
+# Databases & logs
+*.sqlite3*
+*.log
+*.analysis
+*.tar.gz
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# macOS
+.DS_Store
+._*
+.AppleDouble
+
+# IDE
+.idea/
+.vscode/
+*.swp

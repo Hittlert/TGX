@@ -1,0 +1,10 @@
+FROM scratch
+
+WORKDIR /app
+COPY build/telegram-downloader-linux-amd64 /app/telegram-downloader
+
+HEALTHCHECK --interval=10s --timeout=3s --retries=6 --start-period=10s \
+  CMD ["/app/telegram-downloader", "healthcheck", "--url", "http://127.0.0.1:18080/healthz"]
+
+ENTRYPOINT ["/app/telegram-downloader"]
+CMD ["serve"]

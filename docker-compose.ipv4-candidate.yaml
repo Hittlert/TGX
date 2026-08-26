@@ -1,0 +1,95 @@
+services:
+  ipv4-proxy-guard:
+    image: telegram-ipv4-proxy-guard:b680c54a
+    build:
+      context: ./ipv4-proxy-guard
+      dockerfile: Dockerfile
+    environment:
+      - UPSTREAM_PROXY=http://192.168.79.22:6152
+    healthcheck:
+      test: ["CMD", "/ipv4-proxy-guard", "healthcheck", "--url", "http://127.0.0.1:18081/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 3s
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    restart: "unless-stopped"
+
+  tdl-daemon:
+    image: telegram-downloader-host:75d5687-0b075fa
+    command:
+      - serve
+      - --storage-path
+      - /data
+      - --namespace
+      - production
+      - --proxy
+      - http://ipv4-proxy-guard:18081
+      - --reconnect-timeout
+      - "0"
+      - --listen
+      - 0.0.0.0:18080
+      - --dir
+      - /app/downloads
+      - --temp-dir
+      - /app/temp/tdl
+      - --queue-capacity
+      - "1000"
+      - --terminal-limit
+      - "2000"
+      - --file-concurrency
+      - "5"
+      - --download-threads
+      - "8"
+      - --dc-pool-size
+      - "8"
+      - --start-paused=false
+      - --daemon-reconnect-timeout
+      - "0"
+      - --peer-sync-timeout
+      - 3m
+    volumes:
+      - "./tdl-state:/data"
+      - "./temp/tdl:/app/temp/tdl"
+      - "/home/hittler/SpecialMedias/06-碎片整理区/碎片媒体/TG2/:/app/downloads/"
+    healthcheck:
+      test: ["CMD", "/app/telegram-downloader", "healthcheck", "--url", "http://127.0.0.1:18080/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
+    sysctls:
+      net.ipv6.conf.all.disable_ipv6: "1"
+      net.ipv6.conf.default.disable_ipv6: "1"
+    depends_on:
+      ipv4-proxy-guard:
+        condition: service_healthy
+    restart: "unless-stopped"
+
+  telegram_media_downloader_us:
+    image: telegram_media_downloader_us:cdn-b90b276
+    build:
+      context: ./app-src
+      dockerfile: Dockerfile.local
+    command: ["python", "/app-live/media_downloader.py"]
+    ports:
+      - "5875:5000"
+    environment:
+      - http_proxy=http://192.168.79.22:6152
+      - https_proxy=http://192.168.79.22:6152
+    depends_on:
+      tdl-daemon:
+        condition: service_healthy
+    volumes:
+      - "./app-src/:/app-live/:ro"
+      - "/home/hittler/SpecialMedias/06-碎片整理区/碎片媒体/TG2/:/app/downloads/"
+      - "./rclone/:/.config/rclone/"
+      - "./config.yaml:/app/config.yaml"
+      - "./data.yaml:/app/data.yaml"
+      - "./log/:/app/log/"
+      - "./sessions/:/app/sessions"
+      - "./state/:/app/state"
+      - "./temp/:/app/temp"
+    restart: "unless-stopped"

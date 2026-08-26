@@ -1,0 +1,126 @@
+services:
+  xray-proxy:
+    image: telegram-xray:local
+    build:
+      context: ./xray
+      dockerfile: Dockerfile
+    command:
+      - run
+      - -c
+      - /etc/xray/config.json
+    restart: "unless-stopped"
+
+  ipv4-proxy-guard:
+    image: telegram-ipv4-proxy-guard:b680c54a
+    build:
+      context: ./ipv4-proxy-guard
+      dockerfile: Dockerfile
+    environment:
+      - UPSTREAM_PROXY=http://192.168.79.22:6152
+    healthcheck:
+      test: ["CMD", "/ipv4-proxy-guard", "healthcheck", "--url", "http://127.0.0.1:18081/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 3s
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    restart: "unless-stopped"
+
+  tdl-daemon:
+    image: telegram-downloader-host:1f1ebff-6bd3991
+    command:
+      - serve
+      - --storage-path
+      - /data
+      - --namespace
+      - production
+      - --proxy
+      - http://xray-proxy:1081
+      - --reconnect-timeout
+      - "0"
+      - --listen
+      - 0.0.0.0:18080
+      - --dir
+      - /app/downloads
+      - --temp-dir
+      - /app/temp/tdl
+      - --queue-capacity
+      - "1000"
+      - --terminal-limit
+      - "2000"
+      - --file-concurrency
+      - "5"
+      - --publish-concurrency
+      - "1"
+      - --publish-queue-capacity
+      - "10"
+      - --download-threads
+      - "8"
+      - --dc-pool-size
+      - "8"
+      - --start-paused=false
+      - --daemon-reconnect-timeout
+      - "0"
+      - --peer-sync-timeout
+      - 3m
+      - --consumer-enabled
+      - --ledger-path
+      - /app/state/download_records.sqlite3
+      - --migration-backup-dir
+      - /app/state/go-migration-backups
+      - --consumer-inflight
+      - "64"
+      - --producer-enabled
+      - --producer-scan-interval
+      - 10m
+      - --producer-error-retry-delay
+      - 30s
+    volumes:
+      - "./deployments/209c828-fd63c02/telegram-downloader-linux-amd64:/app/telegram-downloader:ro"
+      - "./tdl-state:/data"
+      - "./state:/app/state"
+      - "./temp/tdl:/app/temp/tdl"
+      - "/home/hittler/SpecialMedias/06-碎片整理区/碎片媒体/TG2/:/app/downloads/"
+    healthcheck:
+      test: ["CMD", "/app/telegram-downloader", "healthcheck", "--url", "http://127.0.0.1:18080/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
+    sysctls:
+      net.ipv6.conf.all.disable_ipv6: "1"
+      net.ipv6.conf.default.disable_ipv6: "1"
+    depends_on:
+      xray-proxy:
+        condition: service_started
+    restart: "unless-stopped"
+
+  telegram_media_downloader_us:
+    image: telegram_media_downloader_us:cdn-b90b276
+    build:
+      context: ./app-src
+      dockerfile: Dockerfile.local
+    command: ["python", "/app-live/media_downloader.py"]
+    ports:
+      - "5875:5000"
+    environment:
+      - http_proxy=http://xray-proxy:1081
+      - https_proxy=http://xray-proxy:1081
+      - no_proxy=tdl-daemon,localhost,127.0.0.1,xray-proxy
+      - NO_PROXY=tdl-daemon,localhost,127.0.0.1,xray-proxy
+    depends_on:
+      tdl-daemon:
+        condition: service_healthy
+    volumes:
+      - "./app-src/:/app-live/:ro"
+      - "/home/hittler/SpecialMedias/06-碎片整理区/碎片媒体/TG2/:/app/downloads/"
+      - "./rclone/:/.config/rclone/"
+      - "./config.yaml:/app/config.yaml"
+      - "./data.yaml:/app/data.yaml"
+      - "./log/:/app/log/"
+      - "./sessions/:/app/sessions"
+      - "./state:/app/state"
+      - "./temp/:/app/temp"
+    restart: "unless-stopped"

@@ -1,0 +1,13 @@
+kurigram==2.2.24
+PyYAML==5.3.1
+rich==12.5.1
+PyTgCrypto==1.2.6
+loguru==0.6.0
+# aligo==5.4.0
+Werkzeug==2.2.2
+flask==2.2.2
+ply==3.11
+ruamel.yaml==0.17.21
+flask-login==0.6.2
+pycryptodome==3.18.0
+requests==2.32.3

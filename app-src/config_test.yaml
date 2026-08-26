@@ -1,0 +1,34 @@
+api_id: 123
+api_hash: hasw5Tgawsuj67
+chat:
+- chat_id: 8654123
+  last_read_message_id: 1217
+  ids_to_retry:
+  - 1
+  - 2
+media_types:
+- audio
+- voice
+- document
+- photo
+- video
+- video_note
+file_formats:
+  audio:
+  - all
+  voice:
+  - all
+  video:
+  - all
+save_path: /root/project
+file_name_prefix:
+- message_id
+- caption
+- file_name
+file_path_prefix:
+- chat_title
+- media_datetime
+language: EN
+filter_advertisement_list: []
+replace_advertisement_list: []
+group_add_advertisement: {}

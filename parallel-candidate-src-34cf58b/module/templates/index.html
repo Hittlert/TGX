@@ -1,0 +1,747 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Telegram Media Downloader</title>
+  <link href="static/layui/css/layui.css" rel="stylesheet">
+  <link href="static/css/index.css" rel="stylesheet">
+</head>
+
+<body>
+  <div class="layui-tab" lay-filter="telegram_media_downloader">
+    <div class="header-title layui-tab-brief">
+      <ul class="layui-tab-title">
+        <li class="layui-this">Downloading</li>
+        <li>Downloaded</li>
+        <li>Targets</li>
+      </ul>
+      <div class="stop-btn" id="download_state" data-value="{{ download_state }}" onclick="download_state_change(this)"> {{ download_state }} </div>
+    </div>
+    <div class="layui-tab-content" style="padding: 0;">
+      <div class="layui-tab-item layui-show">
+        <div class="mobile-job-list" id="download_mobile_list">
+          <div class="mobile-empty">No active downloads</div>
+        </div>
+        <table class="layui-hide" id="download_list" lay-filter="download_list"></table>
+      </div>
+      <div class="layui-tab-item">
+        <div class="mobile-job-list" id="already_download_mobile_list">
+          <div class="mobile-empty">No downloaded files</div>
+        </div>
+        <table class="layui-hide" id="already_download_list" lay-filter="already_download_list"></table>
+      </div>
+      <div class="layui-tab-item">
+        <div class="target-toolbar">
+          <div class="target-search">
+            <i class="layui-icon layui-icon-search"></i>
+            <input id="target_search" type="text" autocomplete="off" placeholder="Search dialogs">
+          </div>
+          <button id="reload_dialogs" type="button" class="layui-btn layui-btn-primary layui-btn-sm" aria-label="Refresh dialogs">
+            <i class="layui-icon layui-icon-refresh"></i>
+            <span class="target-action-text">Refresh</span>
+          </button>
+          <button id="save_targets" type="button" class="layui-btn layui-btn-sm" aria-label="Save targets">
+            <i class="layui-icon layui-icon-ok"></i>
+            <span class="target-action-text">Save</span>
+          </button>
+          <div class="target-count">
+            <span id="target_enabled_count">0</span>/<span id="target_total_count">0</span>
+          </div>
+        </div>
+        <div class="target-list" id="target_list">
+          <div class="target-empty">Loading cache...</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="layui-footer">
+    <div class="layui-row layui-col-space1">
+      <div class="layui-col-md2">
+        <p>Telegram Media Downloader V <b id="app_version" style="color: #009688;">undefined</b>
+      </div>
+      <div class="layui-col-md7">
+      </div>
+      <div class="layui-col-md3">
+        <div style="padding: 5px; float: right;">
+          <!-- <i class="layui-icon layui-icon-upload-circle" style="font-size: 16px; color: #1E9FFF; font-weight: 700;">
+            <i id="upload_speed_title" style="color: black;"> 0.00 B/s </i>
+          </i> -->
+
+          <i class="layui-icon layui-icon-download-circle"
+            style="font-size: 16px; color: #5FB878; font-weight: 700; margin-left: 15px;">
+            <i id="download_speed_title" style="color: black;"> 0.00 B/s </i>
+          </i>
+
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="static/layui/layui.js"></script>
+  <script>
+
+    layui.use(['table', 'element'], function () {
+      var table = layui.table;
+      var element = layui.element;
+      var layer = layui.layer;
+      var $ = layui.$;
+      var already_download_list_data = new Array()
+      var download_list_table_data = new Array()
+
+      $.ajax({
+        url: "get_app_version"
+        , type: "get"
+        , async: false
+        , dataType: "text"
+        , success: function (result) {
+          $("#app_version").html(result)
+        }
+      });
+
+      download_state_change = function(e) {
+        $.ajax({
+        url: "set_download_state?state=" + e.dataset.value
+        , type: "post"
+        , async: false
+        , dataType: "text"
+        , success: function (result) {
+          $("#download_state").html(result)
+          e.dataset.value=result
+        }
+      });
+    }
+
+      var target_rows = [];
+      var target_loaded = false;
+
+      function escape_html(value) {
+        return String(value == null ? '' : value)
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;')
+          .replace(/"/g, '&quot;')
+          .replace(/'/g, '&#39;');
+      }
+
+      function target_key(value) {
+        return String(value == null ? '' : value);
+      }
+
+      function find_target_row(chat_key) {
+        for (var i = 0; i < target_rows.length; i++) {
+          if (target_key(target_rows[i].chat_id) == chat_key) {
+            return target_rows[i];
+          }
+        }
+        return null;
+      }
+
+      function target_display_name(row) {
+        if (row.title) {
+          return row.title;
+        }
+        if (row.username) {
+          return '@' + row.username;
+        }
+        if (row.chat_id) {
+          return row.chat_id;
+        }
+        return 'Unknown dialog';
+      }
+
+      function target_meta(row) {
+        var parts = [];
+        if (row.type) {
+          parts.push(row.type);
+        }
+        if (row.username) {
+          parts.push('@' + row.username);
+        }
+        if (row.chat_id) {
+          parts.push('id ' + row.chat_id);
+        }
+        var listen_chat_id = normalized_listen_chat_id(row);
+        if (listen_chat_id && String(listen_chat_id) != String(row.chat_id || '')) {
+          parts.push('listen ' + listen_chat_id);
+        }
+        return parts.join(' / ');
+      }
+
+      function normalized_listen_chat_id(row) {
+        var chat_type = String(row.type || '').toLowerCase();
+        var username = String(row.username || '').replace(/^@/, '');
+        if (username && (chat_type == 'bot' || chat_type == 'private' || chat_type == 'user')) {
+          return '@' + username;
+        }
+
+        var chat_id = row.chat_id;
+        var chat_id_text = String(chat_id == null ? '' : chat_id);
+        if (
+          chat_id_text &&
+          chat_id_text.indexOf('-') !== 0 &&
+          /^\d+$/.test(chat_id_text) &&
+          (chat_type == 'channel' || chat_type == 'supergroup')
+        ) {
+          return '-100' + chat_id_text;
+        }
+
+        if (row.target_chat_id) {
+          return row.target_chat_id;
+        }
+
+        return chat_id;
+      }
+
+      function format_timestamp(value) {
+        var timestamp = parseInt(value || 0, 10);
+        if (!timestamp) {
+          return 'Never';
+        }
+
+        var date = new Date(timestamp * 1000);
+        var pad = function (number) {
+          return number < 10 ? '0' + number : String(number);
+        };
+        return [
+          date.getFullYear(),
+          pad(date.getMonth() + 1),
+          pad(date.getDate())
+        ].join('-') + ' ' + pad(date.getHours()) + ':' + pad(date.getMinutes());
+      }
+
+      function get_scan_status(row) {
+        if (!row.scan_status || typeof row.scan_status != 'object') {
+          return {};
+        }
+        return row.scan_status;
+      }
+
+      function scan_status_label(status) {
+        if (status == 'ok') {
+          return 'OK';
+        }
+        if (status == 'error') {
+          return 'Error';
+        }
+        if (status == 'scanning') {
+          return 'Scanning';
+        }
+        return 'Pending';
+      }
+
+      function scan_status_class(status) {
+        if (status == 'ok' || status == 'error' || status == 'scanning') {
+          return status;
+        }
+        return 'pending';
+      }
+
+      function target_scan_html(row) {
+        var scan = get_scan_status(row);
+        var status = scan.status || 'pending';
+        var scan_time = scan.last_scan_finished_at || scan.last_scan_started_at || 0;
+        var time_label = status == 'scanning' ? 'Started ' : 'Last scan ';
+        var error = scan.error
+          ? '<div class="target-scan-error">' + escape_html(scan.error) + '</div>'
+          : '';
+
+        return '<div class="target-scan">' +
+          '<span class="target-status-badge is-' + scan_status_class(status) + '">' + scan_status_label(status) + '</span>' +
+          '<span class="target-scan-time">' + time_label + format_timestamp(scan_time) + '</span>' +
+          '</div>' + error;
+      }
+
+      function sync_target_row(dom_row) {
+        var row = find_target_row($(dom_row).attr('data-chat-key'));
+        if (!row) {
+          return;
+        }
+        row.enabled = $(dom_row).find('.target-enabled').prop('checked');
+        row.last_read_message_id = $(dom_row).find('.target-cursor').val() || 0;
+        row.download_filter = $(dom_row).find('.target-filter').val() || '';
+      }
+
+      function sync_visible_target_rows() {
+        $('#target_list .target-item[data-chat-key]').each(function () {
+          sync_target_row(this);
+        });
+      }
+
+      function update_target_count() {
+        var enabled_count = 0;
+        for (var i = 0; i < target_rows.length; i++) {
+          if (target_rows[i].enabled) {
+            enabled_count += 1;
+          }
+        }
+        $('#target_enabled_count').html(enabled_count);
+        $('#target_total_count').html(target_rows.length);
+      }
+
+      function clamp_progress(value) {
+        var progress = parseFloat(value || 0);
+        if (isNaN(progress)) {
+          progress = 0;
+        }
+        return Math.max(0, Math.min(100, progress));
+      }
+
+      function render_file_card(row, done) {
+        var filename = row.filename || row.save_path || ('Message ' + (row.id || ''));
+        var progress = clamp_progress(row.download_progress);
+        var meta = [];
+        if (row.chat) {
+          meta.push('chat ' + row.chat);
+        }
+        if (row.id) {
+          meta.push('msg ' + row.id);
+        }
+        if (row.total_size) {
+          meta.push(row.total_size);
+        }
+        var path = done && row.save_path
+          ? '<div class="mobile-job-path">' + escape_html(row.save_path) + '</div>'
+          : '';
+        var progress_html = done
+          ? '<span class="mobile-job-badge">Done</span>'
+          : '<div class="mobile-progress"><div style="width: ' + progress + '%;"></div></div>';
+        var status = done ? '' : '<div class="mobile-job-speed">' + escape_html(row.download_speed || '') + '</div>';
+
+        return '<section class="mobile-job-card">' +
+          '<div class="mobile-job-main">' +
+          '<div class="mobile-job-file">' + escape_html(filename) + '</div>' +
+          '<div class="mobile-job-meta">' + escape_html(meta.join(' / ')) + '</div>' +
+          path +
+          '</div>' +
+          '<div class="mobile-job-side">' +
+          progress_html +
+          status +
+          '</div>' +
+          '</section>';
+      }
+
+      function render_active_download_cards(rows) {
+        var html = '';
+        for (var i = 0; i < rows.length; i++) {
+          if (clamp_progress(rows[i].download_progress) >= 100) {
+            continue;
+          }
+          html += render_file_card(rows[i], false);
+        }
+        $('#download_mobile_list').html(html || '<div class="mobile-empty">No active downloads</div>');
+      }
+
+      function render_downloaded_cards(rows) {
+        var html = '';
+        for (var i = 0; i < rows.length; i++) {
+          html += render_file_card(rows[i], true);
+        }
+        $('#already_download_mobile_list').html(html || '<div class="mobile-empty">No downloaded files</div>');
+      }
+
+      function render_target_list() {
+        var query = ($('#target_search').val() || '').toLowerCase();
+        var html = '';
+        var shown_count = 0;
+
+        for (var i = 0; i < target_rows.length; i++) {
+          var row = target_rows[i];
+          var scan_status = get_scan_status(row);
+          var search_text = [
+            row.chat_id,
+            row.title,
+            row.username,
+            row.type,
+            scan_status.status,
+            scan_status.error
+          ].join(' ').toLowerCase();
+          if (query && search_text.indexOf(query) < 0) {
+            continue;
+          }
+
+          shown_count += 1;
+          var chat_key = escape_html(target_key(row.chat_id));
+          var checked = row.enabled ? 'checked' : '';
+          var config_open = row.config_open ? ' is-config-open' : '';
+          var top_message_id = parseInt(row.top_message_id || 0, 10);
+          var latest_button = top_message_id > 0
+            ? '<button type="button" class="target-icon-btn cursor-latest" title="Use latest message id" aria-label="Use latest message id"><i class="layui-icon layui-icon-set"></i></button>'
+            : '';
+          html += '<section class="target-item' + (row.enabled ? ' is-enabled' : '') + config_open + '" data-chat-key="' + chat_key + '">' +
+            '<div class="target-item-head">' +
+            '<label class="target-listen"><input class="target-enabled" type="checkbox" ' + checked + '><span>Listen</span></label>' +
+            '<div class="target-identity"><div class="target-name">' + escape_html(target_display_name(row)) + '</div>' +
+            '<div class="target-meta">' + escape_html(target_meta(row)) + '</div>' +
+            target_scan_html(row) + '</div>' +
+            '<button type="button" class="target-config-toggle" title="Configure cursor and filter" aria-label="Configure cursor and filter" aria-expanded="' + (row.config_open ? 'true' : 'false') + '"><i class="layui-icon layui-icon-set"></i><span class="target-config-text">Config</span></button>' +
+            '</div>' +
+            '<div class="target-controls">' +
+            '<label class="target-field"><span>Cursor</span><div class="target-cursor-cell"><input class="target-cursor" type="number" min="0" step="1" value="' + escape_html(row.last_read_message_id || 0) + '">' + latest_button + '</div></label>' +
+            '<label class="target-field"><span>Filter</span><input class="target-filter" type="text" value="' + escape_html(row.download_filter || '') + '" placeholder="download_filter"></label>' +
+            '</div>' +
+            '</section>';
+        }
+
+        if (!shown_count) {
+          html = '<div class="target-empty">No dialogs</div>';
+        }
+
+        $('#target_list').html(html);
+        update_target_count();
+      }
+
+      function load_dialogs(refresh) {
+        var loading_text = refresh ? 'Refreshing...' : 'Loading cache...';
+        $('#target_list').html('<div class="target-empty">' + loading_text + '</div>');
+        $.ajax({
+          url: refresh ? "api/dialogs?refresh=true" : "api/dialogs",
+          type: "get",
+          dataType: "json",
+          success: function (result) {
+            if (!result.ok) {
+              layer.msg(result.error || 'Load failed');
+              return;
+            }
+            target_rows = result.dialogs || [];
+            target_rows.sort(function (a, b) {
+              return Number(Boolean(b.enabled)) - Number(Boolean(a.enabled));
+            });
+            target_loaded = true;
+            render_target_list();
+          },
+          error: function (err) {
+            var message = 'Load failed';
+            if (err.responseJSON && err.responseJSON.error) {
+              message = err.responseJSON.error;
+            }
+            layer.msg(message);
+            $('#target_list').html('<div class="target-empty">Load failed</div>');
+          }
+        });
+      }
+
+      function save_targets() {
+        sync_visible_target_rows();
+        var targets = [];
+        for (var i = 0; i < target_rows.length; i++) {
+          if (!target_rows[i].enabled) {
+            continue;
+          }
+          targets.push({
+            enabled: true,
+            chat_id: normalized_listen_chat_id(target_rows[i]),
+            source_chat_id: target_rows[i].chat_id,
+            title: target_display_name(target_rows[i]),
+            username: target_rows[i].username || '',
+            type: target_rows[i].type || '',
+            last_read_message_id: parseInt(target_rows[i].last_read_message_id || 0, 10) || 0,
+            download_filter: target_rows[i].download_filter || '',
+            upload_telegram_chat_id: target_rows[i].upload_telegram_chat_id || ''
+          });
+        }
+
+        $.ajax({
+          url: "api/listen_targets",
+          type: "post",
+          dataType: "json",
+          contentType: "application/json",
+          data: JSON.stringify({ targets: targets }),
+          success: function (result) {
+            if (!result.ok) {
+              layer.msg(result.error || 'Save failed');
+              return;
+            }
+            layer.msg('Saved');
+            load_dialogs(false);
+          },
+          error: function (err) {
+            var message = 'Save failed';
+            if (err.responseJSON && err.responseJSON.error) {
+              message = err.responseJSON.error;
+            }
+            layer.msg(message);
+          }
+        });
+      }
+
+      $('#target_search').on('input', function () {
+        sync_visible_target_rows();
+        render_target_list();
+      });
+
+      $('#reload_dialogs').on('click', function () {
+        load_dialogs(true);
+      });
+
+      $('#save_targets').on('click', function () {
+        save_targets();
+      });
+
+      $('#target_list').on('change', '.target-enabled', function () {
+        var item = $(this).closest('.target-item');
+        sync_target_row(item);
+        item.toggleClass('is-enabled', $(this).prop('checked'));
+        update_target_count();
+      });
+
+      $('#target_list').on('input', '.target-cursor, .target-filter', function () {
+        sync_target_row($(this).closest('.target-item'));
+      });
+
+      $('#target_list').on('click', '.target-config-toggle', function () {
+        var row_el = $(this).closest('.target-item');
+        var row = find_target_row(row_el.attr('data-chat-key'));
+        if (!row) {
+          return;
+        }
+        sync_target_row(row_el);
+        row.config_open = !row.config_open;
+        row_el.toggleClass('is-config-open', row.config_open);
+        $(this).attr('aria-expanded', row.config_open ? 'true' : 'false');
+      });
+
+      $('#target_list').on('click', '.cursor-latest', function () {
+        var row_el = $(this).closest('.target-item');
+        var row = find_target_row(row_el.attr('data-chat-key'));
+        if (!row) {
+          return;
+        }
+        row.last_read_message_id = row.top_message_id || 0;
+        row_el.find('.target-cursor').val(row.last_read_message_id);
+      });
+
+      tableIns = table.render({
+        elem: '#download_list'
+        , data: download_list_table_data
+        , title: 'download_list'
+        , height: 'full-160'
+        , limit: 10000
+        , cols: [[
+          { field: 'chat', title: 'chat', width: 100 },
+          { field: 'id', title: 'id', width: 100 }
+          , { field: 'filename', title: 'file name', align: 'center' }
+          , { field: 'total_size', title: 'total byte', align: 'center' }
+          , {
+            field: 'download_progress', title: 'download progress', align: 'center', templet: function (d) {
+              var ys = '';
+              if (30 < d.download_progress && d.download_progress < 100) {
+                ys = 'layui-bg-blue'
+              } else if (0 < d.download_progress && d.download_progress <= 30) {
+                ys = 'layui-bg-red'
+              }
+              else if (100 == d.download_progress) {
+                ys = 'layui-bg-green'
+              }
+              return '<div class="layui-progress layui-progress-big" lay-showpercent="true"  lay-filter="down-' + d.id + '"><div class="layui-progress-bar ' + ys + '" lay-percent="' + d.download_progress + '%"></div></div>'
+            }
+          }
+          , { field: 'download_speed', title: 'download speed', align: 'center' }
+        ]]
+        , done: function (res, currentCount) {
+          element.render()
+        }
+      });
+
+      table.render({
+        elem: '#already_download_list'
+        , data: already_download_list_data
+        , title: 'already_download_list'
+        , height: 'full-160'
+        , limit: 10000
+        , cols: [[
+
+          { field: 'id', title: 'id', width: 100 }
+          , { field: 'filename', title: 'file name', align: 'center' }
+          , { field: 'total_size', title: 'total size', align: 'center' }
+          , { field: 'save_path', title: 'save path', align: 'center' }
+        ]], done: function (res, currentCount) {
+          element.render()
+        }
+      });
+
+      function update_download_list() {
+        $.ajax({
+          url: "get_download_list?already_down=false"
+          , type: "get"
+          , async: false
+          , dataType: "json"
+          , success: function (result) {
+            render_active_download_cards(result);
+            var active_keys = {};
+            for (var i = 0, len = result.length; i < len; i++) {
+              active_keys[result[i].chat + '-' + result[i].id] = true;
+            }
+            for (var j = download_list_table_data.length - 1; j >= 0; j--) {
+              var row_key = download_list_table_data[j].chat + '-' + download_list_table_data[j].id;
+              if (!active_keys[row_key]) {
+                $('div[lay-id="download_list"]  tr[data-index="' + row_key + '"]').remove();
+                download_list_table_data.splice(j, 1);
+              }
+            }
+            // first remove finish and update
+            for (var j = 0, len2 = download_list_table_data.length; j < len2; j++) {
+              find_iter = false
+              for (var i = 0, len = result.length; i < len; i++) {
+                if (result[i].chat == download_list_table_data[j].chat && result[i].id == download_list_table_data[j].id) {
+                  download_list_table_data[j].download_progress = result[i].download_progress
+                  var progress = download_list_table_data[j].download_progress
+                  element.progress('down-' + result[i].chat + '-' + result[i].id, progress + '%');
+
+                  var download_speed_obj = $('div[lay-filter="down_speed-' + result[i].chat + '-' + result[i].id + '"]')
+                  download_speed_obj.html(result[i].download_speed)
+
+                  if (progress == 100) {
+                    var device_obj = $('div[lay-filter="down-' + result[i].chat + '-' + result[i].id + '"] div')
+                    device_obj.removeClass("layui-bg-blue")
+                    device_obj.addClass("layui-bg-green")
+                    obj = $('div[lay-id="download_list"]  tr[data-index="' + result[i].chat + '-' + result[i].id + '"]')
+                    obj.remove()
+                  }
+                  find_iter = true
+                  break
+                }
+              }
+
+            }
+
+            // new task
+            for (var i = 0, len = result.length; i < len; i++) {
+              find_iter = false
+              for (var j = 0, len2 = download_list_table_data.length; j < len2; j++) {
+                if (result[i].chat == download_list_table_data[j].chat && result[i].id == download_list_table_data[j].id) {
+                  find_iter = true
+                  break
+                }
+              }
+
+              if (find_iter || result[i].download_progress == 100) {
+                continue;
+              }
+              // not found
+              obj = $('div[lay-id="download_list"]  .layui-table-body .layui-table tbody')
+              var tr = ' <tr data-index="' + result[i].chat + '-' + result[i].id + '">' +
+                '<td data-field="id" data-key="1-0-0" class=""><div class="layui-table-cell laytable-cell-1-0-0">' + result[i].chat + '</div></td>' +
+                '<td data-field="id" data-key="1-0-1" class=""><div class="layui-table-cell laytable-cell-1-0-1">' + result[i].id + '</div></td>' +
+                '<td data-field="filename" data-key="1-0-2" class=""><div class="layui-table-cell laytable-cell-1-0-2" align="center">' + result[i].filename + '</div></td>' +
+                '<td data-field="total_size" data-key="1-0-3" class=""><div class="layui-table-cell laytable-cell-1-0-3" align="center">' + result[i].total_size + '</div></td>' +
+                '<td data-field="download_progress" data-key="1-0-4" data-content="' + result[i].download_progress + '" class=""><div class="layui-table-cell laytable-cell-1-0-4" align="center"><div class="layui-progress layui-progress-big" lay-showpercent="true" lay-filter="down-' + result[i].chat + '-' + result[i].id + '"><div class="layui-progress-bar layui-bg-blue" lay-percent="' + result[i].download_progress + '%" style="width: ' + result[i].download_progress + '%;"><span class="layui-progress-text">' + result[i].download_progress + '%</span></div></div></div></td>' +
+                '<td data-field="download_speed" data-key="1-0-5" class=""><div class="layui-table-cell laytable-cell-1-0-5" align="center"lay-filter="down_speed-' + result[i].chat + '-' + result[i].id + '">' + result[i].download_speed + '</div></td>' +
+                "  </tr>";
+              obj.append(tr)
+              download_list_table_data.push(result[i])
+
+              if (download_list_table_data.length == 1) {
+                $(".layui-none").remove()
+              }
+
+              element.render()
+
+            }
+
+            element.render()
+          }
+        });
+
+      };
+
+
+      function update_download_status() {
+        $.ajax({
+          url: "get_download_status"
+          , type: "get"
+          , async: false
+          , dataType: "json"
+          , success: function (result) {
+            $("#download_speed_title").html(result.download_speed)
+          }
+        });
+
+      };
+
+
+      var update_download_list_int = self.setInterval(update_download_list, 1000);
+      var update_download_status_int = self.setInterval(update_download_status, 1000);
+      var update_already_download_list_int = 0;
+
+
+      function update_already_download_list() {
+        $.ajax({
+          url: "get_download_list?already_down=true"
+          , type: "get"
+          , async: false
+          , dataType: "json"
+          , success: function (result) {
+            // if not exist then add
+            for (var i = 0, len = result.length; i < len; i++) {
+              if (result[i].download_progress != 100) {
+                continue
+              }
+
+              find_iter = false
+
+              for (var j = 0, len2 = already_download_list_data.length; j < len2; j++) {
+                if (result[i].chat == already_download_list_data[j].chat && result[i].id == already_download_list_data[j].id) {
+                  find_iter = true
+                  break
+                }
+              }
+
+              if (find_iter) {
+                continue;
+              }
+              // not found
+              obj = $('div[lay-id="already_download_list"]  .layui-table-body .layui-table tbody')
+              var tr = ' <tr data-index="' + result[i].chat + '-' + result[i].id + '">' +
+                '<td data-field="id" data-key="2-0-0" class=""><div class="layui-table-cell laytable-cell-2-0-0">' + result[i].id + '</div></td>' +
+                '<td data-field="filename" data-key="2-0-1" class=""><div class="layui-table-cell laytable-cell-2-0-1" align="center">' + result[i].filename + '</div></td>' +
+                '<td data-field="total_size" data-key="2-0-2" class=""><div class="layui-table-cell laytable-cell-2-0-2" align="center">' + result[i].total_size + '</div></td>' +
+                '<td data-field="save_path" data-key="2-0-3" class=""><div class="layui-table-cell laytable-cell-2-0-3" align="center">' + result[i].save_path + '</div></td>' +
+                "  </tr>";
+              obj.append(tr)
+
+              already_download_list_data.push(result[i])
+
+              if (already_download_list_data.length == 1) {
+                $(".layui-none").remove()
+              }
+              element.render()
+            }
+
+            element.render()
+            render_downloaded_cards(already_download_list_data);
+          }
+        });
+
+      };
+
+      element.on('tab(telegram_media_downloader)', function (data) {
+        if (data.index != 0) {
+          clearInterval(update_download_list_int);
+        }
+
+        if (data.index == 0) {
+          update_download_list_int = self.setInterval(update_download_list, 1000);
+        }
+
+        if (data.index != 1) {
+          clearInterval(update_already_download_list_int);
+        }
+
+        if (data.index == 1) {
+          update_already_download_list_int = self.setInterval(update_already_download_list, 1000);
+        }
+
+        if (data.index == 2 && !target_loaded) {
+          load_dialogs(false);
+        }
+
+      });
+
+    });
+  </script>
+</body>
+
+</html>

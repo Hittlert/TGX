@@ -1,0 +1,28 @@
+services:
+  telegram_media_downloader_us:
+    image: telegram_media_downloader_us:local
+    build:
+      context: ./app-src
+      dockerfile: Dockerfile.local
+    ports:
+      - "5875:5000"
+    environment:
+      - http_proxy=http://192.168.79.206:6152
+      - https_proxy=http://192.168.79.206:6152
+    volumes:
+      # Here is what you need to edit
+      - "/home/hittler/SpecialMedias/06-碎片整理区/碎片媒体/TG2/:/app/downloads/"
+
+      # Rclone
+      - "./rclone/:/.config/rclone/"
+
+      # The following is what you don't need to edit
+      - "./config.yaml:/app/config.yaml"
+      - "./data.yaml:/app/data.yaml"
+      - "./log/:/app/log/"
+      - "./sessions/:/app/sessions"
+      - "./temp/:/app/temp"
+    restart: "unless-stopped"
+# volumes:
+#   sessions:
+#   temp:

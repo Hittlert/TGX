@@ -1,0 +1,10 @@
+chat_scan_status:
+  '8654123':
+    status: ok
+    last_scan_started_at: 1784211158
+    error: ''
+    last_scan_finished_at: 1784211158
+    last_success_at: 1784211158
+chat:
+- chat_id: 8654123
+  ids_to_retry: []
