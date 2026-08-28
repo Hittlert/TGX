@@ -7,7 +7,7 @@ import (
 
 	"github.com/jedib0t/go-pretty/v6/progress"
 
-	"github.com/Hittlert/TG_Downloader/pkg/ps"
+	"github.com/Hittlert/TGX/pkg/ps"
 )
 
 func AppendTracker(pw progress.Writer, formatter progress.UnitsFormatter, message string, total int64) *progress.Tracker {

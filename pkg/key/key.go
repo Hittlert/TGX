@@ -1,7 +1,7 @@
 package key
 
 import (
-	"github.com/Hittlert/TG_Downloader/core/storage/keygen"
+	"github.com/Hittlert/TGX/core/storage/keygen"
 )
 
 func App() string {

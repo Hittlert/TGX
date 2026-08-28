@@ -12,9 +12,9 @@ import (
 	"github.com/spf13/cobra"
 	"golang.org/x/time/rate"
 
-	"github.com/Hittlert/TG_Downloader/app/chat"
-	"github.com/Hittlert/TG_Downloader/core/logctx"
-	"github.com/Hittlert/TG_Downloader/core/storage"
+	"github.com/Hittlert/TGX/app/chat"
+	"github.com/Hittlert/TGX/core/logctx"
+	"github.com/Hittlert/TGX/core/storage"
 )
 
 var limiter = ratelimit.New(rate.Every(500*time.Millisecond), 2)

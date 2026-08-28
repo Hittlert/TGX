@@ -16,16 +16,16 @@ import (
 	"github.com/spf13/viper"
 	"go.uber.org/multierr"
 
-	"github.com/Hittlert/TG_Downloader/app/internal/tctx"
-	"github.com/Hittlert/TG_Downloader/core/dcpool"
-	"github.com/Hittlert/TG_Downloader/core/forwarder"
-	"github.com/Hittlert/TG_Downloader/core/storage"
-	"github.com/Hittlert/TG_Downloader/core/tclient"
-	"github.com/Hittlert/TG_Downloader/core/util/tutil"
-	"github.com/Hittlert/TG_Downloader/pkg/consts"
-	"github.com/Hittlert/TG_Downloader/pkg/prog"
-	"github.com/Hittlert/TG_Downloader/pkg/texpr"
-	"github.com/Hittlert/TG_Downloader/pkg/tmessage"
+	"github.com/Hittlert/TGX/app/internal/tctx"
+	"github.com/Hittlert/TGX/core/dcpool"
+	"github.com/Hittlert/TGX/core/forwarder"
+	"github.com/Hittlert/TGX/core/storage"
+	"github.com/Hittlert/TGX/core/tclient"
+	"github.com/Hittlert/TGX/core/util/tutil"
+	"github.com/Hittlert/TGX/pkg/consts"
+	"github.com/Hittlert/TGX/pkg/prog"
+	"github.com/Hittlert/TGX/pkg/texpr"
+	"github.com/Hittlert/TGX/pkg/tmessage"
 )
 
 type Options struct {

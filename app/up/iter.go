@@ -14,10 +14,10 @@ import (
 	"github.com/gotd/td/telegram/message/html"
 	"github.com/gotd/td/telegram/peers"
 
-	"github.com/Hittlert/TG_Downloader/core/uploader"
-	"github.com/Hittlert/TG_Downloader/core/util/mediautil"
-	"github.com/Hittlert/TG_Downloader/core/util/tutil"
-	"github.com/Hittlert/TG_Downloader/pkg/texpr"
+	"github.com/Hittlert/TGX/core/uploader"
+	"github.com/Hittlert/TGX/core/util/mediautil"
+	"github.com/Hittlert/TGX/core/util/tutil"
+	"github.com/Hittlert/TGX/pkg/texpr"
 )
 
 type File struct {

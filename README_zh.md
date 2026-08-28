@@ -1,13 +1,13 @@
-# TG_Downloader
+# TGX
 
 <div align="center">
 
-**下一代高性能 Telegram 媒体自动化下载与流式归档引擎**
+**TGX - 下一代高性能 Telegram 媒体自动化下载与流式归档引擎**
 
 [![Go Version](https://img.shields.io/badge/Go-1.25+-00ADD8?style=flat&logo=go)](https://golang.org)
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
 [![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?style=flat&logo=docker)](docker-compose.yaml.example)
-[![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20NAS-orange)](https://github.com/Hittlert/TG_Downloader)
+[![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20NAS-orange)](https://github.com/Hittlert/TGX)
 [![Architecture](https://img.shields.io/badge/Engine-SBE%20v4.1-blueviolet)](docs/STREAMING_BLOCK_ENGINE_DESIGN.md)
 [![Proxy](https://img.shields.io/badge/Embedded-sing--box-2ea44f?style=flat)](docs/STREAMING_BLOCK_ENGINE_DESIGN.md)
 
@@ -19,7 +19,7 @@
 
 ## 📖 项目简介
 
-**TG_Downloader** 是专为大规模 Telegram 媒体长期自动化归档、高吞吐下载与低资源占用 NAS / Linux 服务器部署而设计的工业级 Go 原生引擎。基于自主研发的 **Streaming Block Engine (SBE)** 流式分块存储引擎与原生进程级 **内置 sing-box 网络核心**，彻底解决传统下载工具普遍存在的**内存暴涨 (OOM)、磁盘随机 I/O 拥塞、大文件下载饥饿断流与掉电数据损坏**等核心痛点。
+**TGX** 是专为大规模 Telegram 媒体长期自动化归档、高吞吐下载与低资源占用 NAS / Linux 服务器部署而设计的工业级 Go 原生引擎。基于自主研发的 **Streaming Block Engine (SBE)** 流式分块存储引擎与原生进程级 **内置 sing-box 网络核心**，彻底解决传统下载工具普遍存在的**内存暴涨 (OOM)、磁盘随机 I/O 拥塞、大文件下载饥饿断流与掉电数据损坏**等核心痛点。
 
 ---
 
@@ -122,17 +122,17 @@ http://<服务器IP>:5000
 
 ```bash
 # 克隆仓库
-git clone https://github.com/Hittlert/TG_Downloader.git
-cd TG_Downloader
+git clone https://github.com/Hittlert/TGX.git
+cd TGX
 
 # 编译二进制文件
-go build -o tg-downloader .
+go build -o tgx .
 
 # 登录并初始化 Telegram 会话
-./tg-downloader login
+./tgx login
 
 # 启动守护进程与 Web UI
-./tg-downloader serve --listen 0.0.0.0:5000 --dir ./downloads --db-path ./state/records.sqlite3
+./tgx serve --listen 0.0.0.0:5000 --dir ./downloads --db-path ./state/records.sqlite3
 ```
 
 ---
@@ -173,7 +173,7 @@ go build -o tg-downloader .
 
 本项目底层 MTProto 协议交互与登录工具链衍生自开源项目 [tdl](https://github.com/iyear/tdl)（基于 GNU AGPL-3.0 协议）。
 
-在此基础上，**TG_Downloader** 针对 7x24h 长期自动化归档与 NAS 部署场景进行了全面的自主架构演进：
+在此基础上，**TGX** 针对 7x24h 长期自动化归档与 NAS 部署场景进行了全面的自主架构演进：
 1. **研发全新的 SBE 流式块存储引擎**：彻底实现网络 Worker 与磁盘 Writer 解耦，引入双额度租赁内存背压（`BufferLease` 96MB + `DirtyLease` 48MB）与 DRR 双车道公平调度。
 2. **内置 sing-box 进程级代理核心**：内存级直连消除 Loopback 开销，支持 VLESS (Reality)、Hysteria2、TUIC、SS 全协议与 30s 故障自愈看门狗。
 3. **重构崩溃一致性与断点续传**：实现侧车 Attempt 绑定预分配双槽 CRC32 Checkpoint，以及 Linux `RENAME_NOREPLACE` + `linkat` 原子提交回退链。

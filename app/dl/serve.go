@@ -20,13 +20,13 @@ import (
 	"github.com/gotd/td/tg"
 	"github.com/spf13/viper"
 
-	"github.com/Hittlert/TG_Downloader/core/dcpool"
-	"github.com/Hittlert/TG_Downloader/core/logctx"
-	"github.com/Hittlert/TG_Downloader/core/storage"
-	"github.com/Hittlert/TG_Downloader/core/tmedia"
-	"github.com/Hittlert/TG_Downloader/core/util/tutil"
-	"github.com/Hittlert/TG_Downloader/pkg/consts"
-	"github.com/Hittlert/TG_Downloader/pkg/tmessage"
+	"github.com/Hittlert/TGX/core/dcpool"
+	"github.com/Hittlert/TGX/core/logctx"
+	"github.com/Hittlert/TGX/core/storage"
+	"github.com/Hittlert/TGX/core/tmedia"
+	"github.com/Hittlert/TGX/core/util/tutil"
+	"github.com/Hittlert/TGX/pkg/consts"
+	"github.com/Hittlert/TGX/pkg/tmessage"
 )
 
 type media struct {

@@ -14,14 +14,14 @@ import (
 	tdtdesktop "github.com/gotd/td/session/tdesktop"
 	"github.com/spf13/viper"
 
-	"github.com/Hittlert/TG_Downloader/core/storage"
-	"github.com/Hittlert/TG_Downloader/core/util/fsutil"
-	"github.com/Hittlert/TG_Downloader/pkg/consts"
-	"github.com/Hittlert/TG_Downloader/pkg/key"
-	"github.com/Hittlert/TG_Downloader/pkg/kv"
-	"github.com/Hittlert/TG_Downloader/pkg/tclient"
-	"github.com/Hittlert/TG_Downloader/pkg/tdesktop"
-	"github.com/Hittlert/TG_Downloader/pkg/tpath"
+	"github.com/Hittlert/TGX/core/storage"
+	"github.com/Hittlert/TGX/core/util/fsutil"
+	"github.com/Hittlert/TGX/pkg/consts"
+	"github.com/Hittlert/TGX/pkg/key"
+	"github.com/Hittlert/TGX/pkg/kv"
+	"github.com/Hittlert/TGX/pkg/tclient"
+	"github.com/Hittlert/TGX/pkg/tdesktop"
+	"github.com/Hittlert/TGX/pkg/tpath"
 )
 
 const tdata = "tdata"

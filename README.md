@@ -1,13 +1,13 @@
-# TG_Downloader
+# TGX
 
 <div align="center">
 
-**Next-Generation High-Performance Telegram Media Downloader & Archival Engine**
+**TGX - Next-Generation Telegram Media Downloader & Streaming Archive Engine**
 
 [![Go Version](https://img.shields.io/badge/Go-1.25+-00ADD8?style=flat&logo=go)](https://golang.org)
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
 [![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?style=flat&logo=docker)](docker-compose.yaml.example)
-[![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20NAS-orange)](https://github.com/Hittlert/TG_Downloader)
+[![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20NAS-orange)](https://github.com/Hittlert/TGX)
 [![Architecture](https://img.shields.io/badge/Engine-SBE%20v4.1-blueviolet)](docs/STREAMING_BLOCK_ENGINE_DESIGN.md)
 [![Proxy](https://img.shields.io/badge/Embedded-sing--box-2ea44f?style=flat)](docs/STREAMING_BLOCK_ENGINE_DESIGN.md)
 
@@ -19,7 +19,7 @@
 
 ## 📖 Overview
 
-**TG_Downloader** is an enterprise-grade, high-throughput Telegram media downloader and automated daemon archive engine written in pure Go. Featuring the revolutionary **Streaming Block Engine (SBE)** and a native in-process **Embedded sing-box Engine**, it solves the fundamental pain points of traditional Telegram downloaders: memory bloat and OOM crashes, random disk I/O congestion, large file starvation, and crash data corruption.
+**TGX** is an enterprise-grade, high-throughput Telegram media downloader and automated daemon archive engine written in pure Go. Featuring the revolutionary **Streaming Block Engine (SBE)** and a native in-process **Embedded sing-box Engine**, it solves the fundamental pain points of traditional Telegram downloaders: memory bloat and OOM crashes, random disk I/O congestion, large file starvation, and crash data corruption.
 
 ---
 
@@ -122,17 +122,17 @@ Ensure you have **Go 1.25+** installed:
 
 ```bash
 # Clone the repository
-git clone https://github.com/Hittlert/TG_Downloader.git
-cd TG_Downloader
+git clone https://github.com/Hittlert/TGX.git
+cd TGX
 
 # Build binary
-go build -o tg-downloader .
+go build -o tgx .
 
 # Initialize session and login
-./tg-downloader login
+./tgx login
 
 # Start daemon server with Web UI
-./tg-downloader serve --listen 0.0.0.0:5000 --dir ./downloads --db-path ./state/records.sqlite3
+./tgx serve --listen 0.0.0.0:5000 --dir ./downloads --db-path ./state/records.sqlite3
 ```
 
 ---
@@ -173,7 +173,7 @@ go build -o tg-downloader .
 
 This project's underlying MTProto protocol client and session toolchain are derived from the open-source project [tdl](https://github.com/iyear/tdl) (licensed under GNU AGPL-3.0).
 
-Building upon this foundation, **TG_Downloader** introduces a ground-up re-architecture tailored for enterprise 7x24h automated daemon operations:
+Building upon this foundation, **TGX** introduces a ground-up re-architecture tailored for enterprise 7x24h automated daemon operations:
 1. **Streaming Block Engine (SBE)**: Pure block-level decoupling between network workers and disk writers, enforced by dual-lease memory backpressure (`BufferLease` 96 MiB + `DirtyLease` 48 MiB) and DRR fair scheduling.
 2. **Embedded sing-box Engine**: Native in-process proxy core supporting VLESS (Reality), Hysteria2, TUIC, and SS with zero loopback latency.
 3. **Crash-Resilient Atomic Persistence**: Sidecar Attempt-bound dual-slot CRC32 checkpoint bitmaps and Linux `RENAME_NOREPLACE` atomic commit fallback chains.

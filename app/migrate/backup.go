@@ -10,7 +10,7 @@ import (
 	"github.com/klauspost/compress/zstd"
 	"go.uber.org/multierr"
 
-	"github.com/Hittlert/TG_Downloader/pkg/kv"
+	"github.com/Hittlert/TGX/pkg/kv"
 )
 
 func Backup(ctx context.Context, dst string) (rerr error) {

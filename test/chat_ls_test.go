@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 
-	"github.com/Hittlert/TG_Downloader/app/chat"
+	"github.com/Hittlert/TGX/app/chat"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"

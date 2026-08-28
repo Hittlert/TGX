@@ -4,7 +4,7 @@ import (
 	"github.com/gotd/td/telegram/peers"
 	"github.com/gotd/td/tg"
 
-	"github.com/Hittlert/TG_Downloader/core/forwarder"
+	"github.com/Hittlert/TGX/core/forwarder"
 )
 
 type iterElem struct {

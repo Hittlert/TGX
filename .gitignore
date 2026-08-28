@@ -52,6 +52,7 @@ deploy-staging/
 bin/
 telegram-downloader-*
 tg-downloader
+tgx
 tdl
 *.exe
 

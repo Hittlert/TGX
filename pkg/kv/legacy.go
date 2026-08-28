@@ -9,8 +9,8 @@ import (
 	"github.com/mitchellh/mapstructure"
 	"go.etcd.io/bbolt"
 
-	"github.com/Hittlert/TG_Downloader/core/storage"
-	"github.com/Hittlert/TG_Downloader/pkg/validator"
+	"github.com/Hittlert/TGX/core/storage"
+	"github.com/Hittlert/TGX/pkg/validator"
 )
 
 var boltOptions = &bbolt.Options{

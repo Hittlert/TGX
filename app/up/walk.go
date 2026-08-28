@@ -5,9 +5,9 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/Hittlert/TG_Downloader/core/util/fsutil"
-	"github.com/Hittlert/TG_Downloader/pkg/consts"
-	"github.com/Hittlert/TG_Downloader/pkg/filterMap"
+	"github.com/Hittlert/TGX/core/util/fsutil"
+	"github.com/Hittlert/TGX/pkg/consts"
+	"github.com/Hittlert/TGX/pkg/filterMap"
 )
 
 func walk(paths, includes, excludes []string) ([]*File, error) {

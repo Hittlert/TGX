@@ -12,10 +12,10 @@ import (
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
 
-	"github.com/Hittlert/TG_Downloader/core/dcpool"
-	"github.com/Hittlert/TG_Downloader/core/logctx"
-	"github.com/Hittlert/TG_Downloader/core/tmedia"
-	"github.com/Hittlert/TG_Downloader/core/util/tutil"
+	"github.com/Hittlert/TGX/core/dcpool"
+	"github.com/Hittlert/TGX/core/logctx"
+	"github.com/Hittlert/TGX/core/tmedia"
+	"github.com/Hittlert/TGX/core/util/tutil"
 )
 
 //go:generate go-enum --values --names --flag --nocase

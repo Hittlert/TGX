@@ -13,11 +13,11 @@ import (
 	"github.com/gotd/td/tg"
 	"github.com/mitchellh/mapstructure"
 
-	"github.com/Hittlert/TG_Downloader/core/dcpool"
-	"github.com/Hittlert/TG_Downloader/core/forwarder"
-	"github.com/Hittlert/TG_Downloader/core/util/tutil"
-	"github.com/Hittlert/TG_Downloader/pkg/texpr"
-	"github.com/Hittlert/TG_Downloader/pkg/tmessage"
+	"github.com/Hittlert/TGX/core/dcpool"
+	"github.com/Hittlert/TGX/core/forwarder"
+	"github.com/Hittlert/TGX/core/util/tutil"
+	"github.com/Hittlert/TGX/pkg/texpr"
+	"github.com/Hittlert/TGX/pkg/tmessage"
 )
 
 type iterOptions struct {

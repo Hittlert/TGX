@@ -7,9 +7,9 @@ import (
 	"github.com/gotd/td/telegram"
 	"github.com/spf13/cobra"
 
-	"github.com/Hittlert/TG_Downloader/app/up"
-	"github.com/Hittlert/TG_Downloader/core/logctx"
-	"github.com/Hittlert/TG_Downloader/core/storage"
+	"github.com/Hittlert/TGX/app/up"
+	"github.com/Hittlert/TGX/core/logctx"
+	"github.com/Hittlert/TGX/core/storage"
 )
 
 func NewUpload() *cobra.Command {

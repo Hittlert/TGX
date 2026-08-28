@@ -8,9 +8,9 @@ import (
 	pw "github.com/jedib0t/go-pretty/v6/progress"
 	"github.com/mattn/go-runewidth"
 
-	"github.com/Hittlert/TG_Downloader/core/forwarder"
-	"github.com/Hittlert/TG_Downloader/pkg/prog"
-	"github.com/Hittlert/TG_Downloader/pkg/utils"
+	"github.com/Hittlert/TGX/core/forwarder"
+	"github.com/Hittlert/TGX/pkg/prog"
+	"github.com/Hittlert/TGX/pkg/utils"
 )
 
 type progress struct {

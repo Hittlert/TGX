@@ -1,11 +1,11 @@
-module github.com/Hittlert/TG_Downloader/extension
+module github.com/Hittlert/TGX/extension
 
 go 1.25.8
 
 require (
 	github.com/go-faster/errors v0.7.1
 	github.com/gotd/td v0.140.0
-	github.com/Hittlert/TG_Downloader/core v0.20.3
+	github.com/Hittlert/TGX/core v0.20.3
 	go.uber.org/zap v1.28.0
 )
 

@@ -17,16 +17,16 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
     GOOS=$TARGETOS GOARCH=$TARGETARCH \
     go build -trimpath \
     -ldflags "-s -w  \
-    -X github.com/Hittlert/TG_Downloader/pkg/consts.Version=${VERSION}  \
-    -X github.com/Hittlert/TG_Downloader/pkg/consts.Commit=${COMMIT}  \
-    -X github.com/Hittlert/TG_Downloader/pkg/consts.CommitDate=${COMMIT_DATE}" \
-    -o tg-downloader
+    -X github.com/Hittlert/TGX/pkg/consts.Version=${VERSION}  \
+    -X github.com/Hittlert/TGX/pkg/consts.Commit=${COMMIT}  \
+    -X github.com/Hittlert/TGX/pkg/consts.CommitDate=${COMMIT_DATE}" \
+    -o tgx
 
 FROM alpine:latest
 
 RUN apk add --no-cache ca-certificates
 
-COPY --from=builder /tg-downloader /usr/bin/tg-downloader
-RUN ln -s /usr/bin/tg-downloader /usr/bin/tdl
+COPY --from=builder /tgx /usr/bin/tgx
+RUN ln -s /usr/bin/tgx /usr/bin/tg-downloader && ln -s /usr/bin/tgx /usr/bin/tdl
 
-ENTRYPOINT ["tg-downloader"]
+ENTRYPOINT ["tgx"]

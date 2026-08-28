@@ -6,7 +6,7 @@ import (
 
 	"github.com/gotd/td/telegram"
 
-	"github.com/Hittlert/TG_Downloader/core/storage/keygen"
+	"github.com/Hittlert/TGX/core/storage/keygen"
 )
 
 type Session struct {

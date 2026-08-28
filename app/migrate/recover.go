@@ -11,7 +11,7 @@ import (
 	"github.com/klauspost/compress/zstd"
 	"go.uber.org/multierr"
 
-	"github.com/Hittlert/TG_Downloader/pkg/kv"
+	"github.com/Hittlert/TGX/pkg/kv"
 )
 
 func Recover(ctx context.Context, file string) (rerr error) {

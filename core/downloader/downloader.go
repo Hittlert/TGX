@@ -8,9 +8,9 @@ import (
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/Hittlert/TG_Downloader/core/dcpool"
-	"github.com/Hittlert/TG_Downloader/core/logctx"
-	"github.com/Hittlert/TG_Downloader/core/util/tutil"
+	"github.com/Hittlert/TGX/core/dcpool"
+	"github.com/Hittlert/TGX/core/logctx"
+	"github.com/Hittlert/TGX/core/util/tutil"
 )
 
 // MaxPartSize refer to https://core.telegram.org/api/files#downloading-files

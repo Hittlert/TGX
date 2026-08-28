@@ -18,9 +18,9 @@ import (
 	"github.com/jedib0t/go-pretty/v6/progress"
 	"go.uber.org/multierr"
 
-	"github.com/Hittlert/TG_Downloader/core/storage"
-	"github.com/Hittlert/TG_Downloader/core/util/tutil"
-	"github.com/Hittlert/TG_Downloader/pkg/prog"
+	"github.com/Hittlert/TGX/core/storage"
+	"github.com/Hittlert/TGX/core/util/tutil"
+	"github.com/Hittlert/TGX/pkg/prog"
 )
 
 type UsersOptions struct {

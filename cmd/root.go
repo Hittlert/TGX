@@ -18,16 +18,16 @@ import (
 	"go.uber.org/zap"
 	"golang.org/x/net/proxy"
 
-	"github.com/Hittlert/TG_Downloader/core/logctx"
-	"github.com/Hittlert/TG_Downloader/core/storage"
-	tclientcore "github.com/Hittlert/TG_Downloader/core/tclient"
-	"github.com/Hittlert/TG_Downloader/core/util/fsutil"
-	"github.com/Hittlert/TG_Downloader/core/util/logutil"
-	"github.com/Hittlert/TG_Downloader/core/util/netutil"
-	"github.com/Hittlert/TG_Downloader/pkg/consts"
-	"github.com/Hittlert/TG_Downloader/pkg/extensions"
-	"github.com/Hittlert/TG_Downloader/pkg/kv"
-	"github.com/Hittlert/TG_Downloader/pkg/tclient"
+	"github.com/Hittlert/TGX/core/logctx"
+	"github.com/Hittlert/TGX/core/storage"
+	tclientcore "github.com/Hittlert/TGX/core/tclient"
+	"github.com/Hittlert/TGX/core/util/fsutil"
+	"github.com/Hittlert/TGX/core/util/logutil"
+	"github.com/Hittlert/TGX/core/util/netutil"
+	"github.com/Hittlert/TGX/pkg/consts"
+	"github.com/Hittlert/TGX/pkg/extensions"
+	"github.com/Hittlert/TGX/pkg/kv"
+	"github.com/Hittlert/TGX/pkg/tclient"
 )
 
 var (
@@ -66,9 +66,9 @@ func New() *cobra.Command {
 	em := extensions.NewManager(consts.ExtensionsPath)
 
 	cmd := &cobra.Command{
-		Use:           "tg-downloader",
-		Aliases:       []string{"tdl"},
-		Short:         "Next-Generation High-Performance Telegram Media Downloader & Archival Engine",
+		Use:           "tgx",
+		Aliases:       []string{"tg-downloader", "tdl"},
+		Short:         "TGX - Next-Generation Telegram Media Downloader & Streaming Archive Engine",
 		SilenceErrors: true,
 		SilenceUsage:  true,
 		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {

@@ -1,6 +1,6 @@
 .PHONY: all build test clean docker
 
-BINARY_NAME=tg-downloader
+BINARY_NAME=tgx
 
 all: build
 
@@ -14,4 +14,4 @@ clean:
 	rm -f $(BINARY_NAME)
 
 docker:
-	docker build -t hittlert/tg-downloader:latest .
+	docker build -t hittlert/tgx:latest .

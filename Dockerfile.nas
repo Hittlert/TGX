@@ -9,20 +9,20 @@ COPY . .
 
 RUN go build -trimpath \
     -ldflags "-s -w \
-    -X github.com/Hittlert/TG_Downloader/pkg/consts.Version=${VERSION} \
-    -X github.com/Hittlert/TG_Downloader/pkg/consts.Commit=${COMMIT} \
-    -X github.com/Hittlert/TG_Downloader/pkg/consts.CommitDate=${COMMIT_DATE}" \
-    -o /tg-downloader
+    -X github.com/Hittlert/TGX/pkg/consts.Version=${VERSION} \
+    -X github.com/Hittlert/TGX/pkg/consts.Commit=${COMMIT} \
+    -X github.com/Hittlert/TGX/pkg/consts.CommitDate=${COMMIT_DATE}" \
+    -o /tgx
 
 RUN go build -trimpath -ldflags "-s -w" \
-    -o /tdl-import-pyrogram-session ./tools/import-pyrogram-session
+    -o /tgx-import-pyrogram-session ./tools/import-pyrogram-session
 
 FROM alpine:latest
 
 RUN apk add --no-cache ca-certificates
 
-COPY --from=builder /tg-downloader /usr/bin/tg-downloader
-RUN ln -s /usr/bin/tg-downloader /usr/bin/tdl
-COPY --from=builder /tdl-import-pyrogram-session /usr/bin/tdl-import-pyrogram-session
+COPY --from=builder /tgx /usr/bin/tgx
+RUN ln -s /usr/bin/tgx /usr/bin/tg-downloader && ln -s /usr/bin/tgx /usr/bin/tdl
+COPY --from=builder /tgx-import-pyrogram-session /usr/bin/tgx-import-pyrogram-session
 
-ENTRYPOINT ["tg-downloader"]
+ENTRYPOINT ["tgx"]

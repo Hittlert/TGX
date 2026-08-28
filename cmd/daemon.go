@@ -8,9 +8,9 @@ import (
 	"github.com/spf13/cobra"
 	"go.uber.org/zap"
 
-	"github.com/Hittlert/TG_Downloader/app/daemon"
-	"github.com/Hittlert/TG_Downloader/core/logctx"
-	"github.com/Hittlert/TG_Downloader/core/storage"
+	"github.com/Hittlert/TGX/app/daemon"
+	"github.com/Hittlert/TGX/core/logctx"
+	"github.com/Hittlert/TGX/core/storage"
 )
 
 func NewDaemon() *cobra.Command {

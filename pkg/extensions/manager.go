@@ -18,7 +18,7 @@ import (
 	"github.com/google/go-github/v62/github"
 	"go.uber.org/multierr"
 
-	"github.com/Hittlert/TG_Downloader/extension"
+	"github.com/Hittlert/TGX/extension"
 )
 
 var (

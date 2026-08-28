@@ -9,9 +9,9 @@ import (
 	"github.com/go-faster/errors"
 	pw "github.com/jedib0t/go-pretty/v6/progress"
 
-	"github.com/Hittlert/TG_Downloader/core/uploader"
-	"github.com/Hittlert/TG_Downloader/pkg/prog"
-	"github.com/Hittlert/TG_Downloader/pkg/utils"
+	"github.com/Hittlert/TGX/core/uploader"
+	"github.com/Hittlert/TGX/pkg/prog"
+	"github.com/Hittlert/TGX/pkg/utils"
 )
 
 type progress struct {

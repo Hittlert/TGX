@@ -15,10 +15,10 @@ import (
 
 	"github.com/gotd/td/session"
 
-	corestorage "github.com/Hittlert/TG_Downloader/core/storage"
-	"github.com/Hittlert/TG_Downloader/pkg/key"
-	"github.com/Hittlert/TG_Downloader/pkg/kv"
-	"github.com/Hittlert/TG_Downloader/pkg/tclient"
+	corestorage "github.com/Hittlert/TGX/core/storage"
+	"github.com/Hittlert/TGX/pkg/key"
+	"github.com/Hittlert/TGX/pkg/kv"
+	"github.com/Hittlert/TGX/pkg/tclient"
 )
 
 type pyrogramSession struct {

@@ -8,7 +8,7 @@ import (
 
 	"github.com/shirou/gopsutil/v3/process"
 
-	"github.com/Hittlert/TG_Downloader/pkg/utils"
+	"github.com/Hittlert/TGX/pkg/utils"
 )
 
 var proc *process.Process

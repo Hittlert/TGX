@@ -6,7 +6,7 @@ import (
 
 	"github.com/go-faster/errors"
 
-	"github.com/Hittlert/TG_Downloader/core/storage"
+	"github.com/Hittlert/TGX/core/storage"
 )
 
 //go:generate go-enum --values --names --flag --nocase

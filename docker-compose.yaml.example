@@ -1,6 +1,6 @@
 services:
-  tg-downloader:
-    image: hittlert/tg-downloader:latest
+  tgx:
+    image: hittlert/tgx:latest
     restart: unless-stopped
     command:
       - serve
@@ -15,7 +15,7 @@ services:
       - --dir
       - /app/downloads
       - --temp-dir
-      - /app/temp/tg-downloader
+      - /app/temp/tgx
       - --db-path
       - /app/state/download_records.sqlite3
       - --queue-capacity

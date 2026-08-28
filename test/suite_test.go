@@ -13,8 +13,8 @@ import (
 	"github.com/fatih/color"
 	"github.com/spf13/cobra"
 
-	tcmd "github.com/Hittlert/TG_Downloader/cmd"
-	"github.com/Hittlert/TG_Downloader/test/testserver"
+	tcmd "github.com/Hittlert/TGX/cmd"
+	"github.com/Hittlert/TGX/test/testserver"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"

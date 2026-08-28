@@ -19,11 +19,11 @@ import (
 	"github.com/gotd/td/transport"
 	"golang.org/x/net/proxy"
 
-	"github.com/Hittlert/TG_Downloader/core/logctx"
-	"github.com/Hittlert/TG_Downloader/core/middlewares/recovery"
-	"github.com/Hittlert/TG_Downloader/core/middlewares/retry"
-	"github.com/Hittlert/TG_Downloader/core/util/netutil"
-	"github.com/Hittlert/TG_Downloader/core/util/tutil"
+	"github.com/Hittlert/TGX/core/logctx"
+	"github.com/Hittlert/TGX/core/middlewares/recovery"
+	"github.com/Hittlert/TGX/core/middlewares/retry"
+	"github.com/Hittlert/TGX/core/util/netutil"
+	"github.com/Hittlert/TGX/core/util/tutil"
 )
 
 // dc values can be overridden globally

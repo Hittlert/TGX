@@ -3,8 +3,8 @@ package tctx
 import (
 	"context"
 
-	"github.com/Hittlert/TG_Downloader/core/dcpool"
-	"github.com/Hittlert/TG_Downloader/core/storage"
+	"github.com/Hittlert/TGX/core/dcpool"
+	"github.com/Hittlert/TGX/core/storage"
 )
 
 type kvKey struct{}

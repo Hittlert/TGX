@@ -7,8 +7,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/Hittlert/TG_Downloader/app/migrate"
-	"github.com/Hittlert/TG_Downloader/pkg/kv"
+	"github.com/Hittlert/TGX/app/migrate"
+	"github.com/Hittlert/TGX/pkg/kv"
 )
 
 func NewBackup() *cobra.Command {

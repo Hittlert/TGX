@@ -11,12 +11,12 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 
-	"github.com/Hittlert/TG_Downloader/app/extension"
-	"github.com/Hittlert/TG_Downloader/core/storage"
-	extbase "github.com/Hittlert/TG_Downloader/extension"
-	"github.com/Hittlert/TG_Downloader/pkg/consts"
-	"github.com/Hittlert/TG_Downloader/pkg/extensions"
-	"github.com/Hittlert/TG_Downloader/pkg/tclient"
+	"github.com/Hittlert/TGX/app/extension"
+	"github.com/Hittlert/TGX/core/storage"
+	extbase "github.com/Hittlert/TGX/extension"
+	"github.com/Hittlert/TGX/pkg/consts"
+	"github.com/Hittlert/TGX/pkg/extensions"
+	"github.com/Hittlert/TGX/pkg/tclient"
 )
 
 func NewExtension(em *extensions.Manager) *cobra.Command {

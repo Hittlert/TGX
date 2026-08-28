@@ -12,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Hittlert/TG_Downloader/core/downloader"
+	"github.com/Hittlert/TGX/core/downloader"
 )
 
 type trackedWriterAt struct {

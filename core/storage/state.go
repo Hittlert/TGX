@@ -8,7 +8,7 @@ import (
 
 	"github.com/gotd/td/telegram/updates"
 
-	"github.com/Hittlert/TG_Downloader/core/storage/keygen"
+	"github.com/Hittlert/TGX/core/storage/keygen"
 )
 
 type State struct {

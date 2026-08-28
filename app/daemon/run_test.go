@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Hittlert/TG_Downloader/core/util/tutil"
+	"github.com/Hittlert/TGX/core/util/tutil"
 )
 
 func TestOptionsDefaultsAndValidation(t *testing.T) {

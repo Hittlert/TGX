@@ -13,10 +13,10 @@ import (
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
 
-	"github.com/Hittlert/TG_Downloader/core/dcpool"
-	"github.com/Hittlert/TG_Downloader/core/downloader"
-	"github.com/Hittlert/TG_Downloader/core/tmedia"
-	"github.com/Hittlert/TG_Downloader/core/util/tutil"
+	"github.com/Hittlert/TGX/core/dcpool"
+	"github.com/Hittlert/TGX/core/downloader"
+	"github.com/Hittlert/TGX/core/tmedia"
+	"github.com/Hittlert/TGX/core/util/tutil"
 )
 
 type telegramMediaAccess struct {

@@ -1,4 +1,4 @@
-module github.com/Hittlert/TG_Downloader/core
+module github.com/Hittlert/TGX/core
 
 go 1.25.8
 

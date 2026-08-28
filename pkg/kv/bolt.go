@@ -10,8 +10,8 @@ import (
 	"go.etcd.io/bbolt"
 	"go.uber.org/multierr"
 
-	"github.com/Hittlert/TG_Downloader/core/storage"
-	"github.com/Hittlert/TG_Downloader/pkg/validator"
+	"github.com/Hittlert/TGX/core/storage"
+	"github.com/Hittlert/TGX/pkg/validator"
 )
 
 func init() {

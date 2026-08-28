@@ -17,11 +17,11 @@ import (
 	"github.com/gotd/td/telegram/dcs"
 	"github.com/gotd/td/tg"
 
-	"github.com/Hittlert/TG_Downloader/core/dcpool"
-	"github.com/Hittlert/TG_Downloader/core/storage"
-	tclientcore "github.com/Hittlert/TG_Downloader/core/tclient"
-	"github.com/Hittlert/TG_Downloader/pkg/kv"
-	"github.com/Hittlert/TG_Downloader/pkg/tclient"
+	"github.com/Hittlert/TGX/core/dcpool"
+	"github.com/Hittlert/TGX/core/storage"
+	tclientcore "github.com/Hittlert/TGX/core/tclient"
+	"github.com/Hittlert/TGX/pkg/kv"
+	"github.com/Hittlert/TGX/pkg/tclient"
 )
 
 //go:embed public_key.pem

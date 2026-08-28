@@ -12,7 +12,7 @@ import (
 	"github.com/gotd/td/tgerr"
 	"go.uber.org/zap"
 
-	"github.com/Hittlert/TG_Downloader/core/logctx"
+	"github.com/Hittlert/TGX/core/logctx"
 )
 
 type recovery struct {

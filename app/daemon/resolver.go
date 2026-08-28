@@ -7,7 +7,7 @@ import (
 	"strings"
 
 	"github.com/flytam/filenamify"
-	"github.com/Hittlert/TG_Downloader/core/downloader"
+	"github.com/Hittlert/TGX/core/downloader"
 )
 
 type ResolvedMedia struct {

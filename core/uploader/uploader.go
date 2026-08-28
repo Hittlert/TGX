@@ -15,8 +15,8 @@ import (
 	"github.com/samber/lo"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/Hittlert/TG_Downloader/core/util/fsutil"
-	"github.com/Hittlert/TG_Downloader/core/util/mediautil"
+	"github.com/Hittlert/TGX/core/util/fsutil"
+	"github.com/Hittlert/TGX/core/util/mediautil"
 )
 
 // MaxPartSize refer to https://core.telegram.org/api/files#uploading-files

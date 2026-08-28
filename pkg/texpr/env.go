@@ -3,8 +3,8 @@ package texpr
 import (
 	"github.com/gotd/td/tg"
 
-	"github.com/Hittlert/TG_Downloader/core/tmedia"
-	"github.com/Hittlert/TG_Downloader/core/util/tutil"
+	"github.com/Hittlert/TGX/core/tmedia"
+	"github.com/Hittlert/TGX/core/util/tutil"
 )
 
 type EnvMessage struct {

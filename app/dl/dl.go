@@ -14,16 +14,16 @@ import (
 	"go.uber.org/multierr"
 	"go.uber.org/zap"
 
-	"github.com/Hittlert/TG_Downloader/core/dcpool"
-	"github.com/Hittlert/TG_Downloader/core/downloader"
-	"github.com/Hittlert/TG_Downloader/core/logctx"
-	"github.com/Hittlert/TG_Downloader/core/storage"
-	"github.com/Hittlert/TG_Downloader/core/tclient"
-	"github.com/Hittlert/TG_Downloader/pkg/consts"
-	"github.com/Hittlert/TG_Downloader/pkg/key"
-	"github.com/Hittlert/TG_Downloader/pkg/prog"
-	"github.com/Hittlert/TG_Downloader/pkg/tmessage"
-	"github.com/Hittlert/TG_Downloader/pkg/utils"
+	"github.com/Hittlert/TGX/core/dcpool"
+	"github.com/Hittlert/TGX/core/downloader"
+	"github.com/Hittlert/TGX/core/logctx"
+	"github.com/Hittlert/TGX/core/storage"
+	"github.com/Hittlert/TGX/core/tclient"
+	"github.com/Hittlert/TGX/pkg/consts"
+	"github.com/Hittlert/TGX/pkg/key"
+	"github.com/Hittlert/TGX/pkg/prog"
+	"github.com/Hittlert/TGX/pkg/tmessage"
+	"github.com/Hittlert/TGX/pkg/utils"
 )
 
 type Options struct {
