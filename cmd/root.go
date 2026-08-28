@@ -189,11 +189,12 @@ func tOptions(ctx context.Context) (tclient.Options, error) {
 	return o, nil
 }
 
-func tRun(ctx context.Context, f func(ctx context.Context, c *telegram.Client, kvd storage.Storage) error, middlewares ...telegram.Middleware) error {
+func tRunWithUpdateHandler(ctx context.Context, handler telegram.UpdateHandler, f func(ctx context.Context, c *telegram.Client, kvd storage.Storage) error, middlewares ...telegram.Middleware) error {
 	o, err := tOptions(ctx)
 	if err != nil {
 		return errors.Wrap(err, "build telegram options")
 	}
+	o.UpdateHandler = handler
 
 	client, err := tclient.New(ctx, o, false, middlewares...)
 	if err != nil {
@@ -203,6 +204,10 @@ func tRun(ctx context.Context, f func(ctx context.Context, c *telegram.Client, k
 	return tclientcore.RunWithAuth(ctx, client, func(ctx context.Context) error {
 		return f(ctx, client, o.KV)
 	})
+}
+
+func tRun(ctx context.Context, f func(ctx context.Context, c *telegram.Client, kvd storage.Storage) error, middlewares ...telegram.Middleware) error {
+	return tRunWithUpdateHandler(ctx, nil, f, middlewares...)
 }
 
 func migrateLegacyToBolt() (rerr error) {

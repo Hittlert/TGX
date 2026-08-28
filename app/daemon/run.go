@@ -169,6 +169,10 @@ func Run(ctx context.Context, client *telegram.Client, kvd storage.Storage, opts
 	if db != nil {
 		orchestrator = NewOrchestrator(db, slotPool, proxyManager, access, registry, logctx.From(ctx), opts.OutputDir)
 		orchestrator.Start(groupCtx)
+
+		// Start MTProto Real-Time Push Updates Streaming Engine
+		updatesStream := NewUpdatesStream(db, orchestrator, logctx.From(ctx))
+		SetGlobalUpdatesStream(updatesStream)
 	}
 
 	webServer := NewWebServer(db, slotPool, proxyManager, orchestrator, access, registry, logctx.From(ctx), opts.Password)

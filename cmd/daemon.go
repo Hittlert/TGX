@@ -25,8 +25,8 @@ func NewDaemon() *cobra.Command {
 					return cmd.Context().Err()
 				}
 
-				logctx.From(cmd.Context()).Info("Starting Telegram MTProto download daemon session...")
-				err := tRun(cmd.Context(), func(ctx context.Context, client *telegram.Client, kvd storage.Storage) error {
+				logctx.From(cmd.Context()).Info("Starting Telegram MTProto real-time streaming download daemon session...")
+				err := tRunWithUpdateHandler(cmd.Context(), daemon.GlobalUpdateHandler(), func(ctx context.Context, client *telegram.Client, kvd storage.Storage) error {
 					return daemon.Run(logctx.Named(ctx, "daemon"), client, kvd, opts)
 				})
 

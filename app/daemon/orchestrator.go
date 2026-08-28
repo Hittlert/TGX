@@ -83,8 +83,16 @@ func (o *Orchestrator) SetRunning(running bool) {
 	o.running = running
 }
 
+func (o *Orchestrator) TriggerStreamDispatch(ctx context.Context, record DownloadRecord) {
+	if !o.IsRunning() {
+		return
+	}
+	o.dispatchOneRecord(ctx, record)
+}
+
 func (o *Orchestrator) scanLoop(ctx context.Context) {
-	ticker := time.NewTicker(5 * time.Second)
+	// Fallback gap-recovery loop (low frequency: 60s) since real-time events drive streaming downloads
+	ticker := time.NewTicker(60 * time.Second)
 	defer ticker.Stop()
 
 	for {
