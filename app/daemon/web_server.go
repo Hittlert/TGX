@@ -583,6 +583,13 @@ func (s *WebServer) handleListenTargets(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	globalUpdatesStreamMu.RLock()
+	stream := globalUpdatesStream
+	globalUpdatesStreamMu.RUnlock()
+	if stream != nil {
+		stream.refreshTargetCache()
+	}
+
 	saved, _ := s.db.GetListenTargets()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":      true,

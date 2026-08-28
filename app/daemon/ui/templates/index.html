@@ -383,16 +383,17 @@
       }
 
       function target_scan_html(row) {
-        var scan = get_scan_status(row);
-        var status = scan.status || 'idle';
-        var scan_time = scan.last_scan_finished_at || scan.last_scan_started_at || 0;
-        var time_label = status == 'scanning' ? 'Started ' : 'Last scan ';
-        var error = scan.error ? '<div class="target-scan-error">' + escape_html(scan.error) + '</div>' : '';
-
+        var is_active = row.enabled || row.is_target;
+        if (is_active) {
+          return '<div class="target-scan-meta">' +
+            '<span class="apple-status-chip is-ok" style="background: rgba(52, 199, 89, 0.12); color: #34c759; border: 1px solid rgba(52, 199, 89, 0.25); font-weight: 500;">⚡ 实时流式推流中</span>' +
+            '<span class="target-scan-time">0ms 极速响应</span>' +
+            '</div>';
+        }
         return '<div class="target-scan-meta">' +
-          '<span class="apple-status-chip is-' + scan_status_class(status) + '">' + scan_status_label(status) + '</span>' +
-          '<span class="target-scan-time">' + time_label + format_timestamp(scan_time) + '</span>' +
-          '</div>' + error;
+          '<span class="apple-status-chip is-idle" style="background: rgba(142, 142, 147, 0.12); color: #8e8e93; border: 1px solid rgba(142, 142, 147, 0.25);">未启用监听</span>' +
+          '<span class="target-scan-time">点击勾选启用</span>' +
+          '</div>';
       }
 
       function sync_target_row(dom_row) {

@@ -8,8 +8,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/expr-lang/expr"
 	"github.com/flytam/filenamify"
 	"go.uber.org/zap"
+
+	"github.com/Hittlert/TGX/pkg/texpr"
 )
 
 type TelegramAccess interface {
@@ -155,6 +158,27 @@ func (o *Orchestrator) scanTarget(ctx context.Context, target ListenTarget) {
 			cleanFileName := m.FileName
 			if cleanFileName == "" && m.HasMedia {
 				cleanFileName = fmt.Sprintf("media_%d", m.ID)
+			}
+
+			if target.DownloadFilter != "" && m.HasMedia {
+				env := texpr.EnvMessage{
+					ID:      m.ID,
+					Date:    int(m.Date),
+					Message: m.Text,
+					Media: texpr.EnvMessageMedia{
+						Name: cleanFileName,
+						Size: m.FileSize,
+					},
+				}
+				prog, err := expr.Compile(target.DownloadFilter, expr.Env(env), expr.AsBool())
+				if err == nil {
+					result, err := expr.Run(prog, env)
+					if err == nil {
+						if matched, ok := result.(bool); ok && !matched {
+							continue
+						}
+					}
+				}
 			}
 
 			err = o.db.IngestMessage(ChatMessage{
