@@ -32,13 +32,30 @@ func GetPhotoInfo(photo *tg.MessageMediaPhoto) (*Media, bool) {
 }
 
 func GetPhotoSize(sizes []tg.PhotoSizeClass) (string, int, bool) {
-	size := sizes[len(sizes)-1]
-	switch s := size.(type) {
-	case *tg.PhotoSize:
-		return s.Type, s.Size, true
-	case *tg.PhotoSizeProgressive:
-		return s.Type, s.Sizes[len(s.Sizes)-1], true
+	var bestType string
+	var bestSize int
+	found := false
+
+	for _, size := range sizes {
+		switch s := size.(type) {
+		case *tg.PhotoSize:
+			if s.Size > bestSize || !found {
+				bestType = s.Type
+				bestSize = s.Size
+				found = true
+			}
+		case *tg.PhotoSizeProgressive:
+			maxSize := 0
+			if len(s.Sizes) > 0 {
+				maxSize = s.Sizes[len(s.Sizes)-1]
+			}
+			if maxSize > bestSize || !found {
+				bestType = s.Type
+				bestSize = maxSize
+				found = true
+			}
+		}
 	}
 
-	return "", 0, false
+	return bestType, bestSize, found
 }

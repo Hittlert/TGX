@@ -345,15 +345,28 @@ func (d *Database) UpdateDownloadStatus(chatID string, messageID int, status str
 		downloadedAt = &now
 	}
 
+	var nextRetryAt int64 = 0
+	if status == "failed" {
+		lowerErr := strings.ToLower(errMsg)
+		if strings.Contains(lowerErr, "deleted") || strings.Contains(lowerErr, "unavailable") || strings.Contains(lowerErr, "message_id_invalid") {
+			nextRetryAt = now + 86400*7
+		} else {
+			nextRetryAt = now + 300
+		}
+	}
+
 	_, err := d.db.Exec(`
 		UPDATE download_records
 		SET status = ?, file_name = COALESCE(NULLIF(?, ''), file_name), 
 		    save_path = COALESCE(NULLIF(?, ''), save_path),
 		    media_type = COALESCE(NULLIF(?, ''), media_type),
 		    file_size = CASE WHEN ? > 0 THEN ? ELSE file_size END,
-		    error = ?, updated_at = ?, downloaded_at = COALESCE(?, downloaded_at)
+		    error = ?,
+		    attempts = CASE WHEN ? = 'failed' THEN attempts + 1 ELSE attempts END,
+		    next_retry_at = CASE WHEN ? = 'failed' THEN ? ELSE next_retry_at END,
+		    updated_at = ?, downloaded_at = COALESCE(?, downloaded_at)
 		WHERE chat_id = ? AND message_id = ?
-	`, status, fileName, savePath, mediaType, fileSize, fileSize, errMsg, now, downloadedAt, chatID, messageID)
+	`, status, fileName, savePath, mediaType, fileSize, fileSize, errMsg, status, status, nextRetryAt, now, downloadedAt, chatID, messageID)
 	return err
 }
 

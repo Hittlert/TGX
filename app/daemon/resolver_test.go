@@ -71,7 +71,7 @@ func TestResolverPreparesMediaAndExactExistingFile(t *testing.T) {
 	}
 }
 
-func TestResolverRejectsMetadataMismatchAndCollision(t *testing.T) {
+func TestResolverRejectsCollision(t *testing.T) {
 	root := t.TempDir()
 	request := validRequest("mismatch", 1)
 	request.ExpectedSize = 5
@@ -82,8 +82,12 @@ func TestResolverRejectsMetadataMismatchAndCollision(t *testing.T) {
 	resolver := newTaskResolver(&fakeMediaAccess{media: ResolvedMedia{
 		File: fakeDownloadFile{size: 4}, Name: "file.bin", Size: 4,
 	}}, filepath.Join(root, "ssd"), filepath.Join(root, "hdd"))
-	if _, err := resolver.Resolve(t.Context(), task); err == nil || ErrorClass(err) != "metadata" {
-		t.Fatalf("metadata mismatch returned %v", err)
+	elem, err := resolver.Resolve(t.Context(), task)
+	if err != nil {
+		t.Fatalf("expected graceful size update, got %v", err)
+	}
+	if elem == nil || task.Snapshot().TotalSize != 4 {
+		t.Fatalf("expected total size 4, got %d", task.Snapshot().TotalSize)
 	}
 
 	request = validRequest("collision", 2)

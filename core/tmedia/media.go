@@ -20,6 +20,25 @@ func ExtractMedia(m tg.MessageMediaClass) (*Media, bool) {
 		return GetDocumentInfo(m)
 	case *tg.MessageMediaInvoice:
 		return GetExtendedMedia(m.ExtendedMedia)
+	case *tg.MessageMediaPaidMedia:
+		for _, pm := range m.ExtendedMedia {
+			if res, ok := GetExtendedMedia(pm); ok {
+				return res, true
+			}
+		}
+	case *tg.MessageMediaWebPage:
+		if wp, ok := m.Webpage.(*tg.WebPage); ok {
+			if docClass, exists := wp.GetDocument(); exists {
+				if doc, ok := docClass.(*tg.Document); ok {
+					return GetDocumentInfo(&tg.MessageMediaDocument{Document: doc})
+				}
+			}
+			if photoClass, exists := wp.GetPhoto(); exists {
+				if photo, ok := photoClass.(*tg.Photo); ok {
+					return GetPhotoInfo(&tg.MessageMediaPhoto{Photo: photo})
+				}
+			}
+		}
 	}
 	return nil, false
 }

@@ -42,11 +42,6 @@ func (r *taskResolver) Resolve(ctx context.Context, task *Task) (taskElement, er
 		return nil, NewTaskError("unavailable", true, fmt.Errorf("message has no downloadable media"))
 	}
 	task.SetResolved(media.Name, media.Size, media.DCID)
-	if request.ExpectedSize > 0 && request.ExpectedSize != media.Size {
-		return nil, NewTaskError("metadata", false, fmt.Errorf(
-			"Telegram size %d does not match submitted size %d", media.Size, request.ExpectedSize,
-		))
-	}
 
 	finalPath := request.FinalPath
 	if finalPath == "" && media.Name != "" {

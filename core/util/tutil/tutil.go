@@ -175,6 +175,51 @@ func FileExists(msg tg.MessageClass) bool {
 }
 
 func GetSingleMessage(ctx context.Context, c *tg.Client, peer tg.InputPeerClass, msg int) (*tg.Message, error) {
+	// 1. Direct exact message ID lookup (robust against bot messages, topic shifts, and deleted gaps)
+	switch p := peer.(type) {
+	case *tg.InputPeerChannel:
+		req := &tg.ChannelsGetMessagesRequest{
+			Channel: &tg.InputChannel{ChannelID: p.ChannelID, AccessHash: p.AccessHash},
+			ID:      []tg.InputMessageClass{&tg.InputMessageID{ID: msg}},
+		}
+		res, err := c.ChannelsGetMessages(ctx, req)
+		if err == nil {
+			if msgs, ok := res.(*tg.MessagesChannelMessages); ok {
+				for _, mClass := range msgs.Messages {
+					if m, ok := mClass.(*tg.Message); ok && m.ID == msg {
+						return m, nil
+					}
+				}
+			}
+		}
+	default:
+		req := []tg.InputMessageClass{&tg.InputMessageID{ID: msg}}
+		res, err := c.MessagesGetMessages(ctx, req)
+		if err == nil {
+			switch msgs := res.(type) {
+			case *tg.MessagesMessages:
+				for _, mClass := range msgs.Messages {
+					if m, ok := mClass.(*tg.Message); ok && m.ID == msg {
+						return m, nil
+					}
+				}
+			case *tg.MessagesMessagesSlice:
+				for _, mClass := range msgs.Messages {
+					if m, ok := mClass.(*tg.Message); ok && m.ID == msg {
+						return m, nil
+					}
+				}
+			case *tg.MessagesChannelMessages:
+				for _, mClass := range msgs.Messages {
+					if m, ok := mClass.(*tg.Message); ok && m.ID == msg {
+						return m, nil
+					}
+				}
+			}
+		}
+	}
+
+	// 2. Fallback to GetHistory iterator if direct lookup did not return the message
 	it := query.Messages(c).
 		GetHistory(peer).OffsetID(msg + 1).
 		BatchSize(1).Iter()
