@@ -1,0 +1,38 @@
+services:
+  tgx:
+    image: hittlert/tgx:latest
+    restart: unless-stopped
+    command:
+      - serve
+      - --storage-path
+      - /data
+      - --namespace
+      - production
+      - --reconnect-timeout
+      - "30s"
+      - --listen
+      - 0.0.0.0:5000
+      - --dir
+      - /app/downloads
+      - --temp-dir
+      - /app/temp/tgx
+      - --db-path
+      - /app/state/download_records.sqlite3
+      - --queue-capacity
+      - "1000"
+      - --terminal-limit
+      - "2000"
+      - --file-concurrency
+      - "64"
+      - --download-threads
+      - "16"
+      - --dc-pool-size
+      - "64"
+      - --start-paused=false
+    volumes:
+      - ./data:/data
+      - ./downloads:/app/downloads
+      - ./state:/app/state
+      - ./temp:/app/temp
+    ports:
+      - "5000:5000"
