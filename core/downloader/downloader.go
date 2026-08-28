@@ -114,7 +114,7 @@ func (d *Downloader) download(ctx context.Context, elem Elem) error {
 		req := &tg.UploadGetFileRequest{
 			Location: elem.File().Location(),
 			Offset:   0,
-			Limit:    int(partSize),
+			Limit:    int(MaxPartSize),
 		}
 		var res tg.UploadFileClass
 		var fetchErr error
@@ -157,9 +157,6 @@ func (d *Downloader) download(ctx context.Context, elem Elem) error {
 	for i := 0; i < numParts; i++ {
 		offset := int64(i) * partSize
 		limit := int(partSize)
-		if offset+int64(limit) > totalSize {
-			limit = int(totalSize - offset)
-		}
 		jobs <- partJob{index: i, offset: offset, limit: limit}
 	}
 	close(jobs)
