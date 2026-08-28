@@ -2,6 +2,7 @@ package downloader
 
 import (
 	"context"
+	"time"
 
 	"github.com/go-faster/errors"
 	"github.com/gotd/td/telegram/downloader"
@@ -84,11 +85,17 @@ func (d *Downloader) download(ctx context.Context, elem Elem) error {
 	if elem.AsTakeout() {
 		client = d.opts.Pool.Takeout(ctx, elem.File().DC())
 	}
+	timeout := 60 * time.Second + time.Duration(elem.File().Size()/(1024*1024))*time.Second
+	if timeout > 30*time.Minute {
+		timeout = 30 * time.Minute
+	}
+	dlCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 
 	_, err := downloader.NewDownloader().WithPartSize(MaxPartSize).
 		Download(client, elem.File().Location()).
 		WithThreads(tutil.BestThreads(elem.File().Size(), d.opts.Threads)).
-		Parallel(ctx, newWriteAt(elem, d.opts.Progress, MaxPartSize))
+		Parallel(dlCtx, newWriteAt(elem, d.opts.Progress, MaxPartSize))
 	if err != nil {
 		return errors.Wrap(err, "download")
 	}
