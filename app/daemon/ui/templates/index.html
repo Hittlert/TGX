@@ -1,0 +1,1422 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Telegram Media Downloader</title>
+  <link href="static/layui/css/layui.css" rel="stylesheet">
+  <link href="static/css/index.css" rel="stylesheet">
+</head>
+
+<body>
+  <div class="apple-app">
+    <!-- Apple Frosted Glass Top Navigation Bar -->
+    <header class="apple-navbar">
+      <div class="apple-nav-top">
+        <div class="apple-brand">
+          <span class="apple-brand-icon">⚡</span>
+          <span class="apple-brand-title">TG Downloader</span>
+        </div>
+        <div class="apple-nav-actions">
+          <button type="button" class="apple-status-pill" id="download_state" data-value="{{ download_state }}" onclick="download_state_change(this)">
+            <span class="status-dot"></span>
+            <span class="status-label">{{ download_state }}</span>
+          </button>
+          <button type="button" class="apple-icon-btn" id="btn_open_settings" title="Concurrency & Performance Settings">
+            <i class="layui-icon layui-icon-set-fill"></i>
+          </button>
+        </div>
+      </div>
+
+      <!-- Segmented Control Navigation -->
+      <nav class="apple-segmented-control" role="tablist">
+        <button type="button" class="segmented-item is-active" data-tab="downloading">
+          <i class="layui-icon layui-icon-download-circle"></i>
+          <span>Downloading</span>
+        </button>
+        <button type="button" class="segmented-item" data-tab="downloaded">
+          <i class="layui-icon layui-icon-file"></i>
+          <span>Downloaded</span>
+        </button>
+        <button type="button" class="segmented-item" data-tab="targets">
+          <i class="layui-icon layui-icon-layer"></i>
+          <span>Targets</span>
+        </button>
+        <button type="button" class="segmented-item" data-tab="proxy">
+          <i class="layui-icon layui-icon-transfer"></i>
+          <span>Proxy</span>
+        </button>
+      </nav>
+    </header>
+
+    <!-- Main Views Container -->
+    <main class="apple-main-content">
+      <!-- Tab 1: Downloading -->
+      <section id="pane_downloading" class="apple-tab-pane is-active">
+        <div class="download-jobs-grid" id="download_jobs_list">
+          <div class="apple-empty-state" style="grid-column: 1 / -1; padding: 48px 0; text-align: center; color: var(--apple-text-muted);">
+            <i class="layui-icon layui-icon-download-circle" style="font-size: 42px; display: block; margin-bottom: 10px; opacity: 0.5;"></i>
+            <div style="font-size: 15px; font-weight: 500;">No active downloads</div>
+            <div style="font-size: 12px; margin-top: 4px;">Tasks will appear here automatically when downloading.</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Tab 2: Downloaded -->
+      <section id="pane_downloaded" class="apple-tab-pane">
+        <div class="targets-header-bar downloaded-header-bar">
+          <div class="targets-header-row-1">
+            <div class="apple-search-box">
+              <i class="layui-icon layui-icon-search"></i>
+              <input id="downloaded_search" type="text" autocomplete="off" placeholder="Search downloaded files by name, ID, or path...">
+            </div>
+            <div class="apple-count-pill" id="downloaded_count_pill">
+              <span id="downloaded_total_count">0</span><span class="count-divider"></span><span style="font-size: 11px; color: #86868b; margin-left: 3px;">Files</span>
+            </div>
+          </div>
+          <div class="targets-action-buttons downloaded-actions">
+            <button id="reload_downloaded" type="button" class="apple-btn apple-btn-secondary">
+              <i class="layui-icon layui-icon-refresh"></i>
+              <span>Refresh</span>
+            </button>
+          </div>
+        </div>
+
+        <div class="apple-card table-card desktop-only">
+          <table class="layui-hide" id="already_download_list" lay-filter="already_download_list"></table>
+        </div>
+        <div class="mobile-job-list" id="already_download_mobile_list">
+          <div class="apple-empty-state">No downloaded files</div>
+        </div>
+        <div class="apple-mobile-pagination" id="downloaded_mobile_pager">
+          <button type="button" class="apple-btn apple-btn-secondary" id="mobile_prev_page"><i class="layui-icon layui-icon-left"></i> Prev</button>
+          <span class="mobile-page-indicator" id="mobile_page_indicator">Page 1 / 1</span>
+          <button type="button" class="apple-btn apple-btn-secondary" id="mobile_next_page">Next <i class="layui-icon layui-icon-right"></i></button>
+        </div>
+      </section>
+
+      <!-- Tab 3: Targets -->
+      <section id="pane_targets" class="apple-tab-pane">
+        <div class="targets-header-bar">
+          <div class="targets-header-row-1">
+            <div class="apple-search-box">
+              <i class="layui-icon layui-icon-search"></i>
+              <input id="target_search" type="text" autocomplete="off" placeholder="Search targets...">
+            </div>
+            <div class="apple-count-pill">
+              <span id="target_enabled_count">0</span><span class="count-divider">/</span><span id="target_total_count">0</span>
+            </div>
+          </div>
+          <div class="targets-action-buttons">
+            <button id="add_target_btn" type="button" class="apple-btn apple-btn-primary">
+              <i class="layui-icon layui-icon-add-1"></i>
+              <span>Add</span>
+            </button>
+            <button id="reload_dialogs" type="button" class="apple-btn apple-btn-secondary">
+              <i class="layui-icon layui-icon-refresh"></i>
+              <span>Refresh</span>
+            </button>
+            <button id="save_targets" type="button" class="apple-btn apple-btn-success">
+              <i class="layui-icon layui-icon-ok"></i>
+              <span>Save</span>
+            </button>
+          </div>
+        </div>
+
+        <div class="targets-list-container" id="target_list">
+          <div class="apple-empty-state">
+            <div class="apple-spinner"></div>
+            <span>Loading targets...</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- Tab 4: Proxy Outbounds -->
+      <section id="pane_proxy" class="apple-tab-pane">
+        <div class="targets-header-bar">
+          <div class="targets-header-row-1">
+            <div style="font-size: 16px; font-weight: 600; display: flex; align-items: center; gap: 8px;">
+              <span style="font-size: 20px;">🌐</span>
+              <span>Proxy Outbounds (代理配置与切换)</span>
+            </div>
+            <div class="apple-count-pill" id="proxy_count_pill">
+              <span id="proxy_active_label">Loading...</span>
+            </div>
+          </div>
+          <div class="targets-action-buttons" style="display: flex; gap: 8px; align-items: center;">
+            <span class="proxy-watchdog-badge" id="watchdog_badge" style="font-size: 11.5px; padding: 4px 10px; border-radius: 12px; background: rgba(52, 199, 89, 0.1); color: #34c759; border: 1px solid rgba(52, 199, 89, 0.25); font-weight: 500;" title="每300秒通过代理检测一次 http://1.1.1.1，失败则10秒重试3次，仍失败自动切换至下一个可用节点">
+              🛡️ 断网自愈: 运行中 (300s)
+            </span>
+            <button id="btn_refresh_proxies" type="button" class="apple-btn apple-btn-secondary">
+              <i class="layui-icon layui-icon-refresh"></i>
+              <span>Refresh</span>
+            </button>
+          </div>
+        </div>
+
+        <div class="proxy-nodes-grid" id="proxy_nodes_container">
+          <div class="apple-empty-state">
+            <div class="apple-spinner"></div>
+            <span>Loading proxy nodes...</span>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <!-- Frosted Glass Bottom Status Bar -->
+    <footer class="apple-footer">
+      <div class="footer-left">
+        <span>Telegram Media Downloader <b id="app_version">v2.2.8</b></span>
+      </div>
+      <div class="footer-right">
+        <span class="footer-speed-badge">
+          <i class="layui-icon layui-icon-download-circle"></i>
+          <span id="download_speed_title">0.00 B/s</span>
+        </span>
+        <span class="footer-pool-badge" id="media_pool_status" style="cursor: pointer;" title="点击管理全局并发线程槽位池">⚡ 槽位待命 (0/64)</span>
+        <span class="footer-pool-badge" id="footer_proxy_badge" style="cursor: pointer;" title="Click to manage proxies">🌐 Proxy: Loading...</span>
+        <button type="button" class="footer-settings-btn" id="footer_settings_btn" title="Settings">
+          <i class="layui-icon layui-icon-set"></i>
+        </button>
+      </div>
+    </footer>
+  </div>
+
+  <!-- Performance & Concurrency Settings Modal -->
+  <div id="settings_modal" class="apple-modal-backdrop" style="display: none;">
+    <div class="apple-modal-dialog">
+      <div class="modal-header">
+        <div class="modal-title-wrap">
+          <div class="modal-icon"><i class="layui-icon layui-icon-set-fill"></i></div>
+          <div>
+            <h3 class="modal-title">Performance & Concurrency</h3>
+            <p class="modal-subtitle">Configure Go TDL engine & multi-task parallelism</p>
+          </div>
+        </div>
+        <button type="button" class="modal-close-btn" id="btn_close_settings">&times;</button>
+      </div>
+      <div class="modal-body">
+        <form id="settings_form" class="settings-grid">
+          <div class="setting-item">
+            <div class="setting-label-row">
+              <label for="cfg_max_active_files">📁 最大活动文件并发 (Max Active Files)</label>
+              <span class="setting-val-badge" id="val_max_active_files">8</span>
+            </div>
+            <p class="setting-desc">限制同时打开并写入磁盘的文件数，保护机械硬盘磁头免于过多随机寻道。</p>
+            <div class="setting-slider-row">
+              <input type="range" id="cfg_max_active_files" min="1" max="32" step="1" value="8" class="apple-range">
+            </div>
+          </div>
+
+          <div class="setting-item">
+            <div class="setting-label-row">
+              <label for="cfg_global_thread_pool">⚡ 全局线程并发总池 (Global Thread Slots)</label>
+              <span class="setting-val-badge" id="val_global_thread_pool">64</span>
+            </div>
+            <p class="setting-desc">系统全局最大并发线程预算（所有活动文件共享该池），严格控温防风控。</p>
+            <div class="setting-slider-row">
+              <input type="range" id="cfg_global_thread_pool" min="16" max="128" step="8" value="64" class="apple-range">
+            </div>
+          </div>
+
+          <div class="setting-item" style="background: rgba(0, 122, 255, 0.04); border-radius: 12px; padding: 14px; border: 1px solid rgba(0, 122, 255, 0.12);">
+            <div class="setting-label-row">
+              <label style="color: var(--apple-blue); font-weight: 600;">⚡ 单文件算力自适应规则 (Size-Adaptive)</label>
+            </div>
+            <p class="setting-desc" style="margin-bottom: 8px; color: var(--apple-text-secondary);">下载引擎根据 <code>文件体积 / 4MB</code> 自动向总池申请最优槽位数：</p>
+            <div style="font-size: 12px; display: grid; grid-template-columns: 1fr 1fr; gap: 6px; color: var(--apple-text);">
+              <div>• <strong>&lt; 4 MB (图片/语音)</strong>: <code>1 槽位</code> (秒级秒下)</div>
+              <div>• <strong>4 ~ 20 MB (音乐/短片)</strong>: <code>2 ~ 5 槽位</code></div>
+              <div>• <strong>20 ~ 64 MB (短视频)</strong>: <code>6 ~ 16 槽位</code></div>
+              <div>• <strong>&gt; 64 MB (长视频/电影)</strong>: <code>16 槽位</code> (封顶拉满)</div>
+            </div>
+          </div>
+
+          <div class="setting-item" style="padding-top: 4px;">
+            <div class="setting-label-row" style="align-items: center;">
+              <label for="cfg_disable_ipv6">Force IPv4 Only (强制纯 IPv4 模式)</label>
+              <label class="apple-switch">
+                <input type="checkbox" id="cfg_disable_ipv6" checked>
+                <span class="apple-switch-slider"></span>
+              </label>
+            </div>
+            <p class="setting-desc">过滤 Telegram 所有 IPv6 端点，防止境外代理回国时连接超时或产生丢包。</p>
+          </div>
+
+          <div class="settings-summary-box">
+            <div class="summary-item">
+              <span class="summary-label">最大活动文件:</span>
+              <span class="summary-value" id="summary_max_files">8 Files (硬盘保护)</span>
+            </div>
+            <div class="summary-item">
+              <span class="summary-label">全局线程池容量:</span>
+              <span class="summary-value" id="summary_total_threads">64 Slots (自适应)</span>
+            </div>
+            <div class="summary-item">
+              <span class="summary-label">单文件最大分配:</span>
+              <span class="summary-value">16 Threads (4MB/Slot)</span>
+            </div>
+            <div class="summary-item">
+              <span class="summary-label">内存安全预算:</span>
+              <span class="summary-value">~128 MB (极轻量)</span>
+            </div>
+            <div class="summary-item">
+              <span class="summary-label">下载引擎:</span>
+              <span class="summary-value" style="color: #34c759;">Go MTProto Daemon (Active)</span>
+            </div>
+          </div>
+        </form>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="apple-btn apple-btn-secondary" id="btn_cancel_settings">Cancel</button>
+        <button type="button" class="apple-btn apple-btn-primary" id="btn_save_settings">
+          <i class="layui-icon layui-icon-ok"></i>
+          <span>Save & Apply</span>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <script src="static/layui/layui.js"></script>
+  <script>
+    layui.use(['table', 'layer'], function () {
+      var table = layui.table;
+      var layer = layui.layer;
+      var $ = layui.$;
+      var already_download_list_data = [];
+      var download_list_table_data = [];
+
+      // App Version
+      $.ajax({
+        url: "get_app_version",
+        type: "get",
+        dataType: "text",
+        success: function (result) {
+          $("#app_version").html(result);
+        }
+      });
+
+      // Pause/Resume state
+      window.download_state_change = function (e) {
+        $.ajax({
+          url: "download_state_change?state=" + $(e).attr('data-value'),
+          type: "get",
+          dataType: "text",
+          success: function (result) {
+            $("#download_state").attr('data-value', result);
+            $("#download_state .status-label").html(result);
+          }
+        });
+      };
+
+      // State Management
+      var target_rows = [];
+      var target_loaded = false;
+      var target_progress_by_chat = {};
+      var target_progress_loading = false;
+      var target_progress_has_snapshot = false;
+      var target_progress_unavailable = false;
+      var target_progress_poll_int = 0;
+      var TARGET_PROGRESS_POLL_INTERVAL = 8000;
+
+      function escape_html(value) {
+        return String(value == null ? '' : value)
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;')
+          .replace(/"/g, '&quot;')
+          .replace(/'/g, '&#39;');
+      }
+
+      function target_key(value) {
+        return String(value == null ? '' : value);
+      }
+
+      function find_target_row(chat_key) {
+        for (var i = 0; i < target_rows.length; i++) {
+          if (target_key(target_rows[i].chat_id) == chat_key) {
+            return target_rows[i];
+          }
+        }
+        return null;
+      }
+
+      function target_display_name(row) {
+        if (row.title) return row.title;
+        if (row.username) return '@' + row.username;
+        if (row.chat_id) return String(row.chat_id);
+        return 'Unknown dialog';
+      }
+
+      function target_meta(row) {
+        var parts = [];
+        if (row.type) parts.push(row.type);
+        if (row.username) parts.push('@' + row.username);
+        if (row.chat_id) parts.push('ID ' + row.chat_id);
+        return parts.join(' • ');
+      }
+
+      function format_timestamp(value) {
+        var timestamp = parseInt(value || 0, 10);
+        if (!timestamp) return 'Never';
+        var date = new Date(timestamp * 1000);
+        var pad = function (n) { return n < 10 ? '0' + n : String(n); };
+        return date.getFullYear() + '-' + pad(date.getMonth() + 1) + '-' + pad(date.getDate()) + ' ' + pad(date.getHours()) + ':' + pad(date.getMinutes());
+      }
+
+      function get_scan_status(row) {
+        if (!row.scan_status || typeof row.scan_status != 'object') return {};
+        return row.scan_status;
+      }
+
+      function scan_status_label(status) {
+        if (status == 'ok') return 'OK';
+        if (status == 'error') return 'Error';
+        if (status == 'scanning') return 'Scanning';
+        return 'Idle';
+      }
+
+      function scan_status_class(status) {
+        if (status == 'ok' || status == 'error' || status == 'scanning') return status;
+        return 'idle';
+      }
+
+      function target_scan_html(row) {
+        var scan = get_scan_status(row);
+        var status = scan.status || 'idle';
+        var scan_time = scan.last_scan_finished_at || scan.last_scan_started_at || 0;
+        var time_label = status == 'scanning' ? 'Started ' : 'Last scan ';
+        var error = scan.error ? '<div class="target-scan-error">' + escape_html(scan.error) + '</div>' : '';
+
+        return '<div class="target-scan-meta">' +
+          '<span class="apple-status-chip is-' + scan_status_class(status) + '">' + scan_status_label(status) + '</span>' +
+          '<span class="target-scan-time">' + time_label + format_timestamp(scan_time) + '</span>' +
+          '</div>' + error;
+      }
+
+      function sync_target_row(dom_row) {
+        var row = find_target_row($(dom_row).attr('data-chat-key'));
+        if (!row) return;
+        row.enabled = $(dom_row).find('.target-enabled').prop('checked');
+        row.priority = parseInt($(dom_row).find('.target-priority').val() || 0, 10) || 0;
+        row.last_read_message_id = $(dom_row).find('.target-cursor').val() || 0;
+        row.download_filter = $(dom_row).find('.target-filter').val() || '';
+      }
+
+      function sync_visible_target_rows() {
+        $('#target_list .apple-target-card').each(function () {
+          sync_target_row(this);
+        });
+      }
+
+      function update_target_count() {
+        var enabled = 0;
+        for (var i = 0; i < target_rows.length; i++) {
+          if (target_rows[i].enabled) enabled += 1;
+        }
+        $('#target_enabled_count').text(enabled);
+        $('#target_total_count').text(target_rows.length);
+      }
+
+      function format_file_count(count) {
+        return (parseInt(count || 0, 10) || 0).toLocaleString('en-US');
+      }
+
+      function format_downloaded_bytes(bytes) {
+        var value = parseInt(bytes || 0, 10) || 0;
+        if (value <= 0) return '0 B';
+        var units = ['B', 'KB', 'MB', 'GB', 'TB'];
+        var unit_idx = 0;
+        var current = value;
+        while (current >= 1024 && unit_idx < units.length - 1) {
+          current /= 1024;
+          unit_idx += 1;
+        }
+        return (unit_idx === 0 ? current.toFixed(0) : current.toFixed(1)) + ' ' + units[unit_idx];
+      }
+
+      function target_progress_key(row) {
+        return target_key(row.chat_id);
+      }
+
+      function normalize_target_progress(item) {
+        return {
+          chat_id: target_key(item.chat_id),
+          total_files: parseInt(item.total_files || 0, 10) || 0,
+          downloaded_files: parseInt(item.downloaded_files || 0, 10) || 0,
+          pending_files: parseInt(item.pending_files || 0, 10) || 0,
+          processing_files: parseInt(item.processing_files || 0, 10) || 0,
+          failed_files: parseInt(item.failed_files || 0, 10) || 0,
+          skipped_files: parseInt(item.skipped_files || 0, 10) || 0,
+          downloaded_bytes: parseInt(item.downloaded_bytes || 0, 10) || 0
+        };
+      }
+
+      function target_progress_content(progress) {
+        if (!progress) {
+          return '<div class="target-progress-empty">' + (target_progress_unavailable ? 'Progress unavailable' : 'Loading progress...') + '</div>';
+        }
+        var total = progress.total_files;
+        if (!total) {
+          return '<div class="target-progress-empty">No indexed media files</div>';
+        }
+        var downloaded = Math.min(progress.downloaded_files, total);
+        var percent = Math.max(0, Math.min(100, downloaded / total * 100));
+        var percent_text = percent.toFixed(1) + '%';
+        var failed = progress.failed_files ? '<span class="stat-failed">Failed: ' + format_file_count(progress.failed_files) + '</span>' : '<span>Failed: 0</span>';
+        var skipped = progress.skipped_files ? '<span class="stat-skipped">Skipped: <b>' + format_file_count(progress.skipped_files) + '</b></span>' : '<span>Skipped: 0</span>';
+
+        return '<div class="target-progress-summary">' +
+          '<span class="summary-files"><b>' + format_file_count(downloaded) + '</b> / ' + format_file_count(total) + ' files</span>' +
+          '<span class="summary-pct">' + percent_text + '</span>' +
+          '</div>' +
+          '<div class="apple-progress-track"><div class="progress-bar-fill" style="width: ' + percent.toFixed(1) + '%;"></div></div>' +
+          '<div class="target-progress-stats">' +
+          '<span>Pending: <b>' + format_file_count(progress.pending_files) + '</b></span>' +
+          '<span>Downloading: <b>' + format_file_count(progress.processing_files) + '</b></span>' +
+          failed +
+          skipped +
+          '<span>Downloaded: <b>' + format_downloaded_bytes(progress.downloaded_bytes) + '</b></span>' +
+          '</div>';
+      }
+
+      function target_progress_html(row) {
+        if (!row.enabled) return '';
+        var progress_key = target_progress_key(row);
+        return '<div class="target-progress-panel" data-progress-key="' + escape_html(progress_key) + '">' +
+          target_progress_content(target_progress_by_chat[progress_key]) +
+          '</div>';
+      }
+
+      function update_target_progress_nodes() {
+        $('#target_list .target-progress-panel[data-progress-key]').each(function () {
+          var progress_key = $(this).attr('data-progress-key');
+          $(this).html(target_progress_content(target_progress_by_chat[progress_key]));
+        });
+      }
+
+      function load_target_progress() {
+        if (!target_loaded || target_progress_loading) return;
+        target_progress_loading = true;
+        $.ajax({
+          url: "api/target_progress",
+          type: "get",
+          dataType: "json",
+          success: function (result) {
+            if (!result.ok || !Array.isArray(result.progress)) return;
+            var next_progress = {};
+            for (var i = 0; i < result.progress.length; i++) {
+              var p = normalize_target_progress(result.progress[i]);
+              if (p.chat_id) next_progress[p.chat_id] = p;
+            }
+            target_progress_by_chat = next_progress;
+            target_progress_has_snapshot = true;
+            target_progress_unavailable = false;
+            update_target_progress_nodes();
+          },
+          error: function () {
+            if (!target_progress_has_snapshot) {
+              target_progress_unavailable = true;
+              update_target_progress_nodes();
+            }
+          },
+          complete: function () {
+            target_progress_loading = false;
+          }
+        });
+      }
+
+      function stop_target_progress_poll() {
+        clearInterval(target_progress_poll_int);
+        target_progress_poll_int = 0;
+      }
+
+      function start_target_progress_poll() {
+        stop_target_progress_poll();
+        load_target_progress();
+        target_progress_poll_int = self.setInterval(function () {
+          if ($('#pane_targets').hasClass('is-active')) {
+            load_target_progress();
+          }
+        }, TARGET_PROGRESS_POLL_INTERVAL);
+      }
+
+      function render_target_list() {
+        var query = ($('#target_search').val() || '').toLowerCase();
+        var html = '';
+        var shown_count = 0;
+
+        for (var i = 0; i < target_rows.length; i++) {
+          var row = target_rows[i];
+          var scan_status = get_scan_status(row);
+          var search_text = [
+            row.chat_id,
+            row.title,
+            row.username,
+            row.type,
+            scan_status.status,
+            scan_status.error
+          ].join(' ').toLowerCase();
+          if (query && search_text.indexOf(query) < 0) {
+            continue;
+          }
+
+          shown_count += 1;
+          var chat_key = escape_html(target_key(row.chat_id));
+          var checked = row.enabled ? 'checked' : '';
+          var config_open = row.config_open ? ' is-config-open' : '';
+          var top_message_id = parseInt(row.top_message_id || 0, 10);
+          var latest_button = top_message_id > 0
+            ? '<button type="button" class="apple-btn-icon cursor-latest" title="Fill latest message ID" aria-label="Fill latest ID"><i class="layui-icon layui-icon-set"></i></button>'
+            : '';
+          var disp_name = target_display_name(row);
+          var initial = (disp_name || 'T').replace(/^@/, '').charAt(0).toUpperCase() || 'T';
+
+          html += '<div class="apple-target-card' + (row.enabled ? ' is-enabled' : '') + config_open + '" data-chat-key="' + chat_key + '">' +
+            '<div class="card-main-row">' +
+            '<div class="card-left-section">' +
+            '<label class="apple-switch" title="Toggle monitoring"><input class="target-enabled" type="checkbox" ' + checked + '><span class="apple-slider"></span></label>' +
+            '<div class="target-avatar">' + escape_html(initial) + '</div>' +
+            '<div class="target-info">' +
+            '<div class="target-title">' + escape_html(disp_name) + '</div>' +
+            '<div class="target-subtitle">' + escape_html(target_meta(row)) + '</div>' +
+            '</div>' +
+            '</div>' +
+            '</div>' +
+            target_progress_html(row) +
+            '<div class="card-footer-row">' +
+            '<div class="card-footer-left">' + target_scan_html(row) + '</div>' +
+            '<div class="card-footer-right">' +
+            '<button type="button" class="apple-action-btn btn-context" title="View message context around ID"><i class="layui-icon layui-icon-dialogue"></i><span>Context</span></button>' +
+            '<button type="button" class="apple-action-btn btn-config" title="Settings"><i class="layui-icon layui-icon-set"></i><span>Config</span></button>' +
+            '</div>' +
+            '</div>' +
+            '<div class="card-config-drawer">' +
+            '<div class="config-grid">' +
+            '<div class="config-field"><label>Priority</label><input class="target-priority apple-input" type="number" min="-1000000" max="1000000" step="1" value="' + escape_html(row.priority || 0) + '"></div>' +
+            '<div class="config-field"><label>Start Message Cursor</label><div class="cursor-input-group"><input class="target-cursor apple-input" type="number" min="0" step="1" value="' + escape_html(row.last_read_message_id || 0) + '">' + latest_button + '</div></div>' +
+            '<div class="config-field filter-field"><label>Download Regex Filter</label><input class="target-filter apple-input" type="text" value="' + escape_html(row.download_filter || '') + '" placeholder="e.g. \\.mp4$|1080p"></div>' +
+            '</div>' +
+            '</div>' +
+            '</div>';
+        }
+
+        if (!shown_count) {
+          html = '<div class="apple-empty-state">No dialogs found</div>';
+        }
+
+        $('#target_list').html(html);
+        update_target_count();
+      }
+
+      function load_dialogs(refresh) {
+        var loading_text = refresh ? 'Refreshing dialogs...' : 'Loading dialogs...';
+        $('#target_list').html('<div class="apple-empty-state"><div class="apple-spinner"></div><span>' + loading_text + '</span></div>');
+        $.ajax({
+          url: refresh ? "api/dialogs?refresh=true" : "api/dialogs",
+          type: "get",
+          dataType: "json",
+          success: function (result) {
+            if (!result.ok) {
+              layer.msg(result.error || 'Load failed');
+              return;
+            }
+            target_rows = result.dialogs || [];
+            target_rows.sort(function (a, b) {
+              var enabled_order = Number(Boolean(b.enabled)) - Number(Boolean(a.enabled));
+              if (enabled_order) return enabled_order;
+              return (parseInt(b.priority || 0, 10) || 0) - (parseInt(a.priority || 0, 10) || 0);
+            });
+            target_loaded = true;
+            render_target_list();
+            load_target_progress();
+          },
+          error: function (err) {
+            var msg = 'Load failed';
+            if (err.responseJSON && err.responseJSON.error) msg = err.responseJSON.error;
+            layer.msg(msg);
+            $('#target_list').html('<div class="apple-empty-state">Load error</div>');
+          }
+        });
+      }
+
+      function normalized_listen_chat_id(row) {
+        var chat_type = String(row.type || '').toLowerCase();
+        var username = String(row.username || '').replace(/^@/, '');
+        if (username && (chat_type == 'bot' || chat_type == 'private' || chat_type == 'user')) {
+          return '@' + username;
+        }
+
+        var chat_id = row.chat_id;
+        var chat_id_text = String(chat_id == null ? '' : chat_id);
+        if (
+          chat_id_text &&
+          chat_id_text.indexOf('-') !== 0 &&
+          /^\d+$/.test(chat_id_text) &&
+          (chat_type == 'channel' || chat_type == 'supergroup')
+        ) {
+          return '-100' + chat_id_text;
+        }
+
+        if (row.target_chat_id) {
+          return row.target_chat_id;
+        }
+        return chat_id;
+      }
+
+      function add_target() {
+        layer.prompt({
+          title: 'Add Monitored Group / Channel (Chat ID, @username or link)',
+          formType: 0,
+          placeholder: '@channel or -100123456789 or https://t.me/...'
+        }, function (value, index) {
+          var trimmed = $.trim(value);
+          if (!trimmed) return;
+          layer.close(index);
+          var loading_idx = layer.msg('Resolving target...', { icon: 16, shade: 0.1, time: 0 });
+          $.ajax({
+            url: "api/add_target",
+            type: "post",
+            contentType: "application/json",
+            data: JSON.stringify({ query: trimmed, target: trimmed }),
+            dataType: "json",
+            success: function (res) {
+              layer.close(loading_idx);
+              if (res.ok && res.dialog) {
+                var dialog = res.dialog;
+                dialog.enabled = true;
+                dialog.priority = 0;
+                dialog.last_read_message_id = dialog.top_message_id || 0;
+                dialog.download_filter = '';
+                dialog.upload_telegram_chat_id = '';
+                dialog.scan_status = {};
+
+                var existing = find_target_row(target_key(dialog.chat_id));
+                if (existing) {
+                  existing.enabled = true;
+                } else {
+                  target_rows.unshift(dialog);
+                }
+                render_target_list();
+                save_targets(function () {
+                  layer.msg('Target added and persisted to config!', { icon: 1 });
+                });
+              } else {
+                layer.msg(res.error || 'Failed to resolve target');
+              }
+            },
+            error: function (xhr) {
+              layer.close(loading_idx);
+              var err = 'Add failed';
+              if (xhr.responseJSON && xhr.responseJSON.error) err = xhr.responseJSON.error;
+              layer.msg(err);
+            }
+          });
+        });
+      }
+
+      function save_targets(callback) {
+        sync_visible_target_rows();
+        var targets = [];
+        for (var i = 0; i < target_rows.length; i++) {
+          targets.push({
+            enabled: !!target_rows[i].enabled,
+            chat_id: normalized_listen_chat_id(target_rows[i]),
+            source_chat_id: target_rows[i].chat_id,
+            title: target_display_name(target_rows[i]),
+            username: target_rows[i].username || '',
+            type: target_rows[i].type || '',
+            priority: parseInt(target_rows[i].priority || 0, 10) || 0,
+            last_read_message_id: parseInt(target_rows[i].last_read_message_id || 0, 10) || 0,
+            download_filter: target_rows[i].download_filter || '',
+            upload_telegram_chat_id: target_rows[i].upload_telegram_chat_id || ''
+          });
+        }
+
+        var loading_idx = layer.msg('Saving targets to database...', { icon: 16, shade: 0.1, time: 0 });
+        $.ajax({
+          url: "api/listen_targets",
+          type: "post",
+          contentType: "application/json",
+          data: JSON.stringify({ targets: targets }),
+          dataType: "json",
+          success: function (result) {
+            layer.close(loading_idx);
+            if (!result.ok) {
+              layer.msg(result.error || 'Save failed');
+              return;
+            }
+            layer.msg('Targets saved successfully!', { icon: 1 });
+            render_target_list();
+            if (typeof callback === 'function') callback();
+          },
+          error: function (err) {
+            layer.close(loading_idx);
+            var message = 'Save failed';
+            if (err.responseJSON && err.responseJSON.error) message = err.responseJSON.error;
+            layer.msg(message);
+          }
+        });
+      }
+
+      // Event Bindings
+      $('#target_search').on('input', function () {
+        sync_visible_target_rows();
+        render_target_list();
+      });
+
+      $('#add_target_btn').on('click', function () { add_target(); });
+      $('#reload_dialogs').on('click', function () { load_dialogs(true); });
+      $('#save_targets').on('click', function () { save_targets(); });
+
+      $('#target_list').on('change', '.target-enabled', function () {
+        var card = $(this).closest('.apple-target-card');
+        sync_target_row(card);
+        card.toggleClass('is-enabled', $(this).prop('checked'));
+        update_target_count();
+      });
+
+      $('#target_list').on('click', '.btn-config', function () {
+        var card = $(this).closest('.apple-target-card');
+        var row = find_target_row(card.attr('data-chat-key'));
+        if (row) {
+          row.config_open = !row.config_open;
+          card.toggleClass('is-config-open', row.config_open);
+        }
+      });
+
+      $('#target_list').on('click', '.cursor-latest', function () {
+        var card = $(this).closest('.apple-target-card');
+        var row = find_target_row(card.attr('data-chat-key'));
+        if (row && row.top_message_id) {
+          card.find('.target-cursor').val(row.top_message_id);
+          sync_target_row(card);
+        }
+      });
+
+      // Tab Switching
+      var update_download_list_int = 0;
+      var update_already_download_list_int = 0;
+
+      function switch_tab(tab_name) {
+        $('.apple-segmented-control .segmented-item').removeClass('is-active');
+        $('.apple-segmented-control .segmented-item[data-tab="' + tab_name + '"]').addClass('is-active');
+
+        $('.apple-tab-pane').removeClass('is-active');
+        $('#pane_' + tab_name).addClass('is-active');
+
+        clearInterval(update_download_list_int);
+        clearInterval(update_already_download_list_int);
+
+        if (tab_name === 'downloading') {
+          update_download_list_int = self.setInterval(update_download_list, 1000);
+          update_download_list();
+        } else if (tab_name === 'downloaded') {
+          reload_downloaded_data();
+        } else if (tab_name === 'targets') {
+          if (!target_loaded) load_dialogs(false);
+          start_target_progress_poll();
+        } else if (tab_name === 'proxy') {
+          load_proxies();
+        } else {
+          stop_target_progress_poll();
+        }
+      }
+
+      $('.apple-segmented-control').on('click', '.segmented-item', function () {
+        switch_tab($(this).attr('data-tab'));
+      });
+
+      // Context Viewer Modal
+      function open_context_viewer(chat_id, target_title, initial_message_id) {
+        var default_id = parseInt(initial_message_id || 0, 10) || 1;
+        var modal_html = '<div class="apple-sheet-wrap">' +
+          '<div class="apple-sheet-bar">' +
+          '  <div class="sheet-input-group">' +
+          '    <label>Message ID:</label>' +
+          '    <input id="context_mid_input" class="apple-input" type="number" min="1" value="' + default_id + '">' +
+          '    <button id="context_load_btn" class="apple-btn apple-btn-primary"><i class="layui-icon layui-icon-search"></i> Go</button>' +
+          '  </div>' +
+          '  <div class="sheet-nav-group">' +
+          '    <button id="context_prev_btn" class="apple-btn apple-btn-secondary"><i class="layui-icon layui-icon-left"></i> Prev</button>' +
+          '    <button id="context_next_btn" class="apple-btn apple-btn-secondary">Next <i class="layui-icon layui-icon-right"></i></button>' +
+          '  </div>' +
+          '</div>' +
+          '<div class="apple-message-stream" id="context_msg_list">' +
+          '  <div class="apple-empty-state"><div class="apple-spinner"></div><span>Loading messages...</span></div>' +
+          '</div>' +
+          '</div>';
+
+        layer.open({
+          type: 1,
+          title: 'Context Viewer • ' + escape_html(target_title),
+          area: [$(window).width() < 768 ? '95%' : '760px', $(window).width() < 768 ? '90%' : '620px'],
+          maxmin: true,
+          content: modal_html,
+          success: function (layero) {
+            function load_context(mid) {
+              var container = layero.find('#context_msg_list');
+              container.html('<div class="apple-empty-state"><div class="apple-spinner"></div><span>Loading messages around ID ' + mid + '...</span></div>');
+              $.ajax({
+                url: 'api/chat_context?chat_id=' + encodeURIComponent(chat_id) + '&message_id=' + mid + '&limit=30',
+                type: 'get',
+                dataType: 'json',
+                success: function (res) {
+                  if (!res.ok) {
+                    container.html('<div class="apple-empty-state">' + escape_html(res.error || 'Failed to load messages') + '</div>');
+                    return;
+                  }
+                  var msgs = res.messages || [];
+                  if (!msgs.length) {
+                    container.html('<div class="apple-empty-state">No messages recorded around this ID</div>');
+                    return;
+                  }
+                  var html = '';
+                  for (var i = 0; i < msgs.length; i++) {
+                    var m = msgs[i];
+                    var is_target = m.message_id === mid;
+                    var sender = m.sender_name || (m.sender_id ? 'User ' + m.sender_id : 'Unknown');
+                    var date_str = m.date ? format_timestamp(m.date) : '';
+                    var media_badge = m.media_type ? '<span class="apple-badge-media">[' + escape_html(m.media_type) + ']</span>' : '';
+                    var reply_badge = m.reply_to_message_id ? '<span class="apple-badge-reply" data-jump-id="' + m.reply_to_message_id + '">Reply to #' + m.reply_to_message_id + '</span>' : '';
+                    var text_content = m.text ? escape_html(m.text) : '<span class="no-text">[Media only / No text]</span>';
+
+                    html += '<div class="apple-msg-bubble' + (is_target ? ' is-target-message' : '') + '" data-mid="' + m.message_id + '">' +
+                      '<div class="msg-bubble-header">' +
+                      '  <span class="msg-id-chip" data-jump-id="' + m.message_id + '">#' + m.message_id + '</span>' +
+                      '  <span class="msg-sender">' + escape_html(sender) + '</span>' +
+                      '  <span class="msg-date">' + date_str + '</span>' +
+                      media_badge + reply_badge +
+                      (is_target ? '<span class="msg-target-indicator">Target</span>' : '') +
+                      '</div>' +
+                      '<div class="msg-bubble-body">' + text_content + '</div>' +
+                      '</div>';
+                  }
+                  container.html(html);
+
+                  var target_el = container.find('.is-target-message');
+                  if (target_el.length) {
+                    target_el[0].scrollIntoView({ behavior: 'smooth', block: 'center' });
+                  }
+                },
+                error: function (err) {
+                  container.html('<div class="apple-empty-state">Request error (' + err.status + ')</div>');
+                }
+              });
+            }
+
+            layero.find('#context_load_btn').on('click', function () {
+              var mid = parseInt(layero.find('#context_mid_input').val() || 0, 10);
+              if (mid > 0) load_context(mid);
+            });
+
+            layero.find('#context_mid_input').on('keydown', function (e) {
+              if (e.keyCode === 13) {
+                var mid = parseInt($(this).val() || 0, 10);
+                if (mid > 0) load_context(mid);
+              }
+            });
+
+            layero.find('#context_prev_btn').on('click', function () {
+              var mid = parseInt(layero.find('#context_mid_input').val() || 0, 10);
+              var next_mid = Math.max(1, mid - 25);
+              layero.find('#context_mid_input').val(next_mid);
+              load_context(next_mid);
+            });
+
+            layero.find('#context_next_btn').on('click', function () {
+              var mid = parseInt(layero.find('#context_mid_input').val() || 0, 10);
+              var next_mid = mid + 25;
+              layero.find('#context_mid_input').val(next_mid);
+              load_context(next_mid);
+            });
+
+            layero.on('click', '.msg-id-chip, .apple-badge-reply', function () {
+              var jump_id = parseInt($(this).attr('data-jump-id') || 0, 10);
+              if (jump_id > 0) {
+                layero.find('#context_mid_input').val(jump_id);
+                load_context(jump_id);
+              }
+            });
+
+            load_context(default_id);
+          }
+        });
+      }
+
+      $('#target_list').on('click', '.btn-context', function () {
+        var card = $(this).closest('.apple-target-card');
+        var row = find_target_row(card.attr('data-chat-key'));
+        if (!row) return;
+        var initial_id = parseInt(card.find('.target-cursor').val() || row.last_read_message_id || row.top_message_id || 1, 10);
+        open_context_viewer(row.chat_id, target_display_name(row), initial_id);
+      });
+
+      // Downloaded Table
+
+      var downloaded_curr_page = 1;
+      var downloaded_total_pages = 1;
+
+      function update_mobile_pagination_ui() {
+        $('#mobile_page_indicator').text('Page ' + downloaded_curr_page + ' / ' + downloaded_total_pages);
+        $('#mobile_prev_page').prop('disabled', downloaded_curr_page <= 1);
+        $('#mobile_next_page').prop('disabled', downloaded_curr_page >= downloaded_total_pages);
+      }
+
+      var downloaded_table_inst = table.render({
+        elem: '#already_download_list',
+        url: 'api/downloaded_records',
+        page: {
+          limit: 50,
+          limits: [20, 50, 100, 200],
+          layout: ['prev', 'page', 'next', 'skip', 'count', 'limit']
+        },
+        height: 'full-220',
+        where: { q: '' },
+        parseData: function (res) {
+          var count = res.count || 0;
+          var limit = res.limit || 50;
+          $("#downloaded_total_count").text(count.toLocaleString('en-US'));
+          downloaded_total_pages = Math.max(1, Math.ceil(count / limit));
+          downloaded_curr_page = res.page || 1;
+          update_mobile_pagination_ui();
+          render_mobile_downloaded_cards(res.data || []);
+          return {
+            code: res.code || 0,
+            msg: res.msg || '',
+            count: count,
+            data: res.data || []
+          };
+        },
+        cols: [[
+          { field: 'chat', title: 'Chat ID', width: 140 },
+          { field: 'id', title: 'Message ID', width: 110, align: 'center' },
+          { field: 'filename', title: 'File Name', minWidth: 260 },
+          { field: 'total_size', title: 'Size', width: 110, align: 'center' },
+          {
+            field: 'completed_at', title: 'Downloaded At', width: 160, align: 'center', templet: function (d) {
+              return format_timestamp(d.completed_at);
+            }
+          },
+          { field: 'save_path', title: 'Save Path' }
+        ]]
+      });
+
+      function reload_downloaded_data(reset_page) {
+        var q = $('#downloaded_search').val() || '';
+        var opts = { where: { q: q } };
+        if (reset_page) {
+          opts.page = { curr: 1 };
+        }
+        downloaded_table_inst.reload(opts);
+      }
+
+      var downloaded_search_timer = 0;
+      $('#downloaded_search').on('input', function () {
+        clearTimeout(downloaded_search_timer);
+        downloaded_search_timer = setTimeout(function () {
+          reload_downloaded_data(true);
+        }, 300);
+      });
+
+      $('#reload_downloaded').on('click', function () {
+        reload_downloaded_data(false);
+      });
+
+      $('#mobile_prev_page').on('click', function () {
+        if (downloaded_curr_page > 1) {
+          downloaded_table_inst.reload({
+            page: { curr: downloaded_curr_page - 1 }
+          });
+        }
+      });
+
+      $('#mobile_next_page').on('click', function () {
+        if (downloaded_curr_page < downloaded_total_pages) {
+          downloaded_table_inst.reload({
+            page: { curr: downloaded_curr_page + 1 }
+          });
+        }
+      });
+
+      function render_mobile_downloaded_cards(items) {
+        if (!items || !items.length) {
+          $('#already_download_mobile_list').html('<div class="apple-empty-state">No downloaded files</div>');
+          return;
+        }
+        var html = '';
+        for (var i = 0; i < items.length; i++) {
+          var item = items[i];
+          var date_str = item.completed_at ? format_timestamp(item.completed_at) : '';
+          html += '<div class="apple-download-card is-done">' +
+            '<div class="download-card-header">' +
+            '  <div class="download-card-name" title="' + escape_html(item.filename) + '">' + escape_html(item.filename) + '</div>' +
+            '  <span class="download-done-badge">Done</span>' +
+            '</div>' +
+            '<div class="download-card-meta">' +
+            '  <span>ID: ' + escape_html(item.id) + '</span>' +
+            '  <span>•</span>' +
+            '  <span>Size: ' + escape_html(item.total_size) + '</span>' +
+            (date_str ? '  <span>•</span>  <span>' + date_str + '</span>' : '') +
+            '</div>' +
+            (item.save_path ? '<div class="download-card-path">' + escape_html(item.save_path) + '</div>' : '') +
+            '</div>';
+        }
+        $('#already_download_mobile_list').html(html);
+      }
+
+      function update_download_list() {
+        $.ajax({
+          url: "get_download_list?already_down=false",
+          type: "get",
+          dataType: "json",
+          success: function (result) {
+            var activeCount = result ? result.length : 0;
+            $("#active_downloading_count").text(activeCount);
+
+            var container = $("#download_jobs_list");
+            if (!result || result.length === 0) {
+              container.html(
+                '<div class="apple-empty-state" style="grid-column: 1 / -1; padding: 48px 0; text-align: center; color: var(--apple-text-muted);">' +
+                '<i class="layui-icon layui-icon-download-circle" style="font-size: 42px; display: block; margin-bottom: 10px; opacity: 0.5;"></i>' +
+                '<div style="font-size: 15px; font-weight: 500;">No active downloads</div>' +
+                '<div style="font-size: 12px; margin-top: 4px;">Tasks will appear here automatically when downloading.</div>' +
+                '</div>'
+              );
+              return;
+            }
+
+            var activeKeys = {};
+            for (var i = 0; i < result.length; i++) {
+              var item = result[i];
+              var key = (item.chat_id || item.chat) + '-' + item.id;
+              activeKeys[key] = true;
+
+              var pct = (parseFloat(item.download_progress) || 0).toFixed(1);
+              var card = container.find('.apple-download-card[data-key="' + key + '"]');
+
+              if (card.length > 0) {
+                // In-place dynamic update without re-rendering DOM
+                card.find('.download-card-name').text(item.filename).attr('title', item.filename);
+                card.find('.download-card-speed').text(item.download_speed || '0 B/s');
+                card.find('.progress-bar-fill').css('width', pct + '%');
+                card.find('.progress-pct-text').text(pct + '%');
+                card.find('.download-meta-size').text(item.total_size || '0 B');
+              } else {
+                container.find('.apple-empty-state').remove();
+
+                var html = '<div class="apple-download-card" data-key="' + key + '">' +
+                  '<div class="download-card-header">' +
+                  '  <div class="download-card-name" title="' + escape_html(item.filename) + '">' + escape_html(item.filename) + '</div>' +
+                  '  <span class="download-card-speed">⚡ ' + escape_html(item.download_speed || '0 B/s') + '</span>' +
+                  '</div>' +
+                  '<div class="download-card-meta">' +
+                  '  <span class="download-meta-item">📁 <strong>' + escape_html(item.chat) + '</strong></span>' +
+                  '  <span>•</span>' +
+                  '  <span class="download-meta-item">ID: <code>' + escape_html(item.id) + '</code></span>' +
+                  '  <span>•</span>' +
+                  '  <span class="download-meta-item download-meta-size">' + escape_html(item.total_size) + '</span>' +
+                  '</div>' +
+                  '<div class="apple-progress-track"><div class="progress-bar-fill" style="width: ' + pct + '%;"></div></div>' +
+                  '<div class="download-card-footer">' +
+                  '  <span class="download-status-chip">⚡ Downloading</span>' +
+                  '  <span style="font-family: var(--font-mono); font-weight: 700; color: var(--apple-text-main);" class="progress-pct-text">' + pct + '%</span>' +
+                  '</div>' +
+                  '</div>';
+                container.append(html);
+              }
+            }
+
+            // Remove finished cards
+            container.find('.apple-download-card').each(function () {
+              var k = $(this).attr('data-key');
+              if (!activeKeys[k]) {
+                $(this).remove();
+              }
+            });
+          }
+        });
+      }
+
+      function update_download_status() {
+        $.ajax({
+          url: "get_download_status",
+          type: "get",
+          dataType: "json",
+          success: function (result) {
+            var speedStr = result.download_speed || '0.00 B/s';
+            $("#download_speed_title").html(speedStr);
+
+            var pool = result.media_pool || {};
+            var sp = result.slot_pool || {};
+            var filesCount = pool.active_files || Object.keys(pool.files || {}).length || 0;
+            var poolText = '⚡ 槽位待命 (0/64)';
+            
+            if (sp && sp.total_slots) {
+              if (filesCount > 0 || sp.used_slots > 0) {
+                poolText = '⚡ ' + filesCount + ' 文件下载中 (槽位 ' + sp.used_slots + '/' + sp.total_slots + ' · ' + sp.utilization_pct + '%)';
+              } else {
+                poolText = '⚡ 槽位待命 (0/' + sp.total_slots + ')';
+              }
+            } else if (filesCount > 0) {
+              poolText = '⚡ ' + filesCount + ' 个文件下载中';
+            }
+            $("#media_pool_status").html(poolText);
+            $("#media_pool_status").attr('title', '点击管理全局并发线程槽位池 (当前 ' + filesCount + ' 个活动文件，已占用 ' + (sp.used_slots || 0) + '/' + (sp.total_slots || 64) + ' 槽位)');
+          }
+        });
+      }
+
+      // Settings Modal Logic
+      function update_settings_ui_summary() {
+        var files = parseInt($('#cfg_max_active_files').val(), 10) || 8;
+        var pool_slots = parseInt($('#cfg_global_thread_pool').val(), 10) || 64;
+        $('#val_max_active_files').text(files);
+        $('#val_global_thread_pool').text(pool_slots);
+        $('#summary_max_files').text(files + ' Files (硬盘保护)');
+        $('#summary_total_threads').text(pool_slots + ' Slots (自适应)');
+      }
+
+      $('.apple-range').on('input change', update_settings_ui_summary);
+
+      function open_settings_modal() {
+        $.ajax({
+          url: "api/settings/concurrency",
+          type: "get",
+          dataType: "json",
+          success: function (res) {
+            if (res.ok && res.settings) {
+              var files = res.settings.max_active_files || 8;
+              var slots = res.settings.global_thread_pool || 64;
+              $('#cfg_max_active_files').val(files);
+              $('#cfg_global_thread_pool').val(slots);
+              $('#cfg_disable_ipv6').prop('checked', res.settings.disable_ipv6 !== false);
+              update_settings_ui_summary();
+            }
+            $('#settings_modal').fadeIn(150);
+          },
+          error: function () {
+            $('#settings_modal').fadeIn(150);
+          }
+        });
+      }
+
+      function close_settings_modal() {
+        $('#settings_modal').fadeOut(150);
+      }
+
+      $('#btn_open_settings, #footer_settings_btn, #media_pool_status').on('click', open_settings_modal);
+      $('#btn_close_settings, #btn_cancel_settings').on('click', close_settings_modal);
+      $('#settings_modal').on('click', function(e) {
+        if ($(e.target).hasClass('apple-modal-backdrop')) {
+          close_settings_modal();
+        }
+      });
+
+      $('#btn_save_settings').on('click', function () {
+        var files = parseInt($('#cfg_max_active_files').val(), 10) || 8;
+        var slots = parseInt($('#cfg_global_thread_pool').val(), 10) || 64;
+        var payload = {
+          max_active_files: files,
+          global_thread_pool: slots,
+          disable_ipv6: $('#cfg_disable_ipv6').is(':checked')
+        };
+
+        var load_idx = layer.load(2);
+        $.ajax({
+          url: "api/settings/concurrency",
+          type: "post",
+          contentType: "application/json",
+          data: JSON.stringify(payload),
+          dataType: "json",
+          success: function (res) {
+            layer.close(load_idx);
+            if (res.ok) {
+              layer.msg(res.message || 'Settings saved and applied successfully!', { icon: 1 });
+              close_settings_modal();
+            } else {
+              layer.msg(res.message || 'Failed to apply settings');
+            }
+          },
+          error: function (err) {
+            layer.close(load_idx);
+            layer.msg('Failed to save settings: ' + (err.responseJSON && err.responseJSON.error || err.statusText));
+          }
+        });
+      });
+
+      // ==========================================================================
+      // Proxy Management Logic
+      // ==========================================================================
+      var current_active_proxy = '';
+
+      function load_proxies() {
+        $.ajax({
+          url: "api/proxy/list",
+          type: "get",
+          dataType: "json",
+          success: function (res) {
+            if (!res.ok) {
+              return;
+            }
+            current_active_proxy = res.active || '';
+            $("#proxy_active_label").text(current_active_proxy || 'None');
+            $("#footer_proxy_badge").html('🌐 Proxy: <b>' + escape_html(current_active_proxy || 'None') + '</b>');
+
+            if (res.watchdog) {
+              var w = res.watchdog;
+              var wText = '🛡️ 断网自愈: 正常 (' + w.interval_seconds + 's)';
+              if (w.failover_count > 0) {
+                wText += ' • 已自动转移: ' + w.failover_count + '次';
+              }
+              $("#watchdog_badge").html(wText);
+            }
+
+            var nodes = res.nodes || [];
+            if (nodes.length === 0) {
+              $("#proxy_nodes_container").html('<div class="apple-empty-state">No proxy nodes configured</div>');
+              return;
+            }
+
+            var html = '';
+            for (var i = 0; i < nodes.length; i++) {
+              var n = nodes[i];
+              var m = n.metrics_24h || {};
+              var isActive = (n.tag === current_active_proxy);
+              var activeClass = isActive ? 'is-active' : '';
+              var badgeHtml = isActive 
+                ? '<span class="proxy-active-badge">✓ Active (当前生效)</span>'
+                : '<span class="proxy-inactive-badge">Standby (备用)</span>';
+
+              var peakLeaderHtml = m.is_peak_leader && m.peak_speed_bps > 0
+                ? '<span style="background: rgba(255, 149, 0, 0.15); color: #ff9500; font-size: 11px; font-weight: 600; padding: 2px 6px; border-radius: 6px; margin-left: 6px;">👑 24h 速度冠军</span>'
+                : '';
+
+              var actionBtnHtml = isActive
+                ? '<button type="button" class="apple-btn apple-btn-secondary" disabled style="opacity: 0.6; cursor: default;">Current Exit</button>'
+                : '<button type="button" class="apple-btn apple-btn-primary btn-switch-proxy" data-tag="' + escape_html(n.tag) + '"><i class="layui-icon layui-icon-release"></i> Switch</button>';
+
+              var pingText = (m.last_ping_ms !== null && m.last_ping_ms !== undefined) 
+                ? m.last_ping_ms + ' ms' 
+                : '--';
+
+              html += '<div class="proxy-node-card ' + activeClass + '" data-node-tag="' + escape_html(n.tag) + '">' +
+                '  <div class="proxy-card-header">' +
+                '    <div class="proxy-node-title">' +
+                '      <span>' + escape_html(n.tag) + '</span>' +
+                '      ' + peakLeaderHtml +
+                '    </div>' +
+                '    ' + badgeHtml +
+                '  </div>' +
+                '  <div class="proxy-card-body">' +
+                '    <div class="proxy-metrics-highlight" style="background: rgba(0, 0, 0, 0.03); border-radius: 8px; padding: 10px 12px; margin-bottom: 12px;">' +
+                '      <div style="display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 4px;">' +
+                '        <span style="font-size: 12px; color: var(--apple-text-muted);">⚡ 24h 实际下载峰值</span>' +
+                '        <span style="font-size: 15px; font-weight: 700; color: #34c759; font-family: var(--font-mono);">' + escape_html(m.peak_speed_str || '0.00 B/s') + '</span>' +
+                '      </div>' +
+                '      <div style="display: flex; justify-content: space-between; font-size: 12px; color: var(--apple-text-secondary);">' +
+                '        <span>📊 实际均速: <b>' + escape_html(m.avg_speed_str || '0.00 B/s') + '</b></span>' +
+                '        <span>📦 24h 流量: <b>' + escape_html(m.total_bytes_str || '0 B') + '</b></span>' +
+                '      </div>' +
+                '    </div>' +
+                '    <div class="proxy-meta-row"><span class="proxy-meta-key">Protocol</span><span class="proxy-meta-val">' + escape_html(n.type.toUpperCase()) + '</span></div>' +
+                '    <div class="proxy-meta-row"><span class="proxy-meta-key">Server</span><span class="proxy-meta-val">' + escape_html(n.server) + ':' + escape_html(n.server_port) + '</span></div>' +
+                '    <div class="proxy-meta-row"><span class="proxy-meta-key">Transport</span><span class="proxy-meta-val">' + escape_html(n.transport || 'tcp') + (n.ws_path ? ' (' + escape_html(n.ws_path) + ')' : '') + '</span></div>' +
+                '    <div class="proxy-meta-row"><span class="proxy-meta-key">Active Status</span><span class="proxy-meta-val" style="color: ' + (isActive ? '#34c759' : 'inherit') + ';">' + escape_html(m.last_active_str || '从未活跃') + '</span></div>' +
+                '  </div>' +
+                '  <div class="proxy-card-footer">' +
+                '    <div class="proxy-ping-badge" id="ping_val_' + i + '"><i class="layui-icon layui-icon-chart"></i> Delay: ' + pingText + '</div>' +
+                '    <div style="display: flex; gap: 8px;">' +
+                '      <button type="button" class="apple-btn apple-btn-secondary btn-ping-proxy" data-tag="' + escape_html(n.tag) + '" data-idx="' + i + '"><i class="layui-icon layui-icon-time"></i> Ping</button>' +
+                '      ' + actionBtnHtml +
+                '    </div>' +
+                '  </div>' +
+                '</div>';
+            }
+            $("#proxy_nodes_container").html(html);
+          },
+          error: function () {
+            // silent fail on poll
+          }
+        });
+      }
+
+      // Initial proxy load for footer
+      load_proxies();
+
+      $("#btn_refresh_proxies").on("click", function () {
+        load_proxies();
+      });
+
+      $("#footer_proxy_badge").on("click", function () {
+        switch_tab("proxy");
+      });
+
+      // Switch Proxy Node
+      $("#proxy_nodes_container").on("click", ".btn-switch-proxy", function () {
+        var node_tag = $(this).attr("data-tag");
+        var loadIndex = layer.load(2, { time: 5000 });
+        $.ajax({
+          url: "api/proxy/switch",
+          type: "post",
+          contentType: "application/json",
+          data: JSON.stringify({ name: node_tag }),
+          dataType: "json",
+          success: function (res) {
+            layer.close(loadIndex);
+            if (res.ok) {
+              layer.msg("Switched active proxy to " + node_tag, { icon: 1 });
+              load_proxies();
+            } else {
+              layer.msg(res.message || "Failed to switch proxy", { icon: 2 });
+            }
+          },
+          error: function () {
+            layer.close(loadIndex);
+            layer.msg("Network error switching proxy", { icon: 2 });
+          }
+        });
+      });
+
+      // Ping Proxy Node
+      $("#proxy_nodes_container").on("click", ".btn-ping-proxy", function () {
+        var node_tag = $(this).attr("data-tag");
+        var idx = $(this).attr("data-idx");
+        var pingEl = $("#ping_val_" + idx);
+        pingEl.html('<i class="layui-icon layui-icon-loading layui-anim layui-anim-rotate layui-anim-loop"></i> Testing...');
+        $.ajax({
+          url: "api/proxy/ping",
+          type: "post",
+          contentType: "application/json",
+          data: JSON.stringify({ name: node_tag }),
+          dataType: "json",
+          success: function (res) {
+            if (res.ok && res.delay_ms !== null && res.delay_ms !== undefined) {
+              pingEl.html('<span style="color: #34c759; font-weight: 600;">' + res.delay_ms + ' ms</span>');
+            } else {
+              pingEl.html('<span style="color: #ff3b30;">Timeout / Error</span>');
+            }
+          },
+          error: function () {
+            pingEl.html('<span style="color: #ff3b30;">Ping failed</span>');
+          }
+        });
+      });
+
+      // Start polling status and downloading queue
+      update_download_status();
+      self.setInterval(update_download_status, 1000);
+
+      update_download_list_int = self.setInterval(update_download_list, 1000);
+      update_download_list();
+
+      // Preload dialogs
+      setTimeout(function () {
+        load_dialogs(false);
+      }, 100);
+    });
+  </script>
+</body>
+
+</html>
