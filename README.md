@@ -5,7 +5,7 @@
 **Next-Generation High-Performance Telegram Media Downloader & Archival Engine**
 
 [![Go Version](https://img.shields.io/badge/Go-1.25+-00ADD8?style=flat&logo=go)](https://golang.org)
-[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
 [![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?style=flat&logo=docker)](docker-compose.yaml.example)
 [![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20NAS-orange)](https://github.com/Hittlert/TG_Downloader)
 [![Architecture](https://img.shields.io/badge/Engine-SBE%20v4.1-blueviolet)](docs/STREAMING_BLOCK_ENGINE_DESIGN.md)
@@ -144,6 +144,18 @@ go build -o tg-downloader .
 
 ---
 
+## 🙏 Acknowledgments & Evolution
+
+This project's underlying MTProto protocol client and session toolchain are derived from the open-source project [tdl](https://github.com/iyear/tdl) (licensed under GNU AGPL-3.0).
+
+Building upon this foundation, **TG_Downloader** introduces a ground-up re-architecture tailored for enterprise 7x24h automated daemon operations:
+1. **Streaming Block Engine (SBE v4.1)**: Pure block-level decoupling between network workers and disk writers, enforced by dual-lease memory backpressure (`BufferLease` 96 MiB + `DirtyLease` 48 MiB) and DRR fair scheduling.
+2. **Crash-Resilient Atomic Persistence**: Sidecar pre-allocated dual-slot CRC32 checkpoint bitmaps and Linux `RENAME_NOREPLACE` atomic commit fallback chains.
+3. **Automated Daemon & Modern Web Dashboard**: Full-featured Apple-style responsive Web UI, continuous channel scanning, and transparent proxy watchdog failover.
+
+---
+
 ## 📄 License
 
-This project is licensed under the [MIT License](LICENSE).
+This project is licensed under the [GNU Affero General Public License v3.0 (AGPL-3.0)](LICENSE).
+

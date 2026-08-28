@@ -5,7 +5,7 @@
 **下一代高性能 Telegram 媒体自动化下载与流式归档引擎**
 
 [![Go Version](https://img.shields.io/badge/Go-1.25+-00ADD8?style=flat&logo=go)](https://golang.org)
-[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
 [![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?style=flat&logo=docker)](docker-compose.yaml.example)
 [![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20NAS-orange)](https://github.com/Hittlert/TG_Downloader)
 [![Architecture](https://img.shields.io/badge/Engine-SBE%20v4.1-blueviolet)](docs/STREAMING_BLOCK_ENGINE_DESIGN.md)
@@ -144,6 +144,18 @@ go build -o tg-downloader .
 
 ---
 
+## 🙏 致谢与演进说明 (Acknowledgments)
+
+本项目底层 MTProto 协议交互与登录工具链衍生自开源项目 [tdl](https://github.com/iyear/tdl)（基于 GNU AGPL-3.0 协议）。
+
+在此基础上，**TG_Downloader** 针对 7x24h 长期自动化归档与 NAS 部署场景进行了全面的自主架构演进：
+1. **研发全新的 SBE v4.1 流式块存储引擎**：彻底实现网络 Worker 与磁盘 Writer 解耦，引入双额度租赁内存背压（`BufferLease` 96MB + `DirtyLease` 48MB）与 DRR 双车道公平调度。
+2. **重构崩溃一致性与断点续传**：实现侧车按分片预分配双槽 CRC32 Checkpoint，以及 Linux `RENAME_NOREPLACE` + `linkat` 原子提交回退链。
+3. **构建完整的自动化守护系统**：提供现代化 Apple 风格响应式 Web 控制台、多频道增量扫描与多节点代理看门狗（Proxy Watchdog）故障自愈。
+
+---
+
 ## 📄 开源许可证
 
-本项目基于 [MIT 许可证](LICENSE) 开源。
+本项目基于 [GNU Affero 通用公共许可证 v3.0 (AGPL-3.0)](LICENSE) 开源。
+
