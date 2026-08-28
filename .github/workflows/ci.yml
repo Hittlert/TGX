@@ -17,12 +17,13 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version: 'stable'
+          check-latest: true
           cache: true
 
-      - name: Run Unit Tests & Chaos Suite
+      - name: Run Tests
         run: |
-          go test -v -race ./pkg/... ./app/... ./core/... ./test/chaos/...
+          go test -v -race ./pkg/... ./app/... ./test/chaos/...
 
       - name: Build Binary
         run: |

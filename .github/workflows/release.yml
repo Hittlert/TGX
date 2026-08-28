@@ -9,6 +9,8 @@ jobs:
   build-release:
     name: Build & Release Artifacts
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     strategy:
       matrix:
         include:
@@ -35,7 +37,8 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version: 'stable'
+          check-latest: true
           cache: true
 
       - name: Cross Compile
@@ -44,6 +47,7 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: 0
         run: |
+          mkdir -p dist
           go build -ldflags="-s -w -X 'github.com/Hittlert/TGX/cmd.Version=${{ github.ref_name }}' -X 'github.com/Hittlert/TGX/cmd.Commit=${{ github.sha }}'" -o dist/${{ matrix.output }} ./main.go
 
       - name: Upload Release Asset
