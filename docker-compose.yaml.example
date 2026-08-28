@@ -1,6 +1,6 @@
 services:
   tgx:
-    image: hittlert/tgx:latest
+    image: ghcr.io/hittlert/tgx:latest
     restart: unless-stopped
     command:
       - serve
