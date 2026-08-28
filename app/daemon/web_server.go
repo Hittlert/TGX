@@ -630,19 +630,11 @@ func (s *WebServer) handleDialogs(w http.ResponseWriter, r *http.Request) {
 
 	decorated := make([]map[string]any, 0, len(targets))
 	for _, t := range targets {
-		cursor, lastScanTime, _ := s.db.GetScanCursorWithTime(t.ChatID)
-		if lastScanTime == 0 {
-			lastScanTime = t.UpdatedAt
-		}
-		if lastScanTime == 0 {
-			lastScanTime = t.CreatedAt
-		}
-
-		scanStatus := map[string]any{
-			"status":                "ok",
-			"last_scan_finished_at": lastScanTime,
-			"last_scan_started_at":  lastScanTime,
-			"error":                 "",
+		cursor, _, _ := s.db.GetScanCursorWithTime(t.ChatID)
+		var lastMsgDate int64
+		_ = s.db.DB().QueryRow(`SELECT COALESCE(MAX(date), 0) FROM chat_messages WHERE chat_id = ?`, t.ChatID).Scan(&lastMsgDate)
+		if lastMsgDate == 0 {
+			lastMsgDate = t.UpdatedAt
 		}
 
 		decorated = append(decorated, map[string]any{
@@ -660,9 +652,9 @@ func (s *WebServer) handleDialogs(w http.ResponseWriter, r *http.Request) {
 			"priority":                t.Priority,
 			"download_filter":         t.DownloadFilter,
 			"upload_telegram_chat_id": t.UploadTelegramChatID,
-			"scan_status":             scanStatus,
-			"last_scan_finished_at":   lastScanTime,
-			"last_scan_started_at":    lastScanTime,
+			"last_message_at":         lastMsgDate,
+			"last_scan_finished_at":   lastMsgDate,
+			"last_scan_started_at":    lastMsgDate,
 			"updated_at":              t.UpdatedAt,
 		})
 	}

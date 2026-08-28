@@ -384,15 +384,18 @@
 
       function target_scan_html(row) {
         var is_active = row.enabled || row.is_target;
+        var last_time = row.last_message_at || row.last_scan_finished_at || row.updated_at || 0;
+        var time_str = last_time > 0 ? format_timestamp(last_time) : '无消息流入记录';
+
         if (is_active) {
           return '<div class="target-scan-meta">' +
-            '<span class="apple-status-chip is-ok" style="background: rgba(52, 199, 89, 0.12); color: #34c759; border: 1px solid rgba(52, 199, 89, 0.25); font-weight: 500;">⚡ 实时流式推流中</span>' +
-            '<span class="target-scan-time">0ms 极速响应</span>' +
+            '<span class="apple-status-chip is-ok">监听中</span>' +
+            '<span class="target-scan-time">末次消息流入: ' + time_str + '</span>' +
             '</div>';
         }
         return '<div class="target-scan-meta">' +
-          '<span class="apple-status-chip is-idle" style="background: rgba(142, 142, 147, 0.12); color: #8e8e93; border: 1px solid rgba(142, 142, 147, 0.25);">未启用监听</span>' +
-          '<span class="target-scan-time">点击勾选启用</span>' +
+          '<span class="apple-status-chip is-idle">未启用</span>' +
+          '<span class="target-scan-time">末次消息流入: ' + time_str + '</span>' +
           '</div>';
       }
 
