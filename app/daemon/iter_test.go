@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"io"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/gotd/td/tg"
 
@@ -49,6 +51,7 @@ type writerAtDiscard struct{}
 func (writerAtDiscard) WriteAt(p []byte, _ int64) (int, error) { return len(p), nil }
 
 type fakeResolver struct {
+	mu      sync.Mutex
 	results []resolveResult
 }
 
@@ -58,6 +61,11 @@ type resolveResult struct {
 }
 
 func (r *fakeResolver) Resolve(_ context.Context, task *Task) (taskElement, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.results) == 0 {
+		return nil, errors.New("no more fake results")
+	}
 	result := r.results[0]
 	r.results = r.results[1:]
 	if result.element != nil {
@@ -83,7 +91,14 @@ func TestTaskIteratorSkipsOneResolutionFailureAndContinues(t *testing.T) {
 	if iter.Value() != healthy {
 		t.Fatalf("iterator returned wrong element: %#v", iter.Value())
 	}
-	deleted, _ := registry.Task("deleted")
+	var deleted TaskSnapshot
+	for attempt := 0; attempt < 50; attempt++ {
+		deleted, _ = registry.Task("deleted")
+		if deleted.State == StateUnavailable && deleted.ErrorClass == "unavailable" {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	if deleted.State != StateUnavailable || deleted.ErrorClass != "unavailable" {
 		t.Fatalf("bad task not isolated: %#v", deleted)
 	}

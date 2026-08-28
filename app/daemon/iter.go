@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"errors"
+	"sync"
 
 	"github.com/Hittlert/TGX/core/downloader"
 )
@@ -27,33 +28,84 @@ type Resolver interface {
 }
 
 type taskIter struct {
-	registry *Registry
-	resolver Resolver
-	current  taskElement
-	err      error
+	registry  *Registry
+	resolver  Resolver
+	current   taskElement
+	err       error
+	readyChan chan taskElement
+	errChan   chan error
+	once      sync.Once
 }
 
 func newTaskIter(registry *Registry, resolver Resolver) *taskIter {
-	return &taskIter{registry: registry, resolver: resolver}
+	return &taskIter{
+		registry:  registry,
+		resolver:  resolver,
+		readyChan: make(chan taskElement, 64),
+		errChan:   make(chan error, 1),
+	}
+}
+
+func (i *taskIter) startWorkers(ctx context.Context) {
+	numWorkers := 16
+	for w := 0; w < numWorkers; w++ {
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+
+				task, err := i.registry.Next(ctx)
+				if err != nil {
+					if errors.Is(err, context.Canceled) {
+						return
+					}
+					select {
+					case i.errChan <- err:
+					default:
+					}
+					return
+				}
+
+				element, err := i.resolver.Resolve(ctx, task)
+				if err != nil {
+					task.Fail(ErrorClass(err), err.Error(), IsUnavailable(err))
+					continue
+				}
+				if path, ok := element.AlreadyComplete(); ok {
+					task.Succeed(path, true)
+					continue
+				}
+
+				select {
+				case <-ctx.Done():
+					return
+				case i.readyChan <- element:
+				}
+			}
+		}()
+	}
 }
 
 func (i *taskIter) Next(ctx context.Context) bool {
-	for {
-		task, err := i.registry.Next(ctx)
-		if err != nil {
-			i.err = err
+	i.once.Do(func() {
+		i.startWorkers(ctx)
+	})
+
+	select {
+	case <-ctx.Done():
+		i.err = ctx.Err()
+		return false
+	case err := <-i.errChan:
+		i.err = err
+		return false
+	case elem, ok := <-i.readyChan:
+		if !ok {
 			return false
 		}
-		element, err := i.resolver.Resolve(ctx, task)
-		if err != nil {
-			task.Fail(ErrorClass(err), err.Error(), IsUnavailable(err))
-			continue
-		}
-		if path, ok := element.AlreadyComplete(); ok {
-			task.Succeed(path, true)
-			continue
-		}
-		i.current = element
+		i.current = elem
 		return true
 	}
 }
