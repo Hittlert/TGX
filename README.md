@@ -9,8 +9,9 @@
 [![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?style=flat&logo=docker)](docker-compose.yaml.example)
 [![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20NAS-orange)](https://github.com/Hittlert/TG_Downloader)
 [![Architecture](https://img.shields.io/badge/Engine-SBE%20v4.1-blueviolet)](docs/STREAMING_BLOCK_ENGINE_DESIGN.md)
+[![Proxy](https://img.shields.io/badge/Embedded-sing--box-2ea44f?style=flat)](docs/STREAMING_BLOCK_ENGINE_DESIGN.md)
 
-[English](README.md) | [中文说明](README_zh.md) | [SBE v4.1 设计规范](docs/STREAMING_BLOCK_ENGINE_DESIGN.md)
+[English](README.md) | [中文说明](README_zh.md) | [Master Architecture & Technical Spec](docs/STREAMING_BLOCK_ENGINE_DESIGN.md)
 
 </div>
 
@@ -18,27 +19,28 @@
 
 ## 📖 Overview
 
-**TG_Downloader** is an enterprise-grade, high-throughput Telegram media downloader and automated daemon archive engine written in pure Go. Built on native MTProto multiplexing and the revolutionary **Streaming Block Engine (SBE v4.1)**, it solves common pain points of traditional Telegram downloaders (memory leaks, OOM crashes, random disk I/O congestion, large file stalls, and crash data corruption).
+**TG_Downloader** is an enterprise-grade, high-throughput Telegram media downloader and automated daemon archive engine written in pure Go. Featuring the revolutionary **Streaming Block Engine (SBE)** and a native in-process **Embedded sing-box Engine**, it solves the fundamental pain points of traditional Telegram downloaders: memory bloat and OOM crashes, random disk I/O congestion, large file starvation, and crash data corruption.
 
 ---
 
 ## ✨ Key Features
 
-- 🚀 **Streaming Block Engine (SBE v4.1)**
-  - **Decoupled Architecture**: 64 logical network workers and 5 disk writers operate independently through lock-free channels.
-  - **Strict Dual-Lease Memory Backpressure**: `BufferLease` (96 MiB) controls in-flight network buffers while `DirtyLease` (48 MiB) caps unflushed disk pages. Physical RSS is strictly bounded under 200 MiB.
-  - **Deficit Round Robin (DRR) Fair Scheduling**: Separate dual-lane queues for small files (≤10 MiB) and large files (>10 MiB) with 3:1 weighted interleaving, preventing head-of-line blocking.
-- 🛡️ **Crash-Resilience & Resumable Downloads**
-  - **Sidecar Checkpoint Bitmaps**: Dedicated `.meta` sidecar files pre-allocated based on `TotalBlocks`, featuring dual-slot (A/B) CRC32 checksummed state persistence.
-  - **Atomic Commit Chain**: Linux `unix.Renameat2(RENAME_NOREPLACE)` with fallback to `linkat + unlink` to guarantee zero data overwrites.
+- 🚀 **Streaming Block Engine (SBE)**
+  - **Decoupled Streaming Pipeline**: 64 logical network workers and 5 disk writers operate completely decoupled via lock-free channels.
+  - **Dual-Lease Memory Backpressure**: Bounded `BufferLease` (96 MiB) caps network buffering while `DirtyLease` (48 MiB) acquired strictly *before* `WriteAt` caps uncommitted dirty pages.
+  - **Deficit Round Robin (DRR) Fair Scheduling**: Dedicated dual-lane queues for small files (≤10 MiB) and large files (>10 MiB) with 3:1 weighted interleaving, preventing head-of-line blocking.
+- ⚡ **Embedded sing-box Engine & Watchdog**
+  - **In-Process Memory-Level Outbound**: Directly integrates `sing-box` in Go memory without local 127.0.0.1 loopback socket overhead.
+  - **Full Modern Protocol Suite**: Native support for VLESS (Reality), Hysteria2, TUIC, Shadowsocks, VMess, Trojan, and WireGuard.
+  - **Visual Node & Subscription Management**: Paste proxy links or base64 subscriptions directly into the Web UI for instant hot-reloading.
+  - **Intelligent Proxy Watchdog**: 30-second periodic health probes and deterministic round-robin failover upon network disruptions, with fallback support for standard external SOCKS5/HTTP proxies.
+- 🛡️ **Crash Resilience & Resumable Downloads**
+  - **Attempt-Bound Sidecar Checkpoints**: Dedicated `.meta.<AttemptID>` pre-allocated files with dual-slot (Slot A/B) CRC32 checksummed state persistence, driven by a dedicated single-writer `CheckpointLoop`.
+  - **Atomic Non-Replacing Commit**: Linux `unix.Renameat2(RENAME_NOREPLACE)` with atomic `linkat + unlinkat` fallback chain to prevent file overwrites.
 - 🌐 **Modern Apple-Style Responsive Web Dashboard**
-  - Real-time 5-second smoothed rolling bandwidth charts.
-  - Active downloading task cards (progress, throughput, DC node, retry counts).
-  - Target channel and group management, scanning progress, and historical stats.
-- 🔄 **Intelligent Multi-Proxy Watchdog**
-  - Background health probe for SOCKS5/HTTP proxy endpoints.
-  - Deterministic round-robin proxy failover within 30 seconds of MTProto network stalls.
-  - Persistent 24-hour proxy metrics and speed baselines.
+  - Real-time 5-second smoothed rolling bandwidth curves.
+  - Live downloading task cards (block progress, throughput, DC node, retry counts).
+  - Target channel and group management, scanning status, and historical stats.
 
 ---
 
@@ -46,28 +48,52 @@
 
 ```mermaid
 flowchart TD
-    subgraph SBE_v4_1 ["Streaming Block Engine (SBE v4.1) Pipeline"]
-        A["Telegram Channels / Chat Monitor"] --> B["Task Queue (SQLite Backend)"]
-        B --> C["DRR Dual-Lane Scheduler (Small : Large = 3:1)"]
+    subgraph NetLayer ["Network & Embedded Proxy Layer"]
+        Watchdog["Proxy Watchdog (30s Health Check / Failover)"] -.-> Router{"Outbound Router"}
+        Router -->|Node / Subscription| SB["Embedded sing-box Engine (In-Memory)"]
+        Router -->|--proxy Flag| ExtProxy["External SOCKS5 / HTTP Proxy"]
+        Router -->|Direct| Direct["Direct Internet"]
         
+        SB --> Gotd["MTProto Long-Lived Session Pool (gotd/td)"]
+        ExtProxy --> Gotd
+        Direct --> Gotd
+    end
+
+    subgraph SBE_Pipeline ["Streaming Block Engine (SBE)"]
+        DB[(SQLite Task DB)] --> Orchestrator["Orchestrator & Task Scheduler"]
+        Orchestrator --> DRR["DRR Dual-Lane Scheduler (Small : Large = 3:1)"]
+        DRR --> ChunkChan["chunkChan Dispatch Queue (Cap 128)"]
+
         subgraph NetStage ["Network Streaming Stage"]
-            C --> D{"Acquire BufferLease (Cap 96 MiB)"}
-            D -->|Granted| E["64x Network Workers (Long-lived MTProto Sessions)"]
-            E -->|Download 2MB Block| F["Leased Block Buffer"]
+            ChunkChan --> AcquireBuf{"Acquire BufferLease (Cap 96 MiB)"}
+            AcquireBuf -->|Granted| NW["64x Logical Network Workers"]
+            NW -->|RPC Loop Chunk Download| Gotd
+            NW -->|Assemble 2MB Block| WriteChan["writeJobChan (Cap 64)"]
         end
-        
-        subgraph DiskStage ["Disk Persistence Stage"]
-            F --> G{"Acquire DirtyLease (Cap 48 MiB)"}
-            G -->|Granted| H["5x Disk Writers (Sequential PwriteAt)"]
-            H -->|Write .part| I["Release BufferLease"]
-            H -->|Flush Batch & fdatasync| J["Write Checkpoint to Sidecar .meta"]
-            J --> K["Release DirtyLease"]
+
+        subgraph DiskStage ["Disk Persistence Stage (Single-Writer Checkpoint)"]
+            WriteChan --> AcquireDirty{"Acquire DirtyLease (Cap 48 MiB)"}
+            AcquireDirty -->|Granted| DW["5x Disk Writers"]
+            DW -->|WriteAt .part.<Attempt>| TempDisk["Temporary Data File"]
+            DW -->|Mark WRITTEN| ReleaseBuf["Release BufferLease"]
+            ReleaseBuf --> AcquireBuf
+            
+            TempDisk --> CheckpointLoop["FileCoordinator Serial CheckpointLoop"]
+            CheckpointLoop -->|Accumulated 16MB or 2s| Fdatasync["unix.Fdatasync(dataFD)"]
+            Fdatasync --> WriteMeta[".meta.<Attempt> Overwrite Slot A/B"]
+            WriteMeta --> MetaSync["MetaFile.Sync()"]
+            MetaSync --> AdvanceDurable["Advance DurableBitmap"]
+            AdvanceDurable --> ReleaseDirty["Release DirtyLease"]
         end
-        
+
         subgraph CommitStage ["Atomic Commit Stage"]
-            K -->|All Blocks Persisted| L["fsync Parent Directory"]
-            L --> M["Atomic Rename (RENAME_NOREPLACE / linkat)"]
-            M --> N["Update SQLite Status to SUCCESS"]
+            AdvanceDurable -->|All Blocks DURABLE| CommittingCAS["SQLite CAS: RUNNING -> COMMITTING"]
+            CommittingCAS --> AtomicRename{"unix.Renameat2(RENAME_NOREPLACE)"}
+            AtomicRename -->|Unsupported| LinkFallback["linkat(temp, final) + unlinkat(temp)"]
+            AtomicRename -->|Success| FsyncDir["fsync Parent Directory"]
+            LinkFallback -->|Success| FsyncDir
+            FsyncDir --> SuccessCAS["SQLite CAS: COMMITTING -> SUCCESS"]
+            SuccessCAS --> RemoveMeta["Remove .meta & fsync Directory"]
         end
     end
 ```
@@ -115,9 +141,9 @@ go build -o tg-downloader .
 
 | Parameter | CLI Flag | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `listen` | `--listen` | `0.0.0.0:5000` | Web UI & API listen address |
+| `listen` | `--listen` | `0.0.0.0:5000` | Web UI & REST API listen address |
 | `dir` | `--dir` | `/app/downloads` | Final media download directory |
-| `temp-dir` | `--temp-dir` | `/app/temp/tdl` | Temporary block download directory (`.part` / `.meta`) |
+| `temp-dir` | `--temp-dir` | `/app/temp/tg-downloader` | Temporary block download directory (`.part` / `.meta`) |
 | `db-path` | `--db-path` | `records.sqlite3` | SQLite task state and historical database |
 | `file-concurrency` | `--file-concurrency` | `64` | Maximum concurrent logical file sessions |
 | `download-threads` | `--download-threads` | `16` | Maximum concurrent block workers per large file |
@@ -136,7 +162,7 @@ go build -o tg-downloader .
 │   ├── downloader/    # MTProto chunk multiplexer
 │   └── tmedia/        # Media metadata parsers and converters
 ├── pkg/               # Reusable packages (bitmaps, memory leases, storage, utils)
-├── docs/              # Comprehensive architectural & SBE v4.1 specifications
+├── docs/              # Master architecture & technical specification
 ├── Dockerfile         # Production multi-stage Docker build
 └── docker-compose.yaml.example # Template Docker Compose file
 ```
@@ -148,13 +174,13 @@ go build -o tg-downloader .
 This project's underlying MTProto protocol client and session toolchain are derived from the open-source project [tdl](https://github.com/iyear/tdl) (licensed under GNU AGPL-3.0).
 
 Building upon this foundation, **TG_Downloader** introduces a ground-up re-architecture tailored for enterprise 7x24h automated daemon operations:
-1. **Streaming Block Engine (SBE v4.1)**: Pure block-level decoupling between network workers and disk writers, enforced by dual-lease memory backpressure (`BufferLease` 96 MiB + `DirtyLease` 48 MiB) and DRR fair scheduling.
-2. **Crash-Resilient Atomic Persistence**: Sidecar pre-allocated dual-slot CRC32 checkpoint bitmaps and Linux `RENAME_NOREPLACE` atomic commit fallback chains.
-3. **Automated Daemon & Modern Web Dashboard**: Full-featured Apple-style responsive Web UI, continuous channel scanning, and transparent proxy watchdog failover.
+1. **Streaming Block Engine (SBE)**: Pure block-level decoupling between network workers and disk writers, enforced by dual-lease memory backpressure (`BufferLease` 96 MiB + `DirtyLease` 48 MiB) and DRR fair scheduling.
+2. **Embedded sing-box Engine**: Native in-process proxy core supporting VLESS (Reality), Hysteria2, TUIC, and SS with zero loopback latency.
+3. **Crash-Resilient Atomic Persistence**: Sidecar Attempt-bound dual-slot CRC32 checkpoint bitmaps and Linux `RENAME_NOREPLACE` atomic commit fallback chains.
+4. **Automated Daemon & Modern Web Dashboard**: Full-featured Apple-style responsive Web UI, continuous channel scanning, and transparent proxy watchdog failover.
 
 ---
 
 ## 📄 License
 
 This project is licensed under the [GNU Affero General Public License v3.0 (AGPL-3.0)](LICENSE).
-
