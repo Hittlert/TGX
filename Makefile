@@ -1,9 +1,17 @@
-.PHONY: build
-build:
-	goreleaser build --rm-dist --single-target --snapshot
-	@echo "go to '.tdl/dist' directory to see the package!"
+.PHONY: all build test clean docker
 
-.PHONY: packaging
-packaging:
-	goreleaser release --skip-publish --auto-snapshot --rm-dist
-	@echo "go to '.tdl/dist' directory to see the packages!"
+BINARY_NAME=tg-downloader
+
+all: build
+
+build:
+	go build -o $(BINARY_NAME) .
+
+test:
+	go test ./pkg/...
+
+clean:
+	rm -f $(BINARY_NAME)
+
+docker:
+	docker build -t hittlert/tg-downloader:latest .

@@ -1,6 +1,6 @@
 services:
-  tdl-daemon:
-    image: hittlert/telegram-downloader:latest
+  tg-downloader:
+    image: hittlert/tg-downloader:latest
     restart: unless-stopped
     command:
       - serve
@@ -15,7 +15,7 @@ services:
       - --dir
       - /app/downloads
       - --temp-dir
-      - /app/temp/tdl
+      - /app/temp/tg-downloader
       - --db-path
       - /app/state/download_records.sqlite3
       - --queue-capacity

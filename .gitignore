@@ -51,6 +51,8 @@ deployments/
 deploy-staging/
 bin/
 telegram-downloader-*
+tg-downloader
+tdl
 *.exe
 
 # Legacy / experimental snapshots

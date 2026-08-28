@@ -12,7 +12,7 @@ RUN go build -trimpath \
     -X github.com/Hittlert/TG_Downloader/pkg/consts.Version=${VERSION} \
     -X github.com/Hittlert/TG_Downloader/pkg/consts.Commit=${COMMIT} \
     -X github.com/Hittlert/TG_Downloader/pkg/consts.CommitDate=${COMMIT_DATE}" \
-    -o /tdl
+    -o /tg-downloader
 
 RUN go build -trimpath -ldflags "-s -w" \
     -o /tdl-import-pyrogram-session ./tools/import-pyrogram-session
@@ -21,7 +21,8 @@ FROM alpine:latest
 
 RUN apk add --no-cache ca-certificates
 
-COPY --from=builder /tdl /usr/bin/tdl
+COPY --from=builder /tg-downloader /usr/bin/tg-downloader
+RUN ln -s /usr/bin/tg-downloader /usr/bin/tdl
 COPY --from=builder /tdl-import-pyrogram-session /usr/bin/tdl-import-pyrogram-session
 
-ENTRYPOINT ["tdl"]
+ENTRYPOINT ["tg-downloader"]

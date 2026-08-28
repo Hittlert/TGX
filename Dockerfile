@@ -20,12 +20,13 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
     -X github.com/Hittlert/TG_Downloader/pkg/consts.Version=${VERSION}  \
     -X github.com/Hittlert/TG_Downloader/pkg/consts.Commit=${COMMIT}  \
     -X github.com/Hittlert/TG_Downloader/pkg/consts.CommitDate=${COMMIT_DATE}" \
-    -o tdl
+    -o tg-downloader
 
 FROM alpine:latest
 
 RUN apk add --no-cache ca-certificates
 
-COPY --from=builder /tdl /usr/bin/tdl
+COPY --from=builder /tg-downloader /usr/bin/tg-downloader
+RUN ln -s /usr/bin/tg-downloader /usr/bin/tdl
 
-ENTRYPOINT ["tdl"]
+ENTRYPOINT ["tg-downloader"]
