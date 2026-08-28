@@ -1,258 +1,280 @@
-# Telegram Media Downloader 流式块存储引擎技术规范 (SBE v4.1 终极方案)
-## Architecture & Production Technical Specification: Streaming Block Engine (SBE v4.1)
+# TG_Downloader 系统架构与技术实现规范
+## Master Architecture & Production Technical Specification (SBE Engine & Embedded sing-box)
 
 ---
 
-## 1. 文档结论与核心定调
+## 1. 架构定位与系统边界
 
-SBE v4.1 采用下面这条单向解耦的主流水线：
+### 1.1 系统定位
+**TG_Downloader** 是专为大规模 Telegram 媒体 7x24h 自动化归档、高吞吐下载与 NAS / Linux 服务器部署而设计的工业级 Go 原生流式下载引擎与守护服务。系统主要由两大核心子系统构成：
 
-1. **分片切分**：一个文件下载任务按固定大小（2 MiB）拆分为若干个顺序分片任务（ChunkTask）。
-2. **受控拉流**：网络 Worker 必须在获取 `BufferLease`（全局 96 MiB 硬预算）后，拉取分片并填入内存块。
-3. **任务转换**：下载完成的分片由网络 Worker 投递到无锁写入通道（`writeJobChan`）。
-4. **顺序写盘**：固定 5 个磁盘 Writer 按物理卷和文件偏移将数据块通过 `WriteAt` 写入同目录临时文件（`.part`）。
-5. **背压与持久化**：写入后立即释放 `BufferLease` 并申请 `DirtyLease`（全局 48 MiB 预算）；数据批次真正落盘（`fdatasync`）后，覆盖更新可恢复双槽侧车位图（`.meta`）并释放 `DirtyLease`。
-6. **原子提交**：全部分片持久化完成后，临时文件通过 `RENAME_NOREPLACE` 原子重命名为最终文件，并更新 SQLite 为 `SUCCESS`。
-7. **崩溃恢复**：进程重启时，根据 `.meta` 双槽校验结果仅重新下载尚未持久化的分片。
+1. **Streaming Block Engine (SBE 流式分块存储引擎)**：
+   - 将网络拉流与磁盘写入物理完全解耦，消除传统顺序下载导致的带宽断流与磁盘瓶颈；
+   - 实行严格的双额度内存租赁背压（`BufferLease` 96 MiB + `DirtyLease` 48 MiB），通过流控信号量杜绝内存无界膨胀；
+   - 实行 Small / Large 双车道加权差额轮询调度（DRR 3:1），保障海量小文件秒级流转与大文件平稳吞吐；
+   - 实行 Attempt 绑定的侧车预分配双槽位图（`.meta`）与单写者 Checkpoint，保障高抗崩溃能力与精确断点续传；
+   - 实行 Linux `RENAME_NOREPLACE` 与 `linkat` 回退链的原子提交协议，杜绝同名文件静默覆盖。
+2. **Embedded sing-box Engine (内置网络驱动与代理看门狗)**：
+   - 原生集成 `sing-box` 核心库，在 Go 进程内部直接初始化 Outbound 实例，消除本地 127.0.0.1 Loopback 握手开销；
+   - 支持 Shadowsocks、VMess、VLESS (Reality)、Trojan、Hysteria2、TUIC、WireGuard 等主流全协议；
+   - 提供 Web 控制台可视化节点与订阅管理；
+   - 配合 Proxy Watchdog 实现 30 秒自动心跳探活与故障自愈转移，同时保留对外部 SOCKS5/HTTP 代理的兼容。
 
-默认启动参数为 64 个逻辑网络 Worker 和 5 个逻辑磁盘 Writer。两者均为 Go 协程池，不等于 64 条 TCP 连接和 5 个物理磁盘请求。TCP/MTProto 连接跨分片、跨文件长期复用；磁盘实际并发受物理卷调度器控制。
-
----
-
-## 2. 目标与边界约束
-
-### 2.1 核心目标
-- **网络并发打满**：海量小文件和分片可并发抢占 64 个网络拉流槽位，不再受活跃文件数量限制。
-- **磁盘顺序写入**：网络多路拉流在写盘前按文件偏移归集，严禁将 64 路网络并发直接映射为磁盘随机 IO。
-- **物理内存绝对锁定**：通过 `BufferLease (96 MiB)` + `DirtyLease (48 MiB)` 双额度租赁背压，将常驻内存（RSS）强力锁定在 200 MiB 以内，杜绝 OOM。
-- **崩溃零数据损坏**：断电或进程强杀重启后，绝对不把未刷盘数据误判为成功，断点续传 0 毫秒对账。
-- **零静默文件覆盖**：通过原子非覆盖重命名与回退链，杜绝文件名冲突导致的文件静默覆盖。
-
-### 2.2 明确系统边界
-- 单机单下载进程独占写入目录；进程启动时必须获取根目录文件锁（flock），未取得锁拒绝启动。
-- 临时文件（`.part`）与最终文件必须位于同一文件系统，严禁跨物理分区 rename。
-- SQLite 数据库仅保存文件级状态（`QUEUED` / `RUNNING` / `COMMITTING` / `SUCCESS` / `FAILED`），逐块进度由同目录侧车 `.meta` 持久化。
-- 2 MiB 为存储与恢复单元，不是 MTProto RPC 单次请求大小（单次 RPC 严格对齐 1 MiB）。
+### 1.2 系统边界与运行前提
+- **单机单进程独占**：下载根目录由单实例通过 `flock` 文件锁独占写入，未取得锁拒绝启动。
+- **同一物理分区**：临时数据文件（`.part`）与最终下载目标目录必须位于同一文件系统，严禁跨物理分区 rename。
+- **状态分离原则**：SQLite 负责全局任务生命周期与元数据持久化，逐块下载进度由同目录的 `.meta` 侧车文件独立承担。
+- **零静默覆盖**：当目标路径已存在文件时，必须通过原子非覆盖重命名阻断，绝不允许覆盖已有数据。
 
 ---
 
-## 3. 总体架构图解
+## 2. 总体架构拓扑
 
 ```mermaid
 flowchart TD
-    DB[(SQLite Task DB)] --> Claim["任务调度与 FileCoordinator"]
-    Claim --> Sched["DRR 双车道调度器 (Small : Large = 3:1)"]
-    Sched --> ChunkQ["chunkChan (容量 128)"]
-
-    subgraph NetworkStage ["网络拉流阶段"]
-        ChunkQ --> AcquireBuf{"申请 BufferLease (上限 96 MiB)"}
-        AcquireBuf -->|获取成功| NW["64 个网络 Worker"]
-        NW --> Limit["账号 / DC / RPC 限流器"]
-        Limit --> Conn["长期 MTProto Session (gotd)"]
-        Conn -->|2x 1MB RPC| NW
-        NW -->|组装 2MB 块| WriteQ["writeJobChan (容量 64)"]
+    subgraph NetworkSubsystem ["网络与代理子系统 (Network & Embedded Proxy)"]
+        Watchdog["Proxy Watchdog (30s 探活 / 故障自愈)"] -.-> Router{"Outbound 路由分发"}
+        Router -->|内置节点/订阅| SB["内置 sing-box 引擎 (Memory-level Outbound)"]
+        Router -->|外部参数 --proxy| ExtProxy["外部 SOCKS5 / HTTP 代理"]
+        Router -->|直连模式| Direct["Direct TCP/IPv4/IPv6"]
+        
+        SB --> Gotd["MTProto 会话连接池 (gotd/td Client Pool)"]
+        ExtProxy --> Gotd
+        Direct --> Gotd
     end
 
-    subgraph DiskStage ["磁盘持久化阶段"]
-        WriteQ --> DS["物理卷调度与 offset 归集"]
-        DS --> AcquireDirty{"申请 DirtyLease (上限 48 MiB)"}
-        AcquireDirty -->|获取成功| DW["5 个磁盘 Writer"]
-        DW -->|WriteAt| Temp[".part 临时数据文件"]
-        DW -->|释放 BufferLease| AcquireBuf
-        Temp -->|累积 16MB 或 2s| SyncBatch["DataFile.Fdatasync()"]
-        SyncBatch --> Checkpoint[".meta 双槽位图更新 (Slot A/B)"]
-        Checkpoint -->|MetaFile.Sync()| ReleaseDirty["释放 DirtyLease"]
-    end
+    subgraph SBE_Pipeline ["SBE 流式分块流水线 (Streaming Block Engine)"]
+        DB[(SQLite Task DB)] --> Orchestrator["Orchestrator 任务编排器"]
+        Orchestrator --> DRR["DRR 双车道调度器 (Small : Large = 3:1)"]
+        DRR --> ChunkChan["chunkChan 分片分发队列 (容量 128)"]
 
-    subgraph CommitStage ["原子提交流程"]
-        ReleaseDirty -->|所有分片完成| CommittingState["SQLite 状态 -> COMMITTING"]
-        CommittingState --> AtomicRename{"Linux Renameat2 (NOREPLACE)"}
-        AtomicRename -->|不支持| LinkFallback["linkat(temp, final) + unlink(temp)"]
-        AtomicRename -->|成功| FsyncDir["fsync 父目录"]
-        LinkFallback -->|成功| FsyncDir
-        FsyncDir --> SuccessState["SQLite 状态 -> SUCCESS"]
-        SuccessState --> CleanupMeta["清理 .meta 文件并 fsync 父目录"]
+        subgraph NetStage ["网络拉流阶段"]
+            ChunkChan --> AcquireBuf{"申请 BufferLease (上限 96 MiB)"}
+            AcquireBuf -->|获取成功| NW["64 个逻辑网络 Worker"]
+            NW -->|RPC 循环分片拉流| Gotd
+            NW -->|填满 2MB 块| WriteChan["writeJobChan 写入队列 (容量 64)"]
+        end
+
+        subgraph DiskStage ["磁盘持久化阶段 (单文件串行 Checkpoint)"]
+            WriteChan --> AcquireDirty{"申请 DirtyLease (上限 48 MiB)"}
+            AcquireDirty -->|获取成功| DW["5 个磁盘 Writer"]
+            DW -->|WriteAt 写入 .part.<Attempt>| TempDisk["临时数据文件"]
+            DW -->|标记 WRITTEN| ReleaseBuf["释放 BufferLease"]
+            ReleaseBuf --> AcquireBuf
+            
+            TempDisk --> CheckpointLoop["FileCoordinator 串行 CheckpointLoop"]
+            CheckpointLoop -->|累积 16MB 或 2s| Fdatasync["unix.Fdatasync(dataFD)"]
+            Fdatasync --> WriteMeta[".meta.<Attempt> Slot A/B 覆写"]
+            WriteMeta --> MetaSync["MetaFile.Sync()"]
+            MetaSync --> AdvanceDurable["推进 DurableBitmap"]
+            AdvanceDurable --> ReleaseDirty["释放 DirtyLease"]
+        end
+
+        subgraph CommitStage ["原子提交流程 (Atomic Commit Protocol)"]
+            AdvanceDurable -->|所有分片 DURABLE| CommittingCAS["SQLite CAS: RUNNING -> COMMITTING"]
+            CommittingCAS --> AtomicRename{"unix.Renameat2(RENAME_NOREPLACE)"}
+            AtomicRename -->|返回 ENOSYS/EINVAL| LinkFallback["linkat(temp, final) + unlinkat(temp)"]
+            AtomicRename -->|成功| FsyncDir["fsync 父目录描述符"]
+            LinkFallback -->|成功| FsyncDir
+            FsyncDir --> SuccessCAS["SQLite CAS: COMMITTING -> SUCCESS"]
+            SuccessCAS --> RemoveMeta["删除 .meta 并再次 fsync 目录"]
+        end
     end
 ```
 
 ---
 
-## 4. 数据结构与生命周期
+## 3. 网络拉流与 RPC 分片组装
 
-### 4.1 核心数据结构
+### 3.1 存储分块与 RPC 实际返回循环
+- **存储块尺寸**：标准块大小 `BlockSize = 2 MiB`（2,097,152 字节），尾块按实际文件剩余字节对齐。
+- **动态循环填充规则**：网络 Worker 在拉取分片时，不固定假设“两次 RPC 必然填满 2 MiB”，而是按实际返回长度累加，确保处理短读、尾块和网络截断：
+  ```text
+  while filled < ChunkTask.Length:
+      partLength = min(1 MiB, ChunkTask.Length - filled)
+      reqOffset = ChunkTask.Offset + filled
+      resBytes = client.UploadGetFile(reqOffset, partLength)
+      
+      if len(resBytes) == 0:
+          return EOFError / NetworkInterrupt
+          
+      copy(leasedBuffer[filled:], resBytes)
+      filled += len(resBytes)
 
-```go
-type SourceRef struct {
-    AccountID int64
-    PeerID    int64
-    MessageID int64
-    MediaID   string
-    DCHint    int
-}
+  // 严格验证：只有当 filled == ChunkTask.Length 时才生成 WriteJob
+  ```
 
-type FileTask struct {
-    FileKey     string
-    AttemptID   string
-    Source      SourceRef
-    TotalSize   int64
-    BlockSize   int64
-    TotalBlocks uint32
-    FinalPath   string
-    TempPath    string
-    MetaPath    string
-}
-
-type ChunkTask struct {
-    FileKey    string
-    AttemptID  string
-    ChunkIndex uint32
-    Offset     int64
-    Length     int
-}
-
-type WriteJob struct {
-    FileKey    string
-    AttemptID  string
-    ChunkIndex uint32
-    Offset     int64
-    Length     int
-    Buffer     *BufferLease // 持有真实 2MB 用户态内存
-}
-```
-
-`WriteJob` 不直接持有裸 `*FileCoordinator`。磁盘 Worker 通过 `FileKey + AttemptID` 从 Registry 获取活动句柄；若 AttemptID 不匹配，则丢弃该块并立即释放 `BufferLease`，防止过期分片污染新文件。
+### 3.2 异常重试与协议自愈
+- **`FILE_REFERENCE_EXPIRED`**：当 Telegram 媒体引用过期时，网络 Worker 捕获该错误，通知 `FileCoordinator` 调用 `RefreshFileReference` 重新拉取最新消息元数据，原地更新引用并重试，无需重置整个任务。
+- **`DC_MIGRATE_X` 与 CDN Redirect**：自动触发连接池对目标 DC 的长连接握手，迁移拉流通道。
+- **`FloodWait`**：精准挂起对应 `(AccountID, DCID)` 队列至 `notBefore`，释放当前分片持有的 `BufferLease`，将 `ChunkTask` 退回调度延迟队列。
 
 ---
 
-## 5. 公平调度与网络拉流
+## 4. 内置 sing-box 网络驱动与 Proxy Watchdog
 
-### 5.1 Small / Large 双车道加权调度 (DRR)
-- **Small Lane**：文件大小 $\le 10\text{ MiB}$，采用单块或少量块拉流，快速轮转释放网络槽位。
-- **Large Lane**：文件大小 $> 10\text{ MiB}$，并发在途大文件上限为 12~16 个，单个大文件并发分片上限为 4 个。
-- **加权调度**：调度器按 `Small : Large = 3 : 1` 差额轮询（DRR），保证小文件即到即走，同时大文件平稳下载。
+### 4.1 In-Process sing-box 架构
+- 系统引入 `pkg/proxy/singbox` 模块，直接调用 `github.com/sagernet/sing-box/box`。
+- **Direct DialContext 注入**：将 sing-box Outbound 的 `DialContext` 直接注入到 `gotd/td` 客户端的底层 TCP Transport 中：
+  ```go
+  instance, err := box.New(box.Options{
+      Options: optionOptions,
+      Context: ctx,
+  })
+  dialer := instance.Outbound()
+  client := telegram.NewClient(appID, appHash, telegram.Options{
+      Resolver: dialer,
+      // ...
+  })
+  ```
+- **内存零开销**：消除本地 SOCKS5 握手往返与内核 TCP 栈多次拷贝。
 
-### 5.2 MTProto 连接复用与 1MB RPC 切分
-- 64 个逻辑 Worker 跨文件、跨分片长期复用按 `(AccountID, DCID)` 维护的 gotd 客户端连接池。
-- 1 个 2 MiB 存储块固定拆分为 **2 次连续的 1 MiB（1,048,576 字节）`upload.getFile` RPC** 请求拉取，并在内存中完成组装。
-- 遇 `FloodWait` 时，精准挂起该账号/DC 的调度队列至 `notBefore`，释放其占用的 `BufferLease`，将未完成分片退回调度队列。
+### 4.2 Proxy Watchdog 故障自愈机制
+- **心跳探活**：后台协程每 30 秒向 Telegram DC 探活端口或公网目标发起轻量 TCP/TLS 心跳；
+- **故障转移 (Failover)**：当连续 2 次探活超时或 MTProto 产生不可恢复连接阻断时，在 30 秒内自动执行确定性轮询（Round-Robin Failover），平滑切换至下一可用节点；
+- **指标持久化**：内存与 SQLite 记录各节点 24 小时延迟、握手成功率与下载速率基线。
 
 ---
 
-## 6. 有界内存与双额度租赁模型
+## 5. 有界内存与双额度租赁模型
 
 ```mermaid
 stateDiagram-v2
     [*] --> IdleLeasePool
-    IdleLeasePool --> BufferLeased: 网络 Worker 申请 BufferLease (96 MiB 额度池)
-    BufferLeased --> Downloading: 填充 2x 1MB RPC 数据
+    IdleLeasePool --> BufferLeased: 网络 Worker 获取 BufferLease (96 MiB 总预算)
+    BufferLeased --> Downloading: 循环填充 2MB 数据
     Downloading --> QueuedInWriteChan: 投递至 writeJobChan
-    QueuedInWriteChan --> DirtyLeased: 磁盘 Writer 执行 WriteAt 完成
-    DirtyLeased --> BufferLeasedReleased: 归还 BufferLease 给网络池
+    QueuedInWriteChan --> DirtyLeased: 磁盘 Writer 先获取 DirtyLease(Length)
+    DirtyLeased --> WrittenToDisk: 执行 WriteAt 写入 .part
+    WrittenToDisk --> BufferLeasedReleased: 标记 WRITTEN，释放 BufferLease
     BufferLeasedReleased --> IdleLeasePool
-    DirtyLeased --> SyncedOnDisk: 累积 16MB 或 2s 执行 fdatasync
-    SyncedOnDisk --> MetaCheckpointWritten: 写入 .meta Slot A/B 并 MetaFile.Sync()
-    MetaCheckpointWritten --> DirtyLeasedReleased: 释放 DirtyLease (48 MiB 额度池)
+    WrittenToDisk --> SyncedToDisk: CheckpointLoop 执行 fdatasync + meta 覆写
+    SyncedToDisk --> DirtyLeasedReleased: 标记 DURABLE，释放 DirtyLease (48 MiB 总预算)
     DirtyLeasedReleased --> [*]
 ```
 
-1. **BufferBudget (96 MiB)**：
-   - 对应全局最多流通 $96 / 2 = 48$ 个满载 2MB 块。
-   - 64 个 Worker 和 16 个并发大文件（每文件 4 块上限）代表调度上限。当 48 个 Lease 被占满时，多余 Worker 在 `sync.Cond` 上阻塞等待，形成精确流控背压。
-2. **DirtyBudget (48 MiB)**：
-   - 限制用户态已调用 `WriteAt` 但尚未调用 `fdatasync` 的脏数据总量。
-   - 当脏数据积压达到 48 MiB 时，磁盘调度器暂停接单并强制触发数据落盘与位图 Checkpoint。
+### 5.1 租赁额度与背压流控
+1. **`BufferBudget` (96 MiB)**：
+   - 限制用户态数据缓冲总量，对应最多流通 $96 / 2 = 48$ 个满载 2MB 块；
+   - 采用带 Context 取消与超时支持的加权信号量（Weighted Semaphore）。当 48 个 Lease 被占满时，多余的 Worker 协程被挂起等待，产生精确网络背压。
+2. **`DirtyBudget` (48 MiB)**：
+   - 限制已调用 `WriteAt` 但尚未调用 `fdatasync` 的未落盘脏数据总量；
+   - **严格时序**：磁盘 Writer **必须在执行 `WriteAt` 前** 成功申请 `DirtyLease(Length)`；写入完成后立即释放 `BufferLease`；落盘完成后释放 `DirtyLease`。
 
 ---
 
-## 7. 磁盘写入、侧车文件与 Checkpoint
+## 6. 磁盘写入、.meta 侧车文件与单写者 Checkpoint
 
-### 7.1 侧车文件格式（.meta）与动态预分配
-大文件（$> 2\text{ MiB}$）初始化时必须在同目录下创建并预分配 `.meta` 文件（单块小文件不生成 `.meta`）。
+### 6.1 .meta Header 身份与 Attempt 强绑定
+为杜绝把同大小旧文件的残余位图误用到新任务上，`.meta` 文件 Header 必须与文件身份和 Attempt 强绑定：
 
-* **尺寸计算公式**：
-  $$\text{MetaSize} = \text{Header}(64\text{B}) + 2 \times \Big(\text{SlotHeader}(32\text{B}) + \lceil \text{TotalBlocks} / 8 \rceil \text{B}\Big)$$
-* **初始化落盘时序**：
-  ```text
-  创建 .meta 临时文件
-  -> 写入文件 Header (Magic, Version, TotalBlocks, BlockSize, FileSize)
-  -> 写入初始无效的 Slot A 和 Slot B (Generation=0, Valid=0)
-  -> MetaFile.Sync()
-  -> fsync 父目录
-  ```
-* **定点覆盖写入**：后续 Checkpoint 仅通过 `WriteAt` 覆写固定物理偏移处的 Slot A（偏移 64）或 Slot B（偏移 $64 + \text{SlotSize}$），无需动态调整文件尺寸。
-
-### 7.2 Group Checkpoint 严格落盘时序
-每文件累计脏数据达 16 MiB 或间隔满 2 秒时触发：
-```text
-1. 内存中快照已写入位图 (WrittenBitmap)
-2. DataFile.Fdatasync() 物理数据落盘
-3. 将 nextDurable 写入 .meta 的下一代槽位 (Slot A 或 Slot B)，并计算 CRC32
-4. MetaFile.Sync() 确保位图落盘
-5. 推进内存中的 DurableBitmap
-6. 释放该批次占用的 DirtyLease
+```go
+type MetaHeader struct {
+    Magic             [4]byte  // 固定为 "SBM1"
+    Version           uint32   // 协议版本，当前为 1
+    FileKeyHash       [32]byte // SHA256(FileKey)
+    SourceFingerprint uint64   // PeerID ^ MessageID ^ MediaIDHash
+    AttemptID         [16]byte // 当前下载 Attempt 的 UUID
+    TotalSize         int64    // 文件总字节数
+    BlockSize         uint32   // 块大小 (2,097,152)
+    TotalBlocks       uint32   // 总分块数
+    HeaderCRC         uint32   // Header 前序字段的 IEEE CRC32 校验和
+}
 ```
 
+- **文件名规范**：
+  - 临时数据文件：`<TargetDir>/<FileName>.part.<AttemptID>`
+  - 侧车位图文件：`<TargetDir>/<FileName>.meta.<AttemptID>`
+- **文件尺寸精确预分配**：
+  $$\text{MetaSize} = \text{Header}(64\text{B}) + 2 \times \Big(\text{SlotHeader}(32\text{B}) + \lceil \text{TotalBlocks} / 8 \rceil \text{B}\Big)$$
+  初始化时一次性写入完整 Header 与初始无效的 Slot A / Slot B，执行 `MetaFile.Sync()` 与父目录 `fsync` 后固定尺寸，后续仅定点覆写。
+
+### 6.2 单写者 CheckpointLoop（串行无锁落盘）
+每个 `FileCoordinator` 拥有唯一的串行 `CheckpointLoop`，彻底杜绝多个磁盘 Writer 竞态修改 BitSet、Generation 和 Slot：
+
+```mermaid
+flowchart TD
+    Start["触发 Checkpoint (累积 16MB 脏数据 或 间隔满 2s)"] --> Snap["1. 快照当前 WrittenBitmap"]
+    Snap --> Fdata["2. unix.Fdatasync(int(dataFile.Fd()))"]
+    Fdata --> SlotCalc["3. 计算下一个 Slot (Generation + 1) 与 CRC32"]
+    SlotCalc --> PwriteSlot["4. MetaFile.WriteAt 写入 Slot A (偏移 64) 或 Slot B"]
+    PwriteSlot --> MetaSync["5. MetaFile.Sync() 落盘位图"]
+    MetaSync --> Advance["6. 推进内存 DurableBitmap = WrittenSnapshot"]
+    Advance --> RelDirty["7. 释放本批次对应的 DirtyLease 额度"]
+```
+
+- **分块状态机**：每个分块生命周期严格遵循：`MISSING → INFLIGHT → WRITTEN → DURABLE`。已进入 `WRITTEN` 或 `DURABLE` 的分块拒绝重复写入与重复扣减额度。
+
 ---
 
-## 8. 原子提交协议与非覆盖重命名
+## 7. 原子提交协议与非覆盖重命名
 
-### 8.1 多块大文件提交流程
+### 7.1 大文件提交流程
 ```text
 1. 校验 DurableBitmap 全满且 activeWrites == 0
-2. SQLite 事务：RUNNING -> COMMITTING (以 FileKey + AttemptID 唯一匹配)
-3. DataFile.Sync() 与 MetaFile 写入 COMPLETE 标记并 Sync()
-4. 关闭 DataFile 与 MetaFile 句柄
-5. 执行非覆盖原子提交：
-   a. 主路径：unix.Renameat2(parentDirFD, tempName, parentDirFD, finalName, unix.RENAME_NOREPLACE)
-   b. 若返回 ENOSYS / EINVAL / EOPNOTSUPP，进入回退链：
-      linkat(parentDirFD, tempName, parentDirFD, finalName, 0) -> unlinkat(parentDirFD, tempName, 0)
-   c. 若仍不支持或发生 EEXIST，明确报错，严禁降级为 os.Rename
-6. fsync 父目录文件描述符
-7. SQLite 事务：COMMITTING -> SUCCESS
-8. 删除 .meta 文件并再次 fsync 父目录
+2. SQLite 乐观 CAS 事务：
+   UPDATE tasks SET state = 'COMMITTING' 
+   WHERE file_key = ? AND attempt_id = ? AND state = 'RUNNING';
+   (严格校验 RowsAffected == 1，否则终止并重试)
+3. dataFile.Sync() 确保尾部数据落盘
+4. metaFile 写入 COMPLETE 标记槽并 MetaFile.Sync()
+5. 关闭 dataFile 与 metaFile 描述符句柄
+6. 执行非覆盖原子提交：
+   a. 主路径：unix.Renameat2(parentDirFD, tempPartName, parentDirFD, finalName, unix.RENAME_NOREPLACE)
+   b. 若返回 ENOSYS / EINVAL / EOPNOTSUPP，进入安全回退链：
+      linkat(parentDirFD, tempPartName, parentDirFD, finalName, 0)
+      -> unlinkat(parentDirFD, tempPartName, 0)
+   c. 若仍不支持或返回 EEXIST (目标已存在)：明确报错阻断，严禁降级为 os.Rename
+7. fsync 父目录文件描述符
+8. SQLite 乐观 CAS 事务：
+   UPDATE tasks SET state = 'SUCCESS' 
+   WHERE file_key = ? AND attempt_id = ? AND state = 'COMMITTING';
+9. 删除 .meta.<AttemptID> 侧车文件并再次 fsync 父目录
 ```
 
-### 8.2 单块小文件提交流程
+### 7.2 单块小文件提交流程
 ```text
-唯一 Attempt 临时文件
--> 精确 WriteAt(buf[:n]) 严格按真实有效长度写入
--> DataFile.Sync()
--> Close DataFile
--> SQLite 事务：RUNNING -> COMMITTING
--> Renameat2 (RENAME_NOREPLACE) [带 linkat 回退链]
--> fsync 父目录 (默认逐文件严格同步；高频目录支持 COMMITTING 保护的 Group Dir Sync 批聚合)
--> SQLite 事务：COMMITTING -> SUCCESS
+唯一 Attempt 临时文件 (.part.<AttemptID>)
+-> 严格按有效长度 WriteAt 写入
+-> dataFile.Sync()
+-> 关闭 dataFile
+-> SQLite CAS: RUNNING -> COMMITTING
+-> unix.Renameat2 (RENAME_NOREPLACE) [带 linkat 回退链]
+-> fsync 父目录 (默认单文件严格同步；高频场景支持带 COMMITTING 保护的 Group Dir Sync 批聚合)
+-> SQLite CAS: COMMITTING -> SUCCESS
 ```
 
 ---
 
-## 9. 崩溃对账与启动恢复矩阵
+## 8. 崩溃对账与启动恢复矩阵
 
-进程重启或崩溃拉起后，针对下载目录中的文件执行确定性对账：
+服务拉起或异常重启后，恢复器根据 SQLite 当前 Attempt 与文件系统物理状态进行严格对账：
 
-| SQLite 状态 | 最终文件存在 | `.part` 存在 | `.meta` 状态 | 恢复判定与动作 |
+| SQLite 状态 | 最终文件 | `.part.<Attempt>` | `.meta.<Attempt>` | 判定结果与自愈动作 |
 | :--- | :--- | :--- | :--- | :--- |
-| `SUCCESS` | 是 | 否 | 否 | **已完成**：正常跳过 |
-| `COMMITTING` | 是 | 否 | 任意 | **提交流程崩溃**：直接对账推进 SQLite 为 `SUCCESS`，清理残余 `.meta` |
-| `COMMITTING` | 否 | 是 | 校验完整 | **提交前崩溃**：重新触发原子重命名与目录 fsync，更新 SQLite 为 `SUCCESS` |
-| `RUNNING` | 否 | 是 | 双槽 CRC 有效 | **断点续传**：根据最新合法 Generation 槽位加载 `DurableBitmap`，仅下载未完成块 |
-| `RUNNING` | 否 | 是 | 双槽损坏/不存在 | **位图损坏**：重置 `.meta` 和 `.part`，重新从第 0 块开始下载 |
-| 任意 | 是 (哈希不符) | 任意 | 任意 | **路径冲突/被篡改**：报错告警，严禁覆盖 |
+| `SUCCESS` | 存在 | 不存在 | 不存在 | **正常完成**：直接跳过 |
+| `COMMITTING` | 存在 | 不存在 | 存在有效 COMPLETE | **提交流程崩溃**：执行父目录 `fsync`，补交 SQLite 推进为 `SUCCESS`，清理残余 `.meta` |
+| `COMMITTING` | 存在且与 part inode 相同 | 存在 | 任意 | **linkat 成功但 unlink 崩溃**：执行 `unlinkat(part)`，`fsync` 目录，推进 `SUCCESS` |
+| `COMMITTING` | 存在但与 part inode 不同 | 存在 | 任意 | **路径严重冲突**：拒绝成功，记录 `PATH_CONFLICT` 错误并告警 |
+| `COMMITTING` | 不存在 | 存在 | 校验完整 | **提交前崩溃**：重新执行原子重命名与目录 `fsync`，推进 SQLite 为 `SUCCESS` |
+| `RUNNING` | 不存在 | 存在 | 双槽 CRC 有效 | **断点续传**：加载最新合法 Generation 槽位的 `DurableBitmap`，仅下载未完成块 |
+| `RUNNING` | 不存在 | 存在 | 双槽损坏/不存在 | **位图损坏**：重置 `.meta` 和 `.part`，从第 0 块重新拉流 |
+| 任意 | 存在 (哈希冲突) | 任意 | 任意 | **外部同名文件存在**：记录 `FILE_ALREADY_EXISTS`，拒绝覆盖已有文件 |
 
 ---
 
-## 10. 默认生产配置参数表
+## 9. 核心生产参数配置表
 
-| 参数项 | 默认值 | 设计依据与说明 |
+| 参数项 | 生产默认值 | 设计依据与说明 |
 | :--- | :---:| :--- |
-| **StorageBlockSize** | **2 MiB** | 存储与断点单元，末块按实际长度裁剪 |
+| **StorageBlockSize** | **2 MiB** | 存储与断点续传单位，末块按实际长度裁剪 |
 | **RPCPartSize** | **1 MiB** | Telegram MTProto 标准单次请求对齐尺寸 |
-| **NetworkWorkers** | **64** | 逻辑网络拉流协程数（复用 MTProto 长期连接） |
-| **DiskWorkers** | **5** | 全局逻辑 Writer 协程数，按物理卷限流 |
-| **BufferBudget** | **96 MiB** | 用户态数据缓冲区硬上限（最多流通 48 个 2MB 块） |
-| **DirtyBudget** | **48 MiB** | 未刷盘脏数据硬上限，达到即触发强制落盘 |
-| **ActiveLargeFiles** | **12~16** | 全局同时激活的大文件会话池上限 |
-| **LargeInflight** | **4** | 单个大文件最大并行在途分片数 |
+| **NetworkWorkers** | **64** | 逻辑网络拉流协程数（跨文件复用 MTProto 长期会话） |
+| **DiskWorkers** | **5** | 全局磁盘 Writer 协程数，按物理卷限流 |
+| **BufferBudget** | **96 MiB** | 用户态数据缓冲区硬上限（最多流通 48 个 2MB 满载块） |
+| **DirtyBudget** | **48 MiB** | 未刷盘脏数据硬上限，达到即暂停写盘并强制 Checkpoint |
+| **ActiveLargeFiles** | **12~16** | 全局同时激活的大文件会话池上限（单文件并发初始为 4，单大文件时自适应增加） |
 | **Small/Large DRR** | **3 : 1** | 小文件与大文件加权调度比 |
-| **CheckpointBytes** | **16 MiB** | 触发单文件 `fdatasync` 的累计数据量阈值 |
+| **CheckpointBytes** | **16 MiB** | 触发单文件 `fdatasync` 的累计脏数据量阈值 |
 | **CheckpointInterval** | **2 秒** | 触发单文件 `fdatasync` 的最大时间延迟 |
+| **ProxyWatchdogInterval**| **30 秒** | 内置 sing-box / 代理心跳探活与故障转移周期 |
