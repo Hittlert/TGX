@@ -15,7 +15,7 @@ import (
 )
 
 // MaxPartSize refer to https://core.telegram.org/api/files#downloading-files
-const MaxPartSize = 1024 * 1024
+const MaxPartSize = 512 * 1024
 
 type Downloader struct {
 	opts Options

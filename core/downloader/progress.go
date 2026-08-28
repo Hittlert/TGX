@@ -1,8 +1,6 @@
 package downloader
 
 import (
-	"time"
-
 	"go.uber.org/atomic"
 )
 
@@ -44,11 +42,6 @@ func (w *writeAt) WriteAt(p []byte, off int64) (int, error) {
 		return 0, err
 	}
 
-	// some small files may finish too fast, terminal history may not be overwritten
-	// this is just a simple way to avoid the problem
-	if at < w.partSize { //  last part(every file only exec once)
-		time.Sleep(time.Millisecond * 200) // to ensure the progress render next time
-	}
 	w.progress.OnDownload(w.elem, ProgressState{
 		Downloaded: w.downloaded.Add(int64(at)),
 		Total:      w.elem.File().Size(),
