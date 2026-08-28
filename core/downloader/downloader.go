@@ -2,10 +2,12 @@ package downloader
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/go-faster/errors"
-	"github.com/gotd/td/telegram/downloader"
+	"github.com/gotd/td/tg"
+	"go.uber.org/atomic"
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 
@@ -78,27 +80,150 @@ func (d *Downloader) download(ctx context.Context, elem Elem) error {
 	default:
 	}
 
-	logctx.From(ctx).Debug("Start download elem",
-		zap.Any("elem", elem))
-
-	client := d.opts.Pool.Client(ctx, elem.File().DC())
-	if elem.AsTakeout() {
-		client = d.opts.Pool.Takeout(ctx, elem.File().DC())
+	totalSize := elem.File().Size()
+	if totalSize <= 0 {
+		return errors.New("file size is 0 or negative")
 	}
-	timeout := 60 * time.Second + time.Duration(elem.File().Size()/(1024*1024))*time.Second
+
+	timeout := 60*time.Second + time.Duration(totalSize/(1024*1024))*time.Second
 	if timeout > 30*time.Minute {
 		timeout = 30 * time.Minute
 	}
 	dlCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	_, err := downloader.NewDownloader().WithPartSize(MaxPartSize).
-		Download(client, elem.File().Location()).
-		WithThreads(tutil.BestThreads(elem.File().Size(), d.opts.Threads)).
-		Parallel(dlCtx, newWriteAt(elem, d.opts.Progress, MaxPartSize))
-	if err != nil {
-		return errors.Wrap(err, "download")
+	logctx.From(dlCtx).Debug("Start download elem",
+		zap.Any("elem", elem))
+
+	partSize := int64(MaxPartSize)
+	numParts := int((totalSize + partSize - 1) / partSize)
+	threads := tutil.BestThreads(totalSize, d.opts.Threads)
+	if threads > numParts {
+		threads = numParts
+	}
+	if threads < 1 {
+		threads = 1
 	}
 
-	return nil
+	// For single-part files (photos, small audio, small video <= 512KB)
+	if numParts == 1 {
+		client := d.opts.Pool.Client(dlCtx, elem.File().DC())
+		if elem.AsTakeout() {
+			client = d.opts.Pool.Takeout(dlCtx, elem.File().DC())
+		}
+		req := &tg.UploadGetFileRequest{
+			Location: elem.File().Location(),
+			Offset:   0,
+			Limit:    int(partSize),
+		}
+		var res tg.UploadFileClass
+		var fetchErr error
+		for attempt := 0; attempt < 3; attempt++ {
+			res, fetchErr = client.UploadGetFile(dlCtx, req)
+			if fetchErr == nil {
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		if fetchErr != nil {
+			return errors.Wrap(fetchErr, "upload.getFile single")
+		}
+		var data []byte
+		switch r := res.(type) {
+		case *tg.UploadFile:
+			data = r.Bytes
+		default:
+			return errors.Errorf("unexpected file response: %T", res)
+		}
+		n, err := elem.To().WriteAt(data, 0)
+		if err != nil {
+			return errors.Wrap(err, "write single chunk")
+		}
+		d.opts.Progress.OnDownload(elem, ProgressState{
+			Downloaded: int64(n),
+			Total:      totalSize,
+		})
+		return nil
+	}
+
+	// Multi-part parallel download with deterministic chunk index queue
+	type partJob struct {
+		index  int
+		offset int64
+		limit  int
+	}
+
+	jobs := make(chan partJob, numParts)
+	for i := 0; i < numParts; i++ {
+		offset := int64(i) * partSize
+		limit := int(partSize)
+		if offset+int64(limit) > totalSize {
+			limit = int(totalSize - offset)
+		}
+		jobs <- partJob{index: i, offset: offset, limit: limit}
+	}
+	close(jobs)
+
+	var downloadedBytes atomic.Int64
+	g, gctx := errgroup.WithContext(dlCtx)
+
+	for w := 0; w < threads; w++ {
+		g.Go(func() error {
+			client := d.opts.Pool.Client(gctx, elem.File().DC())
+			if elem.AsTakeout() {
+				client = d.opts.Pool.Takeout(gctx, elem.File().DC())
+			}
+			for job := range jobs {
+				select {
+				case <-gctx.Done():
+					return gctx.Err()
+				default:
+				}
+
+				var chunkData []byte
+				var fetchErr error
+				for attempt := 0; attempt < 5; attempt++ {
+					req := &tg.UploadGetFileRequest{
+						Location: elem.File().Location(),
+						Offset:   job.offset,
+						Limit:    job.limit,
+					}
+					var res tg.UploadFileClass
+					res, fetchErr = client.UploadGetFile(gctx, req)
+					if fetchErr == nil {
+						if uf, ok := res.(*tg.UploadFile); ok {
+							chunkData = uf.Bytes
+							break
+						}
+					}
+					select {
+					case <-gctx.Done():
+						return gctx.Err()
+					case <-time.After(time.Duration(attempt+1) * 200 * time.Millisecond):
+					}
+				}
+
+				if fetchErr != nil || len(chunkData) == 0 {
+					if fetchErr != nil {
+						return errors.Wrapf(fetchErr, "fetch part %d (offset %d)", job.index, job.offset)
+					}
+					return fmt.Errorf("empty chunk data for part %d", job.index)
+				}
+
+				n, err := elem.To().WriteAt(chunkData, job.offset)
+				if err != nil {
+					return errors.Wrapf(err, "write part %d", job.index)
+				}
+
+				curr := downloadedBytes.Add(int64(n))
+				d.opts.Progress.OnDownload(elem, ProgressState{
+					Downloaded: curr,
+					Total:      totalSize,
+				})
+			}
+			return nil
+		})
+	}
+
+	return g.Wait()
 }
