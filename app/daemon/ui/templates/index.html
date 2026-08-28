@@ -20,6 +20,9 @@
           <canvas id="speed_sparkline" width="80" height="20" style="margin-left: 8px; border-radius: 4px; vertical-align: middle; display: inline-block;" title="实时网络吞吐波动"></canvas>
         </div>
         <div class="apple-nav-actions">
+          <div class="apple-auth-pill" id="tg_auth_pill" style="cursor: pointer; display: inline-flex; align-items: center; gap: 4px; font-size: 11.5px; padding: 4px 10px; border-radius: 12px; background: rgba(52, 199, 89, 0.08); color: #34c759; border: 1px solid rgba(52, 199, 89, 0.2); font-weight: 500;" title="点击登录或管理 Telegram 账号">
+            <span id="tg_auth_label">👤 Telegram: 检查中...</span>
+          </div>
           <div class="apple-disk-pill" id="storage_pill" style="display: inline-flex; align-items: center; gap: 4px; font-size: 11.5px; padding: 4px 10px; border-radius: 12px; background: rgba(0, 122, 255, 0.08); color: #007aff; border: 1px solid rgba(0, 122, 255, 0.2); font-weight: 500;" title="NAS 存储可用空间">
             💾 <span id="storage_free_label">计算中...</span>
           </div>
@@ -282,6 +285,80 @@
     </div>
   </div>
 
+  <!-- Telegram Account Auth Wizard Modal -->
+  <div class="apple-modal-overlay" id="modal_tg_auth">
+    <div class="apple-modal-card" style="max-width: 460px;">
+      <div class="modal-header">
+        <div>
+          <h3 class="modal-title">Telegram 账号授权登录</h3>
+          <p class="modal-subtitle">选择扫码或手机验证码，网页端一键登录</p>
+        </div>
+        <button type="button" class="modal-close" id="btn_close_tg_auth">&times;</button>
+      </div>
+      <div class="modal-body" style="padding-top: 10px;">
+        <!-- Already Logged In View -->
+        <div id="tg_auth_logged_in_view" style="display: none; text-align: center; padding: 20px 0;">
+          <div style="font-size: 42px; margin-bottom: 10px;">✅</div>
+          <div style="font-size: 16px; font-weight: 600; color: var(--apple-text); margin-bottom: 4px;" id="tg_logged_in_name">已授权账号</div>
+          <div style="font-size: 13px; color: var(--apple-text-secondary); margin-bottom: 20px;" id="tg_logged_in_user_info">ID: ...</div>
+          <button type="button" class="apple-btn apple-btn-secondary" id="btn_tg_logout" style="color: #ff3b30; border-color: rgba(255,59,48,0.2);">退出登录并切换账号</button>
+        </div>
+
+        <!-- Login Form View -->
+        <div id="tg_auth_form_view">
+          <!-- Segmented Tab for Login Mode -->
+          <div style="display: flex; gap: 8px; margin-bottom: 20px; background: rgba(120, 120, 128, 0.08); padding: 4px; border-radius: 10px;">
+            <button type="button" id="tab_auth_qr" class="apple-btn" style="flex: 1; border: none; font-size: 13px; font-weight: 600; padding: 6px 0; border-radius: 8px; background: white; box-shadow: 0 1px 3px rgba(0,0,0,0.1); color: var(--apple-text);">📱 扫码登录 (推荐)</button>
+            <button type="button" id="tab_auth_phone" class="apple-btn" style="flex: 1; border: none; font-size: 13px; font-weight: 500; padding: 6px 0; border-radius: 8px; background: transparent; color: var(--apple-text-muted);">💬 手机验证码</button>
+          </div>
+
+          <!-- Mode 1: QR Code Section -->
+          <div id="section_auth_qr" style="text-align: center;">
+            <div id="qr_box" style="margin: 0 auto 16px auto; width: 210px; height: 210px; background: rgba(0,0,0,0.03); border-radius: 16px; border: 1px solid rgba(0,0,0,0.06); display: flex; align-items: center; justify-content: center; overflow: hidden; position: relative;">
+              <img id="tg_qr_img" src="" alt="Telegram QR" style="width: 190px; height: 190px; display: none;">
+              <div id="qr_spinner" class="apple-spinner"></div>
+              <div id="qr_expired_mask" style="display: none; position: absolute; inset: 0; background: rgba(255,255,255,0.92); flex-direction: column; align-items: center; justify-content: center; gap: 8px;">
+                <span style="font-size: 13px; color: #ff3b30; font-weight: 500;">二维码已失效</span>
+                <button type="button" class="apple-btn apple-btn-secondary" id="btn_refresh_qr" style="font-size: 12px; padding: 4px 12px;">点击刷新</button>
+              </div>
+            </div>
+            <div style="font-size: 12.5px; color: var(--apple-text-secondary); line-height: 1.6; margin-bottom: 12px;">
+              请在手机 Telegram 打开：<br>
+              <strong>设置 ➔ 设备 ➔ 关联桌面设备 / 扫描二维码</strong>
+            </div>
+            <!-- 2FA Box inside QR -->
+            <div id="qr_2fa_box" style="display: none; text-align: left; margin-top: 14px; padding: 12px; background: rgba(255, 149, 0, 0.08); border-radius: 12px; border: 1px solid rgba(255, 149, 0, 0.25);">
+              <div style="font-size: 12.5px; font-weight: 600; color: #ff9500; margin-bottom: 6px;">🔐 该账号已开启两步验证 (2FA)</div>
+              <input type="password" id="qr_2fa_password" placeholder="请输入 Telegram 两步验证密码" style="width: 100%; box-sizing: border-box; padding: 8px 12px; border-radius: 8px; border: 1px solid rgba(0,0,0,0.15); font-size: 13px; margin-bottom: 8px;">
+              <button type="button" class="apple-btn apple-btn-primary" id="btn_submit_qr_2fa" style="width: 100%;">确认 2FA 密码并登录</button>
+            </div>
+          </div>
+
+          <!-- Mode 2: Phone Code Section -->
+          <div id="section_auth_phone" style="display: none;">
+            <div style="margin-bottom: 14px;">
+              <label style="display: block; font-size: 12px; font-weight: 500; margin-bottom: 6px; color: var(--apple-text-secondary);">国际手机号 (带国家区号，如 +8613800000000)</label>
+              <div style="display: flex; gap: 8px;">
+                <input type="text" id="tg_phone_input" placeholder="+8613800000000" style="flex: 1; padding: 8px 12px; border-radius: 8px; border: 1px solid rgba(0,0,0,0.15); font-size: 13px;">
+                <button type="button" class="apple-btn apple-btn-primary" id="btn_send_phone_code" style="white-space: nowrap;">获取验证码</button>
+              </div>
+            </div>
+            <div id="phone_verify_box" style="display: none; margin-bottom: 14px;">
+              <label style="display: block; font-size: 12px; font-weight: 500; margin-bottom: 6px; color: var(--apple-text-secondary);">Telegram 验证码 (官方 App 消息或短信)</label>
+              <input type="text" id="tg_code_input" placeholder="输入 5 位验证码" style="width: 100%; box-sizing: border-box; padding: 8px 12px; border-radius: 8px; border: 1px solid rgba(0,0,0,0.15); font-size: 13px; margin-bottom: 8px;">
+              <button type="button" class="apple-btn apple-btn-success" id="btn_submit_phone_code" style="width: 100%;">验证并登录</button>
+            </div>
+            <div id="phone_2fa_box" style="display: none; padding: 12px; background: rgba(255, 149, 0, 0.08); border-radius: 12px; border: 1px solid rgba(255, 149, 0, 0.25);">
+              <div style="font-size: 12.5px; font-weight: 600; color: #ff9500; margin-bottom: 6px;">🔐 请输入两步验证密码 (2FA)</div>
+              <input type="password" id="phone_2fa_password" placeholder="请输入 2FA 密码" style="width: 100%; box-sizing: border-box; padding: 8px 12px; border-radius: 8px; border: 1px solid rgba(0,0,0,0.15); font-size: 13px; margin-bottom: 8px;">
+              <button type="button" class="apple-btn apple-btn-primary" id="btn_submit_phone_2fa" style="width: 100%;">确认密码并完成登录</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <script src="static/layui/layui.js"></script>
   <script>
     layui.use(['table', 'layer'], function () {
@@ -304,6 +381,280 @@
       // System Storage
       update_system_storage();
       setInterval(update_system_storage, 15000);
+
+      // ==========================================
+      // Telegram Web Auth Wizard Controller
+      // ==========================================
+      var qr_poll_timer = null;
+      var current_phone_hash = "";
+
+      function check_tg_auth_status(auto_open_if_unauthorized) {
+        $.ajax({
+          url: "api/auth/status",
+          type: "get",
+          dataType: "json",
+          success: function (res) {
+            if (res && res.logged_in) {
+              var user = res.user || {};
+              var name = user.first_name || user.username || ('ID: ' + user.id);
+              $("#tg_auth_label").html('👤 ' + escape_html(name));
+              $("#tg_auth_pill").css({ background: 'rgba(52, 199, 89, 0.08)', color: '#34c759', borderColor: 'rgba(52, 199, 89, 0.2)' });
+              $("#tg_auth_logged_in_view").show();
+              $("#tg_auth_form_view").hide();
+              $("#tg_logged_in_name").text('已授权: ' + name);
+              $("#tg_logged_in_user_info").text('Username: @' + (user.username || '无') + ' · Phone: ' + (user.phone || '隐藏'));
+            } else {
+              $("#tg_auth_label").html('⚠️ Telegram 未登录');
+              $("#tg_auth_pill").css({ background: 'rgba(255, 149, 0, 0.1)', color: '#ff9500', borderColor: 'rgba(255, 149, 0, 0.3)' });
+              $("#tg_auth_logged_in_view").hide();
+              $("#tg_auth_form_view").show();
+              if (auto_open_if_unauthorized) {
+                open_tg_auth_modal();
+              }
+            }
+          }
+        });
+      }
+
+      function open_tg_auth_modal() {
+        $("#modal_tg_auth").addClass("is-open");
+        if ($("#tg_auth_form_view").is(":visible")) {
+          start_qr_login();
+        }
+      }
+
+      function close_tg_auth_modal() {
+        $("#modal_tg_auth").removeClass("is-open");
+        stop_qr_poll();
+      }
+
+      function stop_qr_poll() {
+        if (qr_poll_timer) {
+          clearInterval(qr_poll_timer);
+          qr_poll_timer = null;
+        }
+      }
+
+      function start_qr_login() {
+        stop_qr_poll();
+        $("#qr_spinner").show();
+        $("#tg_qr_img").hide();
+        $("#qr_expired_mask").hide();
+        $("#qr_2fa_box").hide();
+
+        $.ajax({
+          url: "api/auth/qr/start",
+          type: "post",
+          dataType: "json",
+          success: function (res) {
+            $("#qr_spinner").hide();
+            if (res && res.ok && res.qr_image_base64) {
+              $("#tg_qr_img").attr("src", res.qr_image_base64).show();
+              qr_poll_timer = setInterval(poll_qr_status, 2500);
+            } else {
+              layer.msg(res.msg || "获取二维码失败", { icon: 2 });
+            }
+          },
+          error: function (xhr) {
+            $("#qr_spinner").hide();
+            layer.msg("生成二维码错误: " + xhr.responseText, { icon: 2 });
+          }
+        });
+      }
+
+      function poll_qr_status() {
+        $.ajax({
+          url: "api/auth/qr/poll",
+          type: "get",
+          dataType: "json",
+          success: function (res) {
+            if (!res) return;
+            if (res.status === "success") {
+              stop_qr_poll();
+              layer.msg("🎉 Telegram 账号登录成功！", { icon: 1 });
+              close_tg_auth_modal();
+              check_tg_auth_status(false);
+              setTimeout(function () { location.reload(); }, 800);
+            } else if (res.status === "need_2fa") {
+              stop_qr_poll();
+              $("#qr_2fa_box").slideDown();
+              layer.msg("请输入 Telegram 两步验证密码 (2FA)", { icon: 0 });
+            } else if (res.status === "expired") {
+              stop_qr_poll();
+              $("#qr_expired_mask").css("display", "flex");
+            }
+          }
+        });
+      }
+
+      // Wire Modal Controls
+      $("#tg_auth_pill").click(function () {
+        open_tg_auth_modal();
+      });
+      $("#btn_close_tg_auth").click(function () {
+        close_tg_auth_modal();
+      });
+      $("#btn_refresh_qr").click(function () {
+        start_qr_login();
+      });
+
+      // Switch Tab (QR vs Phone)
+      $("#tab_auth_qr").click(function () {
+        $(this).css({ background: 'white', color: 'var(--apple-text)', fontWeight: '600' });
+        $("#tab_auth_phone").css({ background: 'transparent', color: 'var(--apple-text-muted)', fontWeight: '500' });
+        $("#section_auth_qr").show();
+        $("#section_auth_phone").hide();
+        start_qr_login();
+      });
+
+      $("#tab_auth_phone").click(function () {
+        $(this).css({ background: 'white', color: 'var(--apple-text)', fontWeight: '600' });
+        $("#tab_auth_qr").css({ background: 'transparent', color: 'var(--apple-text-muted)', fontWeight: '500' });
+        $("#section_auth_phone").show();
+        $("#section_auth_qr").hide();
+        stop_qr_poll();
+      });
+
+      // 2FA Submit for QR
+      $("#btn_submit_qr_2fa").click(function () {
+        var pwd = $("#qr_2fa_password").val();
+        if (!pwd) {
+          layer.msg("请输入两步验证密码", { icon: 2 });
+          return;
+        }
+        $.ajax({
+          url: "api/auth/2fa/verify",
+          type: "post",
+          contentType: "application/json",
+          data: JSON.stringify({ password: pwd }),
+          dataType: "json",
+          success: function (res) {
+            if (res && res.status === "success") {
+              layer.msg("🎉 登录成功！", { icon: 1 });
+              close_tg_auth_modal();
+              check_tg_auth_status(false);
+              setTimeout(function () { location.reload(); }, 800);
+            } else {
+              layer.msg(res.message || "密码错误", { icon: 2 });
+            }
+          },
+          error: function (xhr) {
+            layer.msg("验证失败: " + xhr.responseText, { icon: 2 });
+          }
+        });
+      });
+
+      // Phone Send Code
+      $("#btn_send_phone_code").click(function () {
+        var phone = $("#tg_phone_input").val().trim();
+        if (!phone) {
+          layer.msg("请输入手机号 (如 +8613800000000)", { icon: 2 });
+          return;
+        }
+        var btn = $(this);
+        btn.prop("disabled", true).text("发送中...");
+        $.ajax({
+          url: "api/auth/phone/send_code",
+          type: "post",
+          contentType: "application/json",
+          data: JSON.stringify({ phone: phone }),
+          dataType: "json",
+          success: function (res) {
+            btn.prop("disabled", false).text("重新获取");
+            if (res && res.ok) {
+              current_phone_hash = res.phone_code_hash;
+              $("#phone_verify_box").slideDown();
+              layer.msg("验证码已发送至 Telegram 或短信，请查收", { icon: 1 });
+            } else {
+              layer.msg(res.message || "发送失败", { icon: 2 });
+            }
+          },
+          error: function (xhr) {
+            btn.prop("disabled", false).text("获取验证码");
+            layer.msg("请求失败: " + xhr.responseText, { icon: 2 });
+          }
+        });
+      });
+
+      // Phone Verify Code
+      $("#btn_submit_phone_code").click(function () {
+        var code = $("#tg_code_input").val().trim();
+        if (!code) {
+          layer.msg("请输入验证码", { icon: 2 });
+          return;
+        }
+        $.ajax({
+          url: "api/auth/phone/verify_code",
+          type: "post",
+          contentType: "application/json",
+          data: JSON.stringify({ code: code }),
+          dataType: "json",
+          success: function (res) {
+            if (res && res.status === "success") {
+              layer.msg("🎉 登录成功！", { icon: 1 });
+              close_tg_auth_modal();
+              check_tg_auth_status(false);
+              setTimeout(function () { location.reload(); }, 800);
+            } else if (res && res.status === "need_2fa") {
+              $("#phone_2fa_box").slideDown();
+              layer.msg("请输入两步验证 (2FA) 密码", { icon: 0 });
+            } else {
+              layer.msg(res.message || "验证码错误", { icon: 2 });
+            }
+          },
+          error: function (xhr) {
+            layer.msg("验证失败: " + xhr.responseText, { icon: 2 });
+          }
+        });
+      });
+
+      // Phone 2FA Submit
+      $("#btn_submit_phone_2fa").click(function () {
+        var pwd = $("#phone_2fa_password").val();
+        if (!pwd) {
+          layer.msg("请输入两步验证密码", { icon: 2 });
+          return;
+        }
+        $.ajax({
+          url: "api/auth/2fa/verify",
+          type: "post",
+          contentType: "application/json",
+          data: JSON.stringify({ password: pwd }),
+          dataType: "json",
+          success: function (res) {
+            if (res && res.status === "success") {
+              layer.msg("🎉 登录成功！", { icon: 1 });
+              close_tg_auth_modal();
+              check_tg_auth_status(false);
+              setTimeout(function () { location.reload(); }, 800);
+            } else {
+              layer.msg(res.message || "密码错误", { icon: 2 });
+            }
+          },
+          error: function (xhr) {
+            layer.msg("验证失败: " + xhr.responseText, { icon: 2 });
+          }
+        });
+      });
+
+      // Logout Telegram
+      $("#btn_tg_logout").click(function () {
+        layer.confirm("确定要退出当前 Telegram 账号授权吗？", { icon: 3, title: "确认退出" }, function (idx) {
+          layer.close(idx);
+          $.ajax({
+            url: "api/auth/logout",
+            type: "post",
+            dataType: "json",
+            success: function () {
+              layer.msg("已退出 Telegram 授权", { icon: 1 });
+              check_tg_auth_status(true);
+            }
+          });
+        });
+      });
+
+      // Initial check
+      check_tg_auth_status(false);
 
       // Pause/Resume state
       window.download_state_change = function (e) {

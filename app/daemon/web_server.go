@@ -37,6 +37,11 @@ type WebServer struct {
 
 	sessionsMu sync.RWMutex
 	sessions   map[string]time.Time
+	authWizard *AuthWizard
+}
+
+func (s *WebServer) SetAuthWizard(w *AuthWizard) {
+	s.authWizard = w
 }
 
 func NewWebServer(
@@ -153,9 +158,18 @@ func (s *WebServer) Handler() http.Handler {
 		writeJSON(w, http.StatusOK, s.registry.Status())
 	}).Methods(http.MethodPost)
 
-	// Login & Auth
+	// Login & Auth (Web UI Password)
 	r.HandleFunc("/login", s.handleLogin)
 	r.HandleFunc("/logout", s.handleLogout)
+
+	// Telegram Account Auth Wizard (QR, Phone, Code, 2FA)
+	r.HandleFunc("/api/auth/status", s.requireAuth(s.handleAuthStatus)).Methods(http.MethodGet)
+	r.HandleFunc("/api/auth/qr/start", s.requireAuth(s.handleAuthQRStart)).Methods(http.MethodPost)
+	r.HandleFunc("/api/auth/qr/poll", s.requireAuth(s.handleAuthQRPoll)).Methods(http.MethodGet)
+	r.HandleFunc("/api/auth/phone/send_code", s.requireAuth(s.handleAuthSendPhoneCode)).Methods(http.MethodPost)
+	r.HandleFunc("/api/auth/phone/verify_code", s.requireAuth(s.handleAuthVerifyPhoneCode)).Methods(http.MethodPost)
+	r.HandleFunc("/api/auth/2fa/verify", s.requireAuth(s.handleAuthVerify2FA)).Methods(http.MethodPost)
+	r.HandleFunc("/api/auth/logout", s.requireAuth(s.handleAuthLogoutTelegram)).Methods(http.MethodPost)
 
 	// Web Dashboard
 	r.HandleFunc("/", s.requireAuth(s.handleIndex)).Methods(http.MethodGet, http.MethodHead)
@@ -1026,4 +1040,113 @@ func formatBytes(b int64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
+}
+
+func (s *WebServer) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
+	if s.authWizard == nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"logged_in": false,
+			"error":     "auth wizard not initialized",
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, s.authWizard.Status(r.Context()))
+}
+
+func (s *WebServer) handleAuthQRStart(w http.ResponseWriter, r *http.Request) {
+	if s.authWizard == nil {
+		writeError(w, http.StatusInternalServerError, "auth wizard not initialized")
+		return
+	}
+	resp, err := s.authWizard.StartQR(r.Context())
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *WebServer) handleAuthQRPoll(w http.ResponseWriter, r *http.Request) {
+	if s.authWizard == nil {
+		writeError(w, http.StatusInternalServerError, "auth wizard not initialized")
+		return
+	}
+	resp, err := s.authWizard.PollQR(r.Context())
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *WebServer) handleAuthSendPhoneCode(w http.ResponseWriter, r *http.Request) {
+	if s.authWizard == nil {
+		writeError(w, http.StatusInternalServerError, "auth wizard not initialized")
+		return
+	}
+	var req struct {
+		Phone string `json:"phone"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Phone == "" {
+		writeError(w, http.StatusBadRequest, "invalid phone number")
+		return
+	}
+	resp, err := s.authWizard.SendPhoneCode(r.Context(), req.Phone)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *WebServer) handleAuthVerifyPhoneCode(w http.ResponseWriter, r *http.Request) {
+	if s.authWizard == nil {
+		writeError(w, http.StatusInternalServerError, "auth wizard not initialized")
+		return
+	}
+	var req struct {
+		Code string `json:"code"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Code == "" {
+		writeError(w, http.StatusBadRequest, "invalid verification code")
+		return
+	}
+	resp, err := s.authWizard.VerifyPhoneCode(r.Context(), req.Code)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *WebServer) handleAuthVerify2FA(w http.ResponseWriter, r *http.Request) {
+	if s.authWizard == nil {
+		writeError(w, http.StatusInternalServerError, "auth wizard not initialized")
+		return
+	}
+	var req struct {
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Password == "" {
+		writeError(w, http.StatusBadRequest, "invalid password")
+		return
+	}
+	resp, err := s.authWizard.Verify2FA(r.Context(), req.Password)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *WebServer) handleAuthLogoutTelegram(w http.ResponseWriter, r *http.Request) {
+	if s.authWizard == nil {
+		writeError(w, http.StatusInternalServerError, "auth wizard not initialized")
+		return
+	}
+	if err := s.authWizard.Logout(r.Context()); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "logged out successfully"})
 }

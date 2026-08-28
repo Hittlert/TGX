@@ -175,7 +175,9 @@ func Run(ctx context.Context, client *telegram.Client, kvd storage.Storage, opts
 		SetGlobalUpdatesStream(updatesStream)
 	}
 
+	authWizard := NewAuthWizard(client, kvd, logctx.From(ctx))
 	webServer := NewWebServer(db, slotPool, proxyManager, orchestrator, access, registry, logctx.From(ctx), opts.Password)
+	webServer.SetAuthWizard(authWizard)
 	server := &http.Server{
 		Addr: opts.Listen, Handler: webServer.Handler(),
 		ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 30 * time.Second,
