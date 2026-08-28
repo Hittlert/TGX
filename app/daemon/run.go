@@ -37,6 +37,7 @@ type Options struct {
 	StartPaused      bool
 	ReconnectTimeout time.Duration
 	PeerSyncTimeout  time.Duration
+	Namespace        string
 }
 
 func DefaultOptions() Options {
@@ -44,6 +45,9 @@ func DefaultOptions() Options {
 }
 
 func (o Options) withDefaults() Options {
+	if o.Namespace == "" {
+		o.Namespace = "default"
+	}
 	if o.Listen == "" {
 		o.Listen = "0.0.0.0:18080"
 	}
@@ -78,7 +82,7 @@ func (o Options) withDefaults() Options {
 		o.PeerSyncTimeout = 3 * time.Minute
 	}
 	if o == (Options{
-		Listen: "0.0.0.0:18080", OutputDir: "/app/downloads", TempDir: "/app/temp/tdl",
+		Namespace: "default", Listen: "0.0.0.0:18080", OutputDir: "/app/downloads", TempDir: "/app/temp/tdl",
 		DBPath: "/app/state/download_records.sqlite3", SingboxURL: "http://127.0.0.1:9090",
 		QueueCapacity: 1000, TerminalLimit: 2000, FileConcurrency: 5, Threads: 8, PoolSize: 8,
 		PeerSyncTimeout: 3 * time.Minute,
@@ -175,7 +179,7 @@ func Run(ctx context.Context, client *telegram.Client, kvd storage.Storage, opts
 		SetGlobalUpdatesStream(updatesStream)
 	}
 
-	authWizard := NewAuthWizard(client, kvd, logctx.From(ctx))
+	authWizard := NewAuthWizard(db, client, kvd, logctx.From(ctx), opts.Namespace)
 	webServer := NewWebServer(db, slotPool, proxyManager, orchestrator, access, registry, logctx.From(ctx), opts.Password)
 	webServer.SetAuthWizard(authWizard)
 	server := &http.Server{

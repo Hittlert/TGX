@@ -103,6 +103,18 @@ func (d *Database) initSchema() error {
 			revision INTEGER NOT NULL DEFAULT 1,
 			peer_id TEXT NOT NULL DEFAULT ''
 		)`,
+		`CREATE TABLE IF NOT EXISTS telegram_accounts (
+			namespace TEXT PRIMARY KEY,
+			user_id INTEGER NOT NULL DEFAULT 0,
+			first_name TEXT NOT NULL DEFAULT '',
+			last_name TEXT NOT NULL DEFAULT '',
+			username TEXT NOT NULL DEFAULT '',
+			phone TEXT NOT NULL DEFAULT '',
+			is_premium INTEGER NOT NULL DEFAULT 0,
+			is_active INTEGER NOT NULL DEFAULT 0,
+			created_at INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL
+		)`,
 	}
 
 	for _, q := range queries {
@@ -535,4 +547,106 @@ func (d *Database) Get24hSuccessBytes() int64 {
 	`, cutoff, cutoff).Scan(&total)
 
 	return total.Int64
+}
+
+type TelegramAccount struct {
+	Namespace string `json:"namespace"`
+	UserID    int64  `json:"user_id"`
+	FirstName string `json:"first_name"`
+	LastName  string `json:"last_name"`
+	Username  string `json:"username"`
+	Phone     string `json:"phone"`
+	IsPremium bool   `json:"is_premium"`
+	IsActive  bool   `json:"is_active"`
+	CreatedAt int64  `json:"created_at"`
+	UpdatedAt int64  `json:"updated_at"`
+}
+
+func (d *Database) SaveAccount(acc TelegramAccount) error {
+	d.lock.Lock()
+	defer d.lock.Unlock()
+
+	now := time.Now().Unix()
+	if acc.CreatedAt == 0 {
+		acc.CreatedAt = now
+	}
+	acc.UpdatedAt = now
+
+	if acc.IsActive {
+		_, _ = d.db.Exec(`UPDATE telegram_accounts SET is_active = 0`)
+	}
+
+	_, err := d.db.Exec(`
+		INSERT INTO telegram_accounts (namespace, user_id, first_name, last_name, username, phone, is_premium, is_active, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(namespace) DO UPDATE SET
+			user_id = excluded.user_id,
+			first_name = excluded.first_name,
+			last_name = excluded.last_name,
+			username = excluded.username,
+			phone = excluded.phone,
+			is_premium = excluded.is_premium,
+			is_active = excluded.is_active,
+			updated_at = excluded.updated_at
+	`, acc.Namespace, acc.UserID, acc.FirstName, acc.LastName, acc.Username, acc.Phone, acc.IsPremium, acc.IsActive, acc.CreatedAt, acc.UpdatedAt)
+	return err
+}
+
+func (d *Database) GetAccounts() ([]TelegramAccount, error) {
+	d.lock.RLock()
+	defer d.lock.RUnlock()
+
+	rows, err := d.db.Query(`
+		SELECT namespace, user_id, first_name, last_name, username, phone, is_premium, is_active, created_at, updated_at
+		FROM telegram_accounts
+		ORDER BY is_active DESC, updated_at DESC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var list []TelegramAccount
+	for rows.Next() {
+		var a TelegramAccount
+		if err := rows.Scan(&a.Namespace, &a.UserID, &a.FirstName, &a.LastName, &a.Username, &a.Phone, &a.IsPremium, &a.IsActive, &a.CreatedAt, &a.UpdatedAt); err != nil {
+			return nil, err
+		}
+		list = append(list, a)
+	}
+	return list, rows.Err()
+}
+
+func (d *Database) GetActiveAccount() (*TelegramAccount, error) {
+	d.lock.RLock()
+	defer d.lock.RUnlock()
+
+	var a TelegramAccount
+	err := d.db.QueryRow(`
+		SELECT namespace, user_id, first_name, last_name, username, phone, is_premium, is_active, created_at, updated_at
+		FROM telegram_accounts
+		WHERE is_active = 1
+		LIMIT 1
+	`).Scan(&a.Namespace, &a.UserID, &a.FirstName, &a.LastName, &a.Username, &a.Phone, &a.IsPremium, &a.IsActive, &a.CreatedAt, &a.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &a, nil
+}
+
+func (d *Database) SetActiveAccount(namespace string) error {
+	d.lock.Lock()
+	defer d.lock.Unlock()
+
+	_, _ = d.db.Exec(`UPDATE telegram_accounts SET is_active = 0`)
+	_, err := d.db.Exec(`UPDATE telegram_accounts SET is_active = 1, updated_at = ? WHERE namespace = ?`, time.Now().Unix(), namespace)
+	return err
+}
+
+func (d *Database) DeleteAccount(namespace string) error {
+	d.lock.Lock()
+	defer d.lock.Unlock()
+
+	_, err := d.db.Exec(`DELETE FROM telegram_accounts WHERE namespace = ?`, namespace)
+	return err
 }

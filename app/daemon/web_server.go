@@ -162,7 +162,7 @@ func (s *WebServer) Handler() http.Handler {
 	r.HandleFunc("/login", s.handleLogin)
 	r.HandleFunc("/logout", s.handleLogout)
 
-	// Telegram Account Auth Wizard (QR, Phone, Code, 2FA)
+	// Telegram Account Auth Wizard & Multi-Account Management
 	r.HandleFunc("/api/auth/status", s.requireAuth(s.handleAuthStatus)).Methods(http.MethodGet)
 	r.HandleFunc("/api/auth/qr/start", s.requireAuth(s.handleAuthQRStart)).Methods(http.MethodPost)
 	r.HandleFunc("/api/auth/qr/poll", s.requireAuth(s.handleAuthQRPoll)).Methods(http.MethodGet)
@@ -170,6 +170,9 @@ func (s *WebServer) Handler() http.Handler {
 	r.HandleFunc("/api/auth/phone/verify_code", s.requireAuth(s.handleAuthVerifyPhoneCode)).Methods(http.MethodPost)
 	r.HandleFunc("/api/auth/2fa/verify", s.requireAuth(s.handleAuthVerify2FA)).Methods(http.MethodPost)
 	r.HandleFunc("/api/auth/logout", s.requireAuth(s.handleAuthLogoutTelegram)).Methods(http.MethodPost)
+	r.HandleFunc("/api/accounts", s.requireAuth(s.handleGetAccounts)).Methods(http.MethodGet)
+	r.HandleFunc("/api/accounts/switch", s.requireAuth(s.handleSwitchAccount)).Methods(http.MethodPost)
+	r.HandleFunc("/api/accounts/delete", s.requireAuth(s.handleDeleteAccount)).Methods(http.MethodPost)
 
 	// Web Dashboard
 	r.HandleFunc("/", s.requireAuth(s.handleIndex)).Methods(http.MethodGet, http.MethodHead)
@@ -1058,7 +1061,14 @@ func (s *WebServer) handleAuthQRStart(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "auth wizard not initialized")
 		return
 	}
-	resp, err := s.authWizard.StartQR(r.Context())
+	var req struct {
+		Namespace string `json:"namespace"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	if req.Namespace == "" {
+		req.Namespace = r.URL.Query().Get("namespace")
+	}
+	resp, err := s.authWizard.StartQR(r.Context(), req.Namespace)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -1085,13 +1095,14 @@ func (s *WebServer) handleAuthSendPhoneCode(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	var req struct {
-		Phone string `json:"phone"`
+		Phone     string `json:"phone"`
+		Namespace string `json:"namespace"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Phone == "" {
 		writeError(w, http.StatusBadRequest, "invalid phone number")
 		return
 	}
-	resp, err := s.authWizard.SendPhoneCode(r.Context(), req.Phone)
+	resp, err := s.authWizard.SendPhoneCode(r.Context(), req.Phone, req.Namespace)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -1149,4 +1160,66 @@ func (s *WebServer) handleAuthLogoutTelegram(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "logged out successfully"})
+}
+
+func (s *WebServer) handleGetAccounts(w http.ResponseWriter, r *http.Request) {
+	if s.db == nil {
+		writeError(w, http.StatusInternalServerError, "database not initialized")
+		return
+	}
+	accounts, err := s.db.GetAccounts()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":       true,
+		"accounts": accounts,
+	})
+}
+
+func (s *WebServer) handleSwitchAccount(w http.ResponseWriter, r *http.Request) {
+	if s.authWizard == nil {
+		writeError(w, http.StatusInternalServerError, "auth wizard not initialized")
+		return
+	}
+	var req struct {
+		Namespace string `json:"namespace"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Namespace == "" {
+		writeError(w, http.StatusBadRequest, "invalid namespace")
+		return
+	}
+	if err := s.authWizard.SwitchAccount(r.Context(), req.Namespace); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":        true,
+		"message":   "switched active account successfully",
+		"namespace": req.Namespace,
+	})
+}
+
+func (s *WebServer) handleDeleteAccount(w http.ResponseWriter, r *http.Request) {
+	if s.authWizard == nil {
+		writeError(w, http.StatusInternalServerError, "auth wizard not initialized")
+		return
+	}
+	var req struct {
+		Namespace string `json:"namespace"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Namespace == "" {
+		writeError(w, http.StatusBadRequest, "invalid namespace")
+		return
+	}
+	if err := s.authWizard.DeleteAccount(r.Context(), req.Namespace); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":        true,
+		"message":   "account deleted successfully",
+		"namespace": req.Namespace,
+	})
 }

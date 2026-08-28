@@ -20,27 +20,34 @@ import (
 )
 
 type AuthWizard struct {
+	db     *Database
 	client *telegram.Client
 	kv     storage.Storage
 	logger *zap.Logger
 
-	mu            sync.RWMutex
-	currentFlow   string // "idle", "qr", "phone"
-	qrToken       qrlogin.Token
-	qrCancel      context.CancelFunc
-	phone         string
-	phoneCodeHash string
-	need2FA       bool
-	lastError     string
-	isLoggedIn    bool
-	currentUser   *tg.User
+	mu               sync.RWMutex
+	currentNamespace string
+	currentFlow      string // "idle", "qr", "phone"
+	qrToken          qrlogin.Token
+	qrCancel         context.CancelFunc
+	phone            string
+	phoneCodeHash    string
+	need2FA          bool
+	lastError        string
+	isLoggedIn       bool
+	currentUser      *tg.User
 }
 
-func NewAuthWizard(client *telegram.Client, kv storage.Storage, logger *zap.Logger) *AuthWizard {
+func NewAuthWizard(db *Database, client *telegram.Client, kv storage.Storage, logger *zap.Logger, initialNamespace string) *AuthWizard {
+	if initialNamespace == "" {
+		initialNamespace = "default"
+	}
 	w := &AuthWizard{
-		client: client,
-		kv:     kv,
-		logger: logger,
+		db:               db,
+		client:           client,
+		kv:               kv,
+		logger:           logger,
+		currentNamespace: initialNamespace,
 	}
 	_ = w.CheckStatus(context.Background())
 	return w
@@ -61,6 +68,18 @@ func (w *AuthWizard) CheckStatus(ctx context.Context) error {
 		self, err := w.client.Self(ctx)
 		if err == nil {
 			w.currentUser = self
+			if w.db != nil {
+				_ = w.db.SaveAccount(TelegramAccount{
+					Namespace: w.currentNamespace,
+					UserID:    self.ID,
+					FirstName: self.FirstName,
+					LastName:  self.LastName,
+					Username:  self.Username,
+					Phone:     self.Phone,
+					IsPremium: self.Premium,
+					IsActive:  true,
+				})
+			}
 		}
 		return nil
 	}
@@ -75,11 +94,18 @@ func (w *AuthWizard) Status(ctx context.Context) map[string]any {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
 
+	var accounts []TelegramAccount
+	if w.db != nil {
+		accounts, _ = w.db.GetAccounts()
+	}
+
 	resp := map[string]any{
-		"logged_in": w.isLoggedIn,
-		"flow":      w.currentFlow,
-		"need_2fa":  w.need2FA,
-		"error":     w.lastError,
+		"logged_in":         w.isLoggedIn,
+		"current_namespace": w.currentNamespace,
+		"flow":              w.currentFlow,
+		"need_2fa":          w.need2FA,
+		"error":             w.lastError,
+		"accounts":          accounts,
 	}
 
 	if w.currentUser != nil {
@@ -89,18 +115,57 @@ func (w *AuthWizard) Status(ctx context.Context) map[string]any {
 			"last_name":  w.currentUser.LastName,
 			"username":   w.currentUser.Username,
 			"phone":      w.currentUser.Phone,
+			"is_premium": w.currentUser.Premium,
 		}
 	}
 	return resp
 }
 
+func (w *AuthWizard) SetTargetNamespace(ns string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if ns != "" {
+		w.currentNamespace = ns
+	}
+}
+
+func (w *AuthWizard) SwitchAccount(ctx context.Context, namespace string) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.db == nil {
+		return errors.New("database not available")
+	}
+
+	if err := w.db.SetActiveAccount(namespace); err != nil {
+		return err
+	}
+	w.currentNamespace = namespace
+	return nil
+}
+
+func (w *AuthWizard) DeleteAccount(ctx context.Context, namespace string) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.db == nil {
+		return errors.New("database not available")
+	}
+
+	return w.db.DeleteAccount(namespace)
+}
+
 // StartQR generates a new QR code token and returns the Base64 PNG image.
-func (w *AuthWizard) StartQR(ctx context.Context) (map[string]any, error) {
+func (w *AuthWizard) StartQR(ctx context.Context, targetNamespace string) (map[string]any, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
 	if w.client == nil {
 		return nil, errors.New("telegram client not initialized")
+	}
+
+	if targetNamespace != "" {
+		w.currentNamespace = targetNamespace
 	}
 
 	if w.qrCancel != nil {
@@ -130,6 +195,7 @@ func (w *AuthWizard) StartQR(ctx context.Context) (map[string]any, error) {
 
 	return map[string]any{
 		"ok":              true,
+		"namespace":       w.currentNamespace,
 		"qr_url":          token.URL(),
 		"qr_image_base64": b64Image,
 		"expires_in":      int(time.Until(token.Expires()).Seconds()),
@@ -158,7 +224,6 @@ func (w *AuthWizard) PollQR(ctx context.Context) (map[string]any, error) {
 			w.need2FA = true
 			return map[string]any{"status": "need_2fa", "message": "请输入两步验证 (2FA) 密码"}, nil
 		}
-		// Still waiting for scan
 		return map[string]any{"status": "waiting"}, nil
 	}
 
@@ -168,19 +233,35 @@ func (w *AuthWizard) PollQR(ctx context.Context) (map[string]any, error) {
 		w.need2FA = false
 		self, _ := w.client.Self(ctx)
 		w.currentUser = self
-		return map[string]any{"status": "success", "user": self}, nil
+		if w.db != nil && self != nil {
+			_ = w.db.SaveAccount(TelegramAccount{
+				Namespace: w.currentNamespace,
+				UserID:    self.ID,
+				FirstName: self.FirstName,
+				LastName:  self.LastName,
+				Username:  self.Username,
+				Phone:     self.Phone,
+				IsPremium: self.Premium,
+				IsActive:  true,
+			})
+		}
+		return map[string]any{"status": "success", "user": self, "namespace": w.currentNamespace}, nil
 	}
 
 	return map[string]any{"status": "waiting"}, nil
 }
 
 // SendPhoneCode requests Telegram to send an SMS/App authentication code to the phone number.
-func (w *AuthWizard) SendPhoneCode(ctx context.Context, phone string) (map[string]any, error) {
+func (w *AuthWizard) SendPhoneCode(ctx context.Context, phone, targetNamespace string) (map[string]any, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
 	if w.client == nil {
 		return nil, errors.New("telegram client not initialized")
+	}
+
+	if targetNamespace != "" {
+		w.currentNamespace = targetNamespace
 	}
 
 	sentCode, err := w.client.Auth().SendCode(ctx, phone, auth.SendCodeOptions{})
@@ -194,12 +275,23 @@ func (w *AuthWizard) SendPhoneCode(ctx context.Context, phone string) (map[strin
 	case *tg.AuthSentCode:
 		codeHash = s.PhoneCodeHash
 	case *tg.AuthSentCodeSuccess:
-		// Automatically logged in
 		w.isLoggedIn = true
 		w.currentFlow = "idle"
 		self, _ := w.client.Self(ctx)
 		w.currentUser = self
-		return map[string]any{"ok": true, "status": "success", "user": self}, nil
+		if w.db != nil && self != nil {
+			_ = w.db.SaveAccount(TelegramAccount{
+				Namespace: w.currentNamespace,
+				UserID:    self.ID,
+				FirstName: self.FirstName,
+				LastName:  self.LastName,
+				Username:  self.Username,
+				Phone:     self.Phone,
+				IsPremium: self.Premium,
+				IsActive:  true,
+			})
+		}
+		return map[string]any{"ok": true, "status": "success", "user": self, "namespace": w.currentNamespace}, nil
 	}
 
 	w.phone = phone
@@ -211,6 +303,7 @@ func (w *AuthWizard) SendPhoneCode(ctx context.Context, phone string) (map[strin
 	return map[string]any{
 		"ok":              true,
 		"status":          "code_sent",
+		"namespace":       w.currentNamespace,
 		"phone":           phone,
 		"phone_code_hash": codeHash,
 	}, nil
@@ -241,7 +334,20 @@ func (w *AuthWizard) VerifyPhoneCode(ctx context.Context, code string) (map[stri
 	self, _ := w.client.Self(ctx)
 	w.currentUser = self
 
-	return map[string]any{"status": "success", "user": self}, nil
+	if w.db != nil && self != nil {
+		_ = w.db.SaveAccount(TelegramAccount{
+			Namespace: w.currentNamespace,
+			UserID:    self.ID,
+			FirstName: self.FirstName,
+			LastName:  self.LastName,
+			Username:  self.Username,
+			Phone:     self.Phone,
+			IsPremium: self.Premium,
+			IsActive:  true,
+		})
+	}
+
+	return map[string]any{"status": "success", "user": self, "namespace": w.currentNamespace}, nil
 }
 
 // Verify2FA verifies the 2-step verification (Cloud Password) using SRP.
@@ -265,7 +371,20 @@ func (w *AuthWizard) Verify2FA(ctx context.Context, password string) (map[string
 	self, _ := w.client.Self(ctx)
 	w.currentUser = self
 
-	return map[string]any{"status": "success", "user": self}, nil
+	if w.db != nil && self != nil {
+		_ = w.db.SaveAccount(TelegramAccount{
+			Namespace: w.currentNamespace,
+			UserID:    self.ID,
+			FirstName: self.FirstName,
+			LastName:  self.LastName,
+			Username:  self.Username,
+			Phone:     self.Phone,
+			IsPremium: self.Premium,
+			IsActive:  true,
+		})
+	}
+
+	return map[string]any{"status": "success", "user": self, "namespace": w.currentNamespace}, nil
 }
 
 // Logout clears the Telegram session.
@@ -275,6 +394,9 @@ func (w *AuthWizard) Logout(ctx context.Context) error {
 
 	if w.client != nil {
 		_, _ = w.client.API().AuthLogOut(ctx)
+	}
+	if w.db != nil {
+		_ = w.db.DeleteAccount(w.currentNamespace)
 	}
 	w.isLoggedIn = false
 	w.currentUser = nil

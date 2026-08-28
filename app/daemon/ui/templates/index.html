@@ -295,17 +295,20 @@
         </div>
         <button type="button" class="modal-close" id="btn_close_tg_auth">&times;</button>
       </div>
-      <div class="modal-body" style="padding-top: 10px;">
-        <!-- Already Logged In View -->
-        <div id="tg_auth_logged_in_view" style="display: none; text-align: center; padding: 20px 0;">
-          <div style="font-size: 42px; margin-bottom: 10px;">✅</div>
-          <div style="font-size: 16px; font-weight: 600; color: var(--apple-text); margin-bottom: 4px;" id="tg_logged_in_name">已授权账号</div>
-          <div style="font-size: 13px; color: var(--apple-text-secondary); margin-bottom: 20px;" id="tg_logged_in_user_info">ID: ...</div>
-          <button type="button" class="apple-btn apple-btn-secondary" id="btn_tg_logout" style="color: #ff3b30; border-color: rgba(255,59,48,0.2);">退出登录并切换账号</button>
+        <!-- Multi-Account Management List View -->
+        <div id="tg_accounts_list_view" style="display: none;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+            <span style="font-size: 13px; font-weight: 600; color: var(--apple-text);">已授权账号列表</span>
+            <button type="button" class="apple-btn apple-btn-primary" id="btn_open_add_account" style="font-size: 12px; padding: 4px 10px;">+ 添加新账号</button>
+          </div>
+          <div id="tg_accounts_container" style="display: flex; flex-direction: column; gap: 8px; max-height: 280px; overflow-y: auto; margin-bottom: 12px;">
+            <!-- Rendered dynamically -->
+          </div>
         </div>
 
         <!-- Login Form View -->
         <div id="tg_auth_form_view">
+          <button type="button" class="apple-btn apple-btn-secondary" id="btn_back_to_accounts" style="margin-bottom: 12px; font-size: 12px; padding: 4px 10px; display: none;">⬅ 返回账号列表</button>
           <!-- Segmented Tab for Login Mode -->
           <div style="display: flex; gap: 8px; margin-bottom: 20px; background: rgba(120, 120, 128, 0.08); padding: 4px; border-radius: 10px;">
             <button type="button" id="tab_auth_qr" class="apple-btn" style="flex: 1; border: none; font-size: 13px; font-weight: 600; padding: 6px 0; border-radius: 8px; background: white; box-shadow: 0 1px 3px rgba(0,0,0,0.1); color: var(--apple-text);">📱 扫码登录 (推荐)</button>
@@ -383,10 +386,98 @@
       setInterval(update_system_storage, 15000);
 
       // ==========================================
-      // Telegram Web Auth Wizard Controller
+      // Telegram Web Auth Wizard & Multi-Account Controller
       // ==========================================
       var qr_poll_timer = null;
       var current_phone_hash = "";
+      var current_target_ns = "";
+      var saved_accounts_list = [];
+
+      function render_accounts_list(accounts) {
+        saved_accounts_list = accounts || [];
+        var container = $("#tg_accounts_container");
+        container.empty();
+
+        if (saved_accounts_list.length === 0) {
+          $("#tg_accounts_list_view").hide();
+          $("#tg_auth_form_view").show();
+          $("#btn_back_to_accounts").hide();
+          return;
+        }
+
+        $("#tg_accounts_list_view").show();
+        $("#tg_auth_form_view").hide();
+        $("#btn_back_to_accounts").show();
+
+        for (var i = 0; i < saved_accounts_list.length; i++) {
+          var a = saved_accounts_list[i];
+          var displayName = a.first_name || a.username || ('ID: ' + a.user_id);
+          if (a.last_name) displayName += ' ' + a.last_name;
+          var initial = (a.first_name || a.username || 'TG').charAt(0).toUpperCase();
+
+          var itemHtml = '<div style="display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; background: rgba(0,0,0,0.02); border: 1px solid ' + (a.is_active ? '#34c759' : 'rgba(0,0,0,0.08)') + '; border-radius: 12px;">' +
+            '<div style="display: flex; align-items: center; gap: 10px;">' +
+              '<div style="width: 36px; height: 36px; border-radius: 50%; background: ' + (a.is_active ? '#34c759' : '#8e8e93') + '; color: white; display: flex; align-items: center; justify-content: center; font-weight: 600; font-size: 15px;">' + initial + '</div>' +
+              '<div>' +
+                '<div style="font-size: 13.5px; font-weight: 600; color: var(--apple-text); display: flex; align-items: center; gap: 6px;">' +
+                  escape_html(displayName) +
+                  (a.is_premium ? '<span style="font-size: 10px; padding: 1px 5px; border-radius: 4px; background: #ff9500; color: white; font-weight: bold;">⭐ Premium</span>' : '') +
+                  (a.is_active ? '<span style="font-size: 10.5px; padding: 1px 6px; border-radius: 6px; background: rgba(52,199,89,0.15); color: #34c759; font-weight: 500;">🟢 当前活动</span>' : '') +
+                '</div>' +
+                '<div style="font-size: 11.5px; color: var(--apple-text-secondary);">' +
+                  '@' + (a.username || '无') + ' · ' + (a.phone || '隐藏') +
+                '</div>' +
+              '</div>' +
+            '</div>' +
+            '<div style="display: flex; gap: 6px;">' +
+              (!a.is_active ? '<button type="button" class="apple-btn apple-btn-secondary btn-switch-acc" data-ns="' + a.namespace + '" style="font-size: 11.5px; padding: 3px 8px;">切换</button>' : '') +
+              '<button type="button" class="apple-btn apple-btn-secondary btn-del-acc" data-ns="' + a.namespace + '" style="font-size: 11.5px; padding: 3px 8px; color: #ff3b30;" title="删除账号授权">✕</button>' +
+            '</div>' +
+          '</div>';
+
+          container.append(itemHtml);
+        }
+
+        // Wire Switch Button
+        $(".btn-switch-acc").click(function () {
+          var ns = $(this).attr("data-ns");
+          $.ajax({
+            url: "api/accounts/switch",
+            type: "post",
+            contentType: "application/json",
+            data: JSON.stringify({ namespace: ns }),
+            dataType: "json",
+            success: function () {
+              layer.msg("🎉 账号切换成功！", { icon: 1 });
+              close_tg_auth_modal();
+              check_tg_auth_status(false);
+              setTimeout(function () { location.reload(); }, 600);
+            },
+            error: function (xhr) {
+              layer.msg("切换失败: " + xhr.responseText, { icon: 2 });
+            }
+          });
+        });
+
+        // Wire Delete Button
+        $(".btn-del-acc").click(function () {
+          var ns = $(this).attr("data-ns");
+          layer.confirm("确定要删除该账号的登录授权吗？", { icon: 3, title: "确认删除" }, function (idx) {
+            layer.close(idx);
+            $.ajax({
+              url: "api/accounts/delete",
+              type: "post",
+              contentType: "application/json",
+              data: JSON.stringify({ namespace: ns }),
+              dataType: "json",
+              success: function () {
+                layer.msg("已删除账号", { icon: 1 });
+                check_tg_auth_status(false);
+              }
+            });
+          });
+        });
+      }
 
       function check_tg_auth_status(auto_open_if_unauthorized) {
         $.ajax({
@@ -394,20 +485,17 @@
           type: "get",
           dataType: "json",
           success: function (res) {
+            var accounts = res.accounts || [];
             if (res && res.logged_in) {
               var user = res.user || {};
               var name = user.first_name || user.username || ('ID: ' + user.id);
-              $("#tg_auth_label").html('👤 ' + escape_html(name));
+              $("#tg_auth_label").html('👤 ' + escape_html(name) + (accounts.length > 1 ? ' (' + accounts.length + ')' : ''));
               $("#tg_auth_pill").css({ background: 'rgba(52, 199, 89, 0.08)', color: '#34c759', borderColor: 'rgba(52, 199, 89, 0.2)' });
-              $("#tg_auth_logged_in_view").show();
-              $("#tg_auth_form_view").hide();
-              $("#tg_logged_in_name").text('已授权: ' + name);
-              $("#tg_logged_in_user_info").text('Username: @' + (user.username || '无') + ' · Phone: ' + (user.phone || '隐藏'));
+              render_accounts_list(accounts);
             } else {
               $("#tg_auth_label").html('⚠️ Telegram 未登录');
               $("#tg_auth_pill").css({ background: 'rgba(255, 149, 0, 0.1)', color: '#ff9500', borderColor: 'rgba(255, 149, 0, 0.3)' });
-              $("#tg_auth_logged_in_view").hide();
-              $("#tg_auth_form_view").show();
+              render_accounts_list(accounts);
               if (auto_open_if_unauthorized) {
                 open_tg_auth_modal();
               }
@@ -445,6 +533,8 @@
         $.ajax({
           url: "api/auth/qr/start",
           type: "post",
+          contentType: "application/json",
+          data: JSON.stringify({ namespace: current_target_ns }),
           dataType: "json",
           success: function (res) {
             $("#qr_spinner").hide();
@@ -461,6 +551,19 @@
           }
         });
       }
+
+      $("#btn_open_add_account").click(function () {
+        current_target_ns = "acc_" + Date.now();
+        $("#tg_accounts_list_view").hide();
+        $("#tg_auth_form_view").show();
+        start_qr_login();
+      });
+
+      $("#btn_back_to_accounts").click(function () {
+        $("#tg_auth_form_view").hide();
+        $("#tg_accounts_list_view").show();
+        stop_qr_poll();
+      });
 
       function poll_qr_status() {
         $.ajax({
@@ -557,7 +660,7 @@
           url: "api/auth/phone/send_code",
           type: "post",
           contentType: "application/json",
-          data: JSON.stringify({ phone: phone }),
+          data: JSON.stringify({ phone: phone, namespace: current_target_ns }),
           dataType: "json",
           success: function (res) {
             btn.prop("disabled", false).text("重新获取");
