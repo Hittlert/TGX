@@ -212,12 +212,18 @@ func Run(ctx context.Context, client *telegram.Client, kvd storage.Storage, opts
 	})
 	group.Go(func() error {
 		<-groupCtx.Done()
+		if orchestrator != nil {
+			orchestrator.SetRunning(false)
+		}
+		// Graceful drain: wait 1.5s for active SBE checkpoints to flush
+		time.Sleep(1500 * time.Millisecond)
+
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		return server.Shutdown(shutdownCtx)
 	})
 
-	logctx.From(ctx).Info("TDL download daemon started",
+	logctx.From(ctx).Info("TGX download daemon started",
 		zap.String("listen", opts.Listen),
 		zap.Int("file_concurrency", opts.FileConcurrency),
 		zap.Int("threads", opts.Threads),

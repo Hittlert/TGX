@@ -17,8 +17,12 @@
         <div class="apple-brand">
           <span class="apple-brand-icon">⚡</span>
           <span class="apple-brand-title">TGX <span style="font-size: 11px; opacity: 0.6; font-weight: normal; margin-left: 4px;">SBE v4.1</span></span>
+          <canvas id="speed_sparkline" width="80" height="20" style="margin-left: 8px; border-radius: 4px; vertical-align: middle; display: inline-block;" title="实时网络吞吐波动"></canvas>
         </div>
         <div class="apple-nav-actions">
+          <div class="apple-disk-pill" id="storage_pill" style="display: inline-flex; align-items: center; gap: 4px; font-size: 11.5px; padding: 4px 10px; border-radius: 12px; background: rgba(0, 122, 255, 0.08); color: #007aff; border: 1px solid rgba(0, 122, 255, 0.2); font-weight: 500;" title="NAS 存储可用空间">
+            💾 <span id="storage_free_label">计算中...</span>
+          </div>
           <button type="button" class="apple-status-pill" id="download_state" data-value="{{ download_state }}" onclick="download_state_change(this)">
             <span class="status-dot"></span>
             <span class="status-label">{{ download_state }}</span>
@@ -296,6 +300,10 @@
           $("#app_version").html(result);
         }
       });
+
+      // System Storage
+      update_system_storage();
+      setInterval(update_system_storage, 15000);
 
       // Pause/Resume state
       window.download_state_change = function (e) {
@@ -1143,6 +1151,54 @@
         });
       }
 
+      var speed_history = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+      function draw_speed_sparkline(val) {
+        speed_history.push(val);
+        if (speed_history.length > 20) speed_history.shift();
+        var canvas = document.getElementById('speed_sparkline');
+        if (!canvas) return;
+        var ctx = canvas.getContext('2d');
+        var w = canvas.width;
+        var h = canvas.height;
+        ctx.clearRect(0, 0, w, h);
+
+        var max = 1024 * 1024 * 5; // At least 5MB/s scale
+        for (var i = 0; i < speed_history.length; i++) {
+          if (speed_history[i] > max) max = speed_history[i];
+        }
+
+        ctx.beginPath();
+        var step = w / (speed_history.length - 1);
+        for (var i = 0; i < speed_history.length; i++) {
+          var x = i * step;
+          var y = h - (speed_history[i] / max) * (h - 4) - 2;
+          if (i === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        }
+        ctx.strokeStyle = '#007aff';
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+
+        ctx.lineTo(w, h);
+        ctx.lineTo(0, h);
+        ctx.fillStyle = 'rgba(0, 122, 255, 0.12)';
+        ctx.fill();
+      }
+
+      function update_system_storage() {
+        $.ajax({
+          url: "api/system/storage",
+          type: "get",
+          dataType: "json",
+          success: function (res) {
+            if (res && res.ok) {
+              $("#storage_free_label").text(res.free_human + ' 可用 / ' + res.total_human);
+              $("#storage_pill").attr('title', '存储分区: ' + res.path + ' (已用 ' + res.percent_used + ')');
+            }
+          }
+        });
+      }
+
       function update_download_status() {
         $.ajax({
           url: "get_download_status",
@@ -1151,6 +1207,7 @@
           success: function (result) {
             var speedStr = result.download_speed || '0.00 B/s';
             $("#download_speed_title").html(speedStr);
+            draw_speed_sparkline(result.speed_bps || 0);
 
             var pool = result.media_pool || {};
             var sp = result.slot_pool || {};

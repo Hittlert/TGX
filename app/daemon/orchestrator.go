@@ -12,6 +12,7 @@ import (
 	"github.com/flytam/filenamify"
 	"go.uber.org/zap"
 
+	atomic "github.com/Hittlert/TGX/pkg/sbe/atomic"
 	"github.com/Hittlert/TGX/pkg/texpr"
 )
 
@@ -72,6 +73,13 @@ func (o *Orchestrator) metricsLoop(ctx context.Context) {
 			}
 		}
 	}
+}
+
+func (o *Orchestrator) OutputDir() string {
+	if o == nil {
+		return "."
+	}
+	return o.saveDir
 }
 
 func (o *Orchestrator) IsRunning() bool {
@@ -256,8 +264,20 @@ func (o *Orchestrator) dispatchOneRecord(ctx context.Context, record DownloadRec
 	go func() {
 		defer o.inFlight.Delete(taskID)
 
+		// Disk Guard: ensure at least 5GB or file size + 500MB is free
+		freeSpace, _, err := atomic.GetDiskSpace(o.saveDir)
+		if err == nil && (freeSpace < 5*1024*1024*1024 || (record.FileSize > 0 && freeSpace < uint64(record.FileSize)+500*1024*1024)) {
+			o.logger.Warn("⚠️ [Disk Guard] Insufficient disk space, postponing task",
+				zap.String("task_id", taskID),
+				zap.Uint64("free_bytes", freeSpace),
+				zap.Int64("required_bytes", record.FileSize),
+			)
+			_ = o.db.UpdateDownloadStatus(record.ChatID, record.MessageID, "pending", record.FileName, "", record.MediaType, record.FileSize, "disk space below safe threshold")
+			return
+		}
+
 		// Acquire slot
-		_, err := o.slotPool.Acquire(ctx, taskID, record.FileSize)
+		_, err = o.slotPool.Acquire(ctx, taskID, record.FileSize)
 		if err != nil {
 			return
 		}

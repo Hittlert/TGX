@@ -11,16 +11,10 @@ type DirectProvider struct {
 	dialer *net.Dialer
 }
 
-// NewDirectProvider creates a new direct connection provider.
+// NewDirectProvider creates a new direct connection provider with socket tuning.
 func NewDirectProvider(timeout time.Duration) *DirectProvider {
-	if timeout <= 0 {
-		timeout = 30 * time.Second
-	}
 	return &DirectProvider{
-		dialer: &net.Dialer{
-			Timeout:   timeout,
-			KeepAlive: 30 * time.Second,
-		},
+		dialer: NewTunedDialer(timeout),
 	}
 }
 

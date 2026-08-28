@@ -18,6 +18,8 @@ import (
 
 	"github.com/gorilla/mux"
 	"go.uber.org/zap"
+
+	atomic "github.com/Hittlert/TGX/pkg/sbe/atomic"
 )
 
 //go:embed ui/*
@@ -78,6 +80,37 @@ func (s *WebServer) Handler() http.Handler {
 	// Daemon Status & Tasks
 	r.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, s.registry.Status())
+	}).Methods(http.MethodGet)
+
+	r.HandleFunc("/api/system/storage", func(w http.ResponseWriter, r *http.Request) {
+		path := "."
+		if s.orchestrator != nil {
+			path = s.orchestrator.OutputDir()
+		}
+		freeBytes, totalBytes, err := atomic.GetDiskSpace(path)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		usedBytes := uint64(0)
+		if totalBytes > freeBytes {
+			usedBytes = totalBytes - freeBytes
+		}
+		percent := 0.0
+		if totalBytes > 0 {
+			percent = float64(usedBytes) / float64(totalBytes) * 100
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":           true,
+			"path":         path,
+			"free_bytes":   freeBytes,
+			"total_bytes":  totalBytes,
+			"used_bytes":   usedBytes,
+			"free_human":   formatBytes(int64(freeBytes)),
+			"total_human":  formatBytes(int64(totalBytes)),
+			"used_human":   formatBytes(int64(usedBytes)),
+			"percent_used": fmt.Sprintf("%.1f%%", percent),
+		})
 	}).Methods(http.MethodGet)
 
 	r.HandleFunc("/api/tasks", func(w http.ResponseWriter, r *http.Request) {
@@ -347,6 +380,7 @@ func (s *WebServer) handleGetDownloadStatus(w http.ResponseWriter, r *http.Reque
 
 	resp := map[string]any{
 		"download_speed": speedStr,
+		"speed_bps":      speedBytes,
 		"download_state": state,
 		"slot_pool": map[string]any{
 			"total_slots":         snap.TotalSlots,

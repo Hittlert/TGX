@@ -12,6 +12,7 @@ import (
 
 	"github.com/Hittlert/TGX/pkg/sbe/lease"
 	"github.com/Hittlert/TGX/pkg/sbe/meta"
+	atomicHelper "github.com/Hittlert/TGX/pkg/sbe/atomic"
 	"github.com/bits-and-blooms/bitset"
 )
 
@@ -100,6 +101,7 @@ func NewFileCoordinator(cfg Config) (*FileCoordinator, *meta.MetaRecoverResult, 
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to open part file %s: %w", partPath, err)
 	}
+	_ = atomicHelper.Preallocate(partFile, cfg.TotalSize)
 
 	// 2. Open / create .meta file
 	metaH := &meta.MetaHeader{
