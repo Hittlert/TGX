@@ -160,7 +160,13 @@ func Run(ctx context.Context, client *telegram.Client, kvd storage.Storage, opts
 		}
 	}
 
-	slotPool := NewGlobalSlotPool(DefaultSlotPoolConfig())
+	slotCfg := SlotPoolConfig{
+		TotalSlots:      max(256, opts.PoolSize*8),
+		MaxActiveFiles:  max(64, opts.FileConcurrency),
+		SlotUnitMB:      2,
+		MaxSlotsPerFile: max(16, opts.Threads*2),
+	}
+	slotPool := NewGlobalSlotPool(slotCfg)
 	statsFile := ""
 	if opts.DBPath != "" {
 		statsFile = filepath.Join(filepath.Dir(opts.DBPath), "proxy_stats.json")

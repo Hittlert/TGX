@@ -234,8 +234,8 @@ func (o *Orchestrator) dispatchLoop(ctx context.Context) {
 		if needCount < 1 {
 			needCount = 1
 		}
-		if needCount > 16 {
-			needCount = 16
+		if needCount > snapshot.MaxActiveFiles {
+			needCount = snapshot.MaxActiveFiles
 		}
 
 		records, err := o.db.GetPendingDownloads(needCount * 2)
