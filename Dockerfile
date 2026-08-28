@@ -1,5 +1,5 @@
-# https://www.docker.com/blog/faster-multi-platform-builds-dockerfile-cross-compilation-guide/
-FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS builder
+# Multi-platform Docker build for TGX
+FROM --platform=$BUILDPLATFORM golang:1.24-alpine AS builder
 
 ARG VERSION="dev"
 ARG COMMIT="unknown"
