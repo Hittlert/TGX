@@ -138,8 +138,7 @@ go build -o tg-downloader .
 ├── pkg/               # 通用工具包 (位图、内存租赁池、存储、校验等)
 ├── docs/              # SBE v4.1 详细技术架构规范与演进文档
 ├── Dockerfile         # 生产级多阶段 Docker 构建镜像文件
-├── docker-compose.yaml.example # 生产环境 Docker Compose 部署模板
-└── config.yaml.example # 基础配置文件模板
+└── docker-compose.yaml.example # 生产环境 Docker Compose 部署模板
 ```
 
 ---

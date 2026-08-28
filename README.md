@@ -138,8 +138,7 @@ go build -o tg-downloader .
 ├── pkg/               # Reusable packages (bitmaps, memory leases, storage, utils)
 ├── docs/              # Comprehensive architectural & SBE v4.1 specifications
 ├── Dockerfile         # Production multi-stage Docker build
-├── docker-compose.yaml.example # Template Docker Compose file
-└── config.yaml.example # Template configuration file
+└── docker-compose.yaml.example # Template Docker Compose file
 ```
 
 ---
