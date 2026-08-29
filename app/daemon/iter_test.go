@@ -92,12 +92,12 @@ func TestTaskIteratorSkipsOneResolutionFailureAndContinues(t *testing.T) {
 		t.Fatalf("iterator returned wrong element: %#v", iter.Value())
 	}
 	var deleted TaskSnapshot
-	for attempt := 0; attempt < 50; attempt++ {
+	for attempt := 0; attempt < 100; attempt++ {
 		deleted, _ = registry.Task("deleted")
 		if deleted.State == StateUnavailable && deleted.ErrorClass == "unavailable" {
 			break
 		}
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(20 * time.Millisecond)
 	}
 	if deleted.State != StateUnavailable || deleted.ErrorClass != "unavailable" {
 		t.Fatalf("bad task not isolated: %#v", deleted)

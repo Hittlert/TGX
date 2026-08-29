@@ -351,7 +351,17 @@ func (d *Database) UpdateDownloadStatus(chatID string, messageID int, status str
 		if strings.Contains(lowerErr, "deleted") || strings.Contains(lowerErr, "unavailable") || strings.Contains(lowerErr, "message_id_invalid") {
 			nextRetryAt = now + 86400*7
 		} else {
-			nextRetryAt = now + 300
+			var attempts int
+			_ = d.db.QueryRow(`SELECT attempts FROM download_records WHERE chat_id = ? AND message_id = ?`, chatID, messageID).Scan(&attempts)
+			if attempts >= 3 {
+				nextRetryAt = now + 86400*7
+			} else {
+				backoff := int64(300 * (1 << attempts))
+				if backoff > 86400*7 {
+					backoff = 86400 * 7
+				}
+				nextRetryAt = now + backoff
+			}
 		}
 	}
 

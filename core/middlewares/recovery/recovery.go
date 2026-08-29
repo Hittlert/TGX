@@ -31,6 +31,11 @@ func (r *recovery) Handle(next tg.Invoker) telegram.InvokeFunc {
 	return func(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
 		log := logctx.From(r.ctx)
 
+		bo := backoff.NewExponentialBackOff()
+		bo.InitialInterval = 500 * time.Millisecond
+		bo.MaxInterval = 5 * time.Second
+		bo.MaxElapsedTime = 30 * time.Second
+
 		return backoff.RetryNotify(func() error {
 			if err := next.Invoke(ctx, input, output); err != nil {
 				if r.shouldRecover(ctx, err) {
@@ -41,7 +46,7 @@ func (r *recovery) Handle(next tg.Invoker) telegram.InvokeFunc {
 			}
 
 			return nil
-		}, r.backoff, func(err error, duration time.Duration) {
+		}, backoff.WithContext(bo, ctx), func(err error, duration time.Duration) {
 			log.Debug("Wait for connection recovery", zap.Error(err), zap.Duration("duration", duration))
 		})
 	}

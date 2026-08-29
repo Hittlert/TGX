@@ -48,6 +48,7 @@ func (d *Downloader) Download(ctx context.Context, limit int) error {
 			defer func() { d.opts.Progress.OnDone(elem, rerr) }()
 
 			if err := d.download(wgctx, elem); err != nil {
+				rerr = err
 				// canceled by user, so we directly return error to stop all
 				if errors.Is(err, context.Canceled) {
 					return errors.Wrap(err, "download")
@@ -85,9 +86,9 @@ func (d *Downloader) download(ctx context.Context, elem Elem) error {
 		return errors.New("file size is 0 or negative")
 	}
 
-	timeout := 60*time.Second + time.Duration(totalSize/(1024*1024))*time.Second
-	if timeout > 30*time.Minute {
-		timeout = 30 * time.Minute
+	timeout := 10*time.Minute + time.Duration(totalSize/(1024*1024))*5*time.Second
+	if timeout > 2*time.Hour {
+		timeout = 2 * time.Hour
 	}
 	dlCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -192,6 +193,12 @@ func (d *Downloader) download(ctx context.Context, elem Elem) error {
 							chunkData = uf.Bytes
 							break
 						}
+					} else {
+						logctx.From(gctx).Warn("UploadGetFile attempt failed",
+							zap.Int("part", job.index),
+							zap.Int64("offset", job.offset),
+							zap.Int("attempt", attempt+1),
+							zap.Error(fetchErr))
 					}
 					select {
 					case <-gctx.Done():

@@ -303,10 +303,10 @@ var threadsLevels = []struct {
 	threads int
 	size    int64
 }{
-	{2, 512 << 10},
-	{4, 2 << 20},
-	{8, 10 << 20},
-	{16, 50 << 20},
+	{1, 2 << 20},
+	{2, 10 << 20},
+	{4, 50 << 20},
+	{8, 200 << 20},
 }
 
 func BestThreads(size int64, max int) int {

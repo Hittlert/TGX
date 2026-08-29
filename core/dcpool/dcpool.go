@@ -80,7 +80,7 @@ func (p *pool) invoker(ctx context.Context, dc int) tg.Invoker {
 	if dc == p.current() { // can't transfer dc to current dc
 		invoker, err = p.api.Pool(p.size)
 	} else {
-		invoker, err = p.api.DC(ctx, dc, p.size)
+		invoker, err = p.api.DC(context.Background(), dc, p.size)
 	}
 
 	if err != nil {

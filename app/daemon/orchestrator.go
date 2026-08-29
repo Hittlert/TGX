@@ -355,8 +355,8 @@ func (o *Orchestrator) dispatchOneRecord(ctx context.Context, record DownloadRec
 				return
 			}
 
-			// Watchdog: If task is stuck in downloading or resolving for more than 2 minutes without any progress, mark failed and release slot
-			if time.Since(startTime) > 2*time.Minute && snapshot.Downloaded == 0 {
+			// Watchdog: If task is actively downloading for more than 5 minutes without any progress, mark failed
+			if time.Since(startTime) > 5*time.Minute && snapshot.State == StateDownloading && snapshot.Downloaded == 0 {
 				_ = o.db.UpdateDownloadStatus(record.ChatID, record.MessageID, "failed", record.FileName, finalRelPath, record.MediaType, record.FileSize, "download timeout / stalled connection")
 				return
 			}
