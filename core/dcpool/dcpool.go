@@ -2,8 +2,11 @@ package dcpool
 
 import (
 	"context"
+	"fmt"
 	"sync"
+	"time"
 
+	"github.com/gotd/td/bin"
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/tg"
 	"go.uber.org/multierr"
@@ -80,18 +83,29 @@ func (p *pool) invoker(ctx context.Context, dc int) tg.Invoker {
 	if dc == p.current() { // can't transfer dc to current dc
 		invoker, err = p.api.Pool(p.size)
 	} else {
-		invoker, err = p.api.DC(context.Background(), dc, p.size)
+		initCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		invoker, err = p.api.DC(initCtx, dc, p.size)
+		cancel()
 	}
 
 	if err != nil {
-		logctx.From(ctx).Error("create invoker", zap.Error(err))
-		return p.api // degraded
+		logctx.From(ctx).Error("create invoker", zap.Int("dc_id", dc), zap.Error(err))
+		return failedInvoker{dc: dc, err: err}
 	}
 
 	p.closes[dc] = invoker.Close
 	p.invokers[dc] = chainMiddlewares(invoker, p.middlewares...)
 
 	return p.invokers[dc]
+}
+
+type failedInvoker struct {
+	dc  int
+	err error
+}
+
+func (f failedInvoker) Invoke(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
+	return fmt.Errorf("DC %d connection failed: %w", f.dc, f.err)
 }
 
 func (p *pool) Default(ctx context.Context) *tg.Client {

@@ -53,6 +53,7 @@ func (writerAtDiscard) WriteAt(p []byte, _ int64) (int, error) { return len(p), 
 type fakeResolver struct {
 	mu      sync.Mutex
 	results []resolveResult
+	byID    map[string]resolveResult
 }
 
 type resolveResult struct {
@@ -63,6 +64,14 @@ type resolveResult struct {
 func (r *fakeResolver) Resolve(_ context.Context, task *Task) (taskElement, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.byID != nil {
+		if res, ok := r.byID[task.Request().ID]; ok {
+			if res.element != nil {
+				res.element.(*fakeElement).task = task
+			}
+			return res.element, res.err
+		}
+	}
 	if len(r.results) == 0 {
 		return nil, errors.New("no more fake results")
 	}
@@ -79,10 +88,12 @@ func TestTaskIteratorSkipsOneResolutionFailureAndContinues(t *testing.T) {
 	_, _, _ = registry.Submit(validRequest("deleted", 1))
 	_, _, _ = registry.Submit(validRequest("healthy", 2))
 	healthy := &fakeElement{file: fakeDownloadFile{size: 100, dc: 2}}
-	resolver := &fakeResolver{results: []resolveResult{
-		{err: NewTaskError("unavailable", true, errors.New("message deleted"))},
-		{element: healthy},
-	}}
+	resolver := &fakeResolver{
+		byID: map[string]resolveResult{
+			"deleted": {err: NewTaskError("unavailable", true, errors.New("message deleted"))},
+			"healthy": {element: healthy},
+		},
+	}
 	iter := newTaskIter(registry, resolver)
 
 	if !iter.Next(context.Background()) {

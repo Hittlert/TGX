@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -90,13 +91,18 @@ func (f telegramFile) Size() int64                         { return f.media.Size
 func (f telegramFile) DC() int                             { return f.media.DC }
 
 func classifyTelegramError(err error, operation string) error {
+	errStr := strings.ToLower(err.Error())
 	unavailable := errors.Is(err, tutil.ErrMessageDeleted) || tgerr.Is(err,
 		"CHANNEL_PRIVATE",
 		"CHAT_ADMIN_REQUIRED",
 		"USER_BANNED_IN_CHANNEL",
 		"PEER_ID_INVALID",
 		"MESSAGE_ID_INVALID",
-	)
+		"FILEREF_UPGRADE_NEEDED",
+		"FILE_REFERENCE_EXPIRED",
+		"FILE_REFERENCE_INVALID",
+		"FILE_ID_INVALID",
+	) || strings.Contains(errStr, "connection failed")
 	if unavailable {
 		return NewTaskError("unavailable", true, fmt.Errorf("%s: %w", operation, err))
 	}

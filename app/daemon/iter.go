@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 
 	"github.com/Hittlert/TGX/core/downloader"
@@ -129,10 +130,15 @@ func (p *taskProgress) OnDone(element downloader.Elem, transferErr error) {
 	if transferErr != nil {
 		_ = taskElement.Abort()
 		class := "transport"
+		unavailable := false
+		errStr := strings.ToLower(transferErr.Error())
 		if errors.Is(transferErr, context.Canceled) {
 			class = "canceled"
+		} else if strings.Contains(errStr, "connection failed") || strings.Contains(errStr, "file_reference") || strings.Contains(errStr, "fileref") || strings.Contains(errStr, "unavailable") {
+			class = "unavailable"
+			unavailable = true
 		}
-		task.Fail(class, transferErr.Error(), false)
+		task.Fail(class, transferErr.Error(), unavailable)
 		return
 	}
 	task.SetPublishing()
