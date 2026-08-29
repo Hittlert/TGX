@@ -7,6 +7,7 @@ import (
 
 	"github.com/go-faster/errors"
 	"github.com/gotd/td/tg"
+	"github.com/gotd/td/tgerr"
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
@@ -43,18 +44,19 @@ func (d *Downloader) Download(ctx context.Context, limit int) error {
 	for d.opts.Iter.Next(wgctx) {
 		elem := d.opts.Iter.Value()
 
-		wg.Go(func() (rerr error) {
+		wg.Go(func() error {
+			var transferErr error
 			d.opts.Progress.OnAdd(elem)
-			defer func() { d.opts.Progress.OnDone(elem, rerr) }()
+			defer func() { d.opts.Progress.OnDone(elem, transferErr) }()
 
 			if err := d.download(wgctx, elem); err != nil {
-				rerr = err
+				transferErr = err
 				// canceled by user, so we directly return error to stop all
 				if errors.Is(err, context.Canceled) {
 					return errors.Wrap(err, "download")
 				}
 
-				// don't return error, just log it
+				// don't return error to errgroup to keep other downloads running, just log it
 				logctx.
 					From(ctx).
 					Error("Download error",
@@ -113,6 +115,7 @@ func (d *Downloader) download(ctx context.Context, elem Elem) error {
 			client = d.opts.Pool.Takeout(dlCtx, elem.File().DC())
 		}
 		req := &tg.UploadGetFileRequest{
+			Precise:  true,
 			Location: elem.File().Location(),
 			Offset:   0,
 			Limit:    int(MaxPartSize),
@@ -124,6 +127,9 @@ func (d *Downloader) download(ctx context.Context, elem Elem) error {
 			res, fetchErr = client.UploadGetFile(chunkCtx, req)
 			chunkCancel()
 			if fetchErr == nil {
+				break
+			}
+			if tgerr.Is(fetchErr, "FILE_REFERENCE_EXPIRED", "FILEREF_UPGRADE_NEEDED", "FILE_REFERENCE_INVALID", "LOCATION_INVALID") {
 				break
 			}
 			time.Sleep(100 * time.Millisecond)
@@ -184,6 +190,7 @@ func (d *Downloader) download(ctx context.Context, elem Elem) error {
 				var fetchErr error
 				for attempt := 0; attempt < 5; attempt++ {
 					req := &tg.UploadGetFileRequest{
+						Precise:  true,
 						Location: elem.File().Location(),
 						Offset:   job.offset,
 						Limit:    job.limit,
@@ -203,6 +210,9 @@ func (d *Downloader) download(ctx context.Context, elem Elem) error {
 							zap.Int64("offset", job.offset),
 							zap.Int("attempt", attempt+1),
 							zap.Error(fetchErr))
+						if tgerr.Is(fetchErr, "FILE_REFERENCE_EXPIRED", "FILEREF_UPGRADE_NEEDED", "FILE_REFERENCE_INVALID", "LOCATION_INVALID") {
+							break
+						}
 					}
 					select {
 					case <-gctx.Done():

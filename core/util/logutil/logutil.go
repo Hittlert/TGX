@@ -1,6 +1,8 @@
 package logutil
 
 import (
+	"os"
+
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"gopkg.in/natefinch/lumberjack.v2"
@@ -16,7 +18,7 @@ func New(level zapcore.LevelEnabler, path string) *zap.Logger {
 		Compress:   true,
 	}
 
-	writer := zapcore.AddSync(rotate)
+	writer := zapcore.NewMultiWriteSyncer(zapcore.AddSync(rotate), zapcore.AddSync(os.Stdout))
 
 	config := zap.NewDevelopmentEncoderConfig()
 	config.EncodeTime = zapcore.TimeEncoderOfLayout("2006-01-02 15:04:05")
