@@ -9,6 +9,7 @@ import (
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/tg"
+	"github.com/gotd/td/tgerr"
 	"go.uber.org/multierr"
 	"go.uber.org/zap"
 
@@ -49,7 +50,6 @@ func NewPool(c *telegram.Client, size int64, middlewares ...telegram.Middleware)
 		middlewares: middlewares,
 		invokers:    make(map[int]tg.Invoker),
 		closes:      make(map[int]func() error),
-		takeout:     0,
 	}
 }
 
@@ -83,9 +83,23 @@ func (p *pool) invoker(ctx context.Context, dc int) tg.Invoker {
 	if dc == p.current() { // can't transfer dc to current dc
 		invoker, err = p.api.Pool(p.size)
 	} else {
-		initCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		invoker, err = p.api.DC(initCtx, dc, p.size)
-		cancel()
+		// Foreign DC: keep pool size compact (max 2) to prevent auth.exportAuthorization flood on primary DC
+		foreignPoolSize := int64(2)
+		if p.size > 0 && p.size < foreignPoolSize {
+			foreignPoolSize = p.size
+		}
+		for attempt := 0; attempt < 5; attempt++ {
+			invoker, err = p.api.DC(context.Background(), dc, foreignPoolSize)
+			if err == nil {
+				break
+			}
+			if d, isFlood := tgerr.AsFloodWait(err); isFlood {
+				logctx.From(ctx).Warn("DC transfer flood wait, backing off", zap.Int("dc", dc), zap.Duration("wait", d))
+				time.Sleep(d + 1*time.Second)
+				continue
+			}
+			time.Sleep(time.Duration(attempt+1) * 500 * time.Millisecond)
+		}
 	}
 
 	if err != nil {

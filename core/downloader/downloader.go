@@ -104,6 +104,9 @@ func (d *Downloader) download(ctx context.Context, elem Elem) error {
 	if threads > numParts {
 		threads = numParts
 	}
+	if elem.File().DC() != 0 && elem.File().DC() != 4 && threads > 2 {
+		threads = 2
+	}
 	if threads < 1 {
 		threads = 1
 	}
@@ -122,8 +125,8 @@ func (d *Downloader) download(ctx context.Context, elem Elem) error {
 		}
 		var res tg.UploadFileClass
 		var fetchErr error
-		for attempt := 0; attempt < 3; attempt++ {
-			chunkCtx, chunkCancel := context.WithTimeout(dlCtx, 20*time.Second)
+		for attempt := 0; attempt < 8; attempt++ {
+			chunkCtx, chunkCancel := context.WithTimeout(dlCtx, 45*time.Second)
 			res, fetchErr = client.UploadGetFile(chunkCtx, req)
 			chunkCancel()
 			if fetchErr == nil {
@@ -132,7 +135,16 @@ func (d *Downloader) download(ctx context.Context, elem Elem) error {
 			if tgerr.Is(fetchErr, "FILE_REFERENCE_EXPIRED", "FILEREF_UPGRADE_NEEDED", "FILE_REFERENCE_INVALID", "LOCATION_INVALID") {
 				break
 			}
-			time.Sleep(100 * time.Millisecond)
+			if d, isFlood := tgerr.AsFloodWait(fetchErr); isFlood {
+				logctx.From(dlCtx).Info("UploadGetFile single flood wait, backing off", zap.Duration("wait", d))
+				select {
+				case <-dlCtx.Done():
+					return dlCtx.Err()
+				case <-time.After(d + 1*time.Second):
+				}
+				continue
+			}
+			time.Sleep(time.Duration(attempt+1) * 300 * time.Millisecond)
 		}
 		if fetchErr != nil {
 			return errors.Wrap(fetchErr, "upload.getFile single")
@@ -188,14 +200,14 @@ func (d *Downloader) download(ctx context.Context, elem Elem) error {
 
 				var chunkData []byte
 				var fetchErr error
-				for attempt := 0; attempt < 5; attempt++ {
+				for attempt := 0; attempt < 8; attempt++ {
 					req := &tg.UploadGetFileRequest{
 						Precise:  true,
 						Location: elem.File().Location(),
 						Offset:   job.offset,
 						Limit:    job.limit,
 					}
-					chunkCtx, chunkCancel := context.WithTimeout(gctx, 20*time.Second)
+					chunkCtx, chunkCancel := context.WithTimeout(gctx, 45*time.Second)
 					var res tg.UploadFileClass
 					res, fetchErr = client.UploadGetFile(chunkCtx, req)
 					chunkCancel()
@@ -213,11 +225,22 @@ func (d *Downloader) download(ctx context.Context, elem Elem) error {
 						if tgerr.Is(fetchErr, "FILE_REFERENCE_EXPIRED", "FILEREF_UPGRADE_NEEDED", "FILE_REFERENCE_INVALID", "LOCATION_INVALID") {
 							break
 						}
+						if d, isFlood := tgerr.AsFloodWait(fetchErr); isFlood {
+							logctx.From(gctx).Info("UploadGetFile rate limit / flood wait, backing off",
+								zap.Int("part", job.index),
+								zap.Duration("flood_wait", d))
+							select {
+							case <-gctx.Done():
+								return gctx.Err()
+							case <-time.After(d + 1*time.Second):
+							}
+							continue
+						}
 					}
 					select {
 					case <-gctx.Done():
 						return gctx.Err()
-					case <-time.After(time.Duration(attempt+1) * 200 * time.Millisecond):
+					case <-time.After(time.Duration(attempt+1) * 300 * time.Millisecond):
 					}
 				}
 

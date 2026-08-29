@@ -92,7 +92,11 @@ func ParseMessageLink(ctx context.Context, manager *peers.Manager, s string) (pe
 }
 
 func GetInputPeer(ctx context.Context, manager *peers.Manager, from string) (peers.Peer, error) {
-	id, err := strconv.ParseInt(from, 10, 64)
+	cleanFrom := strings.TrimPrefix(from, "-100")
+	id, err := strconv.ParseInt(cleanFrom, 10, 64)
+	if err != nil {
+		id, err = strconv.ParseInt(from, 10, 64)
+	}
 	if err != nil {
 		// from is username
 		p, err := manager.Resolve(ctx, from)
