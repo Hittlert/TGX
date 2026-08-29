@@ -292,7 +292,11 @@ func (o *Orchestrator) dispatchOneRecord(ctx context.Context, record DownloadRec
 			safeFolder = record.ChatID
 		}
 		
-		yearMonth := time.Unix(record.CreatedAt, 0).Format("2006_01")
+		msgTime := record.CreatedAt
+		if msgTime <= 86400 {
+			msgTime = time.Now().Unix()
+		}
+		yearMonth := time.Unix(msgTime, 0).Format("2006_01")
 		rawName := record.FileName
 		if rawName == "" || strings.HasSuffix(rawName, ".bin") || strings.HasSuffix(rawName, ".unknown") {
 			ext := ".mp4"
