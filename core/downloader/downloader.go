@@ -131,7 +131,7 @@ func (d *Downloader) download(ctx context.Context, elem Elem) error {
 		var res tg.UploadFileClass
 		var fetchErr error
 		for attempt := 0; attempt < 8; attempt++ {
-			chunkCtx, chunkCancel := context.WithTimeout(dlCtx, 90*time.Second)
+			chunkCtx, chunkCancel := context.WithTimeout(dlCtx, 180*time.Second)
 			res, fetchErr = client.UploadGetFile(chunkCtx, req)
 			chunkCancel()
 			if fetchErr == nil {
@@ -212,7 +212,7 @@ func (d *Downloader) download(ctx context.Context, elem Elem) error {
 						Offset:   job.offset,
 						Limit:    job.limit,
 					}
-					chunkCtx, chunkCancel := context.WithTimeout(gctx, 90*time.Second)
+					chunkCtx, chunkCancel := context.WithTimeout(gctx, 180*time.Second)
 					var res tg.UploadFileClass
 					res, fetchErr = client.UploadGetFile(chunkCtx, req)
 					chunkCancel()
