@@ -23,11 +23,11 @@ services:
       - --terminal-limit
       - "2000"
       - --file-concurrency
-      - "64"
+      - "5"
       - --download-threads
-      - "16"
+      - "32"
       - --dc-pool-size
-      - "64"
+      - "32"
       - --start-paused=false
     volumes:
       - ./data:/data
