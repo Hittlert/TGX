@@ -40,6 +40,16 @@ func newTelegramMediaAccess(parentCtx context.Context, pool dcpool.Pool, manager
 }
 
 func (a *telegramMediaAccess) Resolve(ctx context.Context, peer string, messageID int) (ResolvedMedia, error) {
+	resolvedPeer, err := tutil.GetInputPeer(ctx, a.manager, peer)
+	if err != nil {
+		if syncErr := a.SyncPeers(ctx); syncErr == nil {
+			resolvedPeer, err = tutil.GetInputPeer(ctx, a.manager, peer)
+		}
+	}
+	if err != nil {
+		return ResolvedMedia{}, classifyTelegramError(err, "resolve peer")
+	}
+
 	if a.gate != nil {
 		if err := a.gate.AcquireControlSlot(ctx); err != nil {
 			return ResolvedMedia{}, err
@@ -47,27 +57,6 @@ func (a *telegramMediaAccess) Resolve(ctx context.Context, peer string, messageI
 		defer a.gate.ReleaseControlSlot()
 	}
 
-	resolvedPeer, err := tutil.GetInputPeer(ctx, a.manager, peer)
-	if err != nil {
-		// Release control slot BEFORE calling SyncPeers to prevent nested deadlock.
-		// SyncPeers will acquire its own slot internally.
-		if a.gate != nil {
-			a.gate.ReleaseControlSlot()
-		}
-		syncErr := a.syncPeersInternal(ctx)
-		// Re-acquire control slot for the remaining work in this function.
-		if a.gate != nil {
-			if acqErr := a.gate.AcquireControlSlot(ctx); acqErr != nil {
-				return ResolvedMedia{}, acqErr
-			}
-		}
-		if syncErr == nil {
-			resolvedPeer, err = tutil.GetInputPeer(ctx, a.manager, peer)
-		}
-	}
-	if err != nil {
-		return ResolvedMedia{}, classifyTelegramError(err, "resolve peer")
-	}
 	message, err := tutil.GetSingleMessage(ctx, a.pool.Default(ctx), resolvedPeer.InputPeer(), messageID)
 	if err != nil {
 		return ResolvedMedia{}, classifyTelegramError(err, "resolve message")
@@ -82,21 +71,7 @@ func (a *telegramMediaAccess) Resolve(ctx context.Context, peer string, messageI
 	}, nil
 }
 
-// SyncPeers is the public entry point that acquires a control slot then delegates.
 func (a *telegramMediaAccess) SyncPeers(ctx context.Context) error {
-	if a.gate != nil {
-		if err := a.gate.AcquireControlSlot(ctx); err != nil {
-			return err
-		}
-		defer a.gate.ReleaseControlSlot()
-	}
-	return a.syncPeersInternal(ctx)
-}
-
-// syncPeersInternal performs the actual peer sync WITHOUT acquiring a control slot.
-// Callers must ensure a control slot is held (or explicitly released before calling).
-func (a *telegramMediaAccess) syncPeersInternal(ctx context.Context) error {
-
 	a.syncMu.Lock()
 	if !a.lastSync.IsZero() && time.Since(a.lastSync) < 30*time.Second {
 		a.syncMu.Unlock()
@@ -111,6 +86,13 @@ func (a *telegramMediaAccess) syncPeersInternal(ctx context.Context) error {
 			return nil, nil
 		}
 		a.syncMu.Unlock()
+
+		if a.gate != nil {
+			if err := a.gate.AcquireControlSlot(a.parentCtx); err != nil {
+				return nil, err
+			}
+			defer a.gate.ReleaseControlSlot()
+		}
 
 		syncCtx, cancel := context.WithTimeout(a.parentCtx, a.syncTimeout)
 		defer cancel()

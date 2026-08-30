@@ -1,9 +1,11 @@
 package downloader
 
 import (
+	"bytes"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -222,10 +224,10 @@ type largeFileCursor struct {
 // 3. Large File Lane: 5 concurrent large files with 4-chunk in-flight guarantee -> 5 per-file chunk disk writers with sliding-window sequential offset writes.
 func (d *Downloader) Download(ctx context.Context, globalConcurrency int) error {
 	netWorkers := d.opts.Threads
-	if netWorkers <= 0 {
-		netWorkers = 32
+	if netWorkers < gate.MaxDataInFlight {
+		netWorkers = gate.MaxDataInFlight
 	}
-	if globalConcurrency > 0 && globalConcurrency < netWorkers {
+	if globalConcurrency > 0 && globalConcurrency > netWorkers {
 		netWorkers = globalConcurrency
 	}
 
@@ -716,9 +718,8 @@ func (d *Downloader) Download(ctx context.Context, globalConcurrency int) error 
 			atomic.StoreInt64(&d.queuedSmall, int64(len(smallReadyQueue)))
 
 			dispatchedCount := 0
-			reservedLargeSlots := int64(len(activeLargeFiles) * MinInflightPerLarge)
 
-			// D. Priority 1: Guarantee MinInflightPerLarge (4 active RPCs) per active large file within byte sliding window
+			// D. Priority 1: Guarantee MinInflightPerLarge (4 chunks) per active large file within byte sliding window
 			for _, fc := range activeLargeFiles {
 				if atomic.LoadInt32(&fc.state.canceled) == 1 {
 					continue
@@ -726,7 +727,7 @@ func (d *Downloader) Download(ctx context.Context, globalConcurrency int) error 
 
 				writtenOffset := atomic.LoadInt64(&fc.state.lastWrittenOffset)
 
-				for fc.nextPart < fc.totalParts && atomic.LoadInt32(&fc.state.activeRPC) < MinInflightPerLarge {
+				for fc.nextPart < fc.totalParts && atomic.LoadInt32(&fc.state.inflight) < MinInflightPerLarge {
 					currentOffset := int64(fc.nextPart) * fc.partSize
 					// Strict byte-based sliding window check: do not dispatch beyond 16 MiB ahead of writer
 					if currentOffset-writtenOffset > MaxLargeWindowBytes {
@@ -757,7 +758,7 @@ func (d *Downloader) Download(ctx context.Context, globalConcurrency int) error 
 						fc.nextPart++
 						dispatchedCount++
 					default:
-						goto SleepOrYield
+						break
 					}
 				}
 			}
@@ -805,8 +806,16 @@ func (d *Downloader) Download(ctx context.Context, globalConcurrency int) error 
 						fc.nextPart++
 						dispatchedCount++
 					default:
-						goto SleepOrYield
+						break
 					}
+				}
+			}
+
+			// Calculate actual in-flight / queued chunks for active large files
+			var largeInflightSum int64
+			for _, fc := range activeLargeFiles {
+				if atomic.LoadInt32(&fc.state.canceled) == 0 {
+					largeInflightSum += int64(atomic.LoadInt32(&fc.state.inflight))
 				}
 			}
 
@@ -815,7 +824,7 @@ func (d *Downloader) Download(ctx context.Context, globalConcurrency int) error 
 				currLargeRPC := atomic.LoadInt64(&d.activeLargeRPC)
 				currSmallRPC := atomic.LoadInt64(&d.activeSmallRPC)
 
-				if len(activeLargeFiles) > 0 && currSmallRPC >= (gate.MaxDataInFlight-reservedLargeSlots) {
+				if len(activeLargeFiles) > 0 && currSmallRPC >= (gate.MaxDataInFlight-largeInflightSum) {
 					break
 				}
 				if currLargeRPC+currSmallRPC >= gate.MaxDataInFlight {
@@ -835,11 +844,10 @@ func (d *Downloader) Download(ctx context.Context, globalConcurrency int) error 
 					dispatchedCount++
 				default:
 					smallBudget.release(nextSmall.totalSize)
-					goto SleepOrYield
+					break
 				}
 			}
 
-		SleepOrYield:
 			if dispatchedCount == 0 {
 				if largeChanClosed && smallChanClosed && len(activeLargeFiles) == 0 && len(largeReadyQueue) == 0 && len(smallReadyQueue) == 0 {
 					break
@@ -859,19 +867,34 @@ func (d *Downloader) Download(ctx context.Context, globalConcurrency int) error 
 	return g.Wait()
 }
 
-func handleCdnRedirect(ctx context.Context, client *tg.Client, redirect *tg.UploadFileCDNRedirect, offset int64, limit int) ([]byte, error) {
+func handleCdnRedirect(ctx context.Context, cdnClient *tg.Client, masterClient *tg.Client, redirect *tg.UploadFileCDNRedirect, offset int64, limit int) ([]byte, error) {
 	req := &tg.UploadGetCDNFileRequest{
 		FileToken: redirect.FileToken,
 		Offset:    offset,
 		Limit:     limit,
 	}
-	res, err := client.UploadGetCDNFile(ctx, req)
+	cdnCtx, cdnCancel := context.WithTimeout(gate.WithTokenPassed(ctx), 60*time.Second)
+	defer cdnCancel()
+
+	res, err := cdnClient.UploadGetCDNFile(cdnCtx, req)
 	if err != nil {
 		return nil, err
 	}
 	switch cdnRes := res.(type) {
 	case *tg.UploadCDNFile:
 		data := cdnRes.Bytes
+		// Verify SHA-256 if FileHashes provided by Telegram CDN
+		if len(redirect.FileHashes) > 0 {
+			for _, h := range redirect.FileHashes {
+				if h.Offset == offset {
+					sum := sha256.Sum256(data)
+					if !bytes.Equal(sum[:], h.Hash) {
+						return nil, fmt.Errorf("CDN chunk SHA256 checksum mismatch at offset %d", offset)
+					}
+					break
+				}
+			}
+		}
 		if len(redirect.EncryptionKey) > 0 && len(redirect.EncryptionIv) > 0 {
 			block, err := aes.NewCipher(redirect.EncryptionKey)
 			if err != nil {
@@ -888,6 +911,50 @@ func handleCdnRedirect(ctx context.Context, client *tg.Client, redirect *tg.Uplo
 		}
 		return data, nil
 	case *tg.UploadCDNFileReuploadNeeded:
+		if masterClient != nil {
+			reupReq := &tg.UploadReuploadCDNFileRequest{
+				FileToken:    redirect.FileToken,
+				RequestToken: cdnRes.RequestToken,
+			}
+			hashes, reupErr := masterClient.UploadReuploadCDNFile(cdnCtx, reupReq)
+			if reupErr == nil {
+				if len(hashes) > 0 {
+					redirect.FileHashes = append(redirect.FileHashes, hashes...)
+				}
+				res2, err2 := cdnClient.UploadGetCDNFile(cdnCtx, req)
+				if err2 == nil {
+					if cdnRes2, ok := res2.(*tg.UploadCDNFile); ok {
+						data := cdnRes2.Bytes
+						if len(redirect.FileHashes) > 0 {
+							for _, h := range redirect.FileHashes {
+								if h.Offset == offset {
+									sum := sha256.Sum256(data)
+									if !bytes.Equal(sum[:], h.Hash) {
+										return nil, fmt.Errorf("CDN chunk SHA256 checksum mismatch at offset %d after reupload", offset)
+									}
+									break
+								}
+							}
+						}
+						if len(redirect.EncryptionKey) > 0 && len(redirect.EncryptionIv) > 0 {
+							block, err := aes.NewCipher(redirect.EncryptionKey)
+							if err != nil {
+								return nil, err
+							}
+							iv := make([]byte, len(redirect.EncryptionIv))
+							copy(iv, redirect.EncryptionIv)
+							if len(iv) >= 16 {
+								ivSeq := binary.BigEndian.Uint32(iv[12:16]) + uint32(offset/16)
+								binary.BigEndian.PutUint32(iv[12:16], ivSeq)
+							}
+							stream := cipher.NewCTR(block, iv)
+							stream.XORKeyStream(data, data)
+						}
+						return data, nil
+					}
+				}
+			}
+		}
 		return nil, tgerr.New(400, "CDN_REUPLOAD_NEEDED")
 	default:
 		return nil, fmt.Errorf("unexpected cdn file type: %T", res)
@@ -983,7 +1050,7 @@ func (d *Downloader) fetchLargeChunk(ctx context.Context, workerID int, job *lar
 			return
 		}
 
-		// Wait for rate limit token and DC cooldown BEFORE acquiring data semaphore.
+		// 1. Wait for rate limit token and DC cooldown BEFORE acquiring data semaphore.
 		// This ensures waiting for tokens does NOT occupy a data slot.
 		if d.floodGate != nil {
 			if err := d.floodGate.Wait(elemCtx, job.dcID); err != nil {
@@ -996,7 +1063,7 @@ func (d *Downloader) fetchLargeChunk(ctx context.Context, workerID int, job *lar
 			}
 		}
 
-		// Acquire data semaphore slot immediately before executing data RPC
+		// 2. Acquire data semaphore slot immediately before executing data RPC
 		if err := d.floodGate.AcquireDataSlot(elemCtx); err != nil {
 			job.fileState.fail(err)
 			select {
@@ -1009,23 +1076,11 @@ func (d *Downloader) fetchLargeChunk(ctx context.Context, workerID int, job *lar
 		atomic.AddInt32(&job.fileState.activeRPC, 1)
 		atomic.AddInt64(&d.activeLargeRPC, 1)
 
-		chunkCtx, chunkCancel := context.WithTimeout(elemCtx, 20*time.Second)
+		// 3. Mark context with WithTokenPassed so middleware does not double-wait
+		chunkCtx, chunkCancel := context.WithTimeout(gate.WithTokenPassed(elemCtx), 60*time.Second)
 		var res tg.UploadFileClass
 		res, fetchErr = client.UploadGetFile(chunkCtx, req)
 		chunkCancel()
-
-		atomic.AddInt32(&job.fileState.activeRPC, -1)
-		atomic.AddInt64(&d.activeLargeRPC, -1)
-		d.floodGate.ReleaseDataSlot()
-
-		if errors.Is(fetchErr, context.Canceled) || elemCtx.Err() != nil {
-			job.fileState.fail(context.Canceled)
-			select {
-			case <-ctx.Done():
-			case writeChan <- &largeWriteJob{fileState: job.fileState, leaseGen: job.leaseGen, offset: job.offset, isFailed: true, err: context.Canceled}:
-			}
-			return
-		}
 
 		var chunkSuccess bool
 		if fetchErr == nil {
@@ -1052,7 +1107,7 @@ func (d *Downloader) fetchLargeChunk(ctx context.Context, workerID int, job *lar
 				}
 			case *tg.UploadFileCDNRedirect:
 				cdnClient := d.opts.Pool.Client(elemCtx, uf.DCID)
-				chunkData, fetchErr = handleCdnRedirect(elemCtx, cdnClient, uf, job.offset, job.limit)
+				chunkData, fetchErr = handleCdnRedirect(elemCtx, cdnClient, client, uf, job.offset, job.limit)
 				if fetchErr == nil {
 					if len(chunkData) > expectedBytes {
 						chunkData = chunkData[:expectedBytes]
@@ -1078,6 +1133,19 @@ func (d *Downloader) fetchLargeChunk(ctx context.Context, workerID int, job *lar
 			}
 		}
 
+		atomic.AddInt32(&job.fileState.activeRPC, -1)
+		atomic.AddInt64(&d.activeLargeRPC, -1)
+		d.floodGate.ReleaseDataSlot()
+
+		if errors.Is(fetchErr, context.Canceled) || elemCtx.Err() != nil {
+			job.fileState.fail(context.Canceled)
+			select {
+			case <-ctx.Done():
+			case writeChan <- &largeWriteJob{fileState: job.fileState, leaseGen: job.leaseGen, offset: job.offset, isFailed: true, err: context.Canceled}:
+			}
+			return
+		}
+
 		if chunkSuccess {
 			break
 		}
@@ -1095,6 +1163,10 @@ func (d *Downloader) fetchLargeChunk(ctx context.Context, workerID int, job *lar
 				d.floodGate.TriggerFloodWait(job.dcID, dWait)
 			}
 			continue
+		}
+
+		if d.floodGate != nil && fetchErr != nil {
+			d.floodGate.TriggerTransportError(fetchErr)
 		}
 
 		select {
@@ -1228,18 +1300,9 @@ func (d *Downloader) fetchSmallFile(ctx context.Context, workerID int, job *smal
 
 			atomic.AddInt64(&d.activeSmallRPC, 1)
 
-			chunkCtx, chunkCancel := context.WithTimeout(elemCtx, 20*time.Second)
+			chunkCtx, chunkCancel := context.WithTimeout(gate.WithTokenPassed(elemCtx), 60*time.Second)
 			res, fetchErr := client.UploadGetFile(chunkCtx, req)
 			chunkCancel()
-
-			atomic.AddInt64(&d.activeSmallRPC, -1)
-			d.floodGate.ReleaseDataSlot()
-
-			if errors.Is(fetchErr, context.Canceled) || elemCtx.Err() != nil {
-				d.opts.Progress.OnDone(job.elem, context.Canceled)
-				budget.release(job.totalSize)
-				return
-			}
 
 			if fetchErr == nil {
 				switch uf := res.(type) {
@@ -1252,13 +1315,13 @@ func (d *Downloader) fetchSmallFile(ctx context.Context, workerID int, job *smal
 						fileBuffer = append(fileBuffer, chunkBytes...)
 						offset += int64(len(chunkBytes))
 						chunkSuccess = true
-						break
+					} else {
+						fetchErr = fmt.Errorf("small file short read at offset %d: expected %d bytes, got %d", offset, expectedBytes, len(chunkBytes))
 					}
-					fetchErr = fmt.Errorf("small file short read at offset %d: expected %d bytes, got %d", offset, expectedBytes, len(chunkBytes))
 				case *tg.UploadFileCDNRedirect:
 					cdnClient := d.opts.Pool.Client(elemCtx, uf.DCID)
 					var cdnBytes []byte
-					cdnBytes, fetchErr = handleCdnRedirect(elemCtx, cdnClient, uf, offset, DownloadPartSize)
+					cdnBytes, fetchErr = handleCdnRedirect(elemCtx, cdnClient, client, uf, offset, DownloadPartSize)
 					if fetchErr == nil {
 						if len(cdnBytes) > expectedBytes {
 							cdnBytes = cdnBytes[:expectedBytes]
@@ -1267,13 +1330,22 @@ func (d *Downloader) fetchSmallFile(ctx context.Context, workerID int, job *smal
 							fileBuffer = append(fileBuffer, cdnBytes...)
 							offset += int64(len(cdnBytes))
 							chunkSuccess = true
-							break
+						} else {
+							fetchErr = fmt.Errorf("cdn small file short read at offset %d: expected %d bytes, got %d", offset, expectedBytes, len(cdnBytes))
 						}
-						fetchErr = fmt.Errorf("cdn small file short read at offset %d: expected %d bytes, got %d", offset, expectedBytes, len(cdnBytes))
 					}
 				default:
 					fetchErr = fmt.Errorf("unexpected upload response type: %T", res)
 				}
+			}
+
+			atomic.AddInt64(&d.activeSmallRPC, -1)
+			d.floodGate.ReleaseDataSlot()
+
+			if errors.Is(fetchErr, context.Canceled) || elemCtx.Err() != nil {
+				d.opts.Progress.OnDone(job.elem, context.Canceled)
+				budget.release(job.totalSize)
+				return
 			}
 
 			if chunkSuccess {
@@ -1299,6 +1371,10 @@ func (d *Downloader) fetchSmallFile(ctx context.Context, workerID int, job *smal
 					d.floodGate.TriggerFloodWait(job.dcID, dWait)
 				}
 				continue
+			}
+
+			if d.floodGate != nil && fetchErr != nil {
+				d.floodGate.TriggerTransportError(fetchErr)
 			}
 
 			select {

@@ -133,7 +133,11 @@ func Run(ctx context.Context, client *telegram.Client, kvd storage.Storage, opts
 	}
 
 	sharedGate := gate.NewFloodGate(gate.InitialStartRate, gate.DefaultBurst)
-	pool := dcpool.NewPoolWithGate(client, int64(opts.PoolSize), sharedGate,
+	effectivePoolSize := opts.PoolSize
+	if effectivePoolSize < gate.MaxDataInFlight {
+		effectivePoolSize = gate.MaxDataInFlight
+	}
+	pool := dcpool.NewPoolWithGate(client, int64(effectivePoolSize), sharedGate,
 		tclient.NewDefaultMiddlewares(ctx, opts.ReconnectTimeout)...)
 	defer func() { resultErr = errors.Join(resultErr, pool.Close()) }()
 	manager := peers.Options{Storage: storage.NewPeers(kvd)}.Build(pool.Default(ctx))

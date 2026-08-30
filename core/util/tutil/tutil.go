@@ -316,10 +316,7 @@ func GetMessagesBatch(ctx context.Context, c *tg.Client, peer tg.InputPeerClass,
 			}
 			res, err := c.ChannelsGetMessages(ctx, req)
 			if err != nil {
-				if isDefinitiveError(err) {
-					return nil, err
-				}
-				continue
+				return nil, err
 			}
 			if msgs, ok := res.(*tg.MessagesChannelMessages); ok {
 				for _, mClass := range msgs.Messages {
@@ -331,10 +328,7 @@ func GetMessagesBatch(ctx context.Context, c *tg.Client, peer tg.InputPeerClass,
 		default:
 			res, err := c.MessagesGetMessages(ctx, inputIDs)
 			if err != nil {
-				if isDefinitiveError(err) {
-					return nil, err
-				}
-				continue
+				return nil, err
 			}
 			switch msgs := res.(type) {
 			case *tg.MessagesMessages:

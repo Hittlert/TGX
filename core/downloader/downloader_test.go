@@ -3,6 +3,9 @@ package downloader
 import (
 	"bytes"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/sha256"
 	"errors"
 	"io"
 	"sync"
@@ -1072,3 +1075,118 @@ func TestDownloader_100SmallFilesBurstLargeThroughputProtected(t *testing.T) {
 		assert.Equal(t, int64(5*1024*1024), progress.downloaded[e])
 	}
 }
+
+func TestDownloader_CdnRedirectDecryptionAndHashVerification(t *testing.T) {
+	key := []byte("0123456789abcdef0123456789abcdef") // 32 bytes
+	iv := []byte("1234567890abcdef")                 // 16 bytes
+	plainData := bytes.Repeat([]byte("A"), 1024*1024)
+
+	// Encrypt plainData with AES-CTR
+	block, err := aes.NewCipher(key)
+	require.NoError(t, err)
+	encryptedData := make([]byte, len(plainData))
+	stream := cipher.NewCTR(block, iv)
+	stream.XORKeyStream(encryptedData, plainData)
+
+	chunkHash := sha256.Sum256(encryptedData)
+
+	cdnInvoker := &fakeCDNInvoker{encryptedData: encryptedData}
+	masterInvoker := &fakeMasterCDNRedirectInvoker{
+		key:       key,
+		iv:        iv,
+		hashes:    []tg.FileHash{{Offset: 0, Limit: len(plainData), Hash: chunkHash[:]}},
+		fileToken: []byte("test_file_token"),
+	}
+
+	pool := &fakeDualPool{master: masterInvoker, cdn: cdnInvoker}
+	buf := newMemWriterAt(int64(len(plainData)))
+	elem := &fakeElem{
+		file: &fakeFile{size: int64(len(plainData)), dc: 2},
+		buf:  buf,
+	}
+
+	iter := &fakeIter{elems: []*fakeElem{elem}}
+	progress := newFakeProgress()
+	fg := gate.NewFloodGate(1000, 100)
+
+	dl := New(Options{
+		Pool:            pool,
+		Threads:         4,
+		DiskWorkers:     2,
+		FileConcurrency: 1,
+		Iter:            iter,
+		Progress:        progress,
+		FloodGate:       fg,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err = dl.Download(ctx, 4)
+	require.NoError(t, err)
+
+	progress.mu.Lock()
+	defer progress.mu.Unlock()
+
+	assert.NoError(t, progress.done[elem])
+	assert.Equal(t, int64(len(plainData)), progress.downloaded[elem])
+
+	// Verify decrypted content on disk matches original plainData
+	buf.mu.Lock()
+	assert.Equal(t, plainData, buf.data)
+	buf.mu.Unlock()
+}
+
+type fakeMasterCDNRedirectInvoker struct {
+	key       []byte
+	iv        []byte
+	hashes    []tg.FileHash
+	fileToken []byte
+}
+
+func (f *fakeMasterCDNRedirectInvoker) Invoke(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
+	out, ok := output.(*tg.UploadFileBox)
+	if ok {
+		out.File = &tg.UploadFileCDNRedirect{
+			DCID:          5, // CDN DC
+			FileToken:     f.fileToken,
+			EncryptionKey: f.key,
+			EncryptionIv:  f.iv,
+			FileHashes:    f.hashes,
+		}
+	}
+	return nil
+}
+
+type fakeCDNInvoker struct {
+	encryptedData []byte
+}
+
+func (f *fakeCDNInvoker) Invoke(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
+	out, ok := output.(*tg.UploadCDNFileBox)
+	if ok {
+		out.CdnFile = &tg.UploadCDNFile{
+			Bytes: f.encryptedData,
+		}
+	}
+	return nil
+}
+
+type fakeDualPool struct {
+	master tg.Invoker
+	cdn    tg.Invoker
+}
+
+func (p *fakeDualPool) Client(ctx context.Context, dc int) *tg.Client {
+	if dc == 5 {
+		return tg.NewClient(p.cdn)
+	}
+	return tg.NewClient(p.master)
+}
+func (p *fakeDualPool) Takeout(ctx context.Context, dc int) *tg.Client {
+	return p.Client(ctx, dc)
+}
+func (p *fakeDualPool) Default(ctx context.Context) *tg.Client {
+	return tg.NewClient(p.master)
+}
+func (p *fakeDualPool) Close() error { return nil }

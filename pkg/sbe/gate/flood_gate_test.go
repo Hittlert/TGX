@@ -2,9 +2,11 @@ package gate
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
+	"github.com/gotd/td/bin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -159,4 +161,50 @@ func TestFloodGate_DataAndControlSemaphores(t *testing.T) {
 		g.ReleaseControlSlot()
 	}
 	assert.Equal(t, int64(0), g.ControlInFlight())
+}
+
+func TestFloodGate_TokenPassedBypass(t *testing.T) {
+	g := NewFloodGate(1.0, 1) // rate 1 req/s, burst 1
+
+	// 1. First Wait consumes the token
+	err := g.Wait(context.Background(), 2)
+	require.NoError(t, err)
+
+	// 2. Normal Wait without token will block
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	err = g.Wait(ctx, 2)
+	assert.Error(t, err) // timed out
+
+	// 3. Middleware with WithTokenPassed skips Wait
+	ctxPassed := WithTokenPassed(context.Background())
+	mw := g.Middleware(2)
+	invoked := false
+	invoker := mw.Handle(fakeInvokerFunc(func(ctx context.Context, in bin.Encoder, out bin.Decoder) error {
+		invoked = true
+		return nil
+	}))
+
+	err = invoker(ctxPassed, nil, nil)
+	require.NoError(t, err)
+	assert.True(t, invoked)
+}
+
+func TestFloodGate_TransportErrorAdaptiveBackoff(t *testing.T) {
+	g := NewFloodGate(100.0, 40)
+	assert.Equal(t, 100.0, g.CurrentRate())
+
+	// Trigger transport error (e.g. broken pipe)
+	g.TriggerTransportError(errors.New("write: broken pipe"))
+	assert.Equal(t, 85.0, g.CurrentRate()) // 100 * 0.85 = 85.0
+
+	// Debounce check: another error within 500ms should not drop rate further
+	g.TriggerTransportError(errors.New("i/o timeout"))
+	assert.Equal(t, 85.0, g.CurrentRate())
+}
+
+type fakeInvokerFunc func(ctx context.Context, in bin.Encoder, out bin.Decoder) error
+
+func (f fakeInvokerFunc) Invoke(ctx context.Context, in bin.Encoder, out bin.Decoder) error {
+	return f(ctx, in, out)
 }

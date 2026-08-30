@@ -2,8 +2,12 @@ package gate
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"math/rand"
+	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -256,6 +260,26 @@ func (g *FloodGate) TriggerFloodWait(dc int, duration time.Duration) {
 	}
 }
 
+// TriggerTransportError adaptively decreases rate on network/transport errors (broken pipe, timeout, EOF).
+func (g *FloodGate) TriggerTransportError(err error) {
+	if g == nil || err == nil {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	now := time.Now()
+	if g.currentRate > g.minRate && now.Sub(g.lastRateDrop) >= 500*time.Millisecond {
+		g.currentRate = g.currentRate * 0.85
+		if g.currentRate < g.minRate {
+			g.currentRate = g.minRate
+		}
+		g.limiter.SetLimit(rate.Limit(g.currentRate))
+		g.lastRamp = now.Add(2 * time.Second) // Pause ramp-up for 2s after transport error
+		g.lastRateDrop = now
+	}
+}
+
 // IsDCCooledDown returns true if the DC is currently undergoing cooldown.
 func (g *FloodGate) IsDCCooledDown(dc int) bool {
 	if g == nil {
@@ -267,6 +291,39 @@ func (g *FloodGate) IsDCCooledDown(dc int) bool {
 	return exists && time.Now().Before(notBefore)
 }
 
+type tokenPassedKey struct{}
+
+// WithTokenPassed returns a child context indicating that Gate.Wait has already been passed.
+func WithTokenPassed(ctx context.Context) context.Context {
+	return context.WithValue(ctx, tokenPassedKey{}, true)
+}
+
+// IsTokenPassed checks whether the context has already passed Gate.Wait.
+func IsTokenPassed(ctx context.Context) bool {
+	v, _ := ctx.Value(tokenPassedKey{}).(bool)
+	return v
+}
+
+func isTransportError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "broken pipe") ||
+		strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "i/o timeout") ||
+		strings.Contains(msg, "handshake timeout") ||
+		strings.Contains(msg, "closed network connection")
+}
+
 type floodGateMiddleware struct {
 	gate *FloodGate
 	dc   int
@@ -275,24 +332,27 @@ type floodGateMiddleware struct {
 func (m *floodGateMiddleware) Handle(next tg.Invoker) telegram.InvokeFunc {
 	return func(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
 		const maxFloodRetries = 5
-		for attempt := 0; ; attempt++ {
-			if m.gate != nil {
+		for attempt := 0; attempt < maxFloodRetries; attempt++ {
+			// If caller already performed Gate.Wait (e.g. data worker before acquiring data semaphore),
+			// skip Wait() to avoid double-token consumption and to avoid holding data semaphore during wait.
+			if m.gate != nil && !IsTokenPassed(ctx) {
 				if err := m.gate.Wait(ctx, m.dc); err != nil {
 					return err
 				}
 			}
 			err := next.Invoke(ctx, input, output)
 			if d, isFlood := tgerr.AsFloodWait(err); isFlood {
-				if attempt >= maxFloodRetries {
-					return fmt.Errorf("flood wait retry limit (%d) exceeded on DC %d: %w", maxFloodRetries, m.dc, err)
-				}
 				if m.gate != nil {
 					m.gate.TriggerFloodWait(m.dc, d)
 				}
 				continue
 			}
+			if m.gate != nil && isTransportError(err) {
+				m.gate.TriggerTransportError(err)
+			}
 			return err
 		}
+		return fmt.Errorf("flood wait retry limit (%d) exceeded on DC %d", maxFloodRetries, m.dc)
 	}
 }
 
