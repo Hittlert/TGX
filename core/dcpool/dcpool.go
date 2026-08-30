@@ -133,6 +133,9 @@ func (p *pool) invoker(ctx context.Context, dc int) tg.Invoker {
 				}
 				continue
 			}
+			if p.floodGate != nil {
+				p.floodGate.TriggerTransportError(err)
+			}
 			select {
 			case <-ctx.Done():
 				return failedInvoker{dc: dc, err: ctx.Err()}
@@ -142,6 +145,9 @@ func (p *pool) invoker(ctx context.Context, dc int) tg.Invoker {
 	}
 
 	if err != nil {
+		if p.floodGate != nil {
+			p.floodGate.TriggerTransportError(err)
+		}
 		logctx.From(ctx).Error("create invoker", zap.Int("dc_id", dc), zap.Error(err))
 		return failedInvoker{dc: dc, err: err}
 	}

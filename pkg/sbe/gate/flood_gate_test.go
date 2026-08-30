@@ -3,6 +3,7 @@ package gate
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -261,6 +262,47 @@ func TestFloodGate_MiddlewareRetryEnforcesCooldown(t *testing.T) {
 	assert.Error(t, err) // Context canceled while waiting for DC 3 cooldown
 	assert.Equal(t, 1, attempts)
 	assert.True(t, g.IsDCCooledDown(3))
+}
+
+func TestFloodGate_ConcurrentAcquireReleaseAndDataInFlightRace(t *testing.T) {
+	g := NewFloodGate(100.0, 40)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	// 20 workers acquiring/releasing slots
+	for w := 0; w < 20; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 50; i++ {
+				if err := g.AcquireDataSlot(ctx); err == nil {
+					time.Sleep(time.Millisecond)
+					g.ReleaseDataSlot()
+				}
+			}
+		}()
+	}
+
+	// Reader goroutine checking DataInFlight continuously
+	stopReader := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-stopReader:
+				return
+			default:
+				inFlight := g.DataInFlight()
+				assert.True(t, inFlight >= 0 && inFlight <= MaxDataInFlight)
+				_ = g.ControlInFlight()
+				_ = g.MaxDataCap()
+			}
+		}
+	}()
+
+	wg.Wait()
+	close(stopReader)
+	assert.Equal(t, int64(0), g.DataInFlight())
 }
 
 type fakeInvokerFunc func(ctx context.Context, in bin.Encoder, out bin.Decoder) error

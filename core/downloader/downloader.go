@@ -890,7 +890,7 @@ func (d *Downloader) Download(ctx context.Context, globalConcurrency int) error 
 	return g.Wait()
 }
 
-func (d *Downloader) handleCdnRedirect(ctx context.Context, cdnClient *tg.Client, masterClient *tg.Client, redirect *tg.UploadFileCDNRedirect, offset int64, limit int) ([]byte, error) {
+func (d *Downloader) handleCdnRedirect(ctx context.Context, cdnClient *tg.Client, masterClient *tg.Client, redirect *tg.UploadFileCDNRedirect, originDC int, offset int64, limit int) ([]byte, error) {
 	const maxCDNAttempts = 3
 	req := &tg.UploadGetCDNFileRequest{
 		FileToken: redirect.FileToken,
@@ -901,11 +901,6 @@ func (d *Downloader) handleCdnRedirect(ctx context.Context, cdnClient *tg.Client
 	// Single overall deadline for entire CDN operation including potential reuploads
 	cdnTotalCtx, cdnCancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cdnCancel()
-
-	masterDC := 2
-	if d.opts.Pool != nil && d.opts.Pool.Default(ctx) != nil {
-		// Master DC
-	}
 
 	for attempt := 0; attempt < maxCDNAttempts; attempt++ {
 		// 1. Enforce rate limiting and cooldown specifically for the CDN DC
@@ -1002,13 +997,13 @@ func (d *Downloader) handleCdnRedirect(ctx context.Context, cdnClient *tg.Client
 				FileToken:    redirect.FileToken,
 				RequestToken: cdnRes.RequestToken,
 			}
-			// Wait on Master DC Gate for reupload request
+			// Wait on Origin DC Gate for reupload request
 			if d.floodGate != nil {
-				if err := d.floodGate.Wait(cdnTotalCtx, masterDC); err != nil {
+				if err := d.floodGate.Wait(cdnTotalCtx, originDC); err != nil {
 					return nil, err
 				}
 			}
-			masterReqCtx := gate.WithAdmissionTicket(cdnTotalCtx, masterDC)
+			masterReqCtx := gate.WithAdmissionTicket(cdnTotalCtx, originDC)
 			hashes, reupErr := masterClient.UploadReuploadCDNFile(masterReqCtx, reupReq)
 			if reupErr != nil {
 				return nil, fmt.Errorf("CDN reupload failed on master DC: %w", reupErr)
@@ -1115,10 +1110,9 @@ func (d *Downloader) fetchLargeChunk(ctx context.Context, workerID int, job *lar
 			return
 		}
 
-		// 1. Wait for rate limit token and DC cooldown BEFORE acquiring data semaphore.
-		// This ensures waiting for tokens does NOT occupy a data slot.
+		// 1. Acquire dynamic data slot FIRST (blocks until capacity within maxDataCap is available)
 		if d.floodGate != nil {
-			if err := d.floodGate.Wait(elemCtx, job.dcID); err != nil {
+			if err := d.floodGate.AcquireDataSlot(elemCtx); err != nil {
 				job.fileState.fail(err)
 				select {
 				case <-ctx.Done():
@@ -1128,20 +1122,25 @@ func (d *Downloader) fetchLargeChunk(ctx context.Context, workerID int, job *lar
 			}
 		}
 
-		// 2. Acquire data semaphore slot immediately before executing data RPC
-		if err := d.floodGate.AcquireDataSlot(elemCtx); err != nil {
-			job.fileState.fail(err)
-			select {
-			case <-ctx.Done():
-			case writeChan <- &largeWriteJob{fileState: job.fileState, leaseGen: job.leaseGen, offset: job.offset, isFailed: true, err: err}:
-			}
-			return
-		}
-
 		atomic.AddInt32(&job.fileState.activeRPC, 1)
 		atomic.AddInt64(&d.activeLargeRPC, 1)
 
-		// 3. Mark context with WithAdmissionTicket so middleware utilizes this physical ticket for job.dcID
+		// 2. Immediately before executing RPC, wait for rate limit token and DC cooldown
+		if d.floodGate != nil {
+			if err := d.floodGate.Wait(elemCtx, job.dcID); err != nil {
+				d.floodGate.ReleaseDataSlot()
+				atomic.AddInt32(&job.fileState.activeRPC, -1)
+				atomic.AddInt64(&d.activeLargeRPC, -1)
+				job.fileState.fail(err)
+				select {
+				case <-ctx.Done():
+				case writeChan <- &largeWriteJob{fileState: job.fileState, leaseGen: job.leaseGen, offset: job.offset, isFailed: true, err: err}:
+				}
+				return
+			}
+		}
+
+		// 3. Mark context with fresh WithAdmissionTicket bound to job.dcID
 		chunkCtx, chunkCancel := context.WithTimeout(gate.WithAdmissionTicket(elemCtx, job.dcID), 60*time.Second)
 		var res tg.UploadFileClass
 		res, fetchErr = client.UploadGetFile(chunkCtx, req)
@@ -1172,7 +1171,7 @@ func (d *Downloader) fetchLargeChunk(ctx context.Context, workerID int, job *lar
 				}
 			case *tg.UploadFileCDNRedirect:
 				cdnClient := d.opts.Pool.Client(elemCtx, uf.DCID)
-				chunkData, fetchErr = d.handleCdnRedirect(elemCtx, cdnClient, client, uf, job.offset, job.limit)
+				chunkData, fetchErr = d.handleCdnRedirect(elemCtx, cdnClient, client, uf, job.dcID, job.offset, job.limit)
 				if fetchErr == nil {
 					if len(chunkData) > expectedBytes {
 						chunkData = chunkData[:expectedBytes]
@@ -1347,24 +1346,29 @@ func (d *Downloader) fetchSmallFile(ctx context.Context, workerID int, job *smal
 			default:
 			}
 
-			// Wait for rate limit token and DC cooldown BEFORE acquiring data semaphore.
+			// 1. Acquire dynamic data slot FIRST
 			if d.floodGate != nil {
-				if err := d.floodGate.Wait(elemCtx, job.dcID); err != nil {
+				if err := d.floodGate.AcquireDataSlot(elemCtx); err != nil {
 					d.opts.Progress.OnDone(job.elem, err)
 					budget.release(job.totalSize)
 					return
 				}
 			}
 
-			// Acquire data semaphore slot immediately before executing data RPC
-			if err := d.floodGate.AcquireDataSlot(elemCtx); err != nil {
-				d.opts.Progress.OnDone(job.elem, err)
-				budget.release(job.totalSize)
-				return
-			}
-
 			atomic.AddInt64(&d.activeSmallRPC, 1)
 
+			// 2. Immediately before executing RPC, wait for rate limit token and DC cooldown
+			if d.floodGate != nil {
+				if err := d.floodGate.Wait(elemCtx, job.dcID); err != nil {
+					d.floodGate.ReleaseDataSlot()
+					atomic.AddInt64(&d.activeSmallRPC, -1)
+					d.opts.Progress.OnDone(job.elem, err)
+					budget.release(job.totalSize)
+					return
+				}
+			}
+
+			// 3. Mark context with fresh WithAdmissionTicket bound to job.dcID
 			chunkCtx, chunkCancel := context.WithTimeout(gate.WithAdmissionTicket(elemCtx, job.dcID), 60*time.Second)
 			res, fetchErr := client.UploadGetFile(chunkCtx, req)
 			chunkCancel()
@@ -1386,7 +1390,7 @@ func (d *Downloader) fetchSmallFile(ctx context.Context, workerID int, job *smal
 				case *tg.UploadFileCDNRedirect:
 					cdnClient := d.opts.Pool.Client(elemCtx, uf.DCID)
 					var cdnBytes []byte
-					cdnBytes, fetchErr = d.handleCdnRedirect(elemCtx, cdnClient, client, uf, offset, DownloadPartSize)
+					cdnBytes, fetchErr = d.handleCdnRedirect(elemCtx, cdnClient, client, uf, job.dcID, offset, DownloadPartSize)
 					if fetchErr == nil {
 						if len(cdnBytes) > expectedBytes {
 							cdnBytes = cdnBytes[:expectedBytes]

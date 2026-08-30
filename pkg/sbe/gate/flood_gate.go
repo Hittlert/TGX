@@ -125,7 +125,9 @@ func (g *FloodGate) DataInFlight() int64 {
 	if g == nil {
 		return 0
 	}
-	return atomic.LoadInt64(&g.activeDataRPC)
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.activeDataRPC
 }
 
 // AcquireControlSlot blocks until a control RPC slot is available within MaxControlInFlight (4).
@@ -136,7 +138,9 @@ func (g *FloodGate) AcquireControlSlot(ctx context.Context) error {
 	if err := g.controlSem.Acquire(ctx, 1); err != nil {
 		return err
 	}
-	atomic.AddInt64(&g.activeControlRPC, 1)
+	g.mu.Lock()
+	g.activeControlRPC++
+	g.mu.Unlock()
 	return nil
 }
 
@@ -145,7 +149,11 @@ func (g *FloodGate) ReleaseControlSlot() {
 	if g == nil {
 		return
 	}
-	atomic.AddInt64(&g.activeControlRPC, -1)
+	g.mu.Lock()
+	if g.activeControlRPC > 0 {
+		g.activeControlRPC--
+	}
+	g.mu.Unlock()
 	g.controlSem.Release(1)
 }
 
@@ -154,7 +162,9 @@ func (g *FloodGate) ControlInFlight() int64 {
 	if g == nil {
 		return 0
 	}
-	return atomic.LoadInt64(&g.activeControlRPC)
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.activeControlRPC
 }
 
 // CurrentRate returns current adaptive rate.
@@ -194,7 +204,7 @@ func (g *FloodGate) Wait(ctx context.Context, dc int) error {
 			}
 		}
 
-// Smooth Additive Increase: if currentRate < maxRate and no active cooldowns, ramp up +5.0 req/s per second
+		// Smooth Additive Increase: if currentRate < maxRate and no active cooldowns, ramp up +5.0 req/s per second
 		if len(g.dcCooldowns) == 0 {
 			if now.Sub(g.lastRamp) >= time.Second {
 				if g.currentRate < g.maxRate {
@@ -206,6 +216,10 @@ func (g *FloodGate) Wait(ctx context.Context, dc int) error {
 				}
 				if g.maxDataCap < MaxDataInFlight {
 					g.maxDataCap++
+					if g.dataWakeCh != nil {
+						close(g.dataWakeCh)
+						g.dataWakeCh = make(chan struct{})
+					}
 				}
 				g.lastRamp = now
 			}

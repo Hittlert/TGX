@@ -54,6 +54,27 @@ func newTelegramMediaAccess(parentCtx context.Context, pool dcpool.Pool, manager
 	}
 }
 
+const maxMsgCacheEntries = 1000
+
+func (a *telegramMediaAccess) cleanExpiredCacheLocked(now time.Time) {
+	if len(a.msgCache) > maxMsgCacheEntries {
+		for k, v := range a.msgCache {
+			if now.After(v.expires) {
+				delete(a.msgCache, k)
+			}
+		}
+	}
+	if len(a.msgCache) > maxMsgCacheEntries {
+		// If still over cap, prune oldest entries
+		for k := range a.msgCache {
+			delete(a.msgCache, k)
+			if len(a.msgCache) <= maxMsgCacheEntries/2 {
+				break
+			}
+		}
+	}
+}
+
 func (a *telegramMediaAccess) mediaFromMessage(peer string, messageID int, message *tg.Message) (ResolvedMedia, error) {
 	if message == nil {
 		return ResolvedMedia{}, NewTaskError("unavailable", true, fmt.Errorf("message %s/%d is empty", peer, messageID))
@@ -87,7 +108,9 @@ func (a *telegramMediaAccess) Resolve(ctx context.Context, peer string, messageI
 		return ResolvedMedia{}, classifyTelegramError(err, "resolve peer")
 	}
 
-	res, err, _ := a.sf.Do(fmt.Sprintf("msg:%s:%d", peer, messageID), func() (interface{}, error) {
+	// SingleFlight batch fetch starting at messageID
+	batchKey := fmt.Sprintf("batch:%s:%d", peer, (messageID/50)*50)
+	_, batchErr, _ := a.sf.Do(batchKey, func() (interface{}, error) {
 		if a.gate != nil {
 			if err := a.gate.AcquireControlSlot(ctx); err != nil {
 				return nil, err
@@ -95,20 +118,67 @@ func (a *telegramMediaAccess) Resolve(ctx context.Context, peer string, messageI
 			defer a.gate.ReleaseControlSlot()
 		}
 
-		msg, fetchErr := tutil.GetSingleMessage(ctx, a.pool.Default(ctx), resolvedPeer.InputPeer(), messageID)
-		if fetchErr != nil {
-			return nil, fetchErr
+		// Prefetch window of up to 50 adjacent message IDs
+		ids := make([]int, 0, 50)
+		for i := 0; i < 50; i++ {
+			ids = append(ids, messageID+i)
 		}
+
+		messages, fetchErr := tutil.GetMessagesBatch(ctx, a.pool.Default(ctx), resolvedPeer.InputPeer(), ids)
+		if fetchErr != nil {
+			// If batch fails, fallback to single message
+			singleMsg, sErr := tutil.GetSingleMessage(ctx, a.pool.Default(ctx), resolvedPeer.InputPeer(), messageID)
+			if sErr != nil {
+				return nil, sErr
+			}
+			a.msgMu.Lock()
+			a.cleanExpiredCacheLocked(time.Now())
+			a.msgCache[cacheKey] = messageCacheEntry{msg: singleMsg, expires: time.Now().Add(60 * time.Second)}
+			a.msgMu.Unlock()
+			return nil, nil
+		}
+
 		a.msgMu.Lock()
-		a.msgCache[cacheKey] = messageCacheEntry{msg: msg, expires: time.Now().Add(60 * time.Second)}
+		now := time.Now()
+		a.cleanExpiredCacheLocked(now)
+		for _, msg := range messages {
+			if msg != nil {
+				k := fmt.Sprintf("%s:%d", peer, msg.ID)
+				a.msgCache[k] = messageCacheEntry{msg: msg, expires: now.Add(60 * time.Second)}
+			}
+		}
 		a.msgMu.Unlock()
-		return msg, nil
+		return nil, nil
 	})
+
+	if batchErr != nil {
+		return ResolvedMedia{}, classifyTelegramError(batchErr, "resolve message")
+	}
+
+	// Read from populated cache
+	a.msgMu.RLock()
+	entry, ok := a.msgCache[cacheKey]
+	a.msgMu.RUnlock()
+	if ok && time.Now().Before(entry.expires) {
+		return a.mediaFromMessage(peer, messageID, entry.msg)
+	}
+
+	// Fallback single message resolution
+	if a.gate != nil {
+		if err := a.gate.AcquireControlSlot(ctx); err != nil {
+			return ResolvedMedia{}, err
+		}
+		defer a.gate.ReleaseControlSlot()
+	}
+	msg, err := tutil.GetSingleMessage(ctx, a.pool.Default(ctx), resolvedPeer.InputPeer(), messageID)
 	if err != nil {
 		return ResolvedMedia{}, classifyTelegramError(err, "resolve message")
 	}
-
-	return a.mediaFromMessage(peer, messageID, res.(*tg.Message))
+	a.msgMu.Lock()
+	a.cleanExpiredCacheLocked(time.Now())
+	a.msgCache[cacheKey] = messageCacheEntry{msg: msg, expires: time.Now().Add(60 * time.Second)}
+	a.msgMu.Unlock()
+	return a.mediaFromMessage(peer, messageID, msg)
 }
 
 func (a *telegramMediaAccess) ResolveBatch(ctx context.Context, peer string, messageIDs []int) (map[int]ResolvedMedia, error) {
@@ -160,6 +230,7 @@ func (a *telegramMediaAccess) ResolveBatch(ctx context.Context, peer string, mes
 	}
 
 	a.msgMu.Lock()
+	a.cleanExpiredCacheLocked(now)
 	for _, msg := range messages {
 		if msg != nil {
 			cacheKey := fmt.Sprintf("%s:%d", peer, msg.ID)
