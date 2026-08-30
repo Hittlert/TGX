@@ -232,6 +232,10 @@ func (e *Engine) networkStreamingWorker(workerID int) {
 			bufLease.Release()
 			task.Coordinator.AbortChunk(task.BlockIndex)
 			e.scheduler.CompleteChunk(task.FileKey, false)
+			// Re-enqueue task to scheduler so it gets retried rather than permanently dropped
+			if !task.Coordinator.IsClosed() {
+				e.scheduler.EnqueueFront(task)
+			}
 			continue
 		}
 
@@ -267,6 +271,9 @@ func (e *Engine) diskWriterWorker(writerID int) {
 			// Write failed -> abort and let coordinator retry
 			fc.AbortChunk(job.Task.BlockIndex)
 			e.scheduler.CompleteChunk(job.Task.FileKey, false)
+			if !fc.IsClosed() {
+				e.scheduler.EnqueueFront(job.Task)
+			}
 			continue
 		}
 

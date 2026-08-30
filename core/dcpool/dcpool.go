@@ -142,8 +142,8 @@ func (p *pool) Takeout(ctx context.Context, dc int) *tg.Client {
 		sid, err := takeout.Takeout(ctx, p.api)
 		if err != nil {
 			logctx.From(ctx).Warn("takeout error", zap.Error(err))
-			// ignore init delay error and return non-takeout client
-			return p.Client(ctx, dc)
+			// ignore init delay error and return non-takeout client without re-acquiring p.mu
+			return tg.NewClient(p.invoker(ctx, dc))
 		}
 		p.takeout = sid
 		logctx.From(ctx).Info("get takeout id", zap.Int64("id", sid))

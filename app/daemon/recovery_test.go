@@ -7,8 +7,6 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/Hittlert/TGX/pkg/sbe/meta"
-	"github.com/bits-and-blooms/bitset"
 	_ "modernc.org/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -21,21 +19,25 @@ func setupTestDB(t *testing.T) *sql.DB {
 	db.SetMaxOpenConns(1)
 
 	_, err = db.Exec(`
-		CREATE TABLE tasks (
-			file_key TEXT PRIMARY KEY,
-			attempt_id TEXT,
-			state TEXT,
+		CREATE TABLE download_records (
+			chat_id TEXT NOT NULL,
+			message_id INTEGER NOT NULL,
+			status TEXT NOT NULL,
 			file_name TEXT,
-			total_size INTEGER,
-			block_size INTEGER,
-			total_blocks INTEGER
+			save_path TEXT,
+			media_type TEXT,
+			file_size INTEGER,
+			error TEXT,
+			created_at INTEGER NOT NULL DEFAULT 0,
+			updated_at INTEGER NOT NULL DEFAULT 0,
+			PRIMARY KEY (chat_id, message_id)
 		);
 	`)
 	require.NoError(t, err)
 	return db
 }
 
-func TestReconciler_CommittingCrashPromotion(t *testing.T) {
+func TestReconciler_PromotesExistingFileToSuccess(t *testing.T) {
 	db := setupTestDB(t)
 	defer db.Close()
 
@@ -47,11 +49,11 @@ func TestReconciler_CommittingCrashPromotion(t *testing.T) {
 	require.NoError(t, err)
 	defer os.RemoveAll(tempDir)
 
-	// Final file exists
+	// Final file exists with exact size
 	finalPath := filepath.Join(outDir, "test.mp4")
 	require.NoError(t, os.WriteFile(finalPath, []byte("data"), 0644))
 
-	_, err = db.Exec(`INSERT INTO tasks VALUES ('f1', 'att1', 'COMMITTING', 'test.mp4', 4, 2, 2)`)
+	_, err = db.Exec(`INSERT INTO download_records (chat_id, message_id, status, file_name, save_path, file_size) VALUES ('123', 1, 'downloading', 'test.mp4', 'test.mp4', 4)`)
 	require.NoError(t, err)
 
 	r := NewReconciler(db, outDir, tempDir, zap.NewNop())
@@ -59,16 +61,16 @@ func TestReconciler_CommittingCrashPromotion(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 1, len(results))
 
-	assert.Equal(t, "SUCCESS", results[0].NextState)
-	assert.Equal(t, "COMMITTING_RENAME_ALREADY_DONE_PROMOTED", results[0].ActionTaken)
+	assert.Equal(t, "success", results[0].NextState)
+	assert.Equal(t, "FINAL_FILE_EXISTS_PROMOTED_TO_SUCCESS", results[0].ActionTaken)
 
-	var newState string
-	err = db.QueryRow(`SELECT state FROM tasks WHERE file_key = 'f1'`).Scan(&newState)
+	var newStatus string
+	err = db.QueryRow(`SELECT status FROM download_records WHERE chat_id = '123' AND message_id = 1`).Scan(&newStatus)
 	require.NoError(t, err)
-	assert.Equal(t, "SUCCESS", newState)
+	assert.Equal(t, "success", newStatus)
 }
 
-func TestReconciler_RunningCompleteMetaPromotion(t *testing.T) {
+func TestReconciler_ResetsIncompleteFileToPending(t *testing.T) {
 	db := setupTestDB(t)
 	defer db.Close()
 
@@ -80,35 +82,8 @@ func TestReconciler_RunningCompleteMetaPromotion(t *testing.T) {
 	require.NoError(t, err)
 	defer os.RemoveAll(tempDir)
 
-	var attempt [16]byte
-	copy(attempt[:], []byte("att2"))
-	fileName := "complete.bin"
-
-	// Create .part file
-	partPath := filepath.Join(tempDir, fileName+".part.61747432000000000000000000000000")
-	require.NoError(t, os.WriteFile(partPath, []byte("complete_data"), 0644))
-
-	// Create COMPLETE .meta file
-	metaH := &meta.MetaHeader{
-		Magic:       meta.MetaMagic,
-		Version:     meta.MetaVersion,
-		AttemptID:   attempt,
-		TotalSize:   13,
-		BlockSize:   2 * 1024 * 1024,
-		TotalBlocks: 1,
-	}
-	copy(metaH.FileKeyHash[:], []byte("f2"))
-
-	mf, _, err := meta.CreateOrOpenMetaFile(tempDir, fileName, metaH)
-	require.NoError(t, err)
-
-	bs := bitset.New(1)
-	bs.Set(0)
-	require.NoError(t, mf.WriteComplete(bs))
-	require.NoError(t, mf.Close())
-
-	// Insert task with RUNNING state
-	_, err = db.Exec(`INSERT INTO tasks VALUES ('f2', '61747432000000000000000000000000', 'RUNNING', 'complete.bin', 13, 2097152, 1)`)
+	// Incomplete file missing on disk
+	_, err = db.Exec(`INSERT INTO download_records (chat_id, message_id, status, file_name, save_path, file_size) VALUES ('123', 2, 'downloading', 'missing.mp4', 'missing.mp4', 100)`)
 	require.NoError(t, err)
 
 	r := NewReconciler(db, outDir, tempDir, zap.NewNop())
@@ -116,10 +91,11 @@ func TestReconciler_RunningCompleteMetaPromotion(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 1, len(results))
 
-	assert.Equal(t, "SUCCESS", results[0].NextState)
-	assert.Equal(t, "COMPLETE_META_PROMOTED_TO_SUCCESS", results[0].ActionTaken)
+	assert.Equal(t, "pending", results[0].NextState)
+	assert.Equal(t, "INCOMPLETE_RESET_TO_PENDING", results[0].ActionTaken)
 
-	// Verify final file was created
-	finalPath := filepath.Join(outDir, fileName)
-	assert.FileExists(t, finalPath)
+	var newStatus string
+	err = db.QueryRow(`SELECT status FROM download_records WHERE chat_id = '123' AND message_id = 2`).Scan(&newStatus)
+	require.NoError(t, err)
+	assert.Equal(t, "pending", newStatus)
 }

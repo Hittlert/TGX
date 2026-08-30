@@ -16,25 +16,33 @@ import (
 
 	"github.com/Hittlert/TGX/core/dcpool"
 	"github.com/Hittlert/TGX/core/logctx"
+	"github.com/Hittlert/TGX/pkg/sbe/gate"
 )
 
 // MaxPartSize refer to https://core.telegram.org/api/files#downloading-files
 const MaxPartSize = 512 * 1024
 
 type Downloader struct {
-	opts Options
+	opts      Options
+	floodGate *gate.FloodGate
 }
 
 type Options struct {
-	Pool     dcpool.Pool
-	Threads  int
-	Iter     Iter
-	Progress Progress
+	Pool      dcpool.Pool
+	Threads   int
+	Iter      Iter
+	Progress  Progress
+	FloodGate *gate.FloodGate
 }
 
 func New(opts Options) *Downloader {
+	fg := opts.FloodGate
+	if fg == nil {
+		fg = gate.NewFloodGate(40.0, 10)
+	}
 	return &Downloader{
-		opts: opts,
+		opts:      opts,
+		floodGate: fg,
 	}
 }
 
@@ -45,6 +53,7 @@ type chunkJob struct {
 	location  tg.InputFileLocationClass
 	offset    int64
 	limit     int
+	totalSize int64
 	writer    io.WriterAt
 	takeout   bool
 	onSuccess func(n int)
@@ -137,13 +146,14 @@ func (d *Downloader) Download(ctx context.Context, globalConcurrency int) error 
 				limit := int(partSize)
 
 				job := &chunkJob{
-					elem:     elem,
-					dcID:     elem.File().DC(),
-					location: elem.File().Location(),
-					offset:   offset,
-					limit:    limit,
-					writer:   elem.To(),
-					takeout:  elem.AsTakeout(),
+					elem:      elem,
+					dcID:      elem.File().DC(),
+					location:  elem.File().Location(),
+					offset:    offset,
+					limit:     limit,
+					totalSize: totalSize,
+					writer:    elem.To(),
+					takeout:   elem.AsTakeout(),
 					onSuccess: func(n int) {
 						curr := atomic.AddInt64(&downloadedBytes, int64(n))
 						d.opts.Progress.OnDownload(elem, ProgressState{
@@ -189,6 +199,11 @@ func (d *Downloader) Download(ctx context.Context, globalConcurrency int) error 
 
 // executeChunk pulls a single 512KB chunk over the DC connection pool and writes it into the target WriterAt.
 func (d *Downloader) executeChunk(ctx context.Context, workerID int, job *chunkJob) {
+	expectedBytes := job.limit
+	if job.offset+int64(job.limit) > job.totalSize {
+		expectedBytes = int(job.totalSize - job.offset)
+	}
+
 	client := d.opts.Pool.Client(ctx, job.dcID)
 	if job.takeout {
 		client = d.opts.Pool.Takeout(ctx, job.dcID)
@@ -204,7 +219,7 @@ func (d *Downloader) executeChunk(ctx context.Context, workerID int, job *chunkJ
 	var chunkData []byte
 	var fetchErr error
 
-	for attempt := 0; attempt < 20; attempt++ {
+	for attempt := 0; attempt < 5; attempt++ {
 		select {
 		case <-ctx.Done():
 			job.onFailure(ctx.Err())
@@ -212,7 +227,14 @@ func (d *Downloader) executeChunk(ctx context.Context, workerID int, job *chunkJ
 		default:
 		}
 
-		chunkCtx, chunkCancel := context.WithTimeout(ctx, 180*time.Second)
+		if d.floodGate != nil {
+			if err := d.floodGate.Wait(ctx, job.dcID); err != nil {
+				job.onFailure(err)
+				return
+			}
+		}
+
+		chunkCtx, chunkCancel := context.WithTimeout(ctx, 60*time.Second)
 		var res tg.UploadFileClass
 		res, fetchErr = client.UploadGetFile(chunkCtx, req)
 		chunkCancel()
@@ -220,7 +242,12 @@ func (d *Downloader) executeChunk(ctx context.Context, workerID int, job *chunkJ
 		if fetchErr == nil {
 			if uf, ok := res.(*tg.UploadFile); ok {
 				chunkData = uf.Bytes
-				break
+				if len(chunkData) == expectedBytes {
+					break
+				}
+				fetchErr = fmt.Errorf("short read at offset %d: expected %d bytes, got %d", job.offset, expectedBytes, len(chunkData))
+			} else {
+				fetchErr = fmt.Errorf("unexpected upload response type: %T", res)
 			}
 		}
 
@@ -229,17 +256,12 @@ func (d *Downloader) executeChunk(ctx context.Context, workerID int, job *chunkJ
 		}
 
 		if dWait, isFlood := tgerr.AsFloodWait(fetchErr); isFlood {
-			jitter := time.Duration(workerID)*200*time.Millisecond + 1*time.Second
-			logctx.From(ctx).Info("UploadGetFile flood wait backoff",
+			logctx.From(ctx).Warn("UploadGetFile shared flood wait triggered",
 				zap.Int("dc", job.dcID),
-				zap.Int64("offset", job.offset),
 				zap.Duration("flood_wait", dWait),
 			)
-			select {
-			case <-ctx.Done():
-				job.onFailure(ctx.Err())
-				return
-			case <-time.After(dWait + jitter):
+			if d.floodGate != nil {
+				d.floodGate.TriggerFloodWait(job.dcID, dWait)
 			}
 			continue
 		}
@@ -252,11 +274,11 @@ func (d *Downloader) executeChunk(ctx context.Context, workerID int, job *chunkJ
 		}
 	}
 
-	if fetchErr != nil || len(chunkData) == 0 {
+	if fetchErr != nil || len(chunkData) != expectedBytes {
 		if fetchErr != nil {
 			job.onFailure(fetchErr)
 		} else {
-			job.onFailure(fmt.Errorf("empty chunk data at offset %d", job.offset))
+			job.onFailure(fmt.Errorf("chunk size mismatch at offset %d: expected %d, got %d", job.offset, expectedBytes, len(chunkData)))
 		}
 		return
 	}

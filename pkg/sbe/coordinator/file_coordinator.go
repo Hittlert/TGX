@@ -267,11 +267,13 @@ func (fc *FileCoordinator) MarkWritten(index uint32, length int64, bufLease *lea
 		fc.mu.Lock()
 		defer fc.mu.Unlock()
 
-		if fc.blockStates[index] == BlockStateInflight {
+		if fc.blockStates[index] == BlockStateInflight || fc.blockStates[index] == BlockStateMissing {
 			fc.blockStates[index] = BlockStateWritten
 			fc.writtenBitmap.Set(uint(index))
 			fc.dirtyBytes += length
-			atomic.AddInt32(&fc.activeWorkers, -1)
+			if fc.blockStates[index] == BlockStateInflight {
+				atomic.AddInt32(&fc.activeWorkers, -1)
+			}
 			atomic.AddInt32(&fc.activeWrites, -1)
 
 			if fc.dirtyBytes >= CheckpointThresholdBytes {
@@ -297,6 +299,12 @@ func (fc *FileCoordinator) MarkWritten(index uint32, length int64, bufLease *lea
 
 // WriteBlock performs the WriteAt operation with DirtyLease acquisition and MarkWritten state update.
 func (fc *FileCoordinator) WriteBlock(ctx context.Context, index uint32, data []byte, bufLease *lease.BufferLease) error {
+	defer func() {
+		if bufLease != nil {
+			bufLease.Release()
+		}
+	}()
+
 	if err := fc.PrepareWrite(); err != nil {
 		return err
 	}
@@ -319,8 +327,8 @@ func (fc *FileCoordinator) WriteBlock(ctx context.Context, index uint32, data []
 		return fmt.Errorf("failed to write data to .part file at offset %d: %w", offset, err)
 	}
 
-	// 3. Mark Written and release BufferLease
-	return fc.MarkWritten(index, length, bufLease)
+	// 3. Mark Written (BufferLease release handled by defer)
+	return fc.MarkWritten(index, length, nil)
 }
 
 // checkpointLoop is the sole serial CheckpointLoop goroutine per file.
@@ -465,6 +473,18 @@ func (fc *FileCoordinator) Finalize(ctx context.Context) error {
 	return nil
 }
 
+// IsClosed returns true if the coordinator has been closed.
+func (fc *FileCoordinator) IsClosed() bool {
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	return fc.isClosed
+}
+
+// ForceCheckpoint explicitly flushes all written blocks to the .meta file.
+func (fc *FileCoordinator) ForceCheckpoint() {
+	fc.doCheckpoint()
+}
+
 // Close safely closes the coordinator and stops background tasks.
 func (fc *FileCoordinator) Close() error {
 	fc.mu.Lock()
@@ -481,6 +501,8 @@ func (fc *FileCoordinator) Close() error {
 		close(fc.stopLoop)
 	}
 	<-fc.loopDone
+
+	fc.doCheckpoint()
 
 	_ = fc.dataFile.Close()
 	_ = fc.metaFile.Close()

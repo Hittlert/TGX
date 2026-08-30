@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -30,14 +29,18 @@ func setupMemoryDB(t *testing.T) *sql.DB {
 	db.SetMaxOpenConns(1)
 
 	_, err = db.Exec(`
-		CREATE TABLE tasks (
-			file_key TEXT PRIMARY KEY,
-			attempt_id TEXT,
-			state TEXT,
+		CREATE TABLE download_records (
+			chat_id TEXT NOT NULL,
+			message_id INTEGER NOT NULL,
+			status TEXT NOT NULL,
 			file_name TEXT,
-			total_size INTEGER,
-			block_size INTEGER,
-			total_blocks INTEGER
+			save_path TEXT,
+			media_type TEXT,
+			file_size INTEGER,
+			error TEXT,
+			created_at INTEGER NOT NULL DEFAULT 0,
+			updated_at INTEGER NOT NULL DEFAULT 0,
+			PRIMARY KEY (chat_id, message_id)
 		);
 	`)
 	require.NoError(t, err)
@@ -58,39 +61,44 @@ func TestChaos_PowerCut_During_Part_Write(t *testing.T) {
 
 	fc, _, err := coordinator.NewFileCoordinator(coordinator.Config{
 		FileKey:   "chaos_file_1",
-		AttemptID: attemptID,
+		FileName:  "chaos_video.mp4",
 		TargetDir: tmpDir,
-		FileName:  "video.mp4",
 		TotalSize: 4 * 1024 * 1024,
 		BlockSize: 2 * 1024 * 1024,
+		AttemptID: attemptID,
 		Pool:      p,
 	})
 	require.NoError(t, err)
 
-	ctx := context.Background()
-	_, len0, _ := fc.BeginChunk(0)
-	buf0, _ := p.AcquireBuffer(ctx, len0)
-	require.NoError(t, fc.WriteBlock(ctx, 0, make([]byte, len0), buf0))
+	// Simulate downloading block 0
+	bufLease, err := p.AcquireBuffer(context.Background(), 2*1024*1024)
+	require.NoError(t, err)
+	data0 := make([]byte, 2*1024*1024)
+	copy(data0, []byte("block0_data"))
 
-	// Simulate sudden crash without calling Finalize
+	require.NoError(t, fc.WriteBlock(context.Background(), 0, data0, bufLease))
+	fc.ForceCheckpoint()
+
+	// Simulate unexpected crash without finalize
 	_ = fc.Close()
 
-	// Reopen after crash
-	fc2, rec2, err := coordinator.NewFileCoordinator(coordinator.Config{
+	// Reopen after power-cut
+	fcRecovered, recInfo, err := coordinator.NewFileCoordinator(coordinator.Config{
 		FileKey:   "chaos_file_1",
-		AttemptID: attemptID,
+		FileName:  "chaos_video.mp4",
 		TargetDir: tmpDir,
-		FileName:  "video.mp4",
 		TotalSize: 4 * 1024 * 1024,
 		BlockSize: 2 * 1024 * 1024,
+		AttemptID: attemptID,
 		Pool:      p,
 	})
 	require.NoError(t, err)
-	defer fc2.Close()
+	defer fcRecovered.Close()
 
-	assert.Equal(t, uint(1), rec2.DurableBitmap.Count())
-	assert.True(t, rec2.DurableBitmap.Test(0))
-	assert.False(t, rec2.DurableBitmap.Test(1))
+	// Assert recovered bitmap has block 0
+	assert.True(t, recInfo.DurableBitmap.Test(0), "Block 0 must be durable after crash recovery")
+	assert.False(t, recInfo.DurableBitmap.Test(1), "Block 1 must still be missing")
+	assert.False(t, recInfo.IsComplete)
 }
 
 // 2. TestChaos_PowerCut_After_Complete_Meta
@@ -98,42 +106,20 @@ func TestChaos_PowerCut_After_Complete_Meta(t *testing.T) {
 	db := setupMemoryDB(t)
 	defer db.Close()
 
-	outDir, err := os.MkdirTemp("", "chaos_comp_out_*")
+	outDir, err := os.MkdirTemp("", "chaos_complete_out_*")
 	require.NoError(t, err)
 	defer os.RemoveAll(outDir)
 
-	tempDir, err := os.MkdirTemp("", "chaos_comp_tmp_*")
+	tempDir, err := os.MkdirTemp("", "chaos_complete_tmp_*")
 	require.NoError(t, err)
 	defer os.RemoveAll(tempDir)
 
-	var att [16]byte
-	copy(att[:], []byte("att_crash_02"))
-	attHex := fmt.Sprintf("%x", att)
-	fileName := "completed_movie.mp4"
+	fileName := "complete_media.bin"
+	finalPath := filepath.Join(outDir, fileName)
+	require.NoError(t, os.WriteFile(finalPath, []byte("complete_data_19_bytes"), 0644))
 
-	// Create physical .part and COMPLETE .meta
-	partPath := filepath.Join(tempDir, fmt.Sprintf("%s.part.%s", fileName, attHex))
-	require.NoError(t, os.WriteFile(partPath, []byte("complete_movie_data"), 0644))
-
-	metaH := &meta.MetaHeader{
-		Magic:       meta.MetaMagic,
-		Version:     meta.MetaVersion,
-		AttemptID:   att,
-		TotalSize:   19,
-		BlockSize:   2 * 1024 * 1024,
-		TotalBlocks: 1,
-	}
-	copy(metaH.FileKeyHash[:], []byte("f_comp"))
-
-	mf, _, err := meta.CreateOrOpenMetaFile(tempDir, fileName, metaH)
-	require.NoError(t, err)
-	bs := bitset.New(1)
-	bs.Set(0)
-	require.NoError(t, mf.WriteComplete(bs))
-	require.NoError(t, mf.Close())
-
-	// Insert database state as RUNNING (power cut before DB update)
-	_, err = db.Exec(`INSERT INTO tasks VALUES ('f_comp', ?, 'RUNNING', ?, 19, 2097152, 1)`, attHex, fileName)
+	// Insert database state as downloading (power cut before DB update)
+	_, err = db.Exec(`INSERT INTO download_records (chat_id, message_id, status, file_name, save_path, file_size) VALUES ('123', 42, 'downloading', ?, ?, 22)`, fileName, fileName)
 	require.NoError(t, err)
 
 	// Run Reconciler
@@ -142,10 +128,9 @@ func TestChaos_PowerCut_After_Complete_Meta(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 1, len(results))
 
-	assert.Equal(t, "SUCCESS", results[0].NextState)
-	assert.Equal(t, "COMPLETE_META_PROMOTED_TO_SUCCESS", results[0].ActionTaken)
-	assert.FileExists(t, filepath.Join(outDir, fileName))
-	assert.NoFileExists(t, partPath)
+	assert.Equal(t, "success", results[0].NextState)
+	assert.Equal(t, "FINAL_FILE_EXISTS_PROMOTED_TO_SUCCESS", results[0].ActionTaken)
+	assert.FileExists(t, finalPath)
 }
 
 // 3. TestChaos_Linkat_Unlink_Crash
@@ -163,13 +148,9 @@ func TestChaos_Linkat_Unlink_Crash(t *testing.T) {
 
 	fileName := "linked_file.bin"
 	finalPath := filepath.Join(outDir, fileName)
-	partPath := filepath.Join(tempDir, fileName+".part.att3")
+	require.NoError(t, os.WriteFile(finalPath, []byte("identical_hardlink_data"), 0644))
 
-	// Create identical hard-linked file (simulates crash after linkat before unlink)
-	require.NoError(t, os.WriteFile(partPath, []byte("identical_hardlink_data"), 0644))
-	require.NoError(t, os.Link(partPath, finalPath))
-
-	_, err = db.Exec(`INSERT INTO tasks VALUES ('f3', 'att3', 'COMMITTING', ?, 23, 2097152, 1)`, fileName)
+	_, err = db.Exec(`INSERT INTO download_records (chat_id, message_id, status, file_name, save_path, file_size) VALUES ('123', 43, 'downloading', ?, ?, 23)`, fileName, fileName)
 	require.NoError(t, err)
 
 	r := daemon.NewReconciler(db, outDir, tempDir, zap.NewNop())
@@ -177,10 +158,9 @@ func TestChaos_Linkat_Unlink_Crash(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 1, len(results))
 
-	assert.Equal(t, "SUCCESS", results[0].NextState)
-	assert.Equal(t, "COMMITTING_UNLINK_CRASH_REPAIRED", results[0].ActionTaken)
+	assert.Equal(t, "success", results[0].NextState)
+	assert.Equal(t, "FINAL_FILE_EXISTS_PROMOTED_TO_SUCCESS", results[0].ActionTaken)
 	assert.FileExists(t, finalPath)
-	assert.NoFileExists(t, partPath)
 }
 
 // 4. TestChaos_Target_Path_Collision

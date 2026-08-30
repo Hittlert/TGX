@@ -43,14 +43,20 @@ type fileElement struct {
 }
 
 func newFileElement(task *Task, file downloader.File, tempRoot, outputRoot string, date int64) (*fileElement, error) {
-	if err := os.MkdirAll(tempRoot, 0o755); err != nil {
-		return nil, fmt.Errorf("create temp root: %w", err)
-	}
-	hash := sha256.Sum256([]byte(task.Request().ID))
-	tempPath := filepath.Join(tempRoot, hex.EncodeToString(hash[:])+".part")
-	writer, err := os.OpenFile(tempPath, os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0o600)
+	absolute, err := safeOutputPath(outputRoot, task.Request().FinalPath)
 	if err != nil {
-		return nil, fmt.Errorf("create temp file: %w", err)
+		return nil, err
+	}
+	dir := filepath.Dir(absolute)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, fmt.Errorf("create destination directory: %w", err)
+	}
+
+	hash := sha256.Sum256([]byte(task.Request().ID))
+	tempPath := filepath.Join(dir, fmt.Sprintf(".tdl-part-%s.part", hex.EncodeToString(hash[:8])))
+	writer, err := os.OpenFile(tempPath, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("create part file: %w", err)
 	}
 	element := &fileElement{
 		task: task, file: file, writer: writer, tempPath: tempPath,
@@ -69,7 +75,9 @@ func (e *fileElement) AlreadyComplete() (string, bool) {
 }
 
 func (e *fileElement) Abort() error {
-	return e.closeTemp()
+	_ = e.closeTemp()
+	_ = os.Remove(e.tempPath)
+	return nil
 }
 
 func (e *fileElement) Publish() (result PublishResult, resultErr error) {
@@ -94,53 +102,23 @@ func (e *fileElement) Publish() (result PublishResult, resultErr error) {
 		return PublishResult{Path: e.finalPath, AlreadyExists: true, absolutePath: absolute}, nil
 	}
 	dir := filepath.Dir(absolute)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return result, fmt.Errorf("create destination directory: %w", err)
-	}
 
-	source, err := os.Open(e.tempPath)
-	if err != nil {
-		return result, fmt.Errorf("open temp file: %w", err)
-	}
-	defer func() { resultErr = errors.Join(resultErr, source.Close()) }()
-	stage, err := os.CreateTemp(dir, ".tdl-stage-*")
-	if err != nil {
-		return result, fmt.Errorf("create destination stage: %w", err)
-	}
-	stagePath := stage.Name()
-	defer os.Remove(stagePath)
-	hasher := sha256.New()
-	written, copyErr := io.Copy(io.MultiWriter(stage, hasher), source)
-	if copyErr != nil {
-		_ = stage.Close()
-		return result, fmt.Errorf("copy to destination stage: %w", copyErr)
-	}
-	if written != e.file.Size() {
-		_ = stage.Close()
-		return result, fmt.Errorf("staged file size %d does not match expected %d", written, e.file.Size())
-	}
-	if err := stage.Chmod(0o644); err != nil {
-		_ = stage.Close()
-		return result, fmt.Errorf("chmod destination stage: %w", err)
-	}
-	if err := stage.Sync(); err != nil {
-		_ = stage.Close()
-		return result, fmt.Errorf("sync destination stage: %w", err)
-	}
-	if err := stage.Close(); err != nil {
-		return result, fmt.Errorf("close destination stage: %w", err)
-	}
 	if e.date > 0 {
 		when := time.Unix(e.date, 0)
-		if err := os.Chtimes(stagePath, when, when); err != nil {
-			return result, fmt.Errorf("set destination time: %w", err)
-		}
+		_ = os.Chtimes(e.tempPath, when, when)
 	}
-	if err := atomic.CommitFile(stagePath, absolute); err != nil {
+
+	shaHash, err := computeSHA256(e.tempPath)
+	if err != nil {
+		return result, fmt.Errorf("hash temp file: %w", err)
+	}
+
+	// Zero-copy direct atomic rename in the exact same directory!
+	if err := atomic.CommitFile(e.tempPath, absolute); err != nil {
 		if errors.Is(err, atomic.ErrTargetExists) {
 			if exists, checkErr := existingFile(absolute, e.file.Size()); checkErr == nil && exists {
 				_ = os.Remove(e.tempPath)
-				return PublishResult{Path: e.finalPath, AlreadyExists: true, absolutePath: absolute}, nil
+				return PublishResult{Path: e.finalPath, SHA256: shaHash, AlreadyExists: true, absolutePath: absolute}, nil
 			}
 			return result, fmt.Errorf("publish destination without overwrite: %w", err)
 		}
@@ -149,12 +127,23 @@ func (e *fileElement) Publish() (result PublishResult, resultErr error) {
 	if err := syncDirectory(dir); err != nil {
 		return result, err
 	}
-	if err := os.Remove(e.tempPath); err != nil {
-		return result, fmt.Errorf("remove temp file: %w", err)
-	}
 	return PublishResult{
-		Path: e.finalPath, SHA256: hex.EncodeToString(hasher.Sum(nil)), absolutePath: absolute,
+		Path: e.finalPath, SHA256: shaHash, absolutePath: absolute,
 	}, nil
+}
+
+func computeSHA256(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 func (e *fileElement) closeTemp() error {
