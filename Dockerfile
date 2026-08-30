@@ -1,5 +1,5 @@
 # Multi-platform Docker build for TGX
-FROM --platform=$BUILDPLATFORM golang:1.24-alpine AS builder
+FROM --platform=$BUILDPLATFORM golang:alpine AS builder
 
 ARG VERSION="dev"
 ARG COMMIT="unknown"
