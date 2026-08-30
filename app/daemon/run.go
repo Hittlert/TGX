@@ -20,6 +20,7 @@ import (
 	"github.com/Hittlert/TGX/core/logctx"
 	"github.com/Hittlert/TGX/core/storage"
 	"github.com/Hittlert/TGX/core/tclient"
+	"github.com/Hittlert/TGX/pkg/sbe/gate"
 )
 
 type Options struct {
@@ -131,8 +132,9 @@ func Run(ctx context.Context, client *telegram.Client, kvd storage.Storage, opts
 		return fmt.Errorf("create daemon output directory: %w", err)
 	}
 
-	pool := dcpool.NewPool(client, int64(opts.PoolSize),
-		tclient.NewDefaultMiddlewares(ctx, opts.ReconnectTimeout)...)
+	sharedGate := gate.NewFloodGate(40.0, 10)
+	pool := dcpool.NewPoolWithGate(client, int64(opts.PoolSize), sharedGate,
+		tclient.NewDefaultMiddlewaresWithGate(ctx, opts.ReconnectTimeout, sharedGate)...)
 	defer func() { resultErr = errors.Join(resultErr, pool.Close()) }()
 	manager := peers.Options{Storage: storage.NewPeers(kvd)}.Build(pool.Default(ctx))
 	access := newTelegramMediaAccess(pool, manager, opts.PeerSyncTimeout)
@@ -148,6 +150,7 @@ func Run(ctx context.Context, client *telegram.Client, kvd storage.Storage, opts
 		FileConcurrency: opts.FileConcurrency,
 		Iter:            iter,
 		Progress:        newTaskProgress(),
+		FloodGate:       sharedGate,
 	})
 
 	db, err := NewDatabase(opts.DBPath)

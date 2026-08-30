@@ -27,15 +27,17 @@ func (f *fakeFile) Size() int64                         { return f.size }
 func (f *fakeFile) DC() int                             { return f.dc }
 
 type fakeElem struct {
-	file   *fakeFile
-	buf    *memWriterAt
-	take   bool
-	onDone func(error)
+	file     *fakeFile
+	buf      *memWriterAt
+	take     bool
+	canceled bool
+	onDone   func(error)
 }
 
 func (e *fakeElem) File() File          { return e.file }
 func (e *fakeElem) To() io.WriterAt     { return e.buf }
 func (e *fakeElem) AsTakeout() bool     { return e.take }
+func (e *fakeElem) IsCanceled() bool    { return e.canceled }
 
 type memWriterAt struct {
 	mu   sync.Mutex
@@ -327,4 +329,42 @@ func TestDownloader_CancellationZeroPanic(t *testing.T) {
 	// Must cleanly return on context cancellation with ZERO panics or send on closed channel
 	err := dl.Download(ctx, 16)
 	assert.Error(t, err)
+}
+
+func TestDownloader_TaskLevelCancellation(t *testing.T) {
+	invoker := &fakeInvoker{}
+	pool := &fakePool{invoker: invoker}
+
+	canceledElem := &fakeElem{
+		file:     &fakeFile{size: 5 * 1024 * 1024, dc: 4},
+		buf:      newMemWriterAt(5 * 1024 * 1024),
+		canceled: true,
+	}
+
+	iter := &fakeIter{elems: []*fakeElem{canceledElem}}
+	progress := newFakeProgress()
+	fg := gate.NewFloodGate(1000, 100)
+
+	dl := New(Options{
+		Pool:            pool,
+		Threads:         4,
+		DiskWorkers:     2,
+		FileConcurrency: 2,
+		Iter:            iter,
+		Progress:        progress,
+		FloodGate:       fg,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	err := dl.Download(ctx, 4)
+	require.NoError(t, err)
+
+	progress.mu.Lock()
+	defer progress.mu.Unlock()
+
+	// Canceled task must fail fast with context.Canceled
+	assert.Equal(t, 1, len(progress.done))
+	assert.Equal(t, context.Canceled, progress.done[canceledElem])
 }

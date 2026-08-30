@@ -15,6 +15,7 @@ import (
 
 	"github.com/Hittlert/TGX/core/logctx"
 	"github.com/Hittlert/TGX/core/middlewares/takeout"
+	"github.com/Hittlert/TGX/pkg/sbe/gate"
 )
 
 var testMode = false
@@ -36,6 +37,7 @@ type pool struct {
 	size        int64
 	mu          *sync.Mutex
 	middlewares []telegram.Middleware
+	floodGate   *gate.FloodGate
 
 	invokers map[int]tg.Invoker
 	closes   map[int]func() error
@@ -43,11 +45,16 @@ type pool struct {
 }
 
 func NewPool(c *telegram.Client, size int64, middlewares ...telegram.Middleware) Pool {
+	return NewPoolWithGate(c, size, nil, middlewares...)
+}
+
+func NewPoolWithGate(c *telegram.Client, size int64, fg *gate.FloodGate, middlewares ...telegram.Middleware) Pool {
 	return &pool{
 		api:         c,
 		size:        size,
 		mu:          &sync.Mutex{},
 		middlewares: middlewares,
+		floodGate:   fg,
 		invokers:    make(map[int]tg.Invoker),
 		closes:      make(map[int]func() error),
 	}
@@ -90,6 +97,9 @@ func (p *pool) invoker(ctx context.Context, dc int) tg.Invoker {
 			}
 			if d, isFlood := tgerr.AsFloodWait(err); isFlood {
 				logctx.From(ctx).Warn("DC transfer flood wait, backing off", zap.Int("dc", dc), zap.Duration("wait", d))
+				if p.floodGate != nil {
+					p.floodGate.TriggerFloodWait(dc, d)
+				}
 				time.Sleep(d + 1*time.Second)
 				continue
 			}
@@ -103,7 +113,11 @@ func (p *pool) invoker(ctx context.Context, dc int) tg.Invoker {
 	}
 
 	p.closes[dc] = invoker.Close
-	p.invokers[dc] = chainMiddlewares(invoker, p.middlewares...)
+	mws := p.middlewares
+	if p.floodGate != nil {
+		mws = append([]telegram.Middleware{p.floodGate.Middleware(dc)}, mws...)
+	}
+	p.invokers[dc] = chainMiddlewares(invoker, mws...)
 
 	return p.invokers[dc]
 }

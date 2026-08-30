@@ -113,22 +113,23 @@ type floodGateMiddleware struct {
 
 func (m *floodGateMiddleware) Handle(next tg.Invoker) telegram.InvokeFunc {
 	return func(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
+		var lastErr error
 		for attempt := 0; attempt < 5; attempt++ {
 			if m.gate != nil {
 				if err := m.gate.Wait(ctx, m.dc); err != nil {
 					return err
 				}
 			}
-			err := next.Invoke(ctx, input, output)
-			if d, isFlood := tgerr.AsFloodWait(err); isFlood {
+			lastErr = next.Invoke(ctx, input, output)
+			if d, isFlood := tgerr.AsFloodWait(lastErr); isFlood {
 				if m.gate != nil {
 					m.gate.TriggerFloodWait(m.dc, d)
 				}
 				continue
 			}
-			return err
+			return lastErr
 		}
-		return next.Invoke(ctx, input, output)
+		return lastErr
 	}
 }
 

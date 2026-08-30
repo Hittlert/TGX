@@ -255,6 +255,10 @@ func (d *Downloader) Download(ctx context.Context, globalConcurrency int) error 
 			newActiveFiles := make([]*fileCursor, 0, len(activeFiles))
 
 			for _, fc := range activeFiles {
+				if ce, ok := fc.state.elem.(CancelableElem); ok && ce.IsCanceled() {
+					fc.state.fail(context.Canceled)
+				}
+
 				select {
 				case <-fc.state.doneChan:
 					// File completed/errored -> vacate slot to admit next file
@@ -314,6 +318,10 @@ func (d *Downloader) Download(ctx context.Context, globalConcurrency int) error 
 }
 
 func (d *Downloader) fetchChunk(ctx context.Context, workerID int, job *chunkJob, writeChan chan<- *writeJob) {
+	if ce, ok := job.fileState.elem.(CancelableElem); ok && ce.IsCanceled() {
+		job.fileState.fail(context.Canceled)
+	}
+
 	// 0. Fail-fast: skip network RPC if file is already cancelled / errored
 	if atomic.LoadInt32(&job.fileState.canceled) == 1 {
 		if atomic.AddInt32(&job.fileState.remParts, -1) == 0 {

@@ -20,6 +20,12 @@ type Elem interface {
 	AsTakeout() bool
 }
 
+// CancelableElem is an optional extension interface to allow upstream task cancellation propagation.
+type CancelableElem interface {
+	Elem
+	IsCanceled() bool
+}
+
 type File interface {
 	Location() tg.InputFileLocationClass
 	Size() int64

@@ -20,9 +20,17 @@
           <canvas id="speed_sparkline" width="80" height="20" style="margin-left: 8px; border-radius: 4px; vertical-align: middle; display: inline-block;" title="实时网络吞吐波动"></canvas>
         </div>
         <div class="apple-nav-actions">
-          <div class="apple-auth-pill" id="tg_auth_pill" style="cursor: pointer; display: inline-flex; align-items: center; gap: 4px; font-size: 11.5px; padding: 4px 10px; border-radius: 12px; background: rgba(52, 199, 89, 0.08); color: #34c759; border: 1px solid rgba(52, 199, 89, 0.2); font-weight: 500;" title="点击登录或管理 Telegram 账号">
-            <span id="tg_auth_label">👤 Telegram: 检查中...</span>
-          </div>
+          <button type="button" class="tg-account-trigger is-checking" id="tg_auth_pill" title="管理 Telegram 账号" aria-haspopup="dialog" aria-controls="modal_tg_auth">
+            <span class="tg-account-trigger-icon" aria-hidden="true">
+              <i class="layui-icon layui-icon-user"></i>
+              <span class="tg-account-status-dot"></span>
+            </span>
+            <span class="tg-account-trigger-copy">
+              <span class="tg-account-trigger-name" id="tg_auth_label">Telegram</span>
+              <span class="tg-account-trigger-meta" id="tg_auth_meta">正在检查账号状态</span>
+            </span>
+            <i class="layui-icon layui-icon-right tg-account-trigger-chevron" aria-hidden="true"></i>
+          </button>
           <div class="apple-disk-pill" id="storage_pill" style="display: inline-flex; align-items: center; gap: 4px; font-size: 11.5px; padding: 4px 10px; border-radius: 12px; background: rgba(0, 122, 255, 0.08); color: #007aff; border: 1px solid rgba(0, 122, 255, 0.2); font-weight: 500;" title="NAS 存储可用空间">
             💾 <span id="storage_free_label">计算中...</span>
           </div>
@@ -286,75 +294,124 @@
   </div>
 
   <!-- Telegram Account Auth Wizard Modal -->
-  <div class="apple-modal-overlay" id="modal_tg_auth">
-    <div class="apple-modal-card" style="max-width: 460px;">
-      <div class="modal-header">
-        <div>
-          <h3 class="modal-title">Telegram 账号授权登录</h3>
-          <p class="modal-subtitle">选择扫码或手机验证码，网页端一键登录</p>
+  <div class="apple-modal-overlay" id="modal_tg_auth" role="dialog" aria-modal="true" aria-labelledby="tg_account_modal_title" aria-hidden="true">
+    <div class="apple-modal-card tg-account-modal">
+      <div class="modal-header tg-account-modal-header">
+        <div class="modal-title-wrap">
+          <div class="modal-icon"><i class="layui-icon layui-icon-user"></i></div>
+          <div>
+            <h3 class="modal-title" id="tg_account_modal_title">Telegram 账号</h3>
+            <p class="modal-subtitle" id="tg_account_modal_subtitle">管理下载服务使用的登录账号</p>
+          </div>
         </div>
-        <button type="button" class="modal-close" id="btn_close_tg_auth">&times;</button>
+        <button type="button" class="modal-close-btn" id="btn_close_tg_auth" title="关闭" aria-label="关闭账号管理">
+          <i class="layui-icon layui-icon-close"></i>
+        </button>
       </div>
+
+      <div class="tg-account-modal-body">
         <!-- Multi-Account Management List View -->
         <div id="tg_accounts_list_view" style="display: none;">
-          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
-            <span style="font-size: 13px; font-weight: 600; color: var(--apple-text);">已授权账号列表</span>
-            <button type="button" class="apple-btn apple-btn-primary" id="btn_open_add_account" style="font-size: 12px; padding: 4px 10px;">+ 添加新账号</button>
+          <div class="tg-account-list-toolbar">
+            <div>
+              <div class="tg-view-title">已授权账号</div>
+              <div class="tg-view-description">当前账号用于读取对话与下载媒体</div>
+            </div>
+            <div class="tg-account-list-actions">
+              <span class="tg-account-count" id="tg_accounts_count">0 个账号</span>
+              <button type="button" class="apple-btn apple-btn-primary" id="btn_open_add_account">
+                <i class="layui-icon layui-icon-add-1"></i>
+                <span>添加账号</span>
+              </button>
+            </div>
           </div>
-          <div id="tg_accounts_container" style="display: flex; flex-direction: column; gap: 8px; max-height: 280px; overflow-y: auto; margin-bottom: 12px;">
+          <div id="tg_accounts_container" class="tg-accounts-list" role="list">
             <!-- Rendered dynamically -->
           </div>
         </div>
 
         <!-- Login Form View -->
         <div id="tg_auth_form_view">
-          <button type="button" class="apple-btn apple-btn-secondary" id="btn_back_to_accounts" style="margin-bottom: 12px; font-size: 12px; padding: 4px 10px; display: none;">⬅ 返回账号列表</button>
-          <!-- Segmented Tab for Login Mode -->
-          <div style="display: flex; gap: 8px; margin-bottom: 20px; background: rgba(120, 120, 128, 0.08); padding: 4px; border-radius: 10px;">
-            <button type="button" id="tab_auth_qr" class="apple-btn" style="flex: 1; border: none; font-size: 13px; font-weight: 600; padding: 6px 0; border-radius: 8px; background: white; box-shadow: 0 1px 3px rgba(0,0,0,0.1); color: var(--apple-text);">📱 扫码登录 (推荐)</button>
-            <button type="button" id="tab_auth_phone" class="apple-btn" style="flex: 1; border: none; font-size: 13px; font-weight: 500; padding: 6px 0; border-radius: 8px; background: transparent; color: var(--apple-text-muted);">💬 手机验证码</button>
+          <div class="tg-auth-view-toolbar">
+            <button type="button" class="tg-back-button" id="btn_back_to_accounts" style="display: none;">
+              <i class="layui-icon layui-icon-left"></i>
+              <span>返回账号列表</span>
+            </button>
+            <span class="tg-new-account-label">新账号授权</span>
+          </div>
+
+          <div class="tg-auth-mode-tabs" role="tablist" aria-label="登录方式">
+            <button type="button" id="tab_auth_qr" class="tg-auth-mode-tab is-active" role="tab" aria-selected="true" aria-controls="section_auth_qr">
+              <i class="layui-icon layui-icon-cellphone"></i>
+              <span>扫码登录</span>
+            </button>
+            <button type="button" id="tab_auth_phone" class="tg-auth-mode-tab" role="tab" aria-selected="false" aria-controls="section_auth_phone">
+              <i class="layui-icon layui-icon-vercode"></i>
+              <span>手机验证码</span>
+            </button>
           </div>
 
           <!-- Mode 1: QR Code Section -->
-          <div id="section_auth_qr" style="text-align: center;">
-            <div id="qr_box" style="margin: 0 auto 16px auto; width: 210px; height: 210px; background: rgba(0,0,0,0.03); border-radius: 16px; border: 1px solid rgba(0,0,0,0.06); display: flex; align-items: center; justify-content: center; overflow: hidden; position: relative;">
-              <img id="tg_qr_img" src="" alt="Telegram QR" style="width: 190px; height: 190px; display: none;">
-              <div id="qr_spinner" class="apple-spinner"></div>
-              <div id="qr_expired_mask" style="display: none; position: absolute; inset: 0; background: rgba(255,255,255,0.92); flex-direction: column; align-items: center; justify-content: center; gap: 8px;">
-                <span style="font-size: 13px; color: #ff3b30; font-weight: 500;">二维码已失效</span>
-                <button type="button" class="apple-btn apple-btn-secondary" id="btn_refresh_qr" style="font-size: 12px; padding: 4px 12px;">点击刷新</button>
+          <div id="section_auth_qr" class="tg-auth-section" role="tabpanel" aria-labelledby="tab_auth_qr">
+            <div class="tg-auth-qr-layout">
+              <div class="tg-qr-panel">
+                <div id="qr_box" class="tg-qr-box">
+                  <img id="tg_qr_img" src="" alt="Telegram 登录二维码" style="display: none;">
+                  <div id="qr_spinner" class="apple-spinner"></div>
+                  <div id="qr_expired_mask" class="tg-qr-expired" style="display: none;">
+                    <i class="layui-icon layui-icon-refresh"></i>
+                    <span>二维码已失效</span>
+                    <button type="button" class="apple-btn apple-btn-secondary" id="btn_refresh_qr">重新生成</button>
+                  </div>
+                </div>
+                <span class="tg-qr-live-status"><span></span>等待手机确认</span>
+              </div>
+              <div class="tg-auth-guidance">
+                <span class="tg-auth-eyebrow">Telegram 手机端</span>
+                <h4>扫描二维码完成授权</h4>
+                <ol class="tg-auth-steps">
+                  <li><span>1</span>打开 Telegram 设置</li>
+                  <li><span>2</span>进入“设备”</li>
+                  <li><span>3</span>选择“关联桌面设备”</li>
+                </ol>
+                <p>二维码只用于本次登录，过期后可直接重新生成。</p>
               </div>
             </div>
-            <div style="font-size: 12.5px; color: var(--apple-text-secondary); line-height: 1.6; margin-bottom: 12px;">
-              请在手机 Telegram 打开：<br>
-              <strong>设置 ➔ 设备 ➔ 关联桌面设备 / 扫描二维码</strong>
-            </div>
-            <!-- 2FA Box inside QR -->
-            <div id="qr_2fa_box" style="display: none; text-align: left; margin-top: 14px; padding: 12px; background: rgba(255, 149, 0, 0.08); border-radius: 12px; border: 1px solid rgba(255, 149, 0, 0.25);">
-              <div style="font-size: 12.5px; font-weight: 600; color: #ff9500; margin-bottom: 6px;">🔐 该账号已开启两步验证 (2FA)</div>
-              <input type="password" id="qr_2fa_password" placeholder="请输入 Telegram 两步验证密码" style="width: 100%; box-sizing: border-box; padding: 8px 12px; border-radius: 8px; border: 1px solid rgba(0,0,0,0.15); font-size: 13px; margin-bottom: 8px;">
-              <button type="button" class="apple-btn apple-btn-primary" id="btn_submit_qr_2fa" style="width: 100%;">确认 2FA 密码并登录</button>
+            <div id="qr_2fa_box" class="tg-auth-security-box" style="display: none;">
+              <div class="tg-auth-security-title"><i class="layui-icon layui-icon-password"></i>需要两步验证</div>
+              <div class="tg-inline-form-row">
+                <input class="tg-auth-input" type="password" id="qr_2fa_password" autocomplete="current-password" placeholder="输入 Telegram 两步验证密码">
+                <button type="button" class="apple-btn apple-btn-primary" id="btn_submit_qr_2fa">确认并登录</button>
+              </div>
             </div>
           </div>
 
           <!-- Mode 2: Phone Code Section -->
-          <div id="section_auth_phone" style="display: none;">
-            <div style="margin-bottom: 14px;">
-              <label style="display: block; font-size: 12px; font-weight: 500; margin-bottom: 6px; color: var(--apple-text-secondary);">国际手机号 (带国家区号，如 +8613800000000)</label>
-              <div style="display: flex; gap: 8px;">
-                <input type="text" id="tg_phone_input" placeholder="+8613800000000" style="flex: 1; padding: 8px 12px; border-radius: 8px; border: 1px solid rgba(0,0,0,0.15); font-size: 13px;">
-                <button type="button" class="apple-btn apple-btn-primary" id="btn_send_phone_code" style="white-space: nowrap;">获取验证码</button>
+          <div id="section_auth_phone" class="tg-auth-section" role="tabpanel" aria-labelledby="tab_auth_phone" style="display: none;">
+            <div class="tg-phone-form">
+              <div class="tg-form-field">
+                <label for="tg_phone_input">国际手机号</label>
+                <span class="tg-form-hint">包含国家区号，例如 +8613800000000</span>
+                <div class="tg-inline-form-row">
+                  <input class="tg-auth-input" type="tel" id="tg_phone_input" autocomplete="tel" inputmode="tel" placeholder="+8613800000000">
+                  <button type="button" class="apple-btn apple-btn-primary" id="btn_send_phone_code">获取验证码</button>
+                </div>
               </div>
-            </div>
-            <div id="phone_verify_box" style="display: none; margin-bottom: 14px;">
-              <label style="display: block; font-size: 12px; font-weight: 500; margin-bottom: 6px; color: var(--apple-text-secondary);">Telegram 验证码 (官方 App 消息或短信)</label>
-              <input type="text" id="tg_code_input" placeholder="输入 5 位验证码" style="width: 100%; box-sizing: border-box; padding: 8px 12px; border-radius: 8px; border: 1px solid rgba(0,0,0,0.15); font-size: 13px; margin-bottom: 8px;">
-              <button type="button" class="apple-btn apple-btn-success" id="btn_submit_phone_code" style="width: 100%;">验证并登录</button>
-            </div>
-            <div id="phone_2fa_box" style="display: none; padding: 12px; background: rgba(255, 149, 0, 0.08); border-radius: 12px; border: 1px solid rgba(255, 149, 0, 0.25);">
-              <div style="font-size: 12.5px; font-weight: 600; color: #ff9500; margin-bottom: 6px;">🔐 请输入两步验证密码 (2FA)</div>
-              <input type="password" id="phone_2fa_password" placeholder="请输入 2FA 密码" style="width: 100%; box-sizing: border-box; padding: 8px 12px; border-radius: 8px; border: 1px solid rgba(0,0,0,0.15); font-size: 13px; margin-bottom: 8px;">
-              <button type="button" class="apple-btn apple-btn-primary" id="btn_submit_phone_2fa" style="width: 100%;">确认密码并完成登录</button>
+              <div class="tg-form-field" id="phone_verify_box" style="display: none;">
+                <label for="tg_code_input">Telegram 验证码</label>
+                <span class="tg-form-hint">查看 Telegram 官方消息或短信</span>
+                <div class="tg-inline-form-row">
+                  <input class="tg-auth-input" type="text" id="tg_code_input" autocomplete="one-time-code" inputmode="numeric" placeholder="输入验证码">
+                  <button type="button" class="apple-btn apple-btn-success" id="btn_submit_phone_code">验证并登录</button>
+                </div>
+              </div>
+              <div class="tg-auth-security-box" id="phone_2fa_box" style="display: none;">
+                <div class="tg-auth-security-title"><i class="layui-icon layui-icon-password"></i>需要两步验证</div>
+                <div class="tg-inline-form-row">
+                  <input class="tg-auth-input" type="password" id="phone_2fa_password" autocomplete="current-password" placeholder="输入 Telegram 两步验证密码">
+                  <button type="button" class="apple-btn apple-btn-primary" id="btn_submit_phone_2fa">确认并登录</button>
+                </div>
+              </div>
             </div>
           </div>
         </div>

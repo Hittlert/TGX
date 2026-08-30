@@ -70,6 +70,9 @@ func (e *fileElement) File() downloader.File { return e.file }
 func (e *fileElement) To() io.WriterAt       { return e.tracked }
 func (e *fileElement) AsTakeout() bool       { return false }
 func (e *fileElement) Task() *Task           { return e.task }
+func (e *fileElement) IsCanceled() bool {
+	return e.task != nil && e.task.IsTerminal()
+}
 func (e *fileElement) AlreadyComplete() (string, bool) {
 	return "", false
 }
