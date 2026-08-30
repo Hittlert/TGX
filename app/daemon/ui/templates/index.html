@@ -1108,25 +1108,15 @@
       }
 
       function normalized_listen_chat_id(row) {
+        var chat_id = String(row.chat_id == null ? '' : row.chat_id).trim();
         var chat_type = String(row.type || '').toLowerCase();
-        var username = String(row.username || '').replace(/^@/, '');
-        if (username && (chat_type == 'bot' || chat_type == 'private' || chat_type == 'user')) {
-          return '@' + username;
-        }
-
-        var chat_id = row.chat_id;
-        var chat_id_text = String(chat_id == null ? '' : chat_id);
         if (
-          chat_id_text &&
-          chat_id_text.indexOf('-') !== 0 &&
-          /^\d+$/.test(chat_id_text) &&
+          chat_id &&
+          chat_id.indexOf('-') !== 0 &&
+          /^\d+$/.test(chat_id) &&
           (chat_type == 'channel' || chat_type == 'supergroup')
         ) {
-          return '-100' + chat_id_text;
-        }
-
-        if (row.target_chat_id) {
-          return row.target_chat_id;
+          return '-100' + chat_id;
         }
         return chat_id;
       }

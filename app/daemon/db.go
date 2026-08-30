@@ -125,7 +125,54 @@ func (d *Database) initSchema() error {
 
 	// Clean any dangling 'downloading' records from crashes back to 'pending'
 	_, _ = d.db.Exec(`UPDATE download_records SET status = 'pending' WHERE status = 'downloading'`)
+
+	// Automatically migrate legacy @username primary keys to canonical numeric IDs
+	d.migrateLegacyUsernameIDs()
+
 	return nil
+}
+
+func (d *Database) migrateLegacyUsernameIDs() {
+	legacyMap := map[string]struct {
+		NumericID string
+		Title     string
+		Username  string
+		Type      string
+	}{
+		"@memento7711bot": {NumericID: "8844705144", Title: "纪念品bot", Username: "memento7711bot", Type: "bot"},
+		"@Spjqr1_bot":     {NumericID: "8955155825", Title: "鱼哥原创视频机器人", Username: "Spjqr1_bot", Type: "bot"},
+		"@XHDGZB521bot":   {NumericID: "7236297057", Title: "花卉市场高中部1", Username: "XHDGZB521bot", Type: "bot"},
+		"@jinianpinbot":   {NumericID: "7377780474", Title: "纪念品bot", Username: "jinianpinbot", Type: "bot"},
+	}
+
+	for oldID, info := range legacyMap {
+		var oldEnabled int
+		err := d.db.QueryRow(`SELECT enabled FROM listen_targets WHERE chat_id = ?`, oldID).Scan(&oldEnabled)
+		if err == nil {
+			_, _ = d.db.Exec(`
+				INSERT INTO listen_targets(chat_id, enabled, title, username, chat_type, download_filter, upload_telegram_chat_id, priority, created_at, updated_at, revision)
+				VALUES(?, ?, ?, ?, ?, '', '', 0, unixepoch(), unixepoch(), 1)
+				ON CONFLICT(chat_id) DO UPDATE SET
+					enabled = excluded.enabled,
+					title = excluded.title,
+					username = excluded.username,
+					chat_type = excluded.chat_type,
+					updated_at = excluded.updated_at
+			`, info.NumericID, oldEnabled, info.Title, info.Username, info.Type)
+			_, _ = d.db.Exec(`DELETE FROM listen_targets WHERE chat_id = ?`, oldID)
+		}
+
+		_, _ = d.db.Exec(`UPDATE OR IGNORE download_records SET chat_id = ? WHERE chat_id = ?`, info.NumericID, oldID)
+		_, _ = d.db.Exec(`DELETE FROM download_records WHERE chat_id = ?`, oldID)
+
+		_, _ = d.db.Exec(`UPDATE OR IGNORE chat_messages SET chat_id = ? WHERE chat_id = ?`, info.NumericID, oldID)
+		_, _ = d.db.Exec(`DELETE FROM chat_messages WHERE chat_id = ?`, oldID)
+
+		_, _ = d.db.Exec(`UPDATE OR IGNORE chat_scan_cursors SET chat_id = ? WHERE chat_id = ?`, info.NumericID, oldID)
+		_, _ = d.db.Exec(`DELETE FROM chat_scan_cursors WHERE chat_id = ?`, oldID)
+	}
+
+	_, _ = d.db.Exec(`DELETE FROM listen_targets WHERE chat_id LIKE '@%' AND chat_id NOT IN (SELECT DISTINCT chat_id FROM download_records)`)
 }
 
 // Helper wrapper
@@ -144,7 +191,7 @@ func (d *Database) GetListenTargets() ([]ListenTarget, error) {
 		       t.upload_telegram_chat_id, t.priority, COALESCE(c.cursor, 0), t.created_at, t.updated_at, t.revision
 		FROM listen_targets t
 		LEFT JOIN chat_scan_cursors c ON t.chat_id = c.chat_id
-		ORDER BY t.enabled DESC, t.priority DESC, t.updated_at DESC
+		ORDER BY t.priority DESC, t.updated_at DESC
 	`)
 	if err != nil {
 		return nil, err
@@ -152,7 +199,6 @@ func (d *Database) GetListenTargets() ([]ListenTarget, error) {
 	defer rows.Close()
 
 	var targets []ListenTarget
-	seen := make(map[string]bool)
 	for rows.Next() {
 		var item ListenTarget
 		var enabledInt int
@@ -164,15 +210,6 @@ func (d *Database) GetListenTargets() ([]ListenTarget, error) {
 			return nil, err
 		}
 		item.Enabled = enabledInt == 1
-
-		key := item.ChatID
-		if item.Username != "" && (item.ChatType == "bot" || item.ChatType == "private" || item.ChatType == "user") {
-			key = "@" + strings.TrimPrefix(strings.ToLower(item.Username), "@")
-		}
-		if seen[key] {
-			continue
-		}
-		seen[key] = true
 		targets = append(targets, item)
 	}
 	return targets, nil

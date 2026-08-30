@@ -678,11 +678,28 @@ func (s *WebServer) handleUpdateSingleTarget(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	canonicalChatID := item.ChatID
+	if strings.HasPrefix(item.ChatID, "@") {
+		info, err := s.access.ResolvePeerInfo(r.Context(), item.ChatID)
+		if err == nil && info.ChatID != "" {
+			canonicalChatID = info.ChatID
+			if item.Title == "" {
+				item.Title = info.Title
+			}
+			if item.Username == "" {
+				item.Username = info.Username
+			}
+			if item.Type == "" {
+				item.Type = info.Type
+			}
+		}
+	}
+
 	targets, _ := s.db.GetListenTargets()
 	var target ListenTarget
 	found := false
 	for _, t := range targets {
-		if t.ChatID == item.ChatID || (item.Username != "" && strings.EqualFold(strings.TrimPrefix(t.Username, "@"), strings.TrimPrefix(item.Username, "@"))) {
+		if t.ChatID == canonicalChatID {
 			target = t
 			found = true
 			break
@@ -690,7 +707,7 @@ func (s *WebServer) handleUpdateSingleTarget(w http.ResponseWriter, r *http.Requ
 	}
 	if !found {
 		target = ListenTarget{
-			ChatID:   item.ChatID,
+			ChatID:   canonicalChatID,
 			Title:    item.Title,
 			Username: item.Username,
 			ChatType: item.Type,
@@ -711,10 +728,10 @@ func (s *WebServer) handleUpdateSingleTarget(w http.ResponseWriter, r *http.Requ
 	if item.UploadTelegramChatID != nil {
 		target.UploadTelegramChatID = *item.UploadTelegramChatID
 	}
-	if item.Title != "" && target.Title == "" {
+	if item.Title != "" {
 		target.Title = item.Title
 	}
-	if item.Username != "" && target.Username == "" {
+	if item.Username != "" {
 		target.Username = item.Username
 	}
 
@@ -743,34 +760,32 @@ func (s *WebServer) handleUpdateSingleTarget(w http.ResponseWriter, r *http.Requ
 func (s *WebServer) handleDialogs(w http.ResponseWriter, r *http.Request) {
 	refresh := r.URL.Query().Get("refresh") == "true"
 
-	if refresh {
-		dialogs, err := s.access.GetDialogs(r.Context())
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-
-		var newTargets []ListenTarget
-		for _, d := range dialogs {
-			newTargets = append(newTargets, ListenTarget{
-				ChatID:   d.ChatID,
-				Title:    d.Title,
-				Username: d.Username,
-				ChatType: d.Type,
-				Enabled:  false,
-			})
-		}
-		_ = s.db.SaveDiscoveredDialogs(newTargets)
-	}
-
 	targets, err := s.db.GetListenTargets()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
-	decorated := make([]map[string]any, 0, len(targets))
+	targetMap := make(map[string]ListenTarget)
 	for _, t := range targets {
+		targetMap[t.ChatID] = t
+	}
+
+	var rawDialogs []DialogDTO
+	if refresh {
+		rawDialogs, err = s.access.GetDialogs(r.Context())
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
+
+	decorated := make([]map[string]any, 0, len(targets)+len(rawDialogs))
+	seenIDs := make(map[string]bool)
+
+	// 1. First append all configured business targets from database
+	for _, t := range targets {
+		seenIDs[t.ChatID] = true
 		cursor, _, _ := s.db.GetScanCursorWithTime(t.ChatID)
 		var lastMsgDate int64
 		_ = s.db.DB().QueryRow(`SELECT COALESCE(MAX(date), 0) FROM chat_messages WHERE chat_id = ?`, t.ChatID).Scan(&lastMsgDate)
@@ -797,6 +812,34 @@ func (s *WebServer) handleDialogs(w http.ResponseWriter, r *http.Request) {
 			"last_scan_finished_at":   lastMsgDate,
 			"last_scan_started_at":    lastMsgDate,
 			"updated_at":              t.UpdatedAt,
+		})
+	}
+
+	// 2. Append newly discovered unconfigured dialogs as read-only view items (without touching DB)
+	for _, d := range rawDialogs {
+		if seenIDs[d.ChatID] {
+			continue
+		}
+		seenIDs[d.ChatID] = true
+		decorated = append(decorated, map[string]any{
+			"id":                      d.ChatID,
+			"chat_id":                 d.ChatID,
+			"title":                   d.Title,
+			"username":                d.Username,
+			"type":                    d.Type,
+			"pinned":                  d.Pinned,
+			"unread_count":            d.UnreadCount,
+			"last_read_message_id":    0,
+			"is_target":               false,
+			"enabled":                 false,
+			"target_enabled":          false,
+			"priority":                0,
+			"download_filter":         "",
+			"upload_telegram_chat_id": "",
+			"last_message_at":         0,
+			"last_scan_finished_at":   0,
+			"last_scan_started_at":    0,
+			"updated_at":              0,
 		})
 	}
 
