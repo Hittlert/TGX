@@ -80,6 +80,19 @@ func (p *GlobalSlotPool) CalculateRequiredSlots(sizeBytes int64) int {
 func (p *GlobalSlotPool) Acquire(ctx context.Context, taskID string, sizeBytes int64) (int, error) {
 	requiredSlots := p.CalculateRequiredSlots(sizeBytes)
 
+	// Context watcher to ensure cond.Wait() never hangs on canceled context
+	stopWatcher := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			p.mu.Lock()
+			p.cond.Broadcast()
+			p.mu.Unlock()
+		case <-stopWatcher:
+		}
+	}()
+	defer close(stopWatcher)
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
 

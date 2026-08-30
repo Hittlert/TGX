@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Hittlert/TGX/core/downloader"
+	atomic "github.com/Hittlert/TGX/pkg/sbe/atomic"
 )
 
 type trackedWriterAt struct {
@@ -135,15 +136,15 @@ func (e *fileElement) Publish() (result PublishResult, resultErr error) {
 			return result, fmt.Errorf("set destination time: %w", err)
 		}
 	}
-	if err := os.Link(stagePath, absolute); err != nil {
-		if exists, checkErr := existingFile(absolute, e.file.Size()); checkErr == nil && exists {
-			_ = os.Remove(e.tempPath)
-			return PublishResult{Path: e.finalPath, AlreadyExists: true, absolutePath: absolute}, nil
+	if err := atomic.CommitFile(stagePath, absolute); err != nil {
+		if errors.Is(err, atomic.ErrTargetExists) {
+			if exists, checkErr := existingFile(absolute, e.file.Size()); checkErr == nil && exists {
+				_ = os.Remove(e.tempPath)
+				return PublishResult{Path: e.finalPath, AlreadyExists: true, absolutePath: absolute}, nil
+			}
+			return result, fmt.Errorf("publish destination without overwrite: %w", err)
 		}
-		return result, fmt.Errorf("publish destination without overwrite: %w", err)
-	}
-	if err := os.Remove(stagePath); err != nil {
-		return result, fmt.Errorf("remove destination stage: %w", err)
+		return result, fmt.Errorf("publish destination atomic rename: %w", err)
 	}
 	if err := syncDirectory(dir); err != nil {
 		return result, err

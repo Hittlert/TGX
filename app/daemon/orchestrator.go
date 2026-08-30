@@ -338,7 +338,9 @@ func (o *Orchestrator) dispatchOneRecord(ctx context.Context, record DownloadRec
 		}
 
 		// Wait for completion via registry polling
-		startTime := time.Now()
+		lastProgressTime := time.Now()
+		lastDownloaded := int64(0)
+
 		for {
 			select {
 			case <-taskCtx.Done():
@@ -346,6 +348,11 @@ func (o *Orchestrator) dispatchOneRecord(ctx context.Context, record DownloadRec
 			case <-ctx.Done():
 				return
 			default:
+			}
+
+			if snapshot.Downloaded > lastDownloaded {
+				lastDownloaded = snapshot.Downloaded
+				lastProgressTime = time.Now()
 			}
 
 			if snapshot.State == StateSuccess {
@@ -369,9 +376,10 @@ func (o *Orchestrator) dispatchOneRecord(ctx context.Context, record DownloadRec
 				return
 			}
 
-			// Watchdog: If task is actively downloading for more than 5 minutes without any progress, mark failed
-			if time.Since(startTime) > 5*time.Minute && snapshot.State == StateDownloading && snapshot.Downloaded == 0 {
-				_ = o.db.UpdateDownloadStatus(record.ChatID, record.MessageID, "failed", record.FileName, finalRelPath, record.MediaType, record.FileSize, "download timeout / stalled connection")
+			// Watchdog: If actively downloading but no byte progress has been made for 5 minutes, abort and mark failed
+			if snapshot.State == StateDownloading && time.Since(lastProgressTime) > 5*time.Minute {
+				_ = o.db.UpdateDownloadStatus(record.ChatID, record.MessageID, "failed", record.FileName, finalRelPath, record.MediaType, record.FileSize, "download stalled / no progress for 5m")
+				taskCancel()
 				return
 			}
 

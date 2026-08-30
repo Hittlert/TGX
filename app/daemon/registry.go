@@ -413,6 +413,20 @@ func (r *Registry) CancelTasksByChatID(chatID string) {
 	defer r.mu.Unlock()
 
 	cleanChatID := strings.TrimPrefix(chatID, "@")
+	var newQueue []*taskState
+	for _, state := range r.queue {
+		peer := strings.TrimPrefix(state.request.Peer, "@")
+		if peer == cleanChatID || peer == chatID {
+			state.state = StateFailed
+			state.errorClass = "canceled"
+			state.errorText = "target disabled by user"
+			state.finishedAt = r.now()
+		} else {
+			newQueue = append(newQueue, state)
+		}
+	}
+	r.queue = newQueue
+
 	for _, state := range r.tasks {
 		if !isTerminal(state.state) {
 			peer := strings.TrimPrefix(state.request.Peer, "@")
