@@ -61,20 +61,20 @@ func (a *telegramMediaAccess) SyncPeers(ctx context.Context) error {
 	syncCtx, cancel := context.WithTimeout(ctx, a.syncTimeout)
 	defer cancel()
 	return query.GetDialogs(a.pool.Default(syncCtx)).BatchSize(100).ForEach(syncCtx, func(ctx context.Context, elem dialogs.Elem) error {
-		id := tutil.GetInputPeerID(elem.Peer)
-		if id == 0 && elem.Dialog != nil {
-			id = tutil.GetPeerID(elem.Dialog.GetPeer())
+		usersMap := elem.Entities.Users()
+		chatsMap := elem.Entities.Chats()
+		channelsMap := elem.Entities.Channels()
+
+		users := make([]tg.UserClass, 0, len(usersMap))
+		for _, u := range usersMap {
+			users = append(users, u)
 		}
-		users := make([]tg.UserClass, 0, 1)
-		if user, ok := elem.Entities.User(id); ok {
-			users = append(users, user)
+		chats := make([]tg.ChatClass, 0, len(chatsMap)+len(channelsMap))
+		for _, c := range chatsMap {
+			chats = append(chats, c)
 		}
-		chats := make([]tg.ChatClass, 0, 1)
-		if chat, ok := elem.Entities.Chat(id); ok {
-			chats = append(chats, chat)
-		}
-		if channel, ok := elem.Entities.Channel(id); ok {
-			chats = append(chats, channel)
+		for _, c := range channelsMap {
+			chats = append(chats, c)
 		}
 		return a.manager.Apply(ctx, users, chats)
 	})
