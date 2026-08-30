@@ -121,7 +121,12 @@ func TestTaskIteratorCompletesPreexistingFileWithoutDownloader(t *testing.T) {
 	_, _, _ = registry.Submit(validRequest("next", 2))
 	existing := &fakeElement{file: fakeDownloadFile{size: 100}, alreadyPath: "Group/existing.mp4"}
 	next := &fakeElement{file: fakeDownloadFile{size: 100}}
-	iter := newTaskIter(registry, &fakeResolver{results: []resolveResult{{element: existing}, {element: next}}})
+	iter := newTaskIter(registry, &fakeResolver{
+		byID: map[string]resolveResult{
+			"existing": {element: existing},
+			"next":     {element: next},
+		},
+	})
 
 	if !iter.Next(context.Background()) || iter.Value() != next {
 		t.Fatalf("iterator did not advance past existing file: err=%v", iter.Err())

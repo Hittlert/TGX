@@ -450,45 +450,63 @@
       var current_target_ns = "";
       var saved_accounts_list = [];
 
+      function set_account_modal_copy(title, subtitle) {
+        $("#tg_account_modal_title").text(title);
+        $("#tg_account_modal_subtitle").text(subtitle);
+      }
+
+      function show_accounts_view() {
+        $("#tg_accounts_list_view").show();
+        $("#tg_auth_form_view").hide();
+        set_account_modal_copy("Telegram 账号", "管理下载服务使用的登录账号");
+      }
+
+      function show_auth_view(can_go_back) {
+        $("#tg_accounts_list_view").hide();
+        $("#tg_auth_form_view").show();
+        $("#btn_back_to_accounts").toggle(!!can_go_back);
+        set_account_modal_copy("添加 Telegram 账号", "选择一种方式完成新账号授权");
+      }
+
       function render_accounts_list(accounts) {
         saved_accounts_list = accounts || [];
         var container = $("#tg_accounts_container");
         container.empty();
+        $("#tg_accounts_count").text(saved_accounts_list.length + " 个账号");
 
         if (saved_accounts_list.length === 0) {
-          $("#tg_accounts_list_view").hide();
-          $("#tg_auth_form_view").show();
-          $("#btn_back_to_accounts").hide();
+          show_auth_view(false);
           return;
         }
 
-        $("#tg_accounts_list_view").show();
-        $("#tg_auth_form_view").hide();
-        $("#btn_back_to_accounts").show();
+        show_accounts_view();
 
         for (var i = 0; i < saved_accounts_list.length; i++) {
           var a = saved_accounts_list[i];
           var displayName = a.first_name || a.username || ('ID: ' + a.user_id);
           if (a.last_name) displayName += ' ' + a.last_name;
           var initial = (a.first_name || a.username || 'TG').charAt(0).toUpperCase();
+          var namespace = escape_html(a.namespace || '');
+          var accountMeta = [];
+          if (a.username) accountMeta.push('@' + escape_html(a.username));
+          if (a.phone) accountMeta.push(escape_html(a.phone));
+          if (accountMeta.length === 0) accountMeta.push('Telegram ID ' + escape_html(a.user_id));
 
-          var itemHtml = '<div style="display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; background: rgba(0,0,0,0.02); border: 1px solid ' + (a.is_active ? '#34c759' : 'rgba(0,0,0,0.08)') + '; border-radius: 12px;">' +
-            '<div style="display: flex; align-items: center; gap: 10px;">' +
-              '<div style="width: 36px; height: 36px; border-radius: 50%; background: ' + (a.is_active ? '#34c759' : '#8e8e93') + '; color: white; display: flex; align-items: center; justify-content: center; font-weight: 600; font-size: 15px;">' + initial + '</div>' +
-              '<div>' +
-                '<div style="font-size: 13.5px; font-weight: 600; color: var(--apple-text); display: flex; align-items: center; gap: 6px;">' +
-                  escape_html(displayName) +
-                  (a.is_premium ? '<span style="font-size: 10px; padding: 1px 5px; border-radius: 4px; background: #ff9500; color: white; font-weight: bold;">⭐ Premium</span>' : '') +
-                  (a.is_active ? '<span style="font-size: 10.5px; padding: 1px 6px; border-radius: 6px; background: rgba(52,199,89,0.15); color: #34c759; font-weight: 500;">🟢 当前活动</span>' : '') +
+          var itemHtml = '<div class="tg-account-row' + (a.is_active ? ' is-active' : '') + '" role="listitem">' +
+            '<div class="tg-account-identity">' +
+              '<div class="tg-account-avatar">' + escape_html(initial) + '</div>' +
+              '<div class="tg-account-copy">' +
+                '<div class="tg-account-name-line">' +
+                  '<span class="tg-account-name">' + escape_html(displayName) + '</span>' +
+                  (a.is_premium ? '<span class="tg-account-badge is-premium">Premium</span>' : '') +
+                  (a.is_active ? '<span class="tg-account-badge is-current"><span></span>当前使用</span>' : '') +
                 '</div>' +
-                '<div style="font-size: 11.5px; color: var(--apple-text-secondary);">' +
-                  '@' + (a.username || '无') + ' · ' + (a.phone || '隐藏') +
-                '</div>' +
+                '<div class="tg-account-meta">' + accountMeta.join('<span class="tg-account-meta-divider"></span>') + '</div>' +
               '</div>' +
             '</div>' +
-            '<div style="display: flex; gap: 6px;">' +
-              (!a.is_active ? '<button type="button" class="apple-btn apple-btn-secondary btn-switch-acc" data-ns="' + a.namespace + '" style="font-size: 11.5px; padding: 3px 8px;">切换</button>' : '') +
-              '<button type="button" class="apple-btn apple-btn-secondary btn-del-acc" data-ns="' + a.namespace + '" style="font-size: 11.5px; padding: 3px 8px; color: #ff3b30;" title="删除账号授权">✕</button>' +
+            '<div class="tg-account-row-actions">' +
+              (!a.is_active ? '<button type="button" class="apple-btn apple-btn-secondary btn-switch-acc" data-ns="' + namespace + '"><i class="layui-icon layui-icon-transfer"></i><span>切换使用</span></button>' : '') +
+              '<button type="button" class="tg-account-delete-btn ' + (a.is_active ? 'btn-logout-active' : 'btn-del-acc') + '" data-ns="' + namespace + '" title="' + (a.is_active ? '退出当前账号' : '删除账号授权') + '" aria-label="' + (a.is_active ? '退出当前账号' : '删除 ' + escape_html(displayName) + ' 的授权') + '"><i class="layui-icon layui-icon-delete"></i></button>' +
             '</div>' +
           '</div>';
 
@@ -530,9 +548,16 @@
               success: function () {
                 layer.msg("已删除账号", { icon: 1 });
                 check_tg_auth_status(false);
+              },
+              error: function (xhr) {
+                layer.msg("删除失败: " + xhr.responseText, { icon: 2 });
               }
             });
           });
+        });
+
+        $(".btn-logout-active").click(function () {
+          logout_current_account();
         });
       }
 
@@ -546,31 +571,42 @@
             if (res && res.logged_in) {
               var user = res.user || {};
               var name = user.first_name || user.username || ('ID: ' + user.id);
-              $("#tg_auth_label").html('👤 ' + escape_html(name) + (accounts.length > 1 ? ' (' + accounts.length + ')' : ''));
-              $("#tg_auth_pill").css({ background: 'rgba(52, 199, 89, 0.08)', color: '#34c759', borderColor: 'rgba(52, 199, 89, 0.2)' });
+              $("#tg_auth_label").text(name);
+              $("#tg_auth_meta").text("已登录 · " + accounts.length + " 个账号");
+              $("#tg_auth_pill").removeClass("is-checking is-unauthorized is-error").addClass("is-authorized");
               render_accounts_list(accounts);
             } else {
-              $("#tg_auth_label").html('⚠️ Telegram 未登录');
-              $("#tg_auth_pill").css({ background: 'rgba(255, 149, 0, 0.1)', color: '#ff9500', borderColor: 'rgba(255, 149, 0, 0.3)' });
+              $("#tg_auth_label").text("Telegram 未登录");
+              $("#tg_auth_meta").text(accounts.length > 0 ? accounts.length + " 个已保存账号" : "点击添加账号");
+              $("#tg_auth_pill").removeClass("is-checking is-authorized is-error").addClass("is-unauthorized");
               render_accounts_list(accounts);
               if (auto_open_if_unauthorized) {
                 open_tg_auth_modal();
               }
             }
+          },
+          error: function () {
+            $("#tg_auth_label").text("账号状态不可用");
+            $("#tg_auth_meta").text("点击打开账号管理");
+            $("#tg_auth_pill").removeClass("is-checking is-authorized is-unauthorized").addClass("is-error");
           }
         });
       }
 
       function open_tg_auth_modal() {
-        $("#modal_tg_auth").addClass("is-open");
-        if ($("#tg_auth_form_view").is(":visible")) {
+        $("#modal_tg_auth").addClass("is-open").attr("aria-hidden", "false");
+        $("body").addClass("has-open-modal");
+        if ($("#tg_auth_form_view").is(":visible") && $("#section_auth_qr").is(":visible")) {
           start_qr_login();
         }
+        setTimeout(function () { $("#btn_close_tg_auth").focus(); }, 0);
       }
 
       function close_tg_auth_modal() {
-        $("#modal_tg_auth").removeClass("is-open");
+        $("#modal_tg_auth").removeClass("is-open").attr("aria-hidden", "true");
+        $("body").removeClass("has-open-modal");
         stop_qr_poll();
+        $("#tg_auth_pill").focus();
       }
 
       function stop_qr_poll() {
@@ -611,14 +647,12 @@
 
       $("#btn_open_add_account").click(function () {
         current_target_ns = "acc_" + Date.now();
-        $("#tg_accounts_list_view").hide();
-        $("#tg_auth_form_view").show();
+        show_auth_view(true);
         start_qr_login();
       });
 
       $("#btn_back_to_accounts").click(function () {
-        $("#tg_auth_form_view").hide();
-        $("#tg_accounts_list_view").show();
+        show_accounts_view();
         stop_qr_poll();
       });
 
@@ -654,22 +688,32 @@
       $("#btn_close_tg_auth").click(function () {
         close_tg_auth_modal();
       });
+      $("#modal_tg_auth").click(function (event) {
+        if (event.target === this) {
+          close_tg_auth_modal();
+        }
+      });
+      $(document).keydown(function (event) {
+        if (event.key === "Escape" && $("#modal_tg_auth").hasClass("is-open")) {
+          close_tg_auth_modal();
+        }
+      });
       $("#btn_refresh_qr").click(function () {
         start_qr_login();
       });
 
       // Switch Tab (QR vs Phone)
       $("#tab_auth_qr").click(function () {
-        $(this).css({ background: 'white', color: 'var(--apple-text)', fontWeight: '600' });
-        $("#tab_auth_phone").css({ background: 'transparent', color: 'var(--apple-text-muted)', fontWeight: '500' });
+        $(this).addClass("is-active").attr("aria-selected", "true");
+        $("#tab_auth_phone").removeClass("is-active").attr("aria-selected", "false");
         $("#section_auth_qr").show();
         $("#section_auth_phone").hide();
         start_qr_login();
       });
 
       $("#tab_auth_phone").click(function () {
-        $(this).css({ background: 'white', color: 'var(--apple-text)', fontWeight: '600' });
-        $("#tab_auth_qr").css({ background: 'transparent', color: 'var(--apple-text-muted)', fontWeight: '500' });
+        $(this).addClass("is-active").attr("aria-selected", "true");
+        $("#tab_auth_qr").removeClass("is-active").attr("aria-selected", "false");
         $("#section_auth_phone").show();
         $("#section_auth_qr").hide();
         stop_qr_poll();
@@ -797,8 +841,8 @@
         });
       });
 
-      // Logout Telegram
-      $("#btn_tg_logout").click(function () {
+      // Logout current Telegram account
+      function logout_current_account() {
         layer.confirm("确定要退出当前 Telegram 账号授权吗？", { icon: 3, title: "确认退出" }, function (idx) {
           layer.close(idx);
           $.ajax({
@@ -808,10 +852,13 @@
             success: function () {
               layer.msg("已退出 Telegram 授权", { icon: 1 });
               check_tg_auth_status(true);
+            },
+            error: function (xhr) {
+              layer.msg("退出失败: " + xhr.responseText, { icon: 2 });
             }
           });
         });
-      });
+      }
 
       // Initial check
       check_tg_auth_status(false);

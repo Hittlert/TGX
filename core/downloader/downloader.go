@@ -377,23 +377,26 @@ func (d *Downloader) fetchChunk(ctx context.Context, workerID int, job *chunkJob
 			return
 		}
 
-		if d.floodGate != nil {
-			if err := d.floodGate.Wait(ctx, job.dcID); err != nil {
-				job.fileState.fail(err)
-				if atomic.AddInt32(&job.fileState.remParts, -1) == 0 {
-					job.fileState.doneOnce.Do(func() {
-						d.opts.Progress.OnDone(job.fileState.elem, job.fileState.firstErr)
-						close(job.fileState.doneChan)
-					})
-				}
-				return
-			}
+		elemCtx := ctx
+		if ce, ok := job.fileState.elem.(ContextElem); ok && ce.Context() != nil {
+			elemCtx = ce.Context()
 		}
 
-		chunkCtx, chunkCancel := context.WithTimeout(ctx, 60*time.Second)
+		chunkCtx, chunkCancel := context.WithTimeout(elemCtx, 60*time.Second)
 		var res tg.UploadFileClass
 		res, fetchErr = client.UploadGetFile(chunkCtx, req)
 		chunkCancel()
+
+		if errors.Is(fetchErr, context.Canceled) || elemCtx.Err() != nil {
+			job.fileState.fail(context.Canceled)
+			if atomic.AddInt32(&job.fileState.remParts, -1) == 0 {
+				job.fileState.doneOnce.Do(func() {
+					d.opts.Progress.OnDone(job.fileState.elem, context.Canceled)
+					close(job.fileState.doneChan)
+				})
+			}
+			return
+		}
 
 		if fetchErr == nil {
 			if uf, ok := res.(*tg.UploadFile); ok {

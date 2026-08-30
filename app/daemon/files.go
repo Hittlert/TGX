@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -70,6 +71,12 @@ func (e *fileElement) File() downloader.File { return e.file }
 func (e *fileElement) To() io.WriterAt       { return e.tracked }
 func (e *fileElement) AsTakeout() bool       { return false }
 func (e *fileElement) Task() *Task           { return e.task }
+func (e *fileElement) Context() context.Context {
+	if e.task != nil {
+		return e.task.Context()
+	}
+	return context.Background()
+}
 func (e *fileElement) IsCanceled() bool {
 	return e.task != nil && e.task.IsTerminal()
 }

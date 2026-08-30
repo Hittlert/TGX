@@ -31,6 +31,7 @@ type fakeElem struct {
 	buf      *memWriterAt
 	take     bool
 	canceled bool
+	ctx      context.Context
 	onDone   func(error)
 }
 
@@ -38,6 +39,12 @@ func (e *fakeElem) File() File          { return e.file }
 func (e *fakeElem) To() io.WriterAt     { return e.buf }
 func (e *fakeElem) AsTakeout() bool     { return e.take }
 func (e *fakeElem) IsCanceled() bool    { return e.canceled }
+func (e *fakeElem) Context() context.Context {
+	if e.ctx != nil {
+		return e.ctx
+	}
+	return context.Background()
+}
 
 type memWriterAt struct {
 	mu   sync.Mutex

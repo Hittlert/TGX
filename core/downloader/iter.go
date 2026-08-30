@@ -26,6 +26,12 @@ type CancelableElem interface {
 	IsCanceled() bool
 }
 
+// ContextElem is an optional extension interface to bind chunk RPCs to the task lifecycle context.
+type ContextElem interface {
+	Elem
+	Context() context.Context
+}
+
 type File interface {
 	Location() tg.InputFileLocationClass
 	Size() int64

@@ -134,7 +134,7 @@ func Run(ctx context.Context, client *telegram.Client, kvd storage.Storage, opts
 
 	sharedGate := gate.NewFloodGate(40.0, 10)
 	pool := dcpool.NewPoolWithGate(client, int64(opts.PoolSize), sharedGate,
-		tclient.NewDefaultMiddlewaresWithGate(ctx, opts.ReconnectTimeout, sharedGate)...)
+		tclient.NewDefaultMiddlewares(ctx, opts.ReconnectTimeout)...)
 	defer func() { resultErr = errors.Join(resultErr, pool.Close()) }()
 	manager := peers.Options{Storage: storage.NewPeers(kvd)}.Build(pool.Default(ctx))
 	access := newTelegramMediaAccess(pool, manager, opts.PeerSyncTimeout)

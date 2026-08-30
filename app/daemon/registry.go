@@ -101,6 +101,8 @@ type taskState struct {
 	firstByte     time.Time
 	lastByte      time.Time
 	smoothedSpeed float64
+	ctx           context.Context
+	cancel        context.CancelFunc
 }
 
 type Registry struct {
@@ -162,8 +164,10 @@ func (r *Registry) Submit(request TaskRequest) (TaskSnapshot, bool, error) {
 				return TaskSnapshot{}, false, ErrQueueFull
 			}
 			now := r.now()
+			taskCtx, taskCancel := context.WithCancel(context.Background())
 			*existing = taskState{
 				request: request, state: StateQueued, totalSize: request.ExpectedSize, createdAt: now,
+				ctx: taskCtx, cancel: taskCancel,
 			}
 			r.removeTerminalLocked(request.ID)
 			r.queue = append(r.queue, existing)
@@ -176,8 +180,10 @@ func (r *Registry) Submit(request TaskRequest) (TaskSnapshot, bool, error) {
 		return TaskSnapshot{}, false, ErrQueueFull
 	}
 	now := r.now()
+	taskCtx, taskCancel := context.WithCancel(context.Background())
 	state := &taskState{
 		request: request, state: StateQueued, totalSize: request.ExpectedSize, createdAt: now,
+		ctx: taskCtx, cancel: taskCancel,
 	}
 	r.tasks[request.ID] = state
 	r.queue = append(r.queue, state)
@@ -408,6 +414,9 @@ func (r *Registry) finish(state *taskState, status TaskState, class, message, fi
 	state.alreadyExists = already
 	state.sha256 = sha256
 	state.finishedAt = r.now()
+	if isTerminal(status) && state.cancel != nil {
+		state.cancel()
+	}
 	if finalPath != "" {
 		state.request.FinalPath = finalPath
 	}
@@ -435,6 +444,9 @@ func (r *Registry) CancelTasksByChatID(chatID string) {
 			state.errorClass = "canceled"
 			state.errorText = "target disabled by user"
 			state.finishedAt = r.now()
+			if state.cancel != nil {
+				state.cancel()
+			}
 		} else {
 			newQueue = append(newQueue, state)
 		}
@@ -449,10 +461,23 @@ func (r *Registry) CancelTasksByChatID(chatID string) {
 				state.errorClass = "canceled"
 				state.errorText = "target disabled by user"
 				state.finishedAt = r.now()
+				if state.cancel != nil {
+					state.cancel()
+				}
 			}
 		}
 	}
 	r.signalLocked()
+}
+
+func (t *Task) Context() context.Context {
+	r := t.registry
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if t.state.ctx != nil {
+		return t.state.ctx
+	}
+	return context.Background()
 }
 
 func (r *Registry) snapshotTaskLocked(state *taskState, now time.Time) TaskSnapshot {
