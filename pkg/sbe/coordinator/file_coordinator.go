@@ -268,10 +268,11 @@ func (fc *FileCoordinator) MarkWritten(index uint32, length int64, bufLease *lea
 		defer fc.mu.Unlock()
 
 		if fc.blockStates[index] == BlockStateInflight || fc.blockStates[index] == BlockStateMissing {
+			wasInflight := (fc.blockStates[index] == BlockStateInflight)
 			fc.blockStates[index] = BlockStateWritten
 			fc.writtenBitmap.Set(uint(index))
 			fc.dirtyBytes += length
-			if fc.blockStates[index] == BlockStateInflight {
+			if wasInflight {
 				atomic.AddInt32(&fc.activeWorkers, -1)
 			}
 			atomic.AddInt32(&fc.activeWrites, -1)
