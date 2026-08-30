@@ -289,6 +289,78 @@ func GetSingleMessage(ctx context.Context, c *tg.Client, peer tg.InputPeerClass,
 	return m, nil
 }
 
+// GetMessagesBatch fetches a batch of message IDs in a single RPC (up to 100 per chunk), aggregated by peer.
+func GetMessagesBatch(ctx context.Context, c *tg.Client, peer tg.InputPeerClass, msgIDs []int) (map[int]*tg.Message, error) {
+	if len(msgIDs) == 0 {
+		return make(map[int]*tg.Message), nil
+	}
+	result := make(map[int]*tg.Message)
+
+	for i := 0; i < len(msgIDs); i += 100 {
+		end := i + 100
+		if end > len(msgIDs) {
+			end = len(msgIDs)
+		}
+		chunk := msgIDs[i:end]
+
+		var inputIDs []tg.InputMessageClass
+		for _, id := range chunk {
+			inputIDs = append(inputIDs, &tg.InputMessageID{ID: id})
+		}
+
+		switch p := peer.(type) {
+		case *tg.InputPeerChannel:
+			req := &tg.ChannelsGetMessagesRequest{
+				Channel: &tg.InputChannel{ChannelID: p.ChannelID, AccessHash: p.AccessHash},
+				ID:      inputIDs,
+			}
+			res, err := c.ChannelsGetMessages(ctx, req)
+			if err != nil {
+				if isDefinitiveError(err) {
+					return nil, err
+				}
+				continue
+			}
+			if msgs, ok := res.(*tg.MessagesChannelMessages); ok {
+				for _, mClass := range msgs.Messages {
+					if m, ok := mClass.(*tg.Message); ok {
+						result[m.ID] = m
+					}
+				}
+			}
+		default:
+			res, err := c.MessagesGetMessages(ctx, inputIDs)
+			if err != nil {
+				if isDefinitiveError(err) {
+					return nil, err
+				}
+				continue
+			}
+			switch msgs := res.(type) {
+			case *tg.MessagesMessages:
+				for _, mClass := range msgs.Messages {
+					if m, ok := mClass.(*tg.Message); ok {
+						result[m.ID] = m
+					}
+				}
+			case *tg.MessagesMessagesSlice:
+				for _, mClass := range msgs.Messages {
+					if m, ok := mClass.(*tg.Message); ok {
+						result[m.ID] = m
+					}
+				}
+			case *tg.MessagesChannelMessages:
+				for _, mClass := range msgs.Messages {
+					if m, ok := mClass.(*tg.Message); ok {
+						result[m.ID] = m
+					}
+				}
+			}
+		}
+	}
+	return result, nil
+}
+
 type Messages []*tg.Message
 
 func (m Messages) Len() int {

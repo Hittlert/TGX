@@ -110,3 +110,53 @@ func TestFloodGateTokenWaitSnapshotRace(t *testing.T) {
 	assert.GreaterOrEqual(t, elapsed, 700*time.Millisecond)
 	assert.False(t, gate.IsDCCooledDown(2))
 }
+
+func TestFloodGate_DataAndControlSemaphores(t *testing.T) {
+	g := NewFloodGate(100.0, 40)
+	ctx := context.Background()
+
+	// 1. Acquire all 40 data slots
+	for i := 0; i < MaxDataInFlight; i++ {
+		err := g.AcquireDataSlot(ctx)
+		require.NoError(t, err)
+	}
+	assert.Equal(t, int64(MaxDataInFlight), g.DataInFlight())
+
+	// 41st slot must block and time out
+	timeoutCtx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	err := g.AcquireDataSlot(timeoutCtx)
+	assert.Error(t, err)
+
+	// Release 1 slot
+	g.ReleaseDataSlot()
+	assert.Equal(t, int64(MaxDataInFlight-1), g.DataInFlight())
+
+	// Now can acquire 1 slot again
+	err = g.AcquireDataSlot(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, int64(MaxDataInFlight), g.DataInFlight())
+
+	for i := 0; i < MaxDataInFlight; i++ {
+		g.ReleaseDataSlot()
+	}
+	assert.Equal(t, int64(0), g.DataInFlight())
+
+	// 2. Acquire all 4 control slots
+	for i := 0; i < MaxControlInFlight; i++ {
+		err := g.AcquireControlSlot(ctx)
+		require.NoError(t, err)
+	}
+	assert.Equal(t, int64(MaxControlInFlight), g.ControlInFlight())
+
+	// 5th control slot must block and time out
+	timeoutCtx2, cancel2 := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel2()
+	err = g.AcquireControlSlot(timeoutCtx2)
+	assert.Error(t, err)
+
+	for i := 0; i < MaxControlInFlight; i++ {
+		g.ReleaseControlSlot()
+	}
+	assert.Equal(t, int64(0), g.ControlInFlight())
+}

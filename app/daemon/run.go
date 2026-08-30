@@ -132,12 +132,12 @@ func Run(ctx context.Context, client *telegram.Client, kvd storage.Storage, opts
 		return fmt.Errorf("create daemon output directory: %w", err)
 	}
 
-	sharedGate := gate.NewFloodGate(40.0, 10)
+	sharedGate := gate.NewFloodGate(gate.InitialStartRate, gate.DefaultBurst)
 	pool := dcpool.NewPoolWithGate(client, int64(opts.PoolSize), sharedGate,
 		tclient.NewDefaultMiddlewares(ctx, opts.ReconnectTimeout)...)
 	defer func() { resultErr = errors.Join(resultErr, pool.Close()) }()
 	manager := peers.Options{Storage: storage.NewPeers(kvd)}.Build(pool.Default(ctx))
-	access := newTelegramMediaAccess(ctx, pool, manager, opts.PeerSyncTimeout)
+	access := newTelegramMediaAccess(ctx, pool, manager, opts.PeerSyncTimeout, sharedGate)
 
 	registry := NewRegistryWithContext(ctx, opts.QueueCapacity, opts.TerminalLimit, time.Now)
 	registry.SetPaused(opts.StartPaused)

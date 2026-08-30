@@ -18,26 +18,35 @@ import (
 	"github.com/Hittlert/TGX/core/downloader"
 	"github.com/Hittlert/TGX/core/tmedia"
 	"github.com/Hittlert/TGX/core/util/tutil"
+	"github.com/Hittlert/TGX/pkg/sbe/gate"
 )
 
 type telegramMediaAccess struct {
 	parentCtx   context.Context
 	pool        dcpool.Pool
 	manager     *peers.Manager
+	gate        *gate.FloodGate
 	syncMu      sync.Mutex
 	lastSync    time.Time
 	sf          singleflight.Group
 	syncTimeout time.Duration
 }
 
-func newTelegramMediaAccess(parentCtx context.Context, pool dcpool.Pool, manager *peers.Manager, syncTimeout time.Duration) *telegramMediaAccess {
+func newTelegramMediaAccess(parentCtx context.Context, pool dcpool.Pool, manager *peers.Manager, syncTimeout time.Duration, gate *gate.FloodGate) *telegramMediaAccess {
 	if parentCtx == nil {
 		parentCtx = context.Background()
 	}
-	return &telegramMediaAccess{parentCtx: parentCtx, pool: pool, manager: manager, syncTimeout: syncTimeout}
+	return &telegramMediaAccess{parentCtx: parentCtx, pool: pool, manager: manager, syncTimeout: syncTimeout, gate: gate}
 }
 
 func (a *telegramMediaAccess) Resolve(ctx context.Context, peer string, messageID int) (ResolvedMedia, error) {
+	if a.gate != nil {
+		if err := a.gate.AcquireControlSlot(ctx); err != nil {
+			return ResolvedMedia{}, err
+		}
+		defer a.gate.ReleaseControlSlot()
+	}
+
 	resolvedPeer, err := tutil.GetInputPeer(ctx, a.manager, peer)
 	if err != nil {
 		if syncErr := a.SyncPeers(ctx); syncErr == nil {
@@ -62,6 +71,13 @@ func (a *telegramMediaAccess) Resolve(ctx context.Context, peer string, messageI
 }
 
 func (a *telegramMediaAccess) SyncPeers(ctx context.Context) error {
+	if a.gate != nil {
+		if err := a.gate.AcquireControlSlot(ctx); err != nil {
+			return err
+		}
+		defer a.gate.ReleaseControlSlot()
+	}
+
 	a.syncMu.Lock()
 	if !a.lastSync.IsZero() && time.Since(a.lastSync) < 30*time.Second {
 		a.syncMu.Unlock()
@@ -80,8 +96,8 @@ func (a *telegramMediaAccess) SyncPeers(ctx context.Context) error {
 		syncCtx, cancel := context.WithTimeout(a.parentCtx, a.syncTimeout)
 		defer cancel()
 
-		seenUsers := make(map[int64]tg.UserClass)
-		seenChats := make(map[int64]tg.ChatClass)
+		seenUsers := make(map[string]tg.UserClass)
+		seenChats := make(map[string]tg.ChatClass)
 
 		var syncErr error
 		iter := query.GetDialogs(a.pool.Default(syncCtx)).BatchSize(100).Iter()
@@ -93,21 +109,24 @@ func (a *telegramMediaAccess) SyncPeers(ctx context.Context) error {
 
 			var newUsers []tg.UserClass
 			for id, u := range usersMap {
-				if _, exists := seenUsers[id]; !exists {
-					seenUsers[id] = u
+				key := fmt.Sprintf("user:%d", id)
+				if _, exists := seenUsers[key]; !exists {
+					seenUsers[key] = u
 					newUsers = append(newUsers, u)
 				}
 			}
 			var newChats []tg.ChatClass
 			for id, c := range chatsMap {
-				if _, exists := seenChats[id]; !exists {
-					seenChats[id] = c
+				key := fmt.Sprintf("chat:%d", id)
+				if _, exists := seenChats[key]; !exists {
+					seenChats[key] = c
 					newChats = append(newChats, c)
 				}
 			}
 			for id, c := range channelsMap {
-				if _, exists := seenChats[id]; !exists {
-					seenChats[id] = c
+				key := fmt.Sprintf("channel:%d", id)
+				if _, exists := seenChats[key]; !exists {
+					seenChats[key] = c
 					newChats = append(newChats, c)
 				}
 			}

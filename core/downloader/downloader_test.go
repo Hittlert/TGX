@@ -497,7 +497,7 @@ func TestDownloader_DualLane_OnlySmallFiles(t *testing.T) {
 
 func TestDownloader_LargeFileChunkFailureConvergesAndReleasesWriter(t *testing.T) {
 	invoker := &fakeInvoker{
-		failOffset: 512 * 1024, // Fail the 2nd chunk of the first file
+		failOffset: 1024 * 1024, // Fail the 2nd chunk (1 MiB) of the first file
 	}
 	pool := &fakePool{invoker: invoker}
 
@@ -840,4 +840,235 @@ func TestDownloader_SlowWriterDrainedBeforeSlotReused(t *testing.T) {
 
 	// Verify that File 1 has zero active writes
 	assert.Equal(t, int32(0), atomic.LoadInt32(&w1.activeWrites))
+}
+
+func TestDownloader_1MiBPartAlignmentAndTailTruncation(t *testing.T) {
+	invoker := &fakeInvoker{}
+	pool := &fakePool{invoker: invoker}
+
+	// 2.5 MiB file -> Part 0 (1 MiB), Part 1 (1 MiB), Part 2 (0.5 MiB)
+	elem := &fakeElem{
+		file: &fakeFile{size: 2621440, dc: 4}, // 2.5 MiB
+		buf:  newMemWriterAt(2621440),
+	}
+
+	iter := &fakeIter{elems: []*fakeElem{elem}}
+	progress := newFakeProgress()
+	fg := gate.NewFloodGate(1000, 100)
+
+	dl := New(Options{
+		Pool:            pool,
+		Threads:         16,
+		DiskWorkers:     6,
+		FileConcurrency: 5,
+		Iter:            iter,
+		Progress:        progress,
+		FloodGate:       fg,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err := dl.Download(ctx, 16)
+	require.NoError(t, err)
+
+	progress.mu.Lock()
+	defer progress.mu.Unlock()
+
+	assert.NoError(t, progress.done[elem])
+	assert.Equal(t, int64(2621440), progress.downloaded[elem])
+
+	invoker.mu.Lock()
+	defer invoker.mu.Unlock()
+
+	// Verify all offsets are 1 MiB aligned: 0, 1048576, 2097152
+	expectedOffsets := []int64{0, 1048576, 2097152}
+	assert.ElementsMatch(t, expectedOffsets, invoker.requests)
+}
+
+type trackMaxInFlightInvoker struct {
+	mu           sync.Mutex
+	activeRPC    int64
+	maxActiveRPC int64
+	delay        time.Duration
+}
+
+func (f *trackMaxInFlightInvoker) Invoke(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
+	f.mu.Lock()
+	f.activeRPC++
+	if f.activeRPC > f.maxActiveRPC {
+		f.maxActiveRPC = f.activeRPC
+	}
+	f.mu.Unlock()
+
+	defer func() {
+		f.mu.Lock()
+		f.activeRPC--
+		f.mu.Unlock()
+	}()
+
+	if f.delay > 0 {
+		time.Sleep(f.delay)
+	}
+
+	req, ok := input.(*tg.UploadGetFileRequest)
+	if !ok {
+		return errors.New("unexpected input type")
+	}
+
+	data := bytes.Repeat([]byte{1}, req.Limit)
+	res := &tg.UploadFile{
+		Type:  &tg.StorageFilePartial{},
+		Mtime: int(time.Now().Unix()),
+		Bytes: data,
+	}
+
+	out, ok := output.(*tg.UploadFileBox)
+	if ok {
+		out.File = res
+	}
+	return nil
+}
+
+func TestDownloader_MaxDataInFlightNeverExceeds40(t *testing.T) {
+	invoker := &trackMaxInFlightInvoker{delay: 15 * time.Millisecond}
+	pool := &fakePool{invoker: invoker}
+
+	// 5 large files (10 MiB each) + 50 small files (100 KiB each)
+	elems := make([]*fakeElem, 0, 55)
+	for i := 0; i < 5; i++ {
+		elems = append(elems, &fakeElem{
+			file: &fakeFile{size: 10 * 1024 * 1024, dc: 4},
+			buf:  newMemWriterAt(10 * 1024 * 1024),
+		})
+	}
+	for i := 0; i < 50; i++ {
+		elems = append(elems, &fakeElem{
+			file: &fakeFile{size: 100 * 1024, dc: 4},
+			buf:  newMemWriterAt(100 * 1024),
+		})
+	}
+
+	iter := &fakeIter{elems: elems}
+	progress := newFakeProgress()
+	fg := gate.NewFloodGate(1000, 100)
+
+	dl := New(Options{
+		Pool:            pool,
+		Threads:         64, // High worker count
+		DiskWorkers:     6,
+		FileConcurrency: 5,
+		Iter:            iter,
+		Progress:        progress,
+		FloodGate:       fg,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	err := dl.Download(ctx, 64)
+	require.NoError(t, err)
+
+	invoker.mu.Lock()
+	maxActive := invoker.maxActiveRPC
+	invoker.mu.Unlock()
+
+	// Invariant 1: Total simultaneous data RPCs in flight NEVER exceeds 40!
+	assert.LessOrEqual(t, maxActive, int64(gate.MaxDataInFlight))
+}
+
+func TestDownloader_SmallFilesBorrowAll40SlotsWhenNoLargeFiles(t *testing.T) {
+	invoker := &trackMaxInFlightInvoker{delay: 20 * time.Millisecond}
+	pool := &fakePool{invoker: invoker}
+
+	// 100 small files ONLY (no large files)
+	elems := make([]*fakeElem, 0, 100)
+	for i := 0; i < 100; i++ {
+		elems = append(elems, &fakeElem{
+			file: &fakeFile{size: 200 * 1024, dc: 4},
+			buf:  newMemWriterAt(200 * 1024),
+		})
+	}
+
+	iter := &fakeIter{elems: elems}
+	progress := newFakeProgress()
+	fg := gate.NewFloodGate(1000, 100)
+
+	dl := New(Options{
+		Pool:            pool,
+		Threads:         64,
+		DiskWorkers:     6,
+		FileConcurrency: 5,
+		Iter:            iter,
+		Progress:        progress,
+		FloodGate:       fg,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	err := dl.Download(ctx, 64)
+	require.NoError(t, err)
+
+	invoker.mu.Lock()
+	maxActive := invoker.maxActiveRPC
+	invoker.mu.Unlock()
+
+	// Small files should be able to scale up toward 40
+	assert.Greater(t, maxActive, int64(20))
+	assert.LessOrEqual(t, maxActive, int64(gate.MaxDataInFlight))
+}
+
+func TestDownloader_100SmallFilesBurstLargeThroughputProtected(t *testing.T) {
+	invoker := &fakeInvoker{}
+	pool := &fakePool{invoker: invoker}
+
+	// 5 Large files (5 MiB each) + 100 Small files (50 KiB each)
+	elems := make([]*fakeElem, 0, 105)
+	largeElems := make([]*fakeElem, 0, 5)
+	for i := 0; i < 5; i++ {
+		e := &fakeElem{
+			file: &fakeFile{size: 5 * 1024 * 1024, dc: 4},
+			buf:  newMemWriterAt(5 * 1024 * 1024),
+		}
+		elems = append(elems, e)
+		largeElems = append(largeElems, e)
+	}
+	for i := 0; i < 100; i++ {
+		elems = append(elems, &fakeElem{
+			file: &fakeFile{size: 50 * 1024, dc: 4},
+			buf:  newMemWriterAt(50 * 1024),
+		})
+	}
+
+	iter := &fakeIter{elems: elems}
+	progress := newFakeProgress()
+	fg := gate.NewFloodGate(1000, 100)
+
+	dl := New(Options{
+		Pool:            pool,
+		Threads:         64,
+		DiskWorkers:     6,
+		FileConcurrency: 5,
+		Iter:            iter,
+		Progress:        progress,
+		FloodGate:       fg,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	err := dl.Download(ctx, 64)
+	require.NoError(t, err)
+
+	progress.mu.Lock()
+	defer progress.mu.Unlock()
+
+	// All 105 files completed
+	assert.Equal(t, 105, len(progress.added))
+	assert.Equal(t, 105, len(progress.done))
+	for _, e := range largeElems {
+		assert.NoError(t, progress.done[e])
+		assert.Equal(t, int64(5*1024*1024), progress.downloaded[e])
+	}
 }

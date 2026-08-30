@@ -396,20 +396,28 @@ func (s *WebServer) handleGetDownloadStatus(w http.ResponseWriter, r *http.Reque
 		state = "paused"
 	}
 
+	var totalBufferBytes int64
+	for _, f := range daemonStatus.ActiveFiles {
+		if f.NetDownloaded > f.Downloaded {
+			totalBufferBytes += (f.NetDownloaded - f.Downloaded)
+		}
+	}
+	bufferUsedMB := float64(totalBufferBytes) / (1024 * 1024)
+
 	resp := map[string]any{
 		"download_speed": speedStr,
 		"speed_bps":      speedBytes,
 		"download_state": state,
 		"slot_pool": map[string]any{
-			"total_slots":         snap.TotalSlots,
-			"used_slots":          snap.UsedSlots,
-			"available_slots":     snap.AvailableSlots,
-			"max_active_files":    snap.MaxActiveFiles,
-			"active_files_count":  snap.ActiveFilesCount,
-			"slot_unit_mb":        snap.SlotUnitMB,
-			"max_slots_per_file":  snap.MaxSlotsPerFile,
+			"total_slots":          snap.TotalSlots,
+			"used_slots":           snap.UsedSlots,
+			"available_slots":      snap.AvailableSlots,
+			"max_active_files":     snap.MaxActiveFiles,
+			"active_files_count":   snap.ActiveFilesCount,
+			"slot_unit_mb":         snap.SlotUnitMB,
+			"max_slots_per_file":   snap.MaxSlotsPerFile,
 			"slot_utilization_pct": snap.SlotUtilizationPct,
-			"utilization_pct":     snap.SlotUtilizationPct,
+			"utilization_pct":      snap.SlotUtilizationPct,
 			"file_utilization_pct": snap.FileUtilizationPct,
 		},
 		"media_pool": map[string]any{
@@ -417,13 +425,13 @@ func (s *WebServer) handleGetDownloadStatus(w http.ResponseWriter, r *http.Reque
 			"files":        filesMap,
 		},
 		"sbe_stats": map[string]any{
-			"engine_version":  "SBE v4.1",
-			"buffer_used_mb":  float64(speedBytes%12) * 1.5, // dynamically calculated from active leases
-			"buffer_limit_mb": 96,
-			"dirty_used_mb":   float64(speedBytes%6) * 1.2,
-			"dirty_limit_mb":  48,
-			"net_workers":     64,
-			"disk_workers":    5,
+			"engine_version":  "TGX-DualLane",
+			"buffer_used_mb":  bufferUsedMB,
+			"buffer_limit_mb": 208, // 16MB * 5 large + 128MB small pool
+			"dirty_used_mb":   bufferUsedMB,
+			"dirty_limit_mb":  80,
+			"net_workers":     32,
+			"disk_workers":    6,
 		},
 		"total_download_task": 0,
 		"total_download_byte": formatBytes(0),

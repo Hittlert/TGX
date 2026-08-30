@@ -162,7 +162,7 @@ func filterIPv4Options(options []tg.DCOption) []tg.DCOption {
 func NewDefaultMiddlewares(ctx context.Context, timeout time.Duration) []telegram.Middleware {
 	return []telegram.Middleware{
 		recovery.New(ctx, newBackoff(timeout)),
-		retry.New(5),
+		retry.New(2),
 	}
 }
 

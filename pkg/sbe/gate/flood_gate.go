@@ -4,45 +4,128 @@ import (
 	"context"
 	"math/rand"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
+	"golang.org/x/sync/semaphore"
 	"golang.org/x/time/rate"
 )
 
-// FloodGate manages shared per-DC cooldowns and global account request rate limiting.
+const (
+	MaxDataInFlight    = 40
+	MaxControlInFlight = 4
+	InitialStartRate   = 100.0
+	MaxStartRate       = 160.0
+	MinRate            = 10.0
+	DefaultBurst       = 40
+)
+
+// FloodGate manages adaptive request rate limiting, data/control in-flight semaphores, and per-DC cooldowns.
 type FloodGate struct {
 	mu           sync.RWMutex
 	baseRate     float64
 	currentRate  float64
+	maxRate      float64
+	minRate      float64
 	burst        int
 	lastRamp     time.Time
 	lastRateDrop time.Time
 	dcCooldowns  map[int]time.Time
 	limiter      *rate.Limiter
+
+	// Dynamic Concurrency Control
+	dataSem          *semaphore.Weighted
+	maxDataCap       int64
+	activeDataRPC    int64
+	controlSem       *semaphore.Weighted
+	activeControlRPC int64
 }
 
-// NewFloodGate creates a FloodGate with a global request rate limiter (default 40 req/s, burst 10).
+// NewFloodGate creates an Adaptive Safety Controller with InitialStartRate=100 req/s, Burst=40, MaxDataInFlight=40, MaxControlInFlight=4.
 func NewFloodGate(reqPerSec float64, burst int) *FloodGate {
 	if reqPerSec <= 0 {
-		reqPerSec = 40.0
+		reqPerSec = InitialStartRate
 	}
 	if burst <= 0 {
-		burst = 10
+		burst = DefaultBurst
 	}
 	now := time.Now()
 	return &FloodGate{
-		baseRate:     reqPerSec,
-		currentRate:  reqPerSec,
-		burst:        burst,
-		lastRamp:     now,
-		lastRateDrop: now.Add(-10 * time.Second),
-		dcCooldowns:  make(map[int]time.Time),
-		limiter:      rate.NewLimiter(rate.Limit(reqPerSec), burst),
+		baseRate:       reqPerSec,
+		currentRate:    reqPerSec,
+		maxRate:        MaxStartRate,
+		minRate:        MinRate,
+		burst:          burst,
+		lastRamp:       now,
+		lastRateDrop:   now.Add(-10 * time.Second),
+		dcCooldowns:    make(map[int]time.Time),
+		limiter:        rate.NewLimiter(rate.Limit(reqPerSec), burst),
+		dataSem:        semaphore.NewWeighted(MaxDataInFlight),
+		maxDataCap:     MaxDataInFlight,
+		controlSem:     semaphore.NewWeighted(MaxControlInFlight),
 	}
+}
+
+// AcquireDataSlot blocks until a data RPC slot is available within MaxDataInFlight (40).
+func (g *FloodGate) AcquireDataSlot(ctx context.Context) error {
+	if g == nil {
+		return nil
+	}
+	if err := g.dataSem.Acquire(ctx, 1); err != nil {
+		return err
+	}
+	atomic.AddInt64(&g.activeDataRPC, 1)
+	return nil
+}
+
+// ReleaseDataSlot releases an acquired data RPC slot.
+func (g *FloodGate) ReleaseDataSlot() {
+	if g == nil {
+		return
+	}
+	atomic.AddInt64(&g.activeDataRPC, -1)
+	g.dataSem.Release(1)
+}
+
+// DataInFlight returns the number of actively executing data RPCs.
+func (g *FloodGate) DataInFlight() int64 {
+	if g == nil {
+		return 0
+	}
+	return atomic.LoadInt64(&g.activeDataRPC)
+}
+
+// AcquireControlSlot blocks until a control RPC slot is available within MaxControlInFlight (4).
+func (g *FloodGate) AcquireControlSlot(ctx context.Context) error {
+	if g == nil {
+		return nil
+	}
+	if err := g.controlSem.Acquire(ctx, 1); err != nil {
+		return err
+	}
+	atomic.AddInt64(&g.activeControlRPC, 1)
+	return nil
+}
+
+// ReleaseControlSlot releases an acquired control RPC slot.
+func (g *FloodGate) ReleaseControlSlot() {
+	if g == nil {
+		return
+	}
+	atomic.AddInt64(&g.activeControlRPC, -1)
+	g.controlSem.Release(1)
+}
+
+// ControlInFlight returns the number of actively executing control RPCs.
+func (g *FloodGate) ControlInFlight() int64 {
+	if g == nil {
+		return 0
+	}
+	return atomic.LoadInt64(&g.activeControlRPC)
 }
 
 // CurrentRate returns current adaptive rate.
@@ -82,12 +165,12 @@ func (g *FloodGate) Wait(ctx context.Context, dc int) error {
 			}
 		}
 
-		// Smooth Additive Increase: if currentRate < baseRate and no active cooldowns, ramp up +2.0 req/s per second
-		if g.currentRate < g.baseRate && len(g.dcCooldowns) == 0 {
+		// Smooth Additive Increase: if currentRate < maxRate and no active cooldowns, ramp up +5.0 req/s per second
+		if g.currentRate < g.maxRate && len(g.dcCooldowns) == 0 {
 			if now.Sub(g.lastRamp) >= time.Second {
-				g.currentRate += 2.0
-				if g.currentRate > g.baseRate {
-					g.currentRate = g.baseRate
+				g.currentRate += 5.0
+				if g.currentRate > g.maxRate {
+					g.currentRate = g.maxRate
 				}
 				g.limiter.SetLimit(rate.Limit(g.currentRate))
 				g.lastRamp = now
@@ -118,7 +201,7 @@ func (g *FloodGate) Wait(ctx context.Context, dc int) error {
 			}
 		}
 
-		// 3. Quick post-token verification under lock in case another worker triggered cooldown while we waited for token
+		// 3. Quick post-token verification under lock in case another worker triggered cooldown while waiting for token
 		g.mu.Lock()
 		now = time.Now()
 		notBefore, hasCooldown = g.dcCooldowns[dc]
@@ -148,18 +231,18 @@ func (g *FloodGate) TriggerFloodWait(dc int, duration time.Duration) {
 
 	now := time.Now()
 	// Debounce rate drops: do not multiply decrease more than once per 500ms
-	if g.currentRate > 10.0 && now.Sub(g.lastRateDrop) >= 500*time.Millisecond {
+	if g.currentRate > g.minRate && now.Sub(g.lastRateDrop) >= 500*time.Millisecond {
 		g.currentRate = g.currentRate * 0.75
-		if g.currentRate < 10.0 {
-			g.currentRate = 10.0
+		if g.currentRate < g.minRate {
+			g.currentRate = g.minRate
 		}
 		g.limiter.SetLimit(rate.Limit(g.currentRate))
 		g.lastRamp = now
 		g.lastRateDrop = now
 	}
 
-	// Add jitter (200ms ~ 1000ms) to prevent lockstep thundering herd on wake-up
-	jitter := time.Duration(200+rand.Intn(800)) * time.Millisecond
+	// Add jitter (100ms ~ 500ms) to prevent lockstep thundering herd on wake-up
+	jitter := time.Duration(100+rand.Intn(400)) * time.Millisecond
 	targetTime := now.Add(duration + jitter)
 
 	if existing, exists := g.dcCooldowns[dc]; !exists || targetTime.After(existing) {
@@ -185,23 +268,21 @@ type floodGateMiddleware struct {
 
 func (m *floodGateMiddleware) Handle(next tg.Invoker) telegram.InvokeFunc {
 	return func(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
-		var lastErr error
-		for attempt := 0; attempt < 5; attempt++ {
+		for {
 			if m.gate != nil {
 				if err := m.gate.Wait(ctx, m.dc); err != nil {
 					return err
 				}
 			}
-			lastErr = next.Invoke(ctx, input, output)
-			if d, isFlood := tgerr.AsFloodWait(lastErr); isFlood {
+			err := next.Invoke(ctx, input, output)
+			if d, isFlood := tgerr.AsFloodWait(err); isFlood {
 				if m.gate != nil {
 					m.gate.TriggerFloodWait(m.dc, d)
 				}
 				continue
 			}
-			return lastErr
+			return err
 		}
-		return lastErr
 	}
 }
 

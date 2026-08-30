@@ -52,9 +52,16 @@ type ResolveRequest struct {
 }
 
 func (a *telegramMediaAccess) GetDialogs(ctx context.Context) ([]DialogDTO, error) {
+	if a.gate != nil {
+		if err := a.gate.AcquireControlSlot(ctx); err != nil {
+			return nil, err
+		}
+		defer a.gate.ReleaseControlSlot()
+	}
+
 	var result []DialogDTO
-	seenUsers := make(map[int64]tg.UserClass)
-	seenChats := make(map[int64]tg.ChatClass)
+	seenUsers := make(map[string]tg.UserClass)
+	seenChats := make(map[string]tg.ChatClass)
 
 	err := query.GetDialogs(a.pool.Default(ctx)).BatchSize(100).ForEach(ctx, func(ctx context.Context, elem dialogs.Elem) error {
 		usersMap := elem.Entities.Users()
@@ -63,26 +70,31 @@ func (a *telegramMediaAccess) GetDialogs(ctx context.Context) ([]DialogDTO, erro
 
 		var newUsers []tg.UserClass
 		for id, u := range usersMap {
-			if _, exists := seenUsers[id]; !exists {
-				seenUsers[id] = u
+			key := fmt.Sprintf("user:%d", id)
+			if _, exists := seenUsers[key]; !exists {
+				seenUsers[key] = u
 				newUsers = append(newUsers, u)
 			}
 		}
 		var newChats []tg.ChatClass
 		for id, c := range chatsMap {
-			if _, exists := seenChats[id]; !exists {
-				seenChats[id] = c
+			key := fmt.Sprintf("chat:%d", id)
+			if _, exists := seenChats[key]; !exists {
+				seenChats[key] = c
 				newChats = append(newChats, c)
 			}
 		}
 		for id, c := range channelsMap {
-			if _, exists := seenChats[id]; !exists {
-				seenChats[id] = c
+			key := fmt.Sprintf("channel:%d", id)
+			if _, exists := seenChats[key]; !exists {
+				seenChats[key] = c
 				newChats = append(newChats, c)
 			}
 		}
 		if len(newUsers) > 0 || len(newChats) > 0 {
-			_ = a.manager.Apply(ctx, newUsers, newChats)
+			if applyErr := a.manager.Apply(ctx, newUsers, newChats); applyErr != nil {
+				return applyErr
+			}
 		}
 		id := tutil.GetInputPeerID(elem.Peer)
 		if id == 0 && elem.Dialog != nil {

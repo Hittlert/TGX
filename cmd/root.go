@@ -86,10 +86,11 @@ func New() *cobra.Command {
 			return nil
 		},
 		PersistentPostRunE: func(cmd *cobra.Command, args []string) error {
-			return multierr.Combine(
-				kv.From(cmd.Context()).Close(),
-				logctx.From(cmd.Context()).Sync(),
-			)
+			_ = logctx.From(cmd.Context()).Sync()
+			if stg := kv.From(cmd.Context()); stg != nil {
+				return stg.Close()
+			}
+			return nil
 		},
 	}
 
