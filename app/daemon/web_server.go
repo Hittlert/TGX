@@ -187,6 +187,7 @@ func (s *WebServer) Handler() http.Handler {
 
 	// Targets & Dialogs
 	r.HandleFunc("/api/listen_targets", s.requireAuth(s.handleListenTargets))
+	r.HandleFunc("/api/target/update", s.requireAuth(s.handleUpdateSingleTarget)).Methods(http.MethodPost)
 	r.HandleFunc("/api/dialogs", s.requireAuth(s.handleDialogs)).Methods(http.MethodGet)
 	r.HandleFunc("/api/resolve_target", s.requireAuth(s.handleResolveTarget)).Methods(http.MethodPost)
 	r.HandleFunc("/api/add_target", s.requireAuth(s.handleAddTarget)).Methods(http.MethodPost)
@@ -653,6 +654,89 @@ func (s *WebServer) handleListenTargets(w http.ResponseWriter, r *http.Request) 
 		"code":    0,
 		"msg":     "success",
 		"targets": saved,
+	})
+}
+
+func (s *WebServer) handleUpdateSingleTarget(w http.ResponseWriter, r *http.Request) {
+	var item struct {
+		ChatID               string  `json:"chat_id"`
+		Enabled              *bool   `json:"enabled"`
+		Priority             *int    `json:"priority"`
+		LastReadMessageID    *int    `json:"last_read_message_id"`
+		DownloadFilter       *string `json:"download_filter"`
+		UploadTelegramChatID *string `json:"upload_telegram_chat_id"`
+		Title                string  `json:"title"`
+		Username             string  `json:"username"`
+		Type                 string  `json:"type"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&item); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	if item.ChatID == "" {
+		writeError(w, http.StatusBadRequest, "chat_id is required")
+		return
+	}
+
+	targets, _ := s.db.GetListenTargets()
+	var target ListenTarget
+	found := false
+	for _, t := range targets {
+		if t.ChatID == item.ChatID || (item.Username != "" && strings.EqualFold(strings.TrimPrefix(t.Username, "@"), strings.TrimPrefix(item.Username, "@"))) {
+			target = t
+			found = true
+			break
+		}
+	}
+	if !found {
+		target = ListenTarget{
+			ChatID:   item.ChatID,
+			Title:    item.Title,
+			Username: item.Username,
+			ChatType: item.Type,
+		}
+	}
+	if item.Enabled != nil {
+		target.Enabled = *item.Enabled
+	}
+	if item.Priority != nil {
+		target.Priority = *item.Priority
+	}
+	if item.LastReadMessageID != nil {
+		target.LastReadMessageID = *item.LastReadMessageID
+	}
+	if item.DownloadFilter != nil {
+		target.DownloadFilter = *item.DownloadFilter
+	}
+	if item.UploadTelegramChatID != nil {
+		target.UploadTelegramChatID = *item.UploadTelegramChatID
+	}
+	if item.Title != "" && target.Title == "" {
+		target.Title = item.Title
+	}
+	if item.Username != "" && target.Username == "" {
+		target.Username = item.Username
+	}
+
+	if err := s.db.SaveSingleListenTarget(target); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	if !target.Enabled && s.orchestrator != nil {
+		s.orchestrator.CancelTasksByChatID(target.ChatID)
+	}
+
+	globalUpdatesStreamMu.RLock()
+	stream := globalUpdatesStream
+	globalUpdatesStreamMu.RUnlock()
+	if stream != nil {
+		stream.refreshTargetCache()
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":     true,
+		"target": target,
 	})
 }
 

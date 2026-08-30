@@ -1183,10 +1183,25 @@
       function save_targets(callback) {
         sync_visible_target_rows();
         var targets = [];
+        var seen_keys = {};
         for (var i = 0; i < target_rows.length; i++) {
+          var cid = normalized_listen_chat_id(target_rows[i]);
+          if (!cid) continue;
+          if (seen_keys[cid]) {
+            if (target_rows[i].enabled) {
+              for (var k = 0; k < targets.length; k++) {
+                if (targets[k].chat_id === cid) {
+                  targets[k].enabled = true;
+                  break;
+                }
+              }
+            }
+            continue;
+          }
+          seen_keys[cid] = true;
           targets.push({
             enabled: !!target_rows[i].enabled,
-            chat_id: normalized_listen_chat_id(target_rows[i]),
+            chat_id: cid,
             source_chat_id: target_rows[i].chat_id,
             title: target_display_name(target_rows[i]),
             username: target_rows[i].username || '',
@@ -1236,9 +1251,34 @@
 
       $('#target_list').on('change', '.target-enabled', function () {
         var card = $(this).closest('.apple-target-card');
-        sync_target_row(card);
-        card.toggleClass('is-enabled', $(this).prop('checked'));
+        var row = find_target_row(card.attr('data-chat-key'));
+        var is_checked = $(this).prop('checked');
+        if (row) {
+          row.enabled = is_checked;
+        }
+        card.toggleClass('is-enabled', is_checked);
         update_target_count();
+
+        if (row) {
+          $.ajax({
+            url: "api/target/update",
+            type: "post",
+            contentType: "application/json",
+            data: JSON.stringify({
+              chat_id: normalized_listen_chat_id(row),
+              username: row.username || '',
+              title: row.title || '',
+              type: row.type || '',
+              enabled: is_checked
+            }),
+            dataType: "json",
+            success: function (res) {
+              if (!res.ok) {
+                layer.msg(res.error || 'Update failed');
+              }
+            }
+          });
+        }
       });
 
       $('#target_list').on('click', '.btn-config', function () {

@@ -144,7 +144,7 @@ func (d *Database) GetListenTargets() ([]ListenTarget, error) {
 		       t.upload_telegram_chat_id, t.priority, COALESCE(c.cursor, 0), t.created_at, t.updated_at, t.revision
 		FROM listen_targets t
 		LEFT JOIN chat_scan_cursors c ON t.chat_id = c.chat_id
-		ORDER BY t.priority DESC, t.updated_at DESC
+		ORDER BY t.enabled DESC, t.priority DESC, t.updated_at DESC
 	`)
 	if err != nil {
 		return nil, err
@@ -152,6 +152,7 @@ func (d *Database) GetListenTargets() ([]ListenTarget, error) {
 	defer rows.Close()
 
 	var targets []ListenTarget
+	seen := make(map[string]bool)
 	for rows.Next() {
 		var item ListenTarget
 		var enabledInt int
@@ -163,6 +164,15 @@ func (d *Database) GetListenTargets() ([]ListenTarget, error) {
 			return nil, err
 		}
 		item.Enabled = enabledInt == 1
+
+		key := item.ChatID
+		if item.Username != "" && (item.ChatType == "bot" || item.ChatType == "private" || item.ChatType == "user") {
+			key = "@" + strings.TrimPrefix(strings.ToLower(item.Username), "@")
+		}
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
 		targets = append(targets, item)
 	}
 	return targets, nil
