@@ -77,3 +77,35 @@ func TestFloodGateAdaptiveRateAIMD(t *testing.T) {
 	// Rate remains throttled right after cooldown
 	assert.LessOrEqual(t, gate.CurrentRate(), 30.0)
 }
+
+func TestFloodGateTokenWaitSnapshotRace(t *testing.T) {
+	// Rate limit = 1 req/s, burst = 1
+	gate := NewFloodGate(1.0, 1)
+
+	// Consume the initial burst token
+	err := gate.Wait(context.Background(), 2)
+	require.NoError(t, err)
+
+	doneCh := make(chan error, 1)
+	start := time.Now()
+
+	// Launch worker waiting for next token (takes ~1s)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		doneCh <- gate.Wait(ctx, 2)
+	}()
+
+	// Sleep 200ms into the token wait, then trigger FloodWait on DC 2 for 500ms
+	time.Sleep(200 * time.Millisecond)
+	gate.TriggerFloodWait(2, 500*time.Millisecond)
+
+	// Worker must NOT return before the 500ms cooldown + jitter expires!
+	err = <-doneCh
+	require.NoError(t, err)
+
+	elapsed := time.Since(start)
+	// Must have waited for token (~1s) + cooldown guarantee
+	assert.GreaterOrEqual(t, elapsed, 700*time.Millisecond)
+	assert.False(t, gate.IsDCCooledDown(2))
+}

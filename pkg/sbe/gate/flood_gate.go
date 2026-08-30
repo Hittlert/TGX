@@ -69,6 +69,18 @@ func (g *FloodGate) Wait(ctx context.Context, dc int) error {
 	}
 
 	for {
+		// 1. Wait for token bucket first
+		g.mu.RLock()
+		limiter := g.limiter
+		g.mu.RUnlock()
+
+		if limiter != nil {
+			if err := limiter.Wait(ctx); err != nil {
+				return err
+			}
+		}
+
+		// 2. Atomic check of live cooldown AFTER token is granted
 		g.mu.Lock()
 		now := time.Now()
 		// Clean up expired DC cooldowns
@@ -90,24 +102,18 @@ func (g *FloodGate) Wait(ctx context.Context, dc int) error {
 			}
 		}
 
-		limiter := g.limiter
 		notBefore, hasCooldown := g.dcCooldowns[dc]
-		g.mu.Unlock()
-
-		// 1. Wait for token bucket
-		if limiter != nil {
-			if err := limiter.Wait(ctx); err != nil {
-				return err
-			}
-		}
-
-		// 2. Check DC cooldown
 		if !hasCooldown || now.After(notBefore) {
+			// No cooldown active right now: proceed!
+			g.mu.Unlock()
 			return nil
 		}
 
-		// Cooldown is active -> sleep until cooldown expires and loop back
+		// Cooldown IS active: calculate remaining wait time accurately based on current time
 		waitTime := notBefore.Sub(now)
+		g.mu.Unlock()
+
+		// Sleep for remaining cooldown under context cancellation, then loop back
 		select {
 		case <-ctx.Done():
 			return ctx.Err()

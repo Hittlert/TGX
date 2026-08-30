@@ -169,11 +169,10 @@ func (f failedInvoker) Invoke(ctx context.Context, input bin.Encoder, output bin
 }
 
 func (p *pool) Default(ctx context.Context) *tg.Client {
-	mws := p.middlewares
 	if p.floodGate != nil {
-		mws = append([]telegram.Middleware{p.floodGate.Middleware(p.current())}, mws...)
+		return tg.NewClient(chainMiddlewares(p.api, p.floodGate.Middleware(p.current())))
 	}
-	return tg.NewClient(chainMiddlewares(p.api, mws...))
+	return tg.NewClient(p.api)
 }
 
 func (p *pool) Close() (err error) {

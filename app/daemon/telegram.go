@@ -10,7 +10,6 @@ import (
 
 	"github.com/gotd/td/telegram/peers"
 	"github.com/gotd/td/telegram/query"
-	"github.com/gotd/td/telegram/query/dialogs"
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
 
@@ -60,7 +59,11 @@ func (a *telegramMediaAccess) SyncPeers(ctx context.Context) error {
 	defer a.syncMu.Unlock()
 	syncCtx, cancel := context.WithTimeout(ctx, a.syncTimeout)
 	defer cancel()
-	return query.GetDialogs(a.pool.Default(syncCtx)).BatchSize(100).ForEach(syncCtx, func(ctx context.Context, elem dialogs.Elem) error {
+
+	iter := query.GetDialogs(a.pool.Default(syncCtx)).BatchSize(100).Iter()
+	count := 0
+	for iter.Next(syncCtx) {
+		elem := iter.Value()
 		usersMap := elem.Entities.Users()
 		chatsMap := elem.Entities.Chats()
 		channelsMap := elem.Entities.Channels()
@@ -76,8 +79,13 @@ func (a *telegramMediaAccess) SyncPeers(ctx context.Context) error {
 		for _, c := range channelsMap {
 			chats = append(chats, c)
 		}
-		return a.manager.Apply(ctx, users, chats)
-	})
+		_ = a.manager.Apply(ctx, users, chats)
+		count++
+		if count >= 100 {
+			break
+		}
+	}
+	return nil
 }
 
 type telegramFile struct {
