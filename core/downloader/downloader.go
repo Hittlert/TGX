@@ -106,15 +106,6 @@ func (d *Downloader) download(ctx context.Context, elem Elem) error {
 	if numParts < threads {
 		threads = numParts
 	}
-	if elem.File().DC() != 0 && elem.File().DC() != 4 && threads > 2 {
-		threads = 2
-	}
-	if totalSize <= 10*1024*1024 && threads > 1 {
-		threads = 1
-	}
-	if threads < 1 {
-		threads = 1
-	}
 
 	// For single-part files (photos, small audio, small video <= 512KB)
 	if numParts == 1 {

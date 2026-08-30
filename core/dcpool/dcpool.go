@@ -80,16 +80,11 @@ func (p *pool) invoker(ctx context.Context, dc int) tg.Invoker {
 		invoker telegram.CloseInvoker
 		err     error
 	)
-	if dc == p.current() { // can't transfer dc to current dc
+	if dc == 0 || dc == p.current() {
 		invoker, err = p.api.Pool(p.size)
 	} else {
-		// Foreign DC: scale pool size with p.size (e.g. 16~32) so concurrent downloads don't starve on connection acquire
-		foreignPoolSize := p.size
-		if foreignPoolSize < 8 {
-			foreignPoolSize = 8
-		}
 		for attempt := 0; attempt < 5; attempt++ {
-			invoker, err = p.api.DC(context.Background(), dc, foreignPoolSize)
+			invoker, err = p.api.DC(context.Background(), dc, p.size)
 			if err == nil {
 				break
 			}
