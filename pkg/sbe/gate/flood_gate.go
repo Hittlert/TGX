@@ -44,6 +44,7 @@ type FloodGate struct {
 
 	// Dynamic Concurrency Control
 	dataSem          *semaphore.Weighted
+	dataWakeCh       chan struct{}
 	maxDataCap       int64
 	activeDataRPC    int64
 	controlSem       *semaphore.Weighted
@@ -70,12 +71,13 @@ func NewFloodGate(reqPerSec float64, burst int) *FloodGate {
 		dcCooldowns:    make(map[int]time.Time),
 		limiter:        rate.NewLimiter(rate.Limit(reqPerSec), burst),
 		dataSem:        semaphore.NewWeighted(MaxDataInFlight),
+		dataWakeCh:     make(chan struct{}),
 		maxDataCap:     MaxDataInFlight,
 		controlSem:     semaphore.NewWeighted(MaxControlInFlight),
 	}
 }
 
-// AcquireDataSlot blocks until a data RPC slot is available within MaxDataInFlight (40).
+// AcquireDataSlot blocks until a data RPC slot is available within dynamic maxDataCap and MaxDataInFlight (40).
 func (g *FloodGate) AcquireDataSlot(ctx context.Context) error {
 	if g == nil {
 		return nil
@@ -83,16 +85,38 @@ func (g *FloodGate) AcquireDataSlot(ctx context.Context) error {
 	if err := g.dataSem.Acquire(ctx, 1); err != nil {
 		return err
 	}
-	atomic.AddInt64(&g.activeDataRPC, 1)
-	return nil
+
+	for {
+		g.mu.Lock()
+		if g.activeDataRPC < g.maxDataCap {
+			g.activeDataRPC++
+			g.mu.Unlock()
+			return nil
+		}
+		wakeCh := g.dataWakeCh
+		g.mu.Unlock()
+
+		select {
+		case <-ctx.Done():
+			g.dataSem.Release(1)
+			return ctx.Err()
+		case <-wakeCh:
+		}
+	}
 }
 
-// ReleaseDataSlot releases an acquired data RPC slot.
+// ReleaseDataSlot releases an acquired data RPC slot and wakes pending dynamic cap waiters.
 func (g *FloodGate) ReleaseDataSlot() {
 	if g == nil {
 		return
 	}
-	atomic.AddInt64(&g.activeDataRPC, -1)
+	g.mu.Lock()
+	if g.activeDataRPC > 0 {
+		g.activeDataRPC--
+	}
+	close(g.dataWakeCh)
+	g.dataWakeCh = make(chan struct{})
+	g.mu.Unlock()
 	g.dataSem.Release(1)
 }
 
@@ -288,6 +312,10 @@ func (g *FloodGate) TriggerTransportError(err error) {
 			if g.maxDataCap < 10 {
 				g.maxDataCap = 10
 			}
+			if g.dataWakeCh != nil {
+				close(g.dataWakeCh)
+				g.dataWakeCh = make(chan struct{})
+			}
 		}
 		g.lastRamp = now.Add(2 * time.Second) // Pause ramp-up for 2s after transport error
 		g.lastRateDrop = now
@@ -315,22 +343,33 @@ func (g *FloodGate) IsDCCooledDown(dc int) bool {
 	return exists && time.Now().Before(notBefore)
 }
 
-type tokenPassedKey struct{}
-
-// WithTokenPassed returns a child context indicating that Gate.Wait has already been passed for the initial attempt.
-func WithTokenPassed(ctx context.Context) context.Context {
-	return context.WithValue(ctx, tokenPassedKey{}, true)
+// AdmissionTicket is a single-use ticket bound to a specific DC ID.
+type AdmissionTicket struct {
+	dcID     int
+	consumed int32
 }
 
-// WithoutTokenPassed returns a child context with the token passed marker cleared.
-func WithoutTokenPassed(ctx context.Context) context.Context {
-	return context.WithValue(ctx, tokenPassedKey{}, false)
+func (t *AdmissionTicket) TryConsume(dc int) bool {
+	if t == nil || t.dcID != dc {
+		return false
+	}
+	return atomic.CompareAndSwapInt32(&t.consumed, 0, 1)
 }
 
-// IsTokenPassed checks whether the context has already passed Gate.Wait.
-func IsTokenPassed(ctx context.Context) bool {
-	v, _ := ctx.Value(tokenPassedKey{}).(bool)
-	return v
+type ticketKey struct{}
+
+// WithAdmissionTicket attaches a single-use admission ticket for the given DC ID to the context.
+func WithAdmissionTicket(ctx context.Context, dc int) context.Context {
+	return context.WithValue(ctx, ticketKey{}, &AdmissionTicket{dcID: dc})
+}
+
+// ConsumeTicketForDC attempts to consume a single-use admission ticket specifically for dc.
+func ConsumeTicketForDC(ctx context.Context, dc int) bool {
+	t, ok := ctx.Value(ticketKey{}).(*AdmissionTicket)
+	if !ok || t == nil {
+		return false
+	}
+	return t.TryConsume(dc)
 }
 
 func isTransportError(err error) bool {
@@ -361,18 +400,14 @@ type floodGateMiddleware struct {
 func (m *floodGateMiddleware) Handle(next tg.Invoker) telegram.InvokeFunc {
 	return func(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
 		const maxFloodRetries = 5
-		firstAttempt := true
 		for attempt := 0; attempt < maxFloodRetries; attempt++ {
-			// On first attempt, if caller already performed Gate.Wait (one-time ticket), skip Wait().
-			// On any RETRY (e.g. after FloodWait), we MUST execute Wait() to respect cooldown & rate limit!
-			if m.gate != nil {
-				if !(firstAttempt && IsTokenPassed(ctx)) {
-					if err := m.gate.Wait(ctx, m.dc); err != nil {
-						return err
-					}
+			// Check if caller provided an unconsumed admission ticket specifically for THIS DC (m.dc):
+			ticketConsumed := ConsumeTicketForDC(ctx, m.dc)
+			if m.gate != nil && !ticketConsumed {
+				if err := m.gate.Wait(ctx, m.dc); err != nil {
+					return err
 				}
 			}
-			firstAttempt = false
 
 			err := next.Invoke(ctx, input, output)
 			if d, isFlood := tgerr.AsFloodWait(err); isFlood {

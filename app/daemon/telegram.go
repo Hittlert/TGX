@@ -21,6 +21,11 @@ import (
 	"github.com/Hittlert/TGX/pkg/sbe/gate"
 )
 
+type messageCacheEntry struct {
+	msg     *tg.Message
+	expires time.Time
+}
+
 type telegramMediaAccess struct {
 	parentCtx   context.Context
 	pool        dcpool.Pool
@@ -30,16 +35,48 @@ type telegramMediaAccess struct {
 	lastSync    time.Time
 	sf          singleflight.Group
 	syncTimeout time.Duration
+
+	msgMu    sync.RWMutex
+	msgCache map[string]messageCacheEntry
 }
 
 func newTelegramMediaAccess(parentCtx context.Context, pool dcpool.Pool, manager *peers.Manager, syncTimeout time.Duration, gate *gate.FloodGate) *telegramMediaAccess {
 	if parentCtx == nil {
 		parentCtx = context.Background()
 	}
-	return &telegramMediaAccess{parentCtx: parentCtx, pool: pool, manager: manager, syncTimeout: syncTimeout, gate: gate}
+	return &telegramMediaAccess{
+		parentCtx:   parentCtx,
+		pool:        pool,
+		manager:     manager,
+		syncTimeout: syncTimeout,
+		gate:        gate,
+		msgCache:    make(map[string]messageCacheEntry),
+	}
+}
+
+func (a *telegramMediaAccess) mediaFromMessage(peer string, messageID int, message *tg.Message) (ResolvedMedia, error) {
+	if message == nil {
+		return ResolvedMedia{}, NewTaskError("unavailable", true, fmt.Errorf("message %s/%d is empty", peer, messageID))
+	}
+	media, ok := tmedia.GetMedia(message)
+	if !ok || media.Size <= 0 {
+		return ResolvedMedia{}, NewTaskError("unavailable", true, fmt.Errorf("message %s/%d has no downloadable media", peer, messageID))
+	}
+	file := telegramFile{media: media}
+	return ResolvedMedia{
+		File: file, Name: media.Name, Size: media.Size, DCID: media.DC, Date: media.Date,
+	}, nil
 }
 
 func (a *telegramMediaAccess) Resolve(ctx context.Context, peer string, messageID int) (ResolvedMedia, error) {
+	cacheKey := fmt.Sprintf("%s:%d", peer, messageID)
+	a.msgMu.RLock()
+	if entry, ok := a.msgCache[cacheKey]; ok && time.Now().Before(entry.expires) {
+		a.msgMu.RUnlock()
+		return a.mediaFromMessage(peer, messageID, entry.msg)
+	}
+	a.msgMu.RUnlock()
+
 	resolvedPeer, err := tutil.GetInputPeer(ctx, a.manager, peer)
 	if err != nil {
 		if syncErr := a.SyncPeers(ctx); syncErr == nil {
@@ -50,25 +87,91 @@ func (a *telegramMediaAccess) Resolve(ctx context.Context, peer string, messageI
 		return ResolvedMedia{}, classifyTelegramError(err, "resolve peer")
 	}
 
+	res, err, _ := a.sf.Do(fmt.Sprintf("msg:%s:%d", peer, messageID), func() (interface{}, error) {
+		if a.gate != nil {
+			if err := a.gate.AcquireControlSlot(ctx); err != nil {
+				return nil, err
+			}
+			defer a.gate.ReleaseControlSlot()
+		}
+
+		msg, fetchErr := tutil.GetSingleMessage(ctx, a.pool.Default(ctx), resolvedPeer.InputPeer(), messageID)
+		if fetchErr != nil {
+			return nil, fetchErr
+		}
+		a.msgMu.Lock()
+		a.msgCache[cacheKey] = messageCacheEntry{msg: msg, expires: time.Now().Add(60 * time.Second)}
+		a.msgMu.Unlock()
+		return msg, nil
+	})
+	if err != nil {
+		return ResolvedMedia{}, classifyTelegramError(err, "resolve message")
+	}
+
+	return a.mediaFromMessage(peer, messageID, res.(*tg.Message))
+}
+
+func (a *telegramMediaAccess) ResolveBatch(ctx context.Context, peer string, messageIDs []int) (map[int]ResolvedMedia, error) {
+	if len(messageIDs) == 0 {
+		return make(map[int]ResolvedMedia), nil
+	}
+
+	resolvedPeer, err := tutil.GetInputPeer(ctx, a.manager, peer)
+	if err != nil {
+		if syncErr := a.SyncPeers(ctx); syncErr == nil {
+			resolvedPeer, err = tutil.GetInputPeer(ctx, a.manager, peer)
+		}
+	}
+	if err != nil {
+		return nil, classifyTelegramError(err, "resolve peer")
+	}
+
+	result := make(map[int]ResolvedMedia)
+	var missingIDs []int
+
+	a.msgMu.RLock()
+	now := time.Now()
+	for _, id := range messageIDs {
+		cacheKey := fmt.Sprintf("%s:%d", peer, id)
+		if entry, ok := a.msgCache[cacheKey]; ok && now.Before(entry.expires) {
+			if media, err := a.mediaFromMessage(peer, id, entry.msg); err == nil {
+				result[id] = media
+			}
+		} else {
+			missingIDs = append(missingIDs, id)
+		}
+	}
+	a.msgMu.RUnlock()
+
+	if len(missingIDs) == 0 {
+		return result, nil
+	}
+
 	if a.gate != nil {
 		if err := a.gate.AcquireControlSlot(ctx); err != nil {
-			return ResolvedMedia{}, err
+			return nil, err
 		}
 		defer a.gate.ReleaseControlSlot()
 	}
 
-	message, err := tutil.GetSingleMessage(ctx, a.pool.Default(ctx), resolvedPeer.InputPeer(), messageID)
+	messages, err := tutil.GetMessagesBatch(ctx, a.pool.Default(ctx), resolvedPeer.InputPeer(), missingIDs)
 	if err != nil {
-		return ResolvedMedia{}, classifyTelegramError(err, "resolve message")
+		return nil, classifyTelegramError(err, "resolve messages batch")
 	}
-	media, ok := tmedia.GetMedia(message)
-	if !ok || media.Size <= 0 {
-		return ResolvedMedia{}, NewTaskError("unavailable", true, fmt.Errorf("message %s/%d has no downloadable media", peer, messageID))
+
+	a.msgMu.Lock()
+	for _, msg := range messages {
+		if msg != nil {
+			cacheKey := fmt.Sprintf("%s:%d", peer, msg.ID)
+			a.msgCache[cacheKey] = messageCacheEntry{msg: msg, expires: time.Now().Add(60 * time.Second)}
+			if media, mErr := a.mediaFromMessage(peer, msg.ID, msg); mErr == nil {
+				result[msg.ID] = media
+			}
+		}
 	}
-	file := telegramFile{media: media}
-	return ResolvedMedia{
-		File: file, Name: media.Name, Size: media.Size, DCID: media.DC, Date: media.Date,
-	}, nil
+	a.msgMu.Unlock()
+
+	return result, nil
 }
 
 func (a *telegramMediaAccess) SyncPeers(ctx context.Context) error {

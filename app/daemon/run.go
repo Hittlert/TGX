@@ -134,8 +134,8 @@ func Run(ctx context.Context, client *telegram.Client, kvd storage.Storage, opts
 
 	sharedGate := gate.NewFloodGate(gate.InitialStartRate, gate.DefaultBurst)
 	effectivePoolSize := opts.PoolSize
-	if effectivePoolSize < gate.MaxDataInFlight {
-		effectivePoolSize = gate.MaxDataInFlight
+	if effectivePoolSize <= 0 {
+		effectivePoolSize = 48
 	}
 	pool := dcpool.NewPoolWithGate(client, int64(effectivePoolSize), sharedGate,
 		tclient.NewDefaultMiddlewares(ctx, opts.ReconnectTimeout)...)
@@ -145,7 +145,7 @@ func Run(ctx context.Context, client *telegram.Client, kvd storage.Storage, opts
 
 	registry := NewRegistryWithContext(ctx, opts.QueueCapacity, opts.TerminalLimit, time.Now)
 	registry.SetPaused(opts.StartPaused)
-	registry.SetPool(PoolSnapshot{Size: opts.PoolSize})
+	registry.SetPool(PoolSnapshot{Size: effectivePoolSize})
 	iter := newTaskIter(registry, newTaskResolver(access, opts.TempDir, opts.OutputDir))
 	dl := downloader.New(downloader.Options{
 		Pool:            pool,

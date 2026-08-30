@@ -9,6 +9,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -224,10 +225,10 @@ type largeFileCursor struct {
 // 3. Large File Lane: 5 concurrent large files with 4-chunk in-flight guarantee -> 5 per-file chunk disk writers with sliding-window sequential offset writes.
 func (d *Downloader) Download(ctx context.Context, globalConcurrency int) error {
 	netWorkers := d.opts.Threads
-	if netWorkers < gate.MaxDataInFlight {
-		netWorkers = gate.MaxDataInFlight
+	if netWorkers <= 0 {
+		netWorkers = 48
 	}
-	if globalConcurrency > 0 && globalConcurrency > netWorkers {
+	if globalConcurrency > 0 {
 		netWorkers = globalConcurrency
 	}
 
@@ -765,6 +766,11 @@ func (d *Downloader) Download(ctx context.Context, globalConcurrency int) error 
 			}
 
 			// E. Priority 2: Feed Surplus Capacity to Large Files (Targeting 1 Gbps / 125 MB/s)
+			currentCap := int64(gate.MaxDataInFlight)
+			if d.floodGate != nil {
+				currentCap = d.floodGate.MaxDataCap()
+			}
+
 		LargeSurplusLoop:
 			for _, fc := range activeLargeFiles {
 				if atomic.LoadInt32(&fc.state.canceled) == 1 {
@@ -775,7 +781,7 @@ func (d *Downloader) Download(ctx context.Context, globalConcurrency int) error 
 
 				for fc.nextPart < fc.totalParts {
 					currTotalRPC := atomic.LoadInt64(&d.activeLargeRPC) + atomic.LoadInt64(&d.activeSmallRPC)
-					if currTotalRPC >= gate.MaxDataInFlight {
+					if currTotalRPC >= currentCap {
 						break LargeSurplusLoop
 					}
 
@@ -813,15 +819,23 @@ func (d *Downloader) Download(ctx context.Context, globalConcurrency int) error 
 				}
 			}
 
-			// Guaranteed reservation for active large files
+			// Calculate actual needed dispatchable reservation for active large files
 			var guaranteedForLarge int64
 			for _, fc := range activeLargeFiles {
 				if atomic.LoadInt32(&fc.state.canceled) == 0 && fc.nextPart < fc.totalParts {
-					guaranteedForLarge += MinInflightPerLarge
+					writtenOffset := atomic.LoadInt64(&fc.state.lastWrittenOffset)
+					maxOffset := writtenOffset + MaxLargeWindowBytes
+					currentOffset := int64(fc.nextPart) * fc.partSize
+					if maxOffset > currentOffset {
+						windowRemaining := int((maxOffset - currentOffset) / fc.partSize)
+						partsRemaining := fc.totalParts - fc.nextPart
+						dispatchable := min(partsRemaining, max(1, windowRemaining))
+						guaranteedForLarge += int64(min(dispatchable, MinInflightPerLarge))
+					}
 				}
 			}
-			if guaranteedForLarge > 36 {
-				guaranteedForLarge = 36 // Always leave at least 4 slots for small lane
+			if guaranteedForLarge > (currentCap - 4) {
+				guaranteedForLarge = max(0, currentCap-4) // Always leave at least 4 slots for small lane
 			}
 
 			// F. Priority 3: Dispatch Small Files if ready, RAM budget allows, and without starving large files
@@ -831,12 +845,12 @@ func (d *Downloader) Download(ctx context.Context, globalConcurrency int) error 
 				currSmallActive := atomic.LoadInt64(&d.activeSmallRPC)
 				currTotalActive := currLargeActive + currSmallActive
 
-				if currTotalActive >= gate.MaxDataInFlight {
+				if currTotalActive >= currentCap {
 					break
 				}
 				// Small lane can dispatch as long as it doesn't starve guaranteed large slots,
 				// and is guaranteed up to 4 concurrent files if total capacity permits.
-				if currSmallActive >= 4 && currSmallActive >= (gate.MaxDataInFlight-guaranteedForLarge) {
+				if currSmallActive >= 4 && currSmallActive >= (currentCap-guaranteedForLarge) {
 					break
 				}
 
@@ -877,89 +891,139 @@ func (d *Downloader) Download(ctx context.Context, globalConcurrency int) error 
 }
 
 func (d *Downloader) handleCdnRedirect(ctx context.Context, cdnClient *tg.Client, masterClient *tg.Client, redirect *tg.UploadFileCDNRedirect, offset int64, limit int) ([]byte, error) {
+	const maxCDNAttempts = 3
 	req := &tg.UploadGetCDNFileRequest{
 		FileToken: redirect.FileToken,
 		Offset:    offset,
 		Limit:     limit,
 	}
 
-	// 1. Enforce rate limiting and cooldown specifically for the CDN DC
-	if d.floodGate != nil {
-		if err := d.floodGate.Wait(ctx, redirect.DCID); err != nil {
-			return nil, err
-		}
-	}
-
-	cdnCtx, cdnCancel := context.WithTimeout(gate.WithTokenPassed(ctx), 60*time.Second)
+	// Single overall deadline for entire CDN operation including potential reuploads
+	cdnTotalCtx, cdnCancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cdnCancel()
 
-	res, err := cdnClient.UploadGetCDNFile(cdnCtx, req)
-	if err != nil {
-		return nil, err
+	masterDC := 2
+	if d.opts.Pool != nil && d.opts.Pool.Default(ctx) != nil {
+		// Master DC
 	}
-	switch cdnRes := res.(type) {
-	case *tg.UploadCDNFile:
-		data := cdnRes.Bytes
-		// 2. Multi-Range SHA-256 Hash Verification across all sub-slices
-		if len(redirect.FileHashes) > 0 {
-			covered := false
+
+	for attempt := 0; attempt < maxCDNAttempts; attempt++ {
+		// 1. Enforce rate limiting and cooldown specifically for the CDN DC
+		if d.floodGate != nil {
+			if err := d.floodGate.Wait(cdnTotalCtx, redirect.DCID); err != nil {
+				return nil, err
+			}
+		}
+
+		// Pass single-use admission ticket for redirect.DCID
+		cdnReqCtx := gate.WithAdmissionTicket(cdnTotalCtx, redirect.DCID)
+		res, err := cdnClient.UploadGetCDNFile(cdnReqCtx, req)
+		if err != nil {
+			return nil, err
+		}
+
+		switch cdnRes := res.(type) {
+		case *tg.UploadCDNFile:
+			data := cdnRes.Bytes
+			chunkStart := offset
+			chunkEnd := offset + int64(len(data))
+
+			// 2. Full Continuous Range SHA-256 Hash Verification
+			if len(redirect.FileHashes) == 0 {
+				return nil, fmt.Errorf("CDN redirect missing file hashes for offset %d", offset)
+			}
+
+			type verifiedRange struct {
+				start int64
+				end   int64
+			}
+			var ranges []verifiedRange
+
 			for _, h := range redirect.FileHashes {
 				hStart := h.Offset
 				hEnd := h.Offset + int64(h.Limit)
-				chunkStart := offset
-				chunkEnd := offset + int64(len(data))
-
 				if hStart >= chunkStart && hEnd <= chunkEnd && h.Limit > 0 {
 					subStart := hStart - chunkStart
 					subEnd := subStart + int64(h.Limit)
 					subData := data[subStart:subEnd]
 					sum := sha256.Sum256(subData)
 					if !bytes.Equal(sum[:], h.Hash) {
-						return nil, fmt.Errorf("CDN chunk SHA256 mismatch at sub-range [%d, %d]", hStart, hEnd)
+						return nil, fmt.Errorf("CDN chunk SHA256 mismatch at sub-range [%d, %d)", hStart, hEnd)
 					}
-					covered = true
+					ranges = append(ranges, verifiedRange{start: hStart, end: hEnd})
 				}
 			}
-			if !covered {
-				return nil, fmt.Errorf("no valid CDN file hash covering chunk range [%d, %d]", offset, offset+int64(len(data)))
-			}
-		}
 
-		// 3. Decrypt with AES-CTR
-		if len(redirect.EncryptionKey) > 0 && len(redirect.EncryptionIv) > 0 {
-			block, err := aes.NewCipher(redirect.EncryptionKey)
-			if err != nil {
-				return nil, err
+			if len(ranges) == 0 {
+				return nil, fmt.Errorf("no valid CDN file hashes covering chunk [%d, %d)", chunkStart, chunkEnd)
 			}
-			iv := make([]byte, len(redirect.EncryptionIv))
-			copy(iv, redirect.EncryptionIv)
-			if len(iv) >= 16 {
-				ivSeq := binary.BigEndian.Uint32(iv[12:16]) + uint32(offset/16)
-				binary.BigEndian.PutUint32(iv[12:16], ivSeq)
-			}
-			stream := cipher.NewCTR(block, iv)
-			stream.XORKeyStream(data, data)
-		}
-		return data, nil
 
-	case *tg.UploadCDNFileReuploadNeeded:
-		if masterClient != nil {
+			// Sort ranges by start offset
+			sort.Slice(ranges, func(i, j int) bool {
+				return ranges[i].start < ranges[j].start
+			})
+
+			// Verify contiguous full coverage from chunkStart to chunkEnd without gaps
+			currentCovered := chunkStart
+			for _, r := range ranges {
+				if r.start > currentCovered {
+					return nil, fmt.Errorf("gap in CDN file hash coverage at offset %d (next hash starts at %d)", currentCovered, r.start)
+				}
+				if r.end > currentCovered {
+					currentCovered = r.end
+				}
+			}
+			if currentCovered < chunkEnd {
+				return nil, fmt.Errorf("CDN file hashes do not fully cover end of chunk (covered to %d, expected %d)", currentCovered, chunkEnd)
+			}
+
+			// 3. Decrypt with AES-CTR
+			if len(redirect.EncryptionKey) > 0 && len(redirect.EncryptionIv) > 0 {
+				block, err := aes.NewCipher(redirect.EncryptionKey)
+				if err != nil {
+					return nil, err
+				}
+				iv := make([]byte, len(redirect.EncryptionIv))
+				copy(iv, redirect.EncryptionIv)
+				if len(iv) >= 16 {
+					ivSeq := binary.BigEndian.Uint32(iv[12:16]) + uint32(offset/16)
+					binary.BigEndian.PutUint32(iv[12:16], ivSeq)
+				}
+				stream := cipher.NewCTR(block, iv)
+				stream.XORKeyStream(data, data)
+			}
+			return data, nil
+
+		case *tg.UploadCDNFileReuploadNeeded:
+			if masterClient == nil {
+				return nil, tgerr.New(400, "CDN_REUPLOAD_NEEDED_NO_MASTER")
+			}
 			reupReq := &tg.UploadReuploadCDNFileRequest{
 				FileToken:    redirect.FileToken,
 				RequestToken: cdnRes.RequestToken,
 			}
-			hashes, reupErr := masterClient.UploadReuploadCDNFile(cdnCtx, reupReq)
-			if reupErr == nil {
-				if len(hashes) > 0 {
-					redirect.FileHashes = append(redirect.FileHashes, hashes...)
+			// Wait on Master DC Gate for reupload request
+			if d.floodGate != nil {
+				if err := d.floodGate.Wait(cdnTotalCtx, masterDC); err != nil {
+					return nil, err
 				}
-				return d.handleCdnRedirect(ctx, cdnClient, masterClient, redirect, offset, limit)
 			}
+			masterReqCtx := gate.WithAdmissionTicket(cdnTotalCtx, masterDC)
+			hashes, reupErr := masterClient.UploadReuploadCDNFile(masterReqCtx, reupReq)
+			if reupErr != nil {
+				return nil, fmt.Errorf("CDN reupload failed on master DC: %w", reupErr)
+			}
+			if len(hashes) > 0 {
+				redirect.FileHashes = append(redirect.FileHashes, hashes...)
+			}
+			// Continue bounded loop to retry fetching from CDN DC with newly provided hashes
+			continue
+
+		default:
+			return nil, fmt.Errorf("unexpected cdn file type: %T", res)
 		}
-		return nil, tgerr.New(400, "CDN_REUPLOAD_NEEDED")
-	default:
-		return nil, fmt.Errorf("unexpected cdn file type: %T", res)
 	}
+	return nil, tgerr.New(400, "CDN_REUPLOAD_ATTEMPTS_EXHAUSTED")
 }
 
 // fetchLargeChunk downloads a single 1MiB chunk for an active large file.
@@ -1077,8 +1141,8 @@ func (d *Downloader) fetchLargeChunk(ctx context.Context, workerID int, job *lar
 		atomic.AddInt32(&job.fileState.activeRPC, 1)
 		atomic.AddInt64(&d.activeLargeRPC, 1)
 
-		// 3. Mark context with WithTokenPassed so middleware does not double-wait
-		chunkCtx, chunkCancel := context.WithTimeout(gate.WithTokenPassed(elemCtx), 60*time.Second)
+		// 3. Mark context with WithAdmissionTicket so middleware utilizes this physical ticket for job.dcID
+		chunkCtx, chunkCancel := context.WithTimeout(gate.WithAdmissionTicket(elemCtx, job.dcID), 60*time.Second)
 		var res tg.UploadFileClass
 		res, fetchErr = client.UploadGetFile(chunkCtx, req)
 		chunkCancel()
@@ -1301,7 +1365,7 @@ func (d *Downloader) fetchSmallFile(ctx context.Context, workerID int, job *smal
 
 			atomic.AddInt64(&d.activeSmallRPC, 1)
 
-			chunkCtx, chunkCancel := context.WithTimeout(gate.WithTokenPassed(elemCtx), 60*time.Second)
+			chunkCtx, chunkCancel := context.WithTimeout(gate.WithAdmissionTicket(elemCtx, job.dcID), 60*time.Second)
 			res, fetchErr := client.UploadGetFile(chunkCtx, req)
 			chunkCancel()
 

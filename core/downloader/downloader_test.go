@@ -1248,6 +1248,7 @@ func TestDownloader_CdnRedirectMultiRangeHashAndMismatchError(t *testing.T) {
 	// 2. Hash mismatch case must fail
 	badHashes := []tg.FileHash{
 		{Offset: 0, Limit: 512 * 1024, Hash: []byte("corrupted_hash_data_000000000000")},
+		{Offset: 512 * 1024, Limit: 512 * 1024, Hash: h2[:]},
 	}
 	masterInvokerBad := &fakeMasterCDNRedirectInvoker{
 		key:       key,
@@ -1276,8 +1277,42 @@ func TestDownloader_CdnRedirectMultiRangeHashAndMismatchError(t *testing.T) {
 
 	_ = dlBad.Download(ctxBad, 4)
 	progBad.mu.Lock()
-	defer progBad.mu.Unlock()
 	assert.Error(t, progBad.done[elemBad])
+	progBad.mu.Unlock()
+
+	// 3. Gap in hash coverage (only first 512 KiB covered, second 512 KiB missing) must fail
+	gapHashes := []tg.FileHash{
+		{Offset: 0, Limit: 512 * 1024, Hash: h1[:]},
+	}
+	masterInvokerGap := &fakeMasterCDNRedirectInvoker{
+		key:       key,
+		iv:        iv,
+		hashes:    gapHashes,
+		fileToken: []byte("gap_token"),
+	}
+	bufGap := newMemWriterAt(int64(len(plainData)))
+	elemGap := &fakeElem{
+		file: &fakeFile{size: int64(len(plainData)), dc: 2},
+		buf:  bufGap,
+	}
+	progGap := newFakeProgress()
+	dlGap := New(Options{
+		Pool:            &fakeDualPool{master: masterInvokerGap, cdn: cdnInvoker},
+		Threads:         4,
+		DiskWorkers:     2,
+		FileConcurrency: 1,
+		Iter:            &fakeIter{elems: []*fakeElem{elemGap}},
+		Progress:        progGap,
+		FloodGate:       gate.NewFloodGate(1000, 100),
+	})
+
+	ctxGap, cancelGap := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelGap()
+
+	_ = dlGap.Download(ctxGap, 4)
+	progGap.mu.Lock()
+	assert.Error(t, progGap.done[elemGap])
+	progGap.mu.Unlock()
 }
 
 func TestDownloader_SchedulerChannelFullDoesNotBusySpin(t *testing.T) {

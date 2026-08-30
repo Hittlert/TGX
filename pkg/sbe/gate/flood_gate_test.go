@@ -171,14 +171,14 @@ func TestFloodGate_TokenPassedBypass(t *testing.T) {
 	err := g.Wait(context.Background(), 2)
 	require.NoError(t, err)
 
-	// 2. Normal Wait without token will block
+	// 2. Normal Wait without ticket will block
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	err = g.Wait(ctx, 2)
 	assert.Error(t, err) // timed out
 
-	// 3. Middleware with WithTokenPassed skips Wait
-	ctxPassed := WithTokenPassed(context.Background())
+	// 3. Middleware with WithAdmissionTicket(ctx, 2) skips Wait for DC 2 once
+	ctxTicket := WithAdmissionTicket(context.Background(), 2)
 	mw := g.Middleware(2)
 	invoked := false
 	invoker := mw.Handle(fakeInvokerFunc(func(ctx context.Context, in bin.Encoder, out bin.Decoder) error {
@@ -186,22 +186,54 @@ func TestFloodGate_TokenPassedBypass(t *testing.T) {
 		return nil
 	}))
 
-	err = invoker(ctxPassed, nil, nil)
+	err = invoker(ctxTicket, nil, nil)
 	require.NoError(t, err)
 	assert.True(t, invoked)
+
+	// 4. Ticket for DC 2 cannot be reused on DC 5
+	mwDC5 := g.Middleware(5)
+	timeoutCtx5, cancel5 := context.WithTimeout(ctxTicket, 50*time.Millisecond)
+	defer cancel5()
+	invoker5 := mwDC5.Handle(fakeInvokerFunc(func(ctx context.Context, in bin.Encoder, out bin.Decoder) error {
+		return nil
+	}))
+	err = invoker5(timeoutCtx5, nil, nil)
+	assert.Error(t, err) // Blocked by DC 5 Wait since ticket was for DC 2
 }
 
-func TestFloodGate_TransportErrorAdaptiveBackoff(t *testing.T) {
+func TestFloodGate_TransportErrorAdaptiveBackoffAndDynamicCapEnforcement(t *testing.T) {
 	g := NewFloodGate(100.0, 40)
 	assert.Equal(t, 100.0, g.CurrentRate())
+	assert.Equal(t, int64(40), g.MaxDataCap())
 
 	// Trigger transport error (e.g. broken pipe)
 	g.TriggerTransportError(errors.New("write: broken pipe"))
-	assert.Equal(t, 85.0, g.CurrentRate()) // 100 * 0.85 = 85.0
-
-	// Debounce check: another error within 500ms should not drop rate further
-	g.TriggerTransportError(errors.New("i/o timeout"))
 	assert.Equal(t, 85.0, g.CurrentRate())
+	assert.Equal(t, int64(38), g.MaxDataCap()) // Decreased by 2
+
+	// Acquire up to new cap (38)
+	ctx := context.Background()
+	for i := int64(0); i < 38; i++ {
+		err := g.AcquireDataSlot(ctx)
+		require.NoError(t, err)
+	}
+	assert.Equal(t, int64(38), g.DataInFlight())
+
+	// 39th acquire must block
+	blockCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancel()
+	err := g.AcquireDataSlot(blockCtx)
+	assert.Error(t, err) // timed out because activeDataRPC (38) >= maxDataCap (38)
+
+	// Releasing 1 slot allows acquire
+	g.ReleaseDataSlot()
+	err = g.AcquireDataSlot(ctx)
+	require.NoError(t, err)
+
+	for i := int64(0); i < 38; i++ {
+		g.ReleaseDataSlot()
+	}
+	assert.Equal(t, int64(0), g.DataInFlight())
 }
 
 func TestFloodGate_MiddlewareRetryEnforcesCooldown(t *testing.T) {
@@ -218,11 +250,11 @@ func TestFloodGate_MiddlewareRetryEnforcesCooldown(t *testing.T) {
 		return nil
 	}))
 
-	// Pass context with WithTokenPassed
-	ctxPassed := WithTokenPassed(context.Background())
+	// Pass context with WithAdmissionTicket for DC 3
+	ctxTicket := WithAdmissionTicket(context.Background(), 3)
 
 	// Run invoker with 100ms timeout context - should time out during second attempt waiting for 1s cooldown
-	timeoutCtx, cancel := context.WithTimeout(ctxPassed, 100*time.Millisecond)
+	timeoutCtx, cancel := context.WithTimeout(ctxTicket, 100*time.Millisecond)
 	defer cancel()
 
 	err := invoker(timeoutCtx, nil, nil)
