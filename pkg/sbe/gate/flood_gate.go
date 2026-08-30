@@ -16,11 +16,14 @@ import (
 // FloodGate manages shared per-DC cooldowns and global account request rate limiting.
 type FloodGate struct {
 	mu          sync.RWMutex
+	baseRate    float64
+	currentRate float64
+	burst       int
 	dcCooldowns map[int]time.Time
 	limiter     *rate.Limiter
 }
 
-// NewFloodGate creates a FloodGate with a global request rate limiter (e.g. 40 req/s, burst 10).
+// NewFloodGate creates a FloodGate with a global request rate limiter (default 40 req/s, burst 10).
 func NewFloodGate(reqPerSec float64, burst int) *FloodGate {
 	if reqPerSec <= 0 {
 		reqPerSec = 40.0
@@ -29,6 +32,9 @@ func NewFloodGate(reqPerSec float64, burst int) *FloodGate {
 		burst = 10
 	}
 	return &FloodGate{
+		baseRate:    reqPerSec,
+		currentRate: reqPerSec,
+		burst:       burst,
 		dcCooldowns: make(map[int]time.Time),
 		limiter:     rate.NewLimiter(rate.Limit(reqPerSec), burst),
 	}
@@ -42,8 +48,12 @@ func (g *FloodGate) Wait(ctx context.Context, dc int) error {
 
 	for {
 		// 1. Wait for token bucket first
-		if g.limiter != nil {
-			if err := g.limiter.Wait(ctx); err != nil {
+		g.mu.RLock()
+		limiter := g.limiter
+		g.mu.RUnlock()
+
+		if limiter != nil {
+			if err := limiter.Wait(ctx); err != nil {
 				return err
 			}
 		}
@@ -62,6 +72,11 @@ func (g *FloodGate) Wait(ctx context.Context, dc int) error {
 			g.mu.Lock()
 			if nb, exists := g.dcCooldowns[dc]; exists && time.Now().After(nb) {
 				delete(g.dcCooldowns, dc)
+				// Slowly restore rate toward baseRate
+				if g.currentRate < g.baseRate {
+					g.currentRate = g.baseRate
+					g.limiter.SetLimit(rate.Limit(g.currentRate))
+				}
 			}
 			g.mu.Unlock()
 			return nil
@@ -77,7 +92,7 @@ func (g *FloodGate) Wait(ctx context.Context, dc int) error {
 	}
 }
 
-// TriggerFloodWait registers a shared cooldown for the given DC across all workers.
+// TriggerFloodWait registers a shared cooldown for the given DC across all workers and adaptively lowers rate.
 func (g *FloodGate) TriggerFloodWait(dc int, duration time.Duration) {
 	if g == nil || duration <= 0 {
 		return
@@ -85,6 +100,15 @@ func (g *FloodGate) TriggerFloodWait(dc int, duration time.Duration) {
 
 	g.mu.Lock()
 	defer g.mu.Unlock()
+
+	// Adaptively throttle rate limit on flood wait
+	if g.currentRate > 10.0 {
+		g.currentRate = g.currentRate * 0.75
+		if g.currentRate < 10.0 {
+			g.currentRate = 10.0
+		}
+		g.limiter.SetLimit(rate.Limit(g.currentRate))
+	}
 
 	// Add jitter (200ms ~ 1000ms) to prevent lockstep thundering herd on wake-up
 	jitter := time.Duration(200+rand.Intn(800)) * time.Millisecond

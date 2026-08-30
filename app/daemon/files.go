@@ -151,6 +151,156 @@ func (e *fileElement) Publish() (result PublishResult, resultErr error) {
 	}, nil
 }
 
+type memBufferWriterAt struct {
+	mu   sync.Mutex
+	data []byte
+	task *Task
+}
+
+func newMemBufferWriterAt(size int64, task *Task) *memBufferWriterAt {
+	return &memBufferWriterAt{
+		data: make([]byte, 0, size),
+		task: task,
+	}
+}
+
+func (w *memBufferWriterAt) WriteAt(p []byte, offset int64) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	end := offset + int64(len(p))
+	if int64(len(w.data)) < end {
+		newSlice := make([]byte, end)
+		copy(newSlice, w.data)
+		w.data = newSlice
+	}
+	copy(w.data[offset:], p)
+	if w.task != nil {
+		w.task.RecordWrite(offset, len(p))
+	}
+	return len(p), nil
+}
+
+func (w *memBufferWriterAt) Bytes() []byte {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.data
+}
+
+// lazySmallFileElement handles <= 1 MiB files completely in memory with zero disk ops during resolve.
+type lazySmallFileElement struct {
+	task       *Task
+	file       downloader.File
+	outputRoot string
+	finalPath  string
+	date       int64
+	buf        *memBufferWriterAt
+}
+
+func newLazySmallFileElement(task *Task, file downloader.File, outputRoot string, date int64) (*lazySmallFileElement, error) {
+	return &lazySmallFileElement{
+		task:       task,
+		file:       file,
+		outputRoot: outputRoot,
+		finalPath:  task.Request().FinalPath,
+		date:       date,
+		buf:        newMemBufferWriterAt(file.Size(), task),
+	}, nil
+}
+
+func (e *lazySmallFileElement) File() downloader.File { return e.file }
+func (e *lazySmallFileElement) To() io.WriterAt       { return e.buf }
+func (e *lazySmallFileElement) AsTakeout() bool       { return false }
+func (e *lazySmallFileElement) Task() *Task           { return e.task }
+func (e *lazySmallFileElement) Context() context.Context {
+	if e.task != nil {
+		return e.task.Context()
+	}
+	return context.Background()
+}
+func (e *lazySmallFileElement) IsCanceled() bool {
+	return e.task != nil && e.task.IsTerminal()
+}
+func (e *lazySmallFileElement) AlreadyComplete() (string, bool) {
+	return "", false
+}
+func (e *lazySmallFileElement) Abort() error { return nil }
+
+func (e *lazySmallFileElement) Publish() (result PublishResult, resultErr error) {
+	if e.task != nil && e.task.IsTerminal() {
+		return result, errors.New("task is terminal, aborting publish")
+	}
+
+	data := e.buf.Bytes()
+	if int64(len(data)) != e.file.Size() {
+		return result, fmt.Errorf("in-memory file size %d does not match expected %d", len(data), e.file.Size())
+	}
+
+	// Compute SHA256 directly in memory - 0 disk reads!
+	hashBytes := sha256.Sum256(data)
+	shaHash := hex.EncodeToString(hashBytes[:])
+
+	absolute, err := safeOutputPath(e.outputRoot, e.finalPath)
+	if err != nil {
+		return result, err
+	}
+	if exists, err := existingFile(absolute, e.file.Size()); err != nil {
+		return result, err
+	} else if exists {
+		return PublishResult{Path: e.finalPath, SHA256: shaHash, AlreadyExists: true, absolutePath: absolute}, nil
+	}
+
+	dir := filepath.Dir(absolute)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return result, fmt.Errorf("create destination directory: %w", err)
+	}
+
+	tempHash := sha256.Sum256([]byte(e.task.Request().ID))
+	tempPath := filepath.Join(dir, fmt.Sprintf(".tdl-part-%s.part", hex.EncodeToString(tempHash[:8])))
+
+	f, err := os.OpenFile(tempPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	if err != nil {
+		return result, fmt.Errorf("create part file: %w", err)
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tempPath)
+		return result, fmt.Errorf("write part file: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tempPath)
+		return result, fmt.Errorf("sync part file: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tempPath)
+		return result, fmt.Errorf("close part file: %w", err)
+	}
+
+	if e.date > 0 {
+		when := time.Unix(e.date, 0)
+		_ = os.Chtimes(tempPath, when, when)
+	}
+
+	if err := atomic.CommitFile(tempPath, absolute); err != nil {
+		if errors.Is(err, atomic.ErrTargetExists) {
+			if exists, checkErr := existingFile(absolute, e.file.Size()); checkErr == nil && exists {
+				_ = os.Remove(tempPath)
+				return PublishResult{Path: e.finalPath, SHA256: shaHash, AlreadyExists: true, absolutePath: absolute}, nil
+			}
+			return result, fmt.Errorf("publish destination without overwrite: %w", err)
+		}
+		return result, fmt.Errorf("publish destination atomic rename: %w", err)
+	}
+
+	if err := syncDirectory(dir); err != nil {
+		return result, err
+	}
+
+	return PublishResult{
+		Path: e.finalPath, SHA256: shaHash, absolutePath: absolute,
+	}, nil
+}
+
 func computeSHA256(path string) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {

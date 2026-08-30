@@ -63,6 +63,15 @@ func (r *taskResolver) Resolve(ctx context.Context, task *Task) (taskElement, er
 	} else if exists {
 		return &existingElement{task: task, file: media.File, path: finalPath}, nil
 	}
+
+	if media.Size <= downloader.SmallFileThreshold {
+		lazyElem, err := newLazySmallFileElement(task, media.File, r.outputRoot, media.Date)
+		if err != nil {
+			return nil, NewTaskError("memory", false, err)
+		}
+		return lazyElem, nil
+	}
+
 	element, err := newFileElement(task, media.File, r.tempRoot, r.outputRoot, media.Date)
 	if err != nil {
 		return nil, NewTaskError("filesystem", false, err)

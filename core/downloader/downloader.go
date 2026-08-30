@@ -25,6 +25,8 @@ const (
 	SmallFileThreshold  = 1024 * 1024       // <= 1 MiB goes to Small File Lane (whole-file in-memory)
 	DefaultSmallMemory  = 128 * 1024 * 1024 // 128 MiB dedicated in-memory budget for small files
 	MinInflightPerLarge = 4                 // 4 chunk in-flight guarantee per active large file
+	MaxLargeReadyQueue  = 10                // Hard capacity limit on queued ready large files
+	MaxSmallReadyQueue  = 64                // Hard capacity limit on queued ready small files
 )
 
 type Downloader struct {
@@ -115,6 +117,7 @@ type smallWriteJob struct {
 type activeLargeFileState struct {
 	elem            Elem
 	writer          io.WriterAt
+	writerIndex     int
 	totalSize       int64
 	totalParts      int32
 	remParts        int32
@@ -185,7 +188,7 @@ type largeFileCursor struct {
 // Download runs the Dual-Lane Streaming Block Engine:
 // 1. Unified 32-worker Network Pool dynamically serving Large and Small lanes.
 // 2. Small File Lane: single-worker whole-file fetch into 128 MiB RAM buffer -> 1 serial disk writer.
-// 3. Large File Lane: 5 concurrent large files with 4-chunk in-flight guarantee -> 5 chunk disk writers.
+// 3. Large File Lane: 5 concurrent large files with 4-chunk in-flight guarantee -> 5 per-file chunk disk writers.
 func (d *Downloader) Download(ctx context.Context, globalConcurrency int) error {
 	netWorkers := d.opts.Threads
 	if netWorkers <= 0 {
@@ -207,7 +210,12 @@ func (d *Downloader) Download(ctx context.Context, globalConcurrency int) error 
 
 	jobChan := make(chan networkJob, netWorkers*2)
 	elemChan := make(chan Elem, netWorkers*2)
-	largeWriteChan := make(chan *largeWriteJob, netWorkers*2)
+
+	// Create per-file sharded write channels for large disk writers to guarantee sequential chunk writes per file
+	largeWriteChans := make([]chan *largeWriteJob, largeDiskWorkers)
+	for i := 0; i < largeDiskWorkers; i++ {
+		largeWriteChans[i] = make(chan *largeWriteJob, netWorkers)
+	}
 	smallWriteChan := make(chan *smallWriteJob, netWorkers*2)
 
 	smallBudget := newMemoryBudget(d.opts.SmallMemBudget)
@@ -234,14 +242,16 @@ func (d *Downloader) Download(ctx context.Context, globalConcurrency int) error 
 		return nil
 	})
 
-	// 2. Launch Large File Disk Writers (5 Dedicated I/O Workers for Chunk Writes)
+	// 2. Launch Large File Disk Writers (5 Dedicated I/O Workers: 1 per active large file)
 	for dw := 0; dw < largeDiskWorkers; dw++ {
+		workerIdx := dw
+		ch := largeWriteChans[workerIdx]
 		g.Go(func() error {
 			for {
 				select {
 				case <-gctx.Done():
 					return gctx.Err()
-				case wJob, ok := <-largeWriteChan:
+				case wJob, ok := <-ch:
 					if !ok {
 						return nil
 					}
@@ -317,7 +327,11 @@ func (d *Downloader) Download(ctx context.Context, globalConcurrency int) error 
 					}
 					switch j := job.(type) {
 					case *largeChunkJob:
-						d.fetchLargeChunk(gctx, workerID, j, largeWriteChan)
+						wIdx := j.fileState.writerIndex
+						if wIdx < 0 || wIdx >= len(largeWriteChans) {
+							wIdx = 0
+						}
+						d.fetchLargeChunk(gctx, workerID, j, largeWriteChans[wIdx])
 					case *smallFetchJob:
 						d.fetchSmallFile(gctx, workerID, j, smallWriteChan, smallBudget)
 					}
@@ -329,7 +343,9 @@ func (d *Downloader) Download(ctx context.Context, globalConcurrency int) error 
 	// Safely close write channels only when all network workers have completely returned
 	go func() {
 		netWg.Wait()
-		close(largeWriteChan)
+		for _, ch := range largeWriteChans {
+			close(ch)
+		}
 		close(smallWriteChan)
 	}()
 
@@ -338,21 +354,25 @@ func (d *Downloader) Download(ctx context.Context, globalConcurrency int) error 
 		defer close(jobChan)
 
 		activeLargeFiles := make([]*largeFileCursor, 0, maxActiveLargeFiles)
-		largeReadyQueue := make([]*largeFileCursor, 0, 64)
-		smallReadyQueue := make([]*smallFetchJob, 0, 64)
+		largeReadyQueue := make([]*largeFileCursor, 0, MaxLargeReadyQueue)
+		smallReadyQueue := make([]*smallFetchJob, 0, MaxSmallReadyQueue)
 		elemChanClosed := false
+		var pendingElem Elem
+		var nextLargeSlot int32
 
-		routeElem := func(elem Elem) {
+		routeElem := func(elem Elem) bool {
 			totalSize := elem.File().Size()
 			if totalSize <= 0 {
 				d.opts.Progress.OnAdd(elem)
 				d.opts.Progress.OnDone(elem, errors.New("file size is 0 or negative"))
-				return
+				return true
 			}
 
-			d.opts.Progress.OnAdd(elem)
-
 			if totalSize <= SmallFileThreshold {
+				if len(smallReadyQueue) >= MaxSmallReadyQueue {
+					return false
+				}
+				d.opts.Progress.OnAdd(elem)
 				smallReadyQueue = append(smallReadyQueue, &smallFetchJob{
 					elem:      elem,
 					dcID:      elem.File().DC(),
@@ -360,54 +380,81 @@ func (d *Downloader) Download(ctx context.Context, globalConcurrency int) error 
 					totalSize: totalSize,
 					takeout:   elem.AsTakeout(),
 				})
-			} else {
-				partSize := int64(MaxPartSize)
-				numParts := int((totalSize + partSize - 1) / partSize)
-				if numParts < 1 {
-					numParts = 1
-				}
-
-				fState := &activeLargeFileState{
-					elem:       elem,
-					writer:     elem.To(),
-					totalSize:  totalSize,
-					totalParts: int32(numParts),
-					remParts:   int32(numParts),
-					doneChan:   make(chan struct{}),
-				}
-
-				cursor := &largeFileCursor{
-					state:      fState,
-					nextPart:   0,
-					totalParts: numParts,
-					partSize:   partSize,
-				}
-
-				if len(activeLargeFiles) < maxActiveLargeFiles {
-					activeLargeFiles = append(activeLargeFiles, cursor)
-				} else {
-					largeReadyQueue = append(largeReadyQueue, cursor)
-				}
+				return true
 			}
+
+			// Large file check
+			if len(activeLargeFiles) >= maxActiveLargeFiles && len(largeReadyQueue) >= MaxLargeReadyQueue {
+				return false
+			}
+
+			d.opts.Progress.OnAdd(elem)
+
+			partSize := int64(MaxPartSize)
+			numParts := int((totalSize + partSize - 1) / partSize)
+			if numParts < 1 {
+				numParts = 1
+			}
+
+			wIdx := int(atomic.AddInt32(&nextLargeSlot, 1)) % largeDiskWorkers
+			if wIdx < 0 {
+				wIdx = -wIdx
+			}
+
+			fState := &activeLargeFileState{
+				elem:        elem,
+				writer:      elem.To(),
+				writerIndex: wIdx,
+				totalSize:   totalSize,
+				totalParts:  int32(numParts),
+				remParts:    int32(numParts),
+				doneChan:    make(chan struct{}),
+			}
+
+			cursor := &largeFileCursor{
+				state:      fState,
+				nextPart:   0,
+				totalParts: numParts,
+				partSize:   partSize,
+			}
+
+			if len(activeLargeFiles) < maxActiveLargeFiles {
+				activeLargeFiles = append(activeLargeFiles, cursor)
+			} else {
+				largeReadyQueue = append(largeReadyQueue, cursor)
+			}
+			return true
 		}
 
 		for {
-			// A. Non-blocking Ingestion from elemChan
-		IngestLoop:
-			for (!elemChanClosed) && (len(activeLargeFiles)+len(largeReadyQueue) < maxActiveLargeFiles*2 || len(smallReadyQueue) < netWorkers*2) {
-				select {
-				case elem, ok := <-elemChan:
-					if !ok {
-						elemChanClosed = true
-						break IngestLoop
-					}
-					routeElem(elem)
-				default:
-					break IngestLoop
+			// A. Process pending element if any
+			if pendingElem != nil {
+				if routeElem(pendingElem) {
+					pendingElem = nil
 				}
 			}
 
-			// B. Clean up finished or canceled large files, and promote from largeReadyQueue
+			// B. Non-blocking Ingestion from elemChan if ready queues have room
+			if pendingElem == nil && (!elemChanClosed) {
+			IngestLoop:
+				for len(largeReadyQueue) < MaxLargeReadyQueue || len(smallReadyQueue) < MaxSmallReadyQueue {
+					select {
+					case elem, ok := <-elemChan:
+						if !ok {
+							elemChanClosed = true
+							break IngestLoop
+						}
+						if !routeElem(elem) {
+							pendingElem = elem
+							break IngestLoop
+						}
+					default:
+						break IngestLoop
+					}
+				}
+			}
+
+			// C. Clean up finished or canceled large files, and promote from largeReadyQueue
 			filteredLargeFiles := make([]*largeFileCursor, 0, len(activeLargeFiles))
 			for _, fc := range activeLargeFiles {
 				if ce, ok := fc.state.elem.(CancelableElem); ok && ce.IsCanceled() {
@@ -454,13 +501,13 @@ func (d *Downloader) Download(ctx context.Context, globalConcurrency int) error 
 			smallReadyQueue = filteredSmallQueue
 
 			// Check termination condition
-			if elemChanClosed && len(activeLargeFiles) == 0 && len(largeReadyQueue) == 0 && len(smallReadyQueue) == 0 {
+			if elemChanClosed && pendingElem == nil && len(activeLargeFiles) == 0 && len(largeReadyQueue) == 0 && len(smallReadyQueue) == 0 {
 				break
 			}
 
 			dispatchedCount := 0
 
-			// C. Priority 1: Guarantee MinInflightPerLarge (4 chunks) for every active large file
+			// D. Priority 1: Guarantee MinInflightPerLarge (4 chunks) for every active large file
 			for _, fc := range activeLargeFiles {
 				if atomic.LoadInt32(&fc.state.canceled) == 1 {
 					continue
@@ -493,7 +540,7 @@ func (d *Downloader) Download(ctx context.Context, globalConcurrency int) error 
 				}
 			}
 
-			// D. Priority 2: Dispatch Small Files if ready and RAM budget allows
+			// E. Priority 2: Dispatch Small Files if ready and RAM budget allows
 			for len(smallReadyQueue) > 0 {
 				nextSmall := smallReadyQueue[0]
 				if !smallBudget.tryAcquire(nextSmall.totalSize) {
@@ -513,7 +560,7 @@ func (d *Downloader) Download(ctx context.Context, globalConcurrency int) error 
 				}
 			}
 
-			// E. Priority 3: Surplus Worker Capacity -> Round-Robin feed active large files beyond min-inflight
+			// F. Priority 3: Surplus Worker Capacity -> Round-Robin feed active large files beyond min-inflight
 			for _, fc := range activeLargeFiles {
 				if atomic.LoadInt32(&fc.state.canceled) == 1 {
 					continue
@@ -548,7 +595,7 @@ func (d *Downloader) Download(ctx context.Context, globalConcurrency int) error 
 
 		SleepOrYield:
 			if dispatchedCount == 0 {
-				if elemChanClosed && len(activeLargeFiles) == 0 && len(largeReadyQueue) == 0 && len(smallReadyQueue) == 0 {
+				if elemChanClosed && pendingElem == nil && len(activeLargeFiles) == 0 && len(largeReadyQueue) == 0 && len(smallReadyQueue) == 0 {
 					break
 				}
 				select {
@@ -558,7 +605,9 @@ func (d *Downloader) Download(ctx context.Context, globalConcurrency int) error 
 					if !ok {
 						elemChanClosed = true
 					} else {
-						routeElem(elem)
+						if !routeElem(elem) {
+							pendingElem = elem
+						}
 					}
 				case <-smallBudget.wakeCh:
 				case <-time.After(20 * time.Millisecond):

@@ -35,7 +35,9 @@ type Pool interface {
 type pool struct {
 	api         *telegram.Client
 	size        int64
-	mu          *sync.Mutex
+	mu          sync.RWMutex
+	dcLocks     map[int]*sync.Mutex
+	dcLocksMu   sync.Mutex
 	middlewares []telegram.Middleware
 	floodGate   *gate.FloodGate
 
@@ -52,7 +54,7 @@ func NewPoolWithGate(c *telegram.Client, size int64, fg *gate.FloodGate, middlew
 	return &pool{
 		api:         c,
 		size:        size,
-		mu:          &sync.Mutex{},
+		dcLocks:     make(map[int]*sync.Mutex),
 		middlewares: middlewares,
 		floodGate:   fg,
 		invokers:    make(map[int]tg.Invoker),
@@ -64,10 +66,18 @@ func (p *pool) current() int {
 	return p.api.Config().ThisDC
 }
 
-func (p *pool) Client(ctx context.Context, dc int) *tg.Client {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+func (p *pool) getDCLock(dc int) *sync.Mutex {
+	p.dcLocksMu.Lock()
+	defer p.dcLocksMu.Unlock()
+	if l, ok := p.dcLocks[dc]; ok {
+		return l
+	}
+	l := &sync.Mutex{}
+	p.dcLocks[dc] = l
+	return l
+}
 
+func (p *pool) Client(ctx context.Context, dc int) *tg.Client {
 	return tg.NewClient(p.invoker(ctx, dc))
 }
 
@@ -78,9 +88,23 @@ func (p *pool) invoker(ctx context.Context, dc int) tg.Invoker {
 		return p.api
 	}
 
+	p.mu.RLock()
 	if i, ok := p.invokers[dc]; ok {
+		p.mu.RUnlock()
 		return i
 	}
+	p.mu.RUnlock()
+
+	dcLock := p.getDCLock(dc)
+	dcLock.Lock()
+	defer dcLock.Unlock()
+
+	p.mu.RLock()
+	if i, ok := p.invokers[dc]; ok {
+		p.mu.RUnlock()
+		return i
+	}
+	p.mu.RUnlock()
 
 	var (
 		invoker telegram.CloseInvoker
@@ -122,14 +146,17 @@ func (p *pool) invoker(ctx context.Context, dc int) tg.Invoker {
 		return failedInvoker{dc: dc, err: err}
 	}
 
+	p.mu.Lock()
 	p.closes[dc] = invoker.Close
 	mws := p.middlewares
 	if p.floodGate != nil {
 		mws = append([]telegram.Middleware{p.floodGate.Middleware(dc)}, mws...)
 	}
 	p.invokers[dc] = chainMiddlewares(invoker, mws...)
+	res := p.invokers[dc]
+	p.mu.Unlock()
 
-	return p.invokers[dc]
+	return res
 }
 
 type failedInvoker struct {
@@ -142,9 +169,6 @@ func (f failedInvoker) Invoke(ctx context.Context, input bin.Encoder, output bin
 }
 
 func (p *pool) Default(ctx context.Context) *tg.Client {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
 	mws := p.middlewares
 	if p.floodGate != nil {
 		mws = append([]telegram.Middleware{p.floodGate.Middleware(p.current())}, mws...)
@@ -153,6 +177,9 @@ func (p *pool) Default(ctx context.Context) *tg.Client {
 }
 
 func (p *pool) Close() (err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	if p.takeout != 0 {
 		err = takeout.UnTakeout(context.TODO(), p.Takeout(context.TODO(), p.current()).Invoker())
 	}
@@ -173,7 +200,6 @@ func (p *pool) Takeout(ctx context.Context, dc int) *tg.Client {
 		sid, err := takeout.Takeout(ctx, p.api)
 		if err != nil {
 			logctx.From(ctx).Warn("takeout error", zap.Error(err))
-			// ignore init delay error and return non-takeout client without re-acquiring p.mu
 			return tg.NewClient(p.invoker(ctx, dc))
 		}
 		p.takeout = sid

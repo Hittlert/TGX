@@ -33,10 +33,10 @@ func TestPool_PerDCMiddlewareAttachment(t *testing.T) {
 	fg := gate.NewFloodGate(100, 10)
 
 	p := &pool{
-		mu:        &sync.Mutex{},
 		floodGate: fg,
 		invokers:  make(map[int]tg.Invoker),
 		closes:    make(map[int]func() error),
+		dcLocks:   make(map[int]*sync.Mutex),
 	}
 
 	mockInvoker := &mockCloseInvoker{}
