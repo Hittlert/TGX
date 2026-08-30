@@ -19,8 +19,13 @@ import (
 	"github.com/Hittlert/TGX/pkg/sbe/gate"
 )
 
-// MaxPartSize refer to https://core.telegram.org/api/files#downloading-files
-const MaxPartSize = 512 * 1024
+// Constants for MTProto Chunking and Dual-Lane Pipeline
+const (
+	MaxPartSize         = 512 * 1024        // 512 KiB per MTProto chunk
+	SmallFileThreshold  = 1024 * 1024       // <= 1 MiB goes to Small File Lane (whole-file in-memory)
+	DefaultSmallMemory  = 128 * 1024 * 1024 // 128 MiB dedicated in-memory budget for small files
+	MinInflightPerLarge = 4                 // 4 chunk in-flight guarantee per active large file
+)
 
 type Downloader struct {
 	opts      Options
@@ -30,11 +35,12 @@ type Downloader struct {
 type Options struct {
 	Pool            dcpool.Pool
 	Threads         int // Network Chunk Workers (default: 32)
-	DiskWorkers     int // Dedicated Disk Writer Workers (default: 6)
-	FileConcurrency int // Max Active Concurrently Downloading Files (default: 5)
+	DiskWorkers     int // Dedicated Disk Writer Workers (default: 6: 5 Large + 1 Small)
+	FileConcurrency int // Max Active Concurrently Downloading Large Files (default: 5)
 	Iter            Iter
 	Progress        Progress
 	FloodGate       *gate.FloodGate
+	SmallMemBudget  int64 // In-memory budget for small files (default: 128 MiB)
 }
 
 func New(opts Options) *Downloader {
@@ -51,15 +57,23 @@ func New(opts Options) *Downloader {
 	if opts.FileConcurrency <= 0 {
 		opts.FileConcurrency = 5
 	}
+	if opts.SmallMemBudget <= 0 {
+		opts.SmallMemBudget = DefaultSmallMemory
+	}
 	return &Downloader{
 		opts:      opts,
 		floodGate: fg,
 	}
 }
 
-// chunkJob represents an atomic 512KB block task dispatched from Chunk Producer to Network Workers.
-type chunkJob struct {
-	fileState *activeFileState
+// networkJob is the union interface for jobs processed by the 32 Network Workers.
+type networkJob interface {
+	isNetworkJob()
+}
+
+// largeChunkJob represents an atomic 512KB chunk fetch for an active large file (>= 1 MiB).
+type largeChunkJob struct {
+	fileState *activeLargeFileState
 	elem      Elem
 	dcID      int
 	location  tg.InputFileLocationClass
@@ -69,20 +83,42 @@ type chunkJob struct {
 	takeout   bool
 }
 
-// writeJob represents downloaded chunk bytes passed from Network Workers to Disk Writers.
-type writeJob struct {
-	fileState *activeFileState
+func (j *largeChunkJob) isNetworkJob() {}
+
+// smallFetchJob represents an entire small file (<= 1 MiB) fetched into memory by 1 network worker.
+type smallFetchJob struct {
+	elem      Elem
+	dcID      int
+	location  tg.InputFileLocationClass
+	totalSize int64
+	takeout   bool
+}
+
+func (j *smallFetchJob) isNetworkJob() {}
+
+// largeWriteJob represents downloaded chunk bytes passed to Large Disk Writers (5 workers).
+type largeWriteJob struct {
+	fileState *activeLargeFileState
 	data      []byte
 	offset    int64
 }
 
-// activeFileState binds and tracks the lifecycle of an active file being downloaded.
-type activeFileState struct {
+// smallWriteJob represents an entire downloaded small file passed to Small Disk Writer (1 worker).
+type smallWriteJob struct {
+	elem      Elem
+	data      []byte
+	totalSize int64
+	err       error
+}
+
+// activeLargeFileState binds and tracks the lifecycle of an active large file (>= 1 MiB).
+type activeLargeFileState struct {
 	elem            Elem
 	writer          io.WriterAt
 	totalSize       int64
 	totalParts      int32
 	remParts        int32
+	inflight        int32
 	downloadedBytes int64
 	canceled        int32
 	firstErr        error
@@ -91,17 +127,47 @@ type activeFileState struct {
 	doneChan        chan struct{}
 }
 
-func (s *activeFileState) fail(err error) {
+func (s *activeLargeFileState) fail(err error) {
 	atomic.StoreInt32(&s.canceled, 1)
 	s.errOnce.Do(func() {
 		s.firstErr = err
 	})
 }
 
-// Download runs the 3-stage Streaming Block Engine:
-// Stage 1: Interleaving Chunk Producer (maintains up to FileConcurrency active files, paving chunks in round-robin order)
-// Stage 2: 32 Network Chunk Workers (pure chunk pullers with shared DC cooldown gate)
-// Stage 3: Dedicated Disk Writer Workers (writes chunk bytes into bound FileCoordinator with zero network blocking)
+// memoryBudget provides thread-safe accounting for the dedicated 128 MiB small file buffer.
+type memoryBudget struct {
+	mu        sync.Mutex
+	available int64
+	cond      *sync.Cond
+}
+
+func newMemoryBudget(limit int64) *memoryBudget {
+	mb := &memoryBudget{available: limit}
+	mb.cond = sync.NewCond(&mb.mu)
+	return mb
+}
+
+func (mb *memoryBudget) tryAcquire(bytes int64) bool {
+	mb.mu.Lock()
+	defer mb.mu.Unlock()
+	if mb.available >= bytes {
+		mb.available -= bytes
+		return true
+	}
+	return false
+}
+
+func (mb *memoryBudget) release(bytes int64) {
+	mb.mu.Lock()
+	mb.available += bytes
+	mb.cond.Broadcast()
+	mb.mu.Unlock()
+}
+
+// Download runs the Dual-Lane Streaming Block Engine:
+// 1. Unified 32-worker Network Pool dynamically serving Large and Small lanes.
+// 2. Small File Lane: single-worker whole-file fetch into 128 MiB RAM buffer -> 1 serial disk writer.
+// 3. Large File Lane: 5 concurrent large files with 4-chunk in-flight guarantee -> 5 chunk disk writers.
 func (d *Downloader) Download(ctx context.Context, globalConcurrency int) error {
 	netWorkers := d.opts.Threads
 	if netWorkers <= 0 {
@@ -111,29 +177,53 @@ func (d *Downloader) Download(ctx context.Context, globalConcurrency int) error 
 		netWorkers = globalConcurrency
 	}
 
-	diskWorkers := d.opts.DiskWorkers
-	if diskWorkers <= 0 {
-		diskWorkers = 6
+	largeDiskWorkers := d.opts.DiskWorkers - 1
+	if largeDiskWorkers < 1 {
+		largeDiskWorkers = 5
 	}
 
-	maxActiveFiles := d.opts.FileConcurrency
-	if maxActiveFiles <= 0 {
-		maxActiveFiles = 5
+	maxActiveLargeFiles := d.opts.FileConcurrency
+	if maxActiveLargeFiles <= 0 {
+		maxActiveLargeFiles = 5
 	}
 
-	jobChan := make(chan *chunkJob, netWorkers*2)
-	writeChan := make(chan *writeJob, netWorkers*2)
+	jobChan := make(chan networkJob, netWorkers*2)
+	elemChan := make(chan Elem, netWorkers*2)
+	largeWriteChan := make(chan *largeWriteJob, netWorkers*2)
+	smallWriteChan := make(chan *smallWriteJob, netWorkers*2)
+
+	smallBudget := newMemoryBudget(d.opts.SmallMemBudget)
 
 	g, gctx := errgroup.WithContext(ctx)
 
-	// 1. Launch Disk Writer Workers (Stage 3: 5~8 Dedicated I/O Workers)
-	for dw := 0; dw < diskWorkers; dw++ {
+	// 1. Launch Ingestion Worker (Decouples Iter.Next blocking from chunk dispatch loop)
+	g.Go(func() error {
+		defer close(elemChan)
+		for d.opts.Iter.Next(gctx) {
+			elem := d.opts.Iter.Value()
+			if elem == nil || elem.File() == nil {
+				continue
+			}
+			select {
+			case <-gctx.Done():
+				return gctx.Err()
+			case elemChan <- elem:
+			}
+		}
+		if err := d.opts.Iter.Err(); err != nil {
+			return errors.Wrap(err, "iter")
+		}
+		return nil
+	})
+
+	// 2. Launch Large File Disk Writers (5 Dedicated I/O Workers for Chunk Writes)
+	for dw := 0; dw < largeDiskWorkers; dw++ {
 		g.Go(func() error {
 			for {
 				select {
 				case <-gctx.Done():
 					return gctx.Err()
-				case wJob, ok := <-writeChan:
+				case wJob, ok := <-largeWriteChan:
 					if !ok {
 						return nil
 					}
@@ -159,7 +249,39 @@ func (d *Downloader) Download(ctx context.Context, globalConcurrency int) error 
 		})
 	}
 
-	// 2. Launch Network Chunk Workers (Stage 2: Strictly 32 Concurrent Workers)
+	// 3. Launch Small File Serial Disk Writer (1 Dedicated I/O Worker for Serial Flush/Rename)
+	g.Go(func() error {
+		for {
+			select {
+			case <-gctx.Done():
+				return gctx.Err()
+			case sJob, ok := <-smallWriteChan:
+				if !ok {
+					return nil
+				}
+				var finalErr error
+				if sJob.err != nil {
+					finalErr = sJob.err
+				} else {
+					w := sJob.elem.To()
+					if w != nil {
+						_, writeErr := w.WriteAt(sJob.data, 0)
+						if writeErr != nil {
+							finalErr = writeErr
+						} else {
+							if closer, ok := w.(io.Closer); ok {
+								_ = closer.Close()
+							}
+						}
+					}
+				}
+				d.opts.Progress.OnDone(sJob.elem, finalErr)
+				smallBudget.release(sJob.totalSize)
+			}
+		}
+	})
+
+	// 4. Launch Unified 32 Network Workers (Pure Network Pullers with Shared Gate)
 	var netWg sync.WaitGroup
 	for nw := 0; nw < netWorkers; nw++ {
 		netWg.Add(1)
@@ -174,84 +296,65 @@ func (d *Downloader) Download(ctx context.Context, globalConcurrency int) error 
 					if !ok {
 						return nil
 					}
-					d.fetchChunk(gctx, workerID, job, writeChan)
+					switch j := job.(type) {
+					case *largeChunkJob:
+						d.fetchLargeChunk(gctx, workerID, j, largeWriteChan)
+					case *smallFetchJob:
+						d.fetchSmallFile(gctx, workerID, j, smallWriteChan, smallBudget)
+					}
 				}
 			}
 		})
 	}
 
-	// Safely close writeChan only when all network workers have completely returned
+	// Safely close write channels only when all network workers have completely returned
 	go func() {
 		netWg.Wait()
-		close(writeChan)
+		close(largeWriteChan)
+		close(smallWriteChan)
 	}()
 
-	// 3. Launch Interleaving Chunk Producer (Stage 1: Maintains Active 5 Files & Paves Chunks Round-Robin)
+	// 5. Launch Priority Dual-Lane Scheduler (Stage 1: Ingests from elemChan and Balances Large & Small Lanes)
 	g.Go(func() error {
 		defer close(jobChan)
 
-		type fileCursor struct {
-			state      *activeFileState
+		type largeFileCursor struct {
+			state      *activeLargeFileState
 			nextPart   int
 			totalParts int
 			partSize   int64
 		}
 
-		activeFiles := make([]*fileCursor, 0, maxActiveFiles*2)
-		iterDone := false
+		activeLargeFiles := make([]*largeFileCursor, 0, maxActiveLargeFiles)
+		smallReadyQueue := make([]*smallFetchJob, 0, 64)
+		elemChanClosed := false
 
-		shouldAdmitMore := func() bool {
-			if iterDone {
-				return false
-			}
-			if len(activeFiles) >= netWorkers*2 {
-				return false
-			}
-			activeLargeFiles := 0
-			pendingChunks := 0
-			for _, fc := range activeFiles {
-				if fc.totalParts > 1 {
-					activeLargeFiles++
-				}
-				if rem := fc.totalParts - fc.nextPart; rem > 0 {
-					pendingChunks += rem
-				}
-			}
-			if activeLargeFiles < maxActiveFiles || pendingChunks < netWorkers {
-				return true
-			}
-			return false
-		}
-
-		for {
-			// A. Fill active window up to capacity (maxLargeFiles or netWorkers saturation)
-			for shouldAdmitMore() {
-				if !d.opts.Iter.Next(gctx) {
-					iterDone = true
-					break
-				}
-
-				elem := d.opts.Iter.Value()
-				if elem == nil || elem.File() == nil {
-					continue
-				}
-
-				totalSize := elem.File().Size()
-				if totalSize <= 0 {
-					d.opts.Progress.OnAdd(elem)
-					d.opts.Progress.OnDone(elem, errors.New("file size is 0 or negative"))
-					continue
-				}
-
+		routeElem := func(elem Elem) {
+			totalSize := elem.File().Size()
+			if totalSize <= 0 {
 				d.opts.Progress.OnAdd(elem)
+				d.opts.Progress.OnDone(elem, errors.New("file size is 0 or negative"))
+				return
+			}
 
+			d.opts.Progress.OnAdd(elem)
+
+			if totalSize <= SmallFileThreshold {
+				smallReadyQueue = append(smallReadyQueue, &smallFetchJob{
+					elem:      elem,
+					dcID:      elem.File().DC(),
+					location:  elem.File().Location(),
+					totalSize: totalSize,
+					takeout:   elem.AsTakeout(),
+				})
+			} else {
 				partSize := int64(MaxPartSize)
 				numParts := int((totalSize + partSize - 1) / partSize)
 				if numParts < 1 {
 					numParts = 1
 				}
 
-				fState := &activeFileState{
+				fState := &activeLargeFileState{
 					elem:       elem,
 					writer:     elem.To(),
 					totalSize:  totalSize,
@@ -260,40 +363,79 @@ func (d *Downloader) Download(ctx context.Context, globalConcurrency int) error 
 					doneChan:   make(chan struct{}),
 				}
 
-				activeFiles = append(activeFiles, &fileCursor{
+				activeLargeFiles = append(activeLargeFiles, &largeFileCursor{
 					state:      fState,
 					nextPart:   0,
 					totalParts: numParts,
 					partSize:   partSize,
 				})
 			}
+		}
 
-			// If no active files and iter is done -> finished
-			if len(activeFiles) == 0 && iterDone {
-				break
+		for {
+			// A. Non-blocking Ingestion from elemChan
+		IngestLoop:
+			for (!elemChanClosed) && (len(activeLargeFiles) < maxActiveLargeFiles || len(smallReadyQueue) < netWorkers*2) {
+				select {
+				case elem, ok := <-elemChan:
+					if !ok {
+						elemChanClosed = true
+						break IngestLoop
+					}
+					routeElem(elem)
+				default:
+					break IngestLoop
+				}
 			}
 
-			// B. Pave 1 chunk from each active file in Round-Robin order!
-			chunksEmitted := 0
-			newActiveFiles := make([]*fileCursor, 0, len(activeFiles))
-
-			for _, fc := range activeFiles {
+			// B. Clean up finished or canceled large and small files
+			filteredLargeFiles := make([]*largeFileCursor, 0, len(activeLargeFiles))
+			for _, fc := range activeLargeFiles {
 				if ce, ok := fc.state.elem.(CancelableElem); ok && ce.IsCanceled() {
 					fc.state.fail(context.Canceled)
 				}
-
+				if atomic.LoadInt32(&fc.state.canceled) == 1 && atomic.LoadInt32(&fc.state.inflight) == 0 {
+					fc.state.doneOnce.Do(func() {
+						d.opts.Progress.OnDone(fc.state.elem, context.Canceled)
+						close(fc.state.doneChan)
+					})
+				}
 				select {
 				case <-fc.state.doneChan:
-					// File completed/errored -> vacate slot to admit next file
-					continue
+					// File completed/errored -> vacate slot
 				default:
+					filteredLargeFiles = append(filteredLargeFiles, fc)
 				}
+			}
+			activeLargeFiles = filteredLargeFiles
 
-				if fc.nextPart < fc.totalParts {
+			filteredSmallQueue := make([]*smallFetchJob, 0, len(smallReadyQueue))
+			for _, sj := range smallReadyQueue {
+				if ce, ok := sj.elem.(CancelableElem); ok && ce.IsCanceled() {
+					d.opts.Progress.OnDone(sj.elem, context.Canceled)
+					continue
+				}
+				filteredSmallQueue = append(filteredSmallQueue, sj)
+			}
+			smallReadyQueue = filteredSmallQueue
+
+			// Check termination condition
+			if elemChanClosed && len(activeLargeFiles) == 0 && len(smallReadyQueue) == 0 {
+				break
+			}
+
+			dispatchedCount := 0
+
+			// C. Priority 1: Guarantee MinInflightPerLarge (4 chunks) for every active large file
+			for _, fc := range activeLargeFiles {
+				if atomic.LoadInt32(&fc.state.canceled) == 1 {
+					continue
+				}
+				for fc.nextPart < fc.totalParts && atomic.LoadInt32(&fc.state.inflight) < MinInflightPerLarge {
 					offset := int64(fc.nextPart) * fc.partSize
 					limit := int(fc.partSize)
 
-					job := &chunkJob{
+					job := &largeChunkJob{
 						fileState: fc.state,
 						elem:      fc.state.elem,
 						dcID:      fc.state.elem.File().DC(),
@@ -308,44 +450,101 @@ func (d *Downloader) Download(ctx context.Context, globalConcurrency int) error 
 					case <-gctx.Done():
 						return gctx.Err()
 					case jobChan <- job:
+						atomic.AddInt32(&fc.state.inflight, 1)
 						fc.nextPart++
-						chunksEmitted++
+						dispatchedCount++
+					default:
+						goto SleepOrYield
 					}
-				}
-
-				select {
-				case <-fc.state.doneChan:
-				default:
-					newActiveFiles = append(newActiveFiles, fc)
 				}
 			}
 
-			activeFiles = newActiveFiles
+			// D. Priority 2: Dispatch Small Files if ready and RAM budget allows
+			for len(smallReadyQueue) > 0 {
+				nextSmall := smallReadyQueue[0]
+				if !smallBudget.tryAcquire(nextSmall.totalSize) {
+					// RAM budget full -> pause small lane backpressure
+					break
+				}
 
-			if chunksEmitted == 0 && len(activeFiles) > 0 {
 				select {
 				case <-gctx.Done():
 					return gctx.Err()
+				case jobChan <- nextSmall:
+					smallReadyQueue = smallReadyQueue[1:]
+					dispatchedCount++
+				default:
+					smallBudget.release(nextSmall.totalSize)
+					goto SleepOrYield
+				}
+			}
+
+			// E. Priority 3: Surplus Worker Capacity -> Round-Robin feed active large files beyond min-inflight
+			for _, fc := range activeLargeFiles {
+				if atomic.LoadInt32(&fc.state.canceled) == 1 {
+					continue
+				}
+				if fc.nextPart < fc.totalParts {
+					offset := int64(fc.nextPart) * fc.partSize
+					limit := int(fc.partSize)
+
+					job := &largeChunkJob{
+						fileState: fc.state,
+						elem:      fc.state.elem,
+						dcID:      fc.state.elem.File().DC(),
+						location:  fc.state.elem.File().Location(),
+						offset:    offset,
+						limit:     limit,
+						totalSize: fc.state.totalSize,
+						takeout:   fc.state.elem.AsTakeout(),
+					}
+
+					select {
+					case <-gctx.Done():
+						return gctx.Err()
+					case jobChan <- job:
+						atomic.AddInt32(&fc.state.inflight, 1)
+						fc.nextPart++
+						dispatchedCount++
+					default:
+						goto SleepOrYield
+					}
+				}
+			}
+
+		SleepOrYield:
+			if dispatchedCount == 0 {
+				if elemChanClosed && len(activeLargeFiles) == 0 && len(smallReadyQueue) == 0 {
+					break
+				}
+				select {
+				case <-gctx.Done():
+					return gctx.Err()
+				case elem, ok := <-elemChan:
+					if !ok {
+						elemChanClosed = true
+					} else {
+						routeElem(elem)
+					}
 				case <-time.After(15 * time.Millisecond):
 				}
 			}
 		}
 
-		if err := d.opts.Iter.Err(); err != nil {
-			return errors.Wrap(err, "iter")
-		}
 		return nil
 	})
 
 	return g.Wait()
 }
 
-func (d *Downloader) fetchChunk(ctx context.Context, workerID int, job *chunkJob, writeChan chan<- *writeJob) {
+// fetchLargeChunk downloads a single 512KB chunk for an active large file.
+func (d *Downloader) fetchLargeChunk(ctx context.Context, workerID int, job *largeChunkJob, writeChan chan<- *largeWriteJob) {
+	defer atomic.AddInt32(&job.fileState.inflight, -1)
+
 	if ce, ok := job.fileState.elem.(CancelableElem); ok && ce.IsCanceled() {
 		job.fileState.fail(context.Canceled)
 	}
 
-	// 0. Fail-fast: skip network RPC if file is already cancelled / errored
 	if atomic.LoadInt32(&job.fileState.canceled) == 1 {
 		if atomic.AddInt32(&job.fileState.remParts, -1) == 0 {
 			job.fileState.doneOnce.Do(func() {
@@ -504,7 +703,6 @@ func (d *Downloader) fetchChunk(ctx context.Context, workerID int, job *chunkJob
 		return
 	}
 
-	// Hand off downloaded chunk to Disk Writer Workers!
 	select {
 	case <-ctx.Done():
 		job.fileState.fail(ctx.Err())
@@ -514,10 +712,148 @@ func (d *Downloader) fetchChunk(ctx context.Context, workerID int, job *chunkJob
 				close(job.fileState.doneChan)
 			})
 		}
-	case writeChan <- &writeJob{
+	case writeChan <- &largeWriteJob{
 		fileState: job.fileState,
 		data:      chunkData,
 		offset:    job.offset,
+	}:
+	}
+}
+
+// fetchSmallFile downloads an entire small file (<= 1 MiB) sequentially in-memory.
+func (d *Downloader) fetchSmallFile(ctx context.Context, workerID int, job *smallFetchJob, writeChan chan<- *smallWriteJob, budget *memoryBudget) {
+	if ce, ok := job.elem.(CancelableElem); ok && ce.IsCanceled() {
+		d.opts.Progress.OnDone(job.elem, context.Canceled)
+		budget.release(job.totalSize)
+		return
+	}
+
+	elemCtx := ctx
+	if ce, ok := job.elem.(ContextElem); ok && ce.Context() != nil {
+		elemCtx = ce.Context()
+	}
+
+	if elemCtx.Err() != nil {
+		d.opts.Progress.OnDone(job.elem, context.Canceled)
+		budget.release(job.totalSize)
+		return
+	}
+
+	client := d.opts.Pool.Client(elemCtx, job.dcID)
+	if job.takeout {
+		client = d.opts.Pool.Takeout(elemCtx, job.dcID)
+	}
+
+	fileBuffer := make([]byte, 0, job.totalSize)
+	var offset int64 = 0
+
+	for offset < job.totalSize {
+		limit := MaxPartSize
+		if offset+int64(limit) > job.totalSize {
+			limit = int(job.totalSize - offset)
+		}
+
+		req := &tg.UploadGetFileRequest{
+			Precise:  true,
+			Location: job.location,
+			Offset:   offset,
+			Limit:    limit,
+		}
+
+		var chunkData []byte
+		var fetchErr error
+
+		for attempt := 0; attempt < 5; attempt++ {
+			select {
+			case <-ctx.Done():
+				d.opts.Progress.OnDone(job.elem, ctx.Err())
+				budget.release(job.totalSize)
+				return
+			case <-elemCtx.Done():
+				d.opts.Progress.OnDone(job.elem, context.Canceled)
+				budget.release(job.totalSize)
+				return
+			default:
+			}
+
+			chunkCtx, chunkCancel := context.WithTimeout(elemCtx, 60*time.Second)
+			var res tg.UploadFileClass
+			res, fetchErr = client.UploadGetFile(chunkCtx, req)
+			chunkCancel()
+
+			if errors.Is(fetchErr, context.Canceled) || elemCtx.Err() != nil {
+				d.opts.Progress.OnDone(job.elem, context.Canceled)
+				budget.release(job.totalSize)
+				return
+			}
+
+			if fetchErr == nil {
+				if uf, ok := res.(*tg.UploadFile); ok {
+					chunkData = uf.Bytes
+					if len(chunkData) == limit {
+						break
+					}
+					fetchErr = fmt.Errorf("short read at offset %d: expected %d bytes, got %d", offset, limit, len(chunkData))
+				} else {
+					fetchErr = fmt.Errorf("unexpected upload response type: %T", res)
+				}
+			}
+
+			if tgerr.Is(fetchErr, "FILE_REFERENCE_EXPIRED", "FILEREF_UPGRADE_NEEDED", "FILE_REFERENCE_INVALID", "LOCATION_INVALID") {
+				break
+			}
+
+			if dWait, isFlood := tgerr.AsFloodWait(fetchErr); isFlood {
+				logctx.From(ctx).Warn("UploadGetFile small file flood wait triggered",
+					zap.Int("dc", job.dcID),
+					zap.Duration("flood_wait", dWait),
+				)
+				if d.floodGate != nil {
+					d.floodGate.TriggerFloodWait(job.dcID, dWait)
+				}
+				continue
+			}
+
+			select {
+			case <-ctx.Done():
+				d.opts.Progress.OnDone(job.elem, ctx.Err())
+				budget.release(job.totalSize)
+				return
+			case <-elemCtx.Done():
+				d.opts.Progress.OnDone(job.elem, context.Canceled)
+				budget.release(job.totalSize)
+				return
+			case <-time.After(time.Duration(attempt+1) * 300 * time.Millisecond):
+			}
+		}
+
+		if fetchErr != nil || len(chunkData) != limit {
+			if fetchErr == nil {
+				fetchErr = fmt.Errorf("chunk size mismatch: expected %d, got %d", limit, len(chunkData))
+			}
+			d.opts.Progress.OnDone(job.elem, fetchErr)
+			budget.release(job.totalSize)
+			return
+		}
+
+		fileBuffer = append(fileBuffer, chunkData...)
+		offset += int64(len(chunkData))
+
+		d.opts.Progress.OnDownload(job.elem, ProgressState{
+			Downloaded: offset,
+			Total:      job.totalSize,
+		})
+	}
+
+	// Send completed whole-file to the Small Disk Writer
+	select {
+	case <-ctx.Done():
+		d.opts.Progress.OnDone(job.elem, ctx.Err())
+		budget.release(job.totalSize)
+	case writeChan <- &smallWriteJob{
+		elem:      job.elem,
+		data:      fileBuffer,
+		totalSize: job.totalSize,
 	}:
 	}
 }

@@ -375,3 +375,99 @@ func TestDownloader_TaskLevelCancellation(t *testing.T) {
 	assert.Equal(t, 1, len(progress.done))
 	assert.Equal(t, context.Canceled, progress.done[canceledElem])
 }
+
+func TestDownloader_DualLane_MixedSmallAndLargeFiles(t *testing.T) {
+	invoker := &fakeInvoker{}
+	pool := &fakePool{invoker: invoker}
+
+	// 3 Large files (2MB each = 4 parts each)
+	// 20 Small files (200KB each = 1 part each)
+	elems := make([]*fakeElem, 0, 23)
+	for i := 0; i < 3; i++ {
+		elems = append(elems, &fakeElem{
+			file: &fakeFile{size: 2 * 1024 * 1024, dc: 4},
+			buf:  newMemWriterAt(2 * 1024 * 1024),
+		})
+	}
+	for i := 0; i < 20; i++ {
+		elems = append(elems, &fakeElem{
+			file: &fakeFile{size: 200 * 1024, dc: 4},
+			buf:  newMemWriterAt(200 * 1024),
+		})
+	}
+
+	iter := &fakeIter{elems: elems}
+	progress := newFakeProgress()
+	fg := gate.NewFloodGate(1000, 100)
+
+	dl := New(Options{
+		Pool:            pool,
+		Threads:         16,
+		DiskWorkers:     6,
+		FileConcurrency: 5,
+		Iter:            iter,
+		Progress:        progress,
+		FloodGate:       fg,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err := dl.Download(ctx, 16)
+	require.NoError(t, err)
+
+	progress.mu.Lock()
+	defer progress.mu.Unlock()
+
+	assert.Equal(t, 23, len(progress.added))
+	assert.Equal(t, 23, len(progress.done))
+	for _, e := range elems {
+		assert.NoError(t, progress.done[e])
+		assert.Equal(t, e.file.size, progress.downloaded[e])
+	}
+}
+
+func TestDownloader_DualLane_OnlySmallFiles(t *testing.T) {
+	invoker := &fakeInvoker{}
+	pool := &fakePool{invoker: invoker}
+
+	// 32 Small files (100KB each)
+	elems := make([]*fakeElem, 32)
+	for i := 0; i < 32; i++ {
+		elems[i] = &fakeElem{
+			file: &fakeFile{size: 100 * 1024, dc: 4},
+			buf:  newMemWriterAt(100 * 1024),
+		}
+	}
+
+	iter := &fakeIter{elems: elems}
+	progress := newFakeProgress()
+	fg := gate.NewFloodGate(1000, 100)
+
+	dl := New(Options{
+		Pool:            pool,
+		Threads:         32,
+		DiskWorkers:     6,
+		FileConcurrency: 5,
+		Iter:            iter,
+		Progress:        progress,
+		FloodGate:       fg,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err := dl.Download(ctx, 32)
+	require.NoError(t, err)
+
+	progress.mu.Lock()
+	defer progress.mu.Unlock()
+
+	assert.Equal(t, 32, len(progress.added))
+	assert.Equal(t, 32, len(progress.done))
+	for _, e := range elems {
+		assert.NoError(t, progress.done[e])
+		assert.Equal(t, e.file.size, progress.downloaded[e])
+	}
+}
+
