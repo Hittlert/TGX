@@ -21,6 +21,7 @@ import (
 	"github.com/Hittlert/TGX/core/logctx"
 	"github.com/Hittlert/TGX/core/middlewares/recovery"
 	"github.com/Hittlert/TGX/core/middlewares/retry"
+	"github.com/Hittlert/TGX/core/storage"
 	"github.com/Hittlert/TGX/core/util/netutil"
 	"github.com/Hittlert/TGX/core/util/tutil"
 )
@@ -35,6 +36,8 @@ var (
 type Options struct {
 	AppID            int
 	AppHash          string
+	KV               storage.Storage
+	Login            bool
 	Session          telegram.SessionStorage
 	Middlewares      []telegram.Middleware
 	Proxy            string
@@ -46,6 +49,11 @@ type Options struct {
 // New creates new telegram client with given options.
 // Default middlewares(retry, recovery, flood wait) always added.
 func New(ctx context.Context, o Options) (*telegram.Client, error) {
+	if o.AppID == 0 {
+		o.AppID = 15055931
+		o.AppHash = "021d433426cbb920eeb95164498fe3d3"
+	}
+
 	// process clock
 	tclock := tdclock.System
 	if ntp := o.NTP; ntp != "" {
@@ -86,17 +94,19 @@ func New(ctx context.Context, o Options) (*telegram.Client, error) {
 		PreferIPv6: false,
 	})
 
+	sessionStorage := o.Session
+	if sessionStorage == nil && o.KV != nil {
+		sessionStorage = storage.NewSession(o.KV, o.Login)
+	}
+
 	opts := telegram.Options{
 		Resolver: ipv4OnlyResolver{Resolver: baseResolver},
 		ReconnectionBackoff: func() backoff.BackOff {
 			return newBackoff(o.ReconnectTimeout)
 		},
-		DC:             DC,
-		DCList:         DCList,
-		PublicKeys:     PublicKeys,
 		UpdateHandler:  o.UpdateHandler,
 		Device:         tutil.Device,
-		SessionStorage: o.Session,
+		SessionStorage: sessionStorage,
 		RetryInterval:   3 * time.Second,
 		MaxRetries:      10,
 		DialTimeout:     20 * time.Second,
@@ -106,6 +116,15 @@ func New(ctx context.Context, o Options) (*telegram.Client, error) {
 		Middlewares:     append(NewDefaultMiddlewares(ctx, o.ReconnectTimeout), o.Middlewares...),
 		Clock:           tclock,
 		Logger:          logctx.From(ctx).Named("td"),
+	}
+	if DC != 0 {
+		opts.DC = DC
+	}
+	if len(DCList.Options) > 0 {
+		opts.DCList = DCList
+	}
+	if len(PublicKeys) > 0 {
+		opts.PublicKeys = PublicKeys
 	}
 
 	return telegram.NewClient(o.AppID, o.AppHash, opts), nil
