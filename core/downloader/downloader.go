@@ -99,13 +99,7 @@ func (d *Downloader) download(ctx context.Context, elem Elem) error {
 
 	partSize := int64(MaxPartSize)
 	numParts := int((totalSize + partSize - 1) / partSize)
-	threads := d.opts.Threads
-	if threads <= 0 {
-		threads = 1
-	}
-	if numParts < threads {
-		threads = numParts
-	}
+	threads := computeOptimalThreads(totalSize, numParts, d.opts.Threads)
 
 	// For single-part files (photos, small audio, small video <= 512KB)
 	if numParts == 1 {
@@ -264,4 +258,33 @@ func (d *Downloader) download(ctx context.Context, elem Elem) error {
 	}
 
 	return g.Wait()
+}
+
+func computeOptimalThreads(totalSize int64, numParts int, maxThreads int) int {
+	if maxThreads <= 0 {
+		maxThreads = 1
+	}
+	if numParts <= 1 {
+		return 1
+	}
+
+	var targetThreads int
+	switch {
+	case totalSize <= 2*1024*1024: // <= 2MB: strictly sequential 1 thread
+		targetThreads = 1
+	case totalSize <= 20*1024*1024: // 2MB ~ 20MB: max 2 threads
+		targetThreads = min(2, maxThreads)
+	case totalSize <= 100*1024*1024: // 20MB ~ 100MB: max 4 threads
+		targetThreads = min(4, maxThreads)
+	default: // > 100MB: up to configured maxThreads
+		targetThreads = maxThreads
+	}
+
+	if targetThreads > numParts {
+		targetThreads = numParts
+	}
+	if targetThreads < 1 {
+		targetThreads = 1
+	}
+	return targetThreads
 }
