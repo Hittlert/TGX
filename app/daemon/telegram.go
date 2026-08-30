@@ -8,8 +8,10 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/sync/singleflight"
 	"github.com/gotd/td/telegram/peers"
 	"github.com/gotd/td/telegram/query"
+	"github.com/gotd/td/telegram/query/dialogs"
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
 
@@ -23,6 +25,8 @@ type telegramMediaAccess struct {
 	pool        dcpool.Pool
 	manager     *peers.Manager
 	syncMu      sync.Mutex
+	lastSync    time.Time
+	sf          singleflight.Group
 	syncTimeout time.Duration
 }
 
@@ -56,36 +60,48 @@ func (a *telegramMediaAccess) Resolve(ctx context.Context, peer string, messageI
 
 func (a *telegramMediaAccess) SyncPeers(ctx context.Context) error {
 	a.syncMu.Lock()
-	defer a.syncMu.Unlock()
-	syncCtx, cancel := context.WithTimeout(ctx, a.syncTimeout)
-	defer cancel()
-
-	iter := query.GetDialogs(a.pool.Default(syncCtx)).BatchSize(100).Iter()
-	count := 0
-	for iter.Next(syncCtx) {
-		elem := iter.Value()
-		usersMap := elem.Entities.Users()
-		chatsMap := elem.Entities.Chats()
-		channelsMap := elem.Entities.Channels()
-
-		users := make([]tg.UserClass, 0, len(usersMap))
-		for _, u := range usersMap {
-			users = append(users, u)
-		}
-		chats := make([]tg.ChatClass, 0, len(chatsMap)+len(channelsMap))
-		for _, c := range chatsMap {
-			chats = append(chats, c)
-		}
-		for _, c := range channelsMap {
-			chats = append(chats, c)
-		}
-		_ = a.manager.Apply(ctx, users, chats)
-		count++
-		if count >= 100 {
-			break
-		}
+	if time.Since(a.lastSync) < 30*time.Second {
+		a.syncMu.Unlock()
+		return nil
 	}
-	return nil
+	a.syncMu.Unlock()
+
+	_, err, _ := a.sf.Do("sync_peers", func() (interface{}, error) {
+		syncCtx, cancel := context.WithTimeout(ctx, a.syncTimeout)
+		defer cancel()
+
+		err := query.GetDialogs(a.pool.Default(syncCtx)).BatchSize(100).ForEach(syncCtx, func(ctx context.Context, elem dialogs.Elem) error {
+			usersMap := elem.Entities.Users()
+			chatsMap := elem.Entities.Chats()
+			channelsMap := elem.Entities.Channels()
+
+			users := make([]tg.UserClass, 0, len(usersMap))
+			for _, u := range usersMap {
+				users = append(users, u)
+			}
+			chats := make([]tg.ChatClass, 0, len(chatsMap)+len(channelsMap))
+			for _, c := range chatsMap {
+				chats = append(chats, c)
+			}
+			for _, c := range channelsMap {
+				chats = append(chats, c)
+			}
+			if len(users) > 0 || len(chats) > 0 {
+				if applyErr := a.manager.Apply(ctx, users, chats); applyErr != nil {
+					return applyErr
+				}
+			}
+			return nil
+		})
+		if err != nil && !errors.Is(err, context.Canceled) {
+			return nil, classifyTelegramError(err, "sync dialogs")
+		}
+		a.syncMu.Lock()
+		a.lastSync = time.Now()
+		a.syncMu.Unlock()
+		return nil, nil
+	})
+	return err
 }
 
 type telegramFile struct {
@@ -101,7 +117,10 @@ func (f telegramFile) DC() int                             { return f.media.DC }
 func classifyTelegramError(err error, operation string) error {
 	errStr := strings.ToLower(err.Error())
 	unavailable := errors.Is(err, tutil.ErrMessageDeleted) || tgerr.Is(err,
+		"CHANNEL_INVALID",
 		"CHANNEL_PRIVATE",
+		"CHAT_ID_INVALID",
+		"USER_ID_INVALID",
 		"CHAT_ADMIN_REQUIRED",
 		"USER_BANNED_IN_CHANNEL",
 		"PEER_ID_INVALID",

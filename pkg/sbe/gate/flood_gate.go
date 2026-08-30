@@ -15,13 +15,14 @@ import (
 
 // FloodGate manages shared per-DC cooldowns and global account request rate limiting.
 type FloodGate struct {
-	mu          sync.RWMutex
-	baseRate    float64
-	currentRate float64
-	burst       int
-	lastRamp    time.Time
-	dcCooldowns map[int]time.Time
-	limiter     *rate.Limiter
+	mu           sync.RWMutex
+	baseRate     float64
+	currentRate  float64
+	burst        int
+	lastRamp     time.Time
+	lastRateDrop time.Time
+	dcCooldowns  map[int]time.Time
+	limiter      *rate.Limiter
 }
 
 // NewFloodGate creates a FloodGate with a global request rate limiter (default 40 req/s, burst 10).
@@ -32,13 +33,15 @@ func NewFloodGate(reqPerSec float64, burst int) *FloodGate {
 	if burst <= 0 {
 		burst = 10
 	}
+	now := time.Now()
 	return &FloodGate{
-		baseRate:    reqPerSec,
-		currentRate: reqPerSec,
-		burst:       burst,
-		lastRamp:    time.Now(),
-		dcCooldowns: make(map[int]time.Time),
-		limiter:     rate.NewLimiter(rate.Limit(reqPerSec), burst),
+		baseRate:     reqPerSec,
+		currentRate:  reqPerSec,
+		burst:        burst,
+		lastRamp:     now,
+		lastRateDrop: now.Add(-10 * time.Second),
+		dcCooldowns:  make(map[int]time.Time),
+		limiter:      rate.NewLimiter(rate.Limit(reqPerSec), burst),
 	}
 }
 
@@ -69,18 +72,7 @@ func (g *FloodGate) Wait(ctx context.Context, dc int) error {
 	}
 
 	for {
-		// 1. Wait for token bucket first
-		g.mu.RLock()
-		limiter := g.limiter
-		g.mu.RUnlock()
-
-		if limiter != nil {
-			if err := limiter.Wait(ctx); err != nil {
-				return err
-			}
-		}
-
-		// 2. Atomic check of live cooldown AFTER token is granted
+		// 1. Check DC cooldown FIRST before taking any global token!
 		g.mu.Lock()
 		now := time.Now()
 		// Clean up expired DC cooldowns
@@ -103,22 +95,45 @@ func (g *FloodGate) Wait(ctx context.Context, dc int) error {
 		}
 
 		notBefore, hasCooldown := g.dcCooldowns[dc]
-		if !hasCooldown || now.After(notBefore) {
-			// No cooldown active right now: proceed!
-			g.mu.Unlock()
-			return nil
+		var waitTime time.Duration
+		if hasCooldown && now.Before(notBefore) {
+			waitTime = notBefore.Sub(now)
 		}
-
-		// Cooldown IS active: calculate remaining wait time accurately based on current time
-		waitTime := notBefore.Sub(now)
+		limiter := g.limiter
 		g.mu.Unlock()
 
-		// Sleep for remaining cooldown under context cancellation, then loop back
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(waitTime):
+		if waitTime > 0 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(waitTime):
+			}
+			continue
 		}
+
+		// 2. DC is healthy: Wait for global token bucket
+		if limiter != nil {
+			if err := limiter.Wait(ctx); err != nil {
+				return err
+			}
+		}
+
+		// 3. Quick post-token verification under lock in case another worker triggered cooldown while we waited for token
+		g.mu.Lock()
+		now = time.Now()
+		notBefore, hasCooldown = g.dcCooldowns[dc]
+		if hasCooldown && now.Before(notBefore) {
+			waitTime = notBefore.Sub(now)
+			g.mu.Unlock()
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(waitTime):
+			}
+			continue
+		}
+		g.mu.Unlock()
+		return nil
 	}
 }
 
@@ -131,19 +146,21 @@ func (g *FloodGate) TriggerFloodWait(dc int, duration time.Duration) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
-	// Adaptively throttle rate limit on flood wait (Multiplicative Decrease: -25%, min 10.0 req/s)
-	if g.currentRate > 10.0 {
+	now := time.Now()
+	// Debounce rate drops: do not multiply decrease more than once per 500ms
+	if g.currentRate > 10.0 && now.Sub(g.lastRateDrop) >= 500*time.Millisecond {
 		g.currentRate = g.currentRate * 0.75
 		if g.currentRate < 10.0 {
 			g.currentRate = 10.0
 		}
 		g.limiter.SetLimit(rate.Limit(g.currentRate))
-		g.lastRamp = time.Now()
+		g.lastRamp = now
+		g.lastRateDrop = now
 	}
 
 	// Add jitter (200ms ~ 1000ms) to prevent lockstep thundering herd on wake-up
 	jitter := time.Duration(200+rand.Intn(800)) * time.Millisecond
-	targetTime := time.Now().Add(duration + jitter)
+	targetTime := now.Add(duration + jitter)
 
 	if existing, exists := g.dcCooldowns[dc]; !exists || targetTime.After(existing) {
 		g.dcCooldowns[dc] = targetTime

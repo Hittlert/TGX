@@ -377,6 +377,38 @@ func (t *Task) Fail(class, message string, unavailable bool) {
 	t.registry.finish(t.state, state, class, message, "", false, "")
 }
 
+func (t *Task) RecordProgress(downloaded int64) {
+	if downloaded <= 0 {
+		return
+	}
+	r := t.registry
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if isTerminal(t.state.state) {
+		return
+	}
+	if t.state.totalSize > 0 && downloaded > t.state.totalSize {
+		downloaded = t.state.totalSize
+	}
+	diff := downloaded - t.state.downloaded
+	if diff <= 0 {
+		return
+	}
+	now := r.now()
+	event := byteEvent{at: now, bytes: diff}
+	t.state.downloaded = downloaded
+	t.state.events = append(t.state.events, event)
+	r.events = append(r.events, event)
+	if t.state.firstByte.IsZero() {
+		t.state.firstByte = now
+	}
+	if r.firstByte.IsZero() {
+		r.firstByte = now
+	}
+	t.state.lastByte = now
+	r.lastByte = now
+}
+
 func (t *Task) RecordWrite(offset int64, size int) int64 {
 	if size <= 0 || offset < 0 {
 		return 0

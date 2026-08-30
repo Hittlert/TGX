@@ -122,7 +122,11 @@ func (p *taskProgress) OnAdd(element downloader.Elem) {
 	element.(taskElement).Task().SetDownloading()
 }
 
-func (p *taskProgress) OnDownload(_ downloader.Elem, _ downloader.ProgressState) {}
+func (p *taskProgress) OnDownload(element downloader.Elem, state downloader.ProgressState) {
+	if te, ok := element.(taskElement); ok && te.Task() != nil {
+		te.Task().RecordProgress(state.Downloaded)
+	}
+}
 
 func (p *taskProgress) OnDone(element downloader.Elem, transferErr error) {
 	taskElement := element.(taskElement)

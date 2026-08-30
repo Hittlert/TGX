@@ -164,7 +164,7 @@ func (f *fakeInvoker) Invoke(ctx context.Context, input bin.Encoder, output bin.
 }
 
 type fakePool struct {
-	invoker *fakeInvoker
+	invoker tg.Invoker
 }
 
 func (p *fakePool) Client(ctx context.Context, dc int) *tg.Client {
@@ -576,6 +576,145 @@ func TestDownloader_MassiveSmallAndLargeInterleavedNonBlocking(t *testing.T) {
 
 	assert.Equal(t, 60, len(progress.added))
 	assert.Equal(t, 60, len(progress.done))
+	for _, e := range elems {
+		assert.NoError(t, progress.done[e])
+		assert.Equal(t, e.file.size, progress.downloaded[e])
+	}
+}
+
+type delayedFakeInvoker struct {
+	mu            sync.Mutex
+	failOffset    int64
+	failCount     int
+	delayOffset   int64
+	delayDuration time.Duration
+}
+
+func (f *delayedFakeInvoker) Invoke(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
+	req, ok := input.(*tg.UploadGetFileRequest)
+	if !ok {
+		return errors.New("unexpected input type")
+	}
+
+	f.mu.Lock()
+	fail := f.failOffset >= 0 && req.Offset == f.failOffset && f.failCount < 5
+	if fail {
+		f.failCount++
+	}
+	delay := f.delayOffset > 0 && req.Offset == f.delayOffset
+	f.mu.Unlock()
+
+	if delay {
+		time.Sleep(f.delayDuration)
+	}
+
+	if fail {
+		return errors.New("simulated chunk failure")
+	}
+
+	data := bytes.Repeat([]byte{byte(req.Offset / 512)}, req.Limit)
+	res := &tg.UploadFile{
+		Type:  &tg.StorageFilePartial{},
+		Mtime: int(time.Now().Unix()),
+		Bytes: data,
+	}
+
+	out, ok := output.(*tg.UploadFileBox)
+	if ok {
+		out.File = res
+	}
+	return nil
+}
+
+func TestDownloader_LateRPCFromOldLeaseGenerationDoesNotCorruptNewFile(t *testing.T) {
+	invoker := &delayedFakeInvoker{
+		failOffset:    0, // fail offset 0 of first file
+		delayOffset:   512 * 1024,
+		delayDuration: 150 * time.Millisecond,
+	}
+	pool := &fakePool{invoker: invoker}
+
+	// 2 Large files (1.5 MB each)
+	elems := []*fakeElem{
+		{
+			file: &fakeFile{size: 1536 * 1024, dc: 4},
+			buf:  newMemWriterAt(1536 * 1024),
+		},
+		{
+			file: &fakeFile{size: 1536 * 1024, dc: 4},
+			buf:  newMemWriterAt(1536 * 1024),
+		},
+	}
+
+	iter := &fakeIter{elems: elems}
+	progress := newFakeProgress()
+	fg := gate.NewFloodGate(1000, 100)
+
+	dl := New(Options{
+		Pool:            pool,
+		Threads:         16,
+		DiskWorkers:     1, // 1 writer slot shared across File 1 then File 2!
+		FileConcurrency: 1,
+		Iter:            iter,
+		Progress:        progress,
+		FloodGate:       fg,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err := dl.Download(ctx, 16)
+	require.NoError(t, err)
+
+	progress.mu.Lock()
+	defer progress.mu.Unlock()
+
+	// File 0 failed cleanly
+	assert.Error(t, progress.done[elems[0]])
+	// File 1 succeeded completely without corruption or dropped chunks!
+	assert.NoError(t, progress.done[elems[1]])
+	assert.Equal(t, int64(1536*1024), progress.downloaded[elems[1]])
+}
+
+func TestDownloader_Massive100SmallFilesWithSlowDiskWriter(t *testing.T) {
+	invoker := &fakeInvoker{}
+	pool := &fakePool{invoker: invoker}
+
+	// 100 small files (50KB each = 5MB total, well within 128MB budget)
+	elems := make([]*fakeElem, 0, 100)
+	for i := 0; i < 100; i++ {
+		elems = append(elems, &fakeElem{
+			file: &fakeFile{size: 50 * 1024, dc: 4},
+			buf:  newMemWriterAt(50 * 1024),
+		})
+	}
+
+	iter := &fakeIter{elems: elems}
+	progress := newFakeProgress()
+	fg := gate.NewFloodGate(1000, 100)
+
+	dl := New(Options{
+		Pool:            pool,
+		Threads:         32,
+		DiskWorkers:     6,
+		FileConcurrency: 5,
+		SmallMemBudget:  128 * 1024 * 1024,
+		Iter:            iter,
+		Progress:        progress,
+		FloodGate:       fg,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	err := dl.Download(ctx, 32)
+	require.NoError(t, err)
+
+	progress.mu.Lock()
+	defer progress.mu.Unlock()
+
+	assert.Equal(t, 100, len(progress.added))
+	assert.Equal(t, 100, len(progress.done))
 	for _, e := range elems {
 		assert.NoError(t, progress.done[e])
 		assert.Equal(t, e.file.size, progress.downloaded[e])

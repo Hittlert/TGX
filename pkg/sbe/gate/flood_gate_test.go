@@ -65,6 +65,7 @@ func TestFloodGateAdaptiveRateAIMD(t *testing.T) {
 	gate.TriggerFloodWait(5, 50*time.Millisecond)
 	assert.Equal(t, 30.0, gate.CurrentRate()) // 40 * 0.75 = 30
 
+	time.Sleep(600 * time.Millisecond)
 	gate.TriggerFloodWait(5, 50*time.Millisecond)
 	assert.Equal(t, 22.5, gate.CurrentRate()) // 30 * 0.75 = 22.5
 
