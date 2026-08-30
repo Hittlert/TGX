@@ -1165,9 +1165,7 @@
                   target_rows.unshift(dialog);
                 }
                 render_target_list();
-                save_targets(function () {
-                  layer.msg('Target added and persisted to config!', { icon: 1 });
-                });
+                layer.msg('Target added and persisted to config!', { icon: 1 });
               } else {
                 layer.msg(res.error || 'Failed to resolve target');
               }

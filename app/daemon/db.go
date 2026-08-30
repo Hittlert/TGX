@@ -219,6 +219,85 @@ func (d *Database) SaveListenTargets(targets []ListenTarget) error {
 	return tx.Commit()
 }
 
+func (d *Database) SaveDiscoveredDialogs(dialogs []ListenTarget) error {
+	d.lock.Lock()
+	defer d.lock.Unlock()
+
+	now := time.Now().Unix()
+	tx, err := d.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	for _, item := range dialogs {
+		_, err := tx.Exec(`
+			INSERT INTO listen_targets(chat_id, enabled, title, username, chat_type, download_filter, upload_telegram_chat_id, priority, created_at, updated_at, revision)
+			VALUES(?, 0, ?, ?, ?, '', '', 0, ?, ?, 1)
+			ON CONFLICT(chat_id) DO UPDATE SET
+				title = CASE WHEN excluded.title != '' THEN excluded.title ELSE listen_targets.title END,
+				username = CASE WHEN excluded.username != '' THEN excluded.username ELSE listen_targets.username END,
+				chat_type = CASE WHEN excluded.chat_type != '' THEN excluded.chat_type ELSE listen_targets.chat_type END,
+				updated_at = excluded.updated_at
+		`, item.ChatID, item.Title, item.Username, item.ChatType, now, now)
+		if err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
+}
+
+func (d *Database) SaveSingleListenTarget(item ListenTarget) error {
+	d.lock.Lock()
+	defer d.lock.Unlock()
+
+	now := time.Now().Unix()
+	enabledInt := 0
+	if item.Enabled {
+		enabledInt = 1
+	}
+
+	tx, err := d.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	_, err = tx.Exec(`
+		INSERT INTO listen_targets(chat_id, enabled, title, username, chat_type, download_filter, upload_telegram_chat_id, priority, created_at, updated_at, revision)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+		ON CONFLICT(chat_id) DO UPDATE SET
+			enabled = excluded.enabled,
+			title = CASE WHEN excluded.title != '' THEN excluded.title ELSE listen_targets.title END,
+			username = CASE WHEN excluded.username != '' THEN excluded.username ELSE listen_targets.username END,
+			chat_type = CASE WHEN excluded.chat_type != '' THEN excluded.chat_type ELSE listen_targets.chat_type END,
+			download_filter = excluded.download_filter,
+			upload_telegram_chat_id = excluded.upload_telegram_chat_id,
+			priority = excluded.priority,
+			updated_at = excluded.updated_at,
+			revision = listen_targets.revision + 1
+	`, item.ChatID, enabledInt, item.Title, item.Username, item.ChatType, item.DownloadFilter, item.UploadTelegramChatID, item.Priority, now, now)
+	if err != nil {
+		return err
+	}
+
+	if item.LastReadMessageID > 0 {
+		_, err = tx.Exec(`
+			INSERT INTO chat_scan_cursors(chat_id, cursor, mirrored_cursor, updated_at)
+			VALUES(?, ?, 0, ?)
+			ON CONFLICT(chat_id) DO UPDATE SET
+				cursor = excluded.cursor,
+				updated_at = excluded.updated_at
+		`, item.ChatID, item.LastReadMessageID, now)
+		if err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
+}
+
 func (d *Database) GetScanCursor(chatID string) (int, error) {
 	cursor, _, err := d.GetScanCursorWithTime(chatID)
 	return cursor, err

@@ -670,7 +670,7 @@ func (s *WebServer) handleDialogs(w http.ResponseWriter, r *http.Request) {
 				Enabled:  false,
 			})
 		}
-		_ = s.db.SaveListenTargets(newTargets)
+		_ = s.db.SaveDiscoveredDialogs(newTargets)
 	}
 
 	targets, err := s.db.GetListenTargets()
@@ -774,6 +774,23 @@ func (s *WebServer) handleAddTarget(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
+	}
+
+	targetItem := ListenTarget{
+		ChatID:   info.ChatID,
+		Title:    info.Title,
+		Username: info.Username,
+		ChatType: info.Type,
+		Enabled:  true,
+		Priority: 0,
+	}
+	_ = s.db.SaveSingleListenTarget(targetItem)
+
+	globalUpdatesStreamMu.RLock()
+	stream := globalUpdatesStream
+	globalUpdatesStreamMu.RUnlock()
+	if stream != nil {
+		stream.refreshTargetCache()
 	}
 
 	dialogObj := map[string]any{
