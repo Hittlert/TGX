@@ -107,6 +107,7 @@ type taskState struct {
 
 type Registry struct {
 	mu            sync.Mutex
+	parentCtx     context.Context
 	queueCapacity int
 	terminalLimit int
 	now           func() time.Time
@@ -129,6 +130,10 @@ type Task struct {
 }
 
 func NewRegistry(queueCapacity, terminalLimit int, now func() time.Time) *Registry {
+	return NewRegistryWithContext(context.Background(), queueCapacity, terminalLimit, now)
+}
+
+func NewRegistryWithContext(ctx context.Context, queueCapacity, terminalLimit int, now func() time.Time) *Registry {
 	if queueCapacity < 1 {
 		queueCapacity = 1
 	}
@@ -138,12 +143,24 @@ func NewRegistry(queueCapacity, terminalLimit int, now func() time.Time) *Regist
 	if now == nil {
 		now = time.Now
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	return &Registry{
+		parentCtx:     ctx,
 		queueCapacity: queueCapacity,
 		terminalLimit: terminalLimit,
 		now:           now,
 		tasks:         make(map[string]*taskState),
 		wake:          make(chan struct{}, 1),
+	}
+}
+
+func (r *Registry) SetParentContext(ctx context.Context) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if ctx != nil {
+		r.parentCtx = ctx
 	}
 }
 
@@ -155,6 +172,10 @@ func (r *Registry) Submit(request TaskRequest) (TaskSnapshot, bool, error) {
 	defer r.mu.Unlock()
 	retry := request.Retry
 	request.Retry = false
+	pCtx := r.parentCtx
+	if pCtx == nil {
+		pCtx = context.Background()
+	}
 	if existing, ok := r.tasks[request.ID]; ok {
 		if existing.request != request {
 			return TaskSnapshot{}, false, ErrIDConflict
@@ -164,7 +185,7 @@ func (r *Registry) Submit(request TaskRequest) (TaskSnapshot, bool, error) {
 				return TaskSnapshot{}, false, ErrQueueFull
 			}
 			now := r.now()
-			taskCtx, taskCancel := context.WithCancel(context.Background())
+			taskCtx, taskCancel := context.WithCancel(pCtx)
 			*existing = taskState{
 				request: request, state: StateQueued, totalSize: request.ExpectedSize, createdAt: now,
 				ctx: taskCtx, cancel: taskCancel,
@@ -180,7 +201,7 @@ func (r *Registry) Submit(request TaskRequest) (TaskSnapshot, bool, error) {
 		return TaskSnapshot{}, false, ErrQueueFull
 	}
 	now := r.now()
-	taskCtx, taskCancel := context.WithCancel(context.Background())
+	taskCtx, taskCancel := context.WithCancel(pCtx)
 	state := &taskState{
 		request: request, state: StateQueued, totalSize: request.ExpectedSize, createdAt: now,
 		ctx: taskCtx, cancel: taskCancel,

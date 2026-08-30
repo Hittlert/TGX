@@ -139,7 +139,7 @@ func Run(ctx context.Context, client *telegram.Client, kvd storage.Storage, opts
 	manager := peers.Options{Storage: storage.NewPeers(kvd)}.Build(pool.Default(ctx))
 	access := newTelegramMediaAccess(pool, manager, opts.PeerSyncTimeout)
 
-	registry := NewRegistry(opts.QueueCapacity, opts.TerminalLimit, time.Now)
+	registry := NewRegistryWithContext(ctx, opts.QueueCapacity, opts.TerminalLimit, time.Now)
 	registry.SetPaused(opts.StartPaused)
 	registry.SetPool(PoolSnapshot{Size: opts.PoolSize})
 	iter := newTaskIter(registry, newTaskResolver(access, opts.TempDir, opts.OutputDir))

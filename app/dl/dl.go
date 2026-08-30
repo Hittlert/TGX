@@ -22,6 +22,7 @@ import (
 	"github.com/Hittlert/TGX/pkg/consts"
 	"github.com/Hittlert/TGX/pkg/key"
 	"github.com/Hittlert/TGX/pkg/prog"
+	"github.com/Hittlert/TGX/pkg/sbe/gate"
 	"github.com/Hittlert/TGX/pkg/tmessage"
 	"github.com/Hittlert/TGX/pkg/utils"
 )
@@ -53,8 +54,10 @@ type parser struct {
 }
 
 func Run(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Options) (rerr error) {
-	pool := dcpool.NewPool(c,
+	sharedGate := gate.NewFloodGate(40.0, 10)
+	pool := dcpool.NewPoolWithGate(c,
 		int64(viper.GetInt(consts.FlagPoolSize)),
+		sharedGate,
 		tclient.NewDefaultMiddlewares(ctx, viper.GetDuration(consts.FlagReconnectTimeout))...)
 	defer multierr.AppendInvoke(&rerr, multierr.Close(pool))
 
@@ -104,10 +107,11 @@ func Run(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Opti
 	}
 
 	options := downloader.Options{
-		Pool:     pool,
-		Threads:  viper.GetInt(consts.FlagThreads),
-		Iter:     it,
-		Progress: newProgress(dlProgress, it, opts),
+		Pool:      pool,
+		Threads:   viper.GetInt(consts.FlagThreads),
+		Iter:      it,
+		Progress:  newProgress(dlProgress, it, opts),
+		FloodGate: sharedGate,
 	}
 	limit := viper.GetInt(consts.FlagLimit)
 

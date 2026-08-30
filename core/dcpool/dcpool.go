@@ -91,7 +91,10 @@ func (p *pool) invoker(ctx context.Context, dc int) tg.Invoker {
 		invoker, err = p.api.Pool(p.size)
 	} else {
 		for attempt := 0; attempt < 5; attempt++ {
-			invoker, err = p.api.DC(context.Background(), dc, p.size)
+			if ctx.Err() != nil {
+				return failedInvoker{dc: dc, err: ctx.Err()}
+			}
+			invoker, err = p.api.DC(ctx, dc, p.size)
 			if err == nil {
 				break
 			}
@@ -100,10 +103,18 @@ func (p *pool) invoker(ctx context.Context, dc int) tg.Invoker {
 				if p.floodGate != nil {
 					p.floodGate.TriggerFloodWait(dc, d)
 				}
-				time.Sleep(d + 1*time.Second)
+				select {
+				case <-ctx.Done():
+					return failedInvoker{dc: dc, err: ctx.Err()}
+				case <-time.After(d + 1*time.Second):
+				}
 				continue
 			}
-			time.Sleep(time.Duration(attempt+1) * 500 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				return failedInvoker{dc: dc, err: ctx.Err()}
+			case <-time.After(time.Duration(attempt+1) * 500 * time.Millisecond):
+			}
 		}
 	}
 
