@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gotd/td/telegram/peers"
 	"github.com/gotd/td/telegram/query"
@@ -51,10 +52,38 @@ type ResolveRequest struct {
 }
 
 func (a *telegramMediaAccess) GetDialogs(ctx context.Context) ([]DialogDTO, error) {
-	_ = a.SyncPeers(ctx)
-
 	var result []DialogDTO
+	seenUsers := make(map[int64]tg.UserClass)
+	seenChats := make(map[int64]tg.ChatClass)
+
 	err := query.GetDialogs(a.pool.Default(ctx)).BatchSize(100).ForEach(ctx, func(ctx context.Context, elem dialogs.Elem) error {
+		usersMap := elem.Entities.Users()
+		chatsMap := elem.Entities.Chats()
+		channelsMap := elem.Entities.Channels()
+
+		var newUsers []tg.UserClass
+		for id, u := range usersMap {
+			if _, exists := seenUsers[id]; !exists {
+				seenUsers[id] = u
+				newUsers = append(newUsers, u)
+			}
+		}
+		var newChats []tg.ChatClass
+		for id, c := range chatsMap {
+			if _, exists := seenChats[id]; !exists {
+				seenChats[id] = c
+				newChats = append(newChats, c)
+			}
+		}
+		for id, c := range channelsMap {
+			if _, exists := seenChats[id]; !exists {
+				seenChats[id] = c
+				newChats = append(newChats, c)
+			}
+		}
+		if len(newUsers) > 0 || len(newChats) > 0 {
+			_ = a.manager.Apply(ctx, newUsers, newChats)
+		}
 		id := tutil.GetInputPeerID(elem.Peer)
 		if id == 0 && elem.Dialog != nil {
 			id = tutil.GetPeerID(elem.Dialog.GetPeer())
@@ -130,6 +159,11 @@ func (a *telegramMediaAccess) GetDialogs(ctx context.Context) ([]DialogDTO, erro
 
 	if err != nil && len(result) == 0 {
 		return nil, err
+	}
+	if err == nil {
+		a.syncMu.Lock()
+		a.lastSync = time.Now()
+		a.syncMu.Unlock()
 	}
 	return result, nil
 }

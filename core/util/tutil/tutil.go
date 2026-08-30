@@ -11,6 +11,7 @@ import (
 	"github.com/gotd/td/telegram/peers"
 	"github.com/gotd/td/telegram/query"
 	"github.com/gotd/td/tg"
+	"github.com/gotd/td/tgerr"
 )
 
 // ErrMessageDeleted is returned when a message is detected as deleted.
@@ -178,8 +179,35 @@ func FileExists(msg tg.MessageClass) bool {
 	}
 }
 
+func isDefinitiveError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	if _, isFlood := tgerr.AsFloodWait(err); isFlood {
+		return true
+	}
+	if tgerr.Is(err,
+		"CHANNEL_PRIVATE",
+		"CHANNEL_INVALID",
+		"CHAT_ADMIN_REQUIRED",
+		"CHAT_WRITE_FORBIDDEN",
+		"USER_BANNED_IN_CHANNEL",
+		"PEER_ID_INVALID",
+		"AUTH_KEY_UNREGISTERED",
+		"SESSION_REVOKED",
+		"SESSION_EXPIRED",
+	) {
+		return true
+	}
+	return false
+}
+
 func GetSingleMessage(ctx context.Context, c *tg.Client, peer tg.InputPeerClass, msg int) (*tg.Message, error) {
 	// 1. Direct exact message ID lookup (robust against bot messages, topic shifts, and deleted gaps)
+	var directErr error
 	switch p := peer.(type) {
 	case *tg.InputPeerChannel:
 		req := &tg.ChannelsGetMessagesRequest{
@@ -194,6 +222,11 @@ func GetSingleMessage(ctx context.Context, c *tg.Client, peer tg.InputPeerClass,
 						return m, nil
 					}
 				}
+			}
+		} else {
+			directErr = err
+			if isDefinitiveError(err) {
+				return nil, err
 			}
 		}
 	default:
@@ -220,6 +253,11 @@ func GetSingleMessage(ctx context.Context, c *tg.Client, peer tg.InputPeerClass,
 					}
 				}
 			}
+		} else {
+			directErr = err
+			if isDefinitiveError(err) {
+				return nil, err
+			}
 		}
 	}
 
@@ -229,7 +267,13 @@ func GetSingleMessage(ctx context.Context, c *tg.Client, peer tg.InputPeerClass,
 		BatchSize(1).Iter()
 
 	if !it.Next(ctx) {
-		return nil, errors.Wrap(it.Err(), "get single message")
+		if it.Err() != nil {
+			return nil, errors.Wrap(it.Err(), "get single message")
+		}
+		if directErr != nil {
+			return nil, errors.Wrap(directErr, "get single message direct")
+		}
+		return nil, fmt.Errorf("the message %d/%d: %w", GetInputPeerID(peer), msg, ErrMessageDeleted)
 	}
 
 	m, ok := it.Value().Msg.(*tg.Message)

@@ -265,3 +265,34 @@ func TestSubmitValidation(t *testing.T) {
 		}
 	}
 }
+
+func TestRecordProgressAndRecordWriteSeparation(t *testing.T) {
+	clock := newFakeClock()
+	registry := NewRegistry(1, 100, clock.Now)
+	_, _, _ = registry.Submit(validRequest("stream-file", 1))
+	task, _ := registry.Next(context.Background())
+	task.SetResolved("stream-file.mp4", 10<<20, 5)
+	task.SetDownloading()
+
+	// 1. Network chunks arrive
+	task.RecordProgress(2 << 20) // 2MB over network
+	task.RecordProgress(5 << 20) // 5MB over network
+	clock.Advance(1 * time.Second)
+
+	// 2. Disk Writer writes chunks
+	task.RecordWrite(0, 2<<20)     // write first 2MB
+	task.RecordWrite(2<<20, 3<<20) // write next 3MB
+
+	snap := registry.Status().ActiveFiles[0]
+	if snap.NetDownloaded != 5<<20 {
+		t.Fatalf("NetDownloaded=%d, want %d", snap.NetDownloaded, 5<<20)
+	}
+	if snap.Downloaded != 5<<20 {
+		t.Fatalf("Downloaded=%d, want %d", snap.Downloaded, 5<<20)
+	}
+
+	// 5MB in 1s -> 5 MB/s (no double-counting from RecordWrite!)
+	if snap.Rolling5sBPS != 5<<20 {
+		t.Fatalf("Rolling5sBPS=%d, want %d (double counting detected!)", snap.Rolling5sBPS, 5<<20)
+	}
+}

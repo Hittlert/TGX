@@ -137,7 +137,7 @@ func Run(ctx context.Context, client *telegram.Client, kvd storage.Storage, opts
 		tclient.NewDefaultMiddlewares(ctx, opts.ReconnectTimeout)...)
 	defer func() { resultErr = errors.Join(resultErr, pool.Close()) }()
 	manager := peers.Options{Storage: storage.NewPeers(kvd)}.Build(pool.Default(ctx))
-	access := newTelegramMediaAccess(pool, manager, opts.PeerSyncTimeout)
+	access := newTelegramMediaAccess(ctx, pool, manager, opts.PeerSyncTimeout)
 
 	registry := NewRegistryWithContext(ctx, opts.QueueCapacity, opts.TerminalLimit, time.Now)
 	registry.SetPaused(opts.StartPaused)

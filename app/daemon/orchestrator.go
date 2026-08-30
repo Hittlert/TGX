@@ -336,6 +336,7 @@ func (o *Orchestrator) dispatchOneRecord(ctx context.Context, record DownloadRec
 		// Wait for completion via registry polling
 		lastProgressTime := time.Now()
 		lastDownloaded := int64(0)
+		lastNetDownloaded := int64(0)
 
 		for {
 			select {
@@ -348,8 +349,13 @@ func (o *Orchestrator) dispatchOneRecord(ctx context.Context, record DownloadRec
 			default:
 			}
 
-			if snapshot.Downloaded > lastDownloaded {
-				lastDownloaded = snapshot.Downloaded
+			if snapshot.Downloaded > lastDownloaded || snapshot.NetDownloaded > lastNetDownloaded {
+				if snapshot.Downloaded > lastDownloaded {
+					lastDownloaded = snapshot.Downloaded
+				}
+				if snapshot.NetDownloaded > lastNetDownloaded {
+					lastNetDownloaded = snapshot.NetDownloaded
+				}
 				lastProgressTime = time.Now()
 			}
 

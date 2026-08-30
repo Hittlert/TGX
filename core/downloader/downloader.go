@@ -633,16 +633,23 @@ func (d *Downloader) Download(ctx context.Context, globalConcurrency int) error 
 						fc.nextPart = fc.totalParts
 						atomic.AddInt32(&fc.state.remParts, -undispatched)
 					}
-					if atomic.LoadInt32(&fc.state.inflight) == 0 {
-						fc.state.doneOnce.Do(func() {
-							d.opts.Progress.OnDone(fc.state.elem, fc.state.error())
-							close(fc.state.doneChan)
-						})
+					if fc.state.writerIndex >= 0 {
+						select {
+						case largeWriteChans[fc.state.writerIndex] <- &largeWriteJob{
+							fileState: fc.state,
+							leaseGen:  fc.state.leaseGen,
+							isFailed:  true,
+							err:       fc.state.error(),
+						}:
+						default:
+						}
 					}
 				}
 				select {
 				case <-fc.state.doneChan:
-					// Draining invariant: Only return writer slot when all in-flight network chunks have completed!
+					// Draining invariant: Only return writer slot when:
+					// 1. ALL in-flight network chunks have completed (inflight == 0)
+					// 2. AND the disk writer has finished all pending writes and closed doneChan!
 					if atomic.LoadInt32(&fc.state.inflight) == 0 {
 						if fc.state.writerIndex >= 0 {
 							freeWriterSlots = append(freeWriterSlots, fc.state.writerIndex)
@@ -901,7 +908,7 @@ func (d *Downloader) fetchLargeChunk(ctx context.Context, workerID int, job *lar
 			return
 		}
 
-		chunkCtx, chunkCancel := context.WithTimeout(elemCtx, 60*time.Second)
+		chunkCtx, chunkCancel := context.WithTimeout(elemCtx, 20*time.Second)
 		var res tg.UploadFileClass
 		res, fetchErr = client.UploadGetFile(chunkCtx, req)
 		chunkCancel()
@@ -1062,7 +1069,7 @@ func (d *Downloader) fetchSmallFile(ctx context.Context, workerID int, job *smal
 			default:
 			}
 
-			chunkCtx, chunkCancel := context.WithTimeout(elemCtx, 60*time.Second)
+			chunkCtx, chunkCancel := context.WithTimeout(elemCtx, 20*time.Second)
 			res, fetchErr := client.UploadGetFile(chunkCtx, req)
 			chunkCancel()
 

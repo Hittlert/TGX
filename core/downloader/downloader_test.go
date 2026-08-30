@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -30,15 +31,25 @@ type fakeElem struct {
 	file     *fakeFile
 	buf      io.WriterAt
 	take     bool
+	cancMu   sync.Mutex
 	canceled bool
 	ctx      context.Context
 	onDone   func(error)
 }
 
-func (e *fakeElem) File() File          { return e.file }
-func (e *fakeElem) To() io.WriterAt     { return e.buf }
-func (e *fakeElem) AsTakeout() bool     { return e.take }
-func (e *fakeElem) IsCanceled() bool    { return e.canceled }
+func (e *fakeElem) File() File      { return e.file }
+func (e *fakeElem) To() io.WriterAt { return e.buf }
+func (e *fakeElem) AsTakeout() bool { return e.take }
+func (e *fakeElem) IsCanceled() bool {
+	e.cancMu.Lock()
+	defer e.cancMu.Unlock()
+	return e.canceled
+}
+func (e *fakeElem) Cancel() {
+	e.cancMu.Lock()
+	defer e.cancMu.Unlock()
+	e.canceled = true
+}
 func (e *fakeElem) Context() context.Context {
 	if e.ctx != nil {
 		return e.ctx
@@ -742,4 +753,91 @@ func TestDownloader_Massive100SmallFilesWithSlowDiskWriter(t *testing.T) {
 		assert.NoError(t, progress.done[e])
 		assert.Equal(t, e.file.size, progress.downloaded[e])
 	}
+}
+
+type trackWriterAt struct {
+	mu           sync.Mutex
+	buf          []byte
+	delay        time.Duration
+	activeWrites int32
+	maxActive    int32
+	finishedAt   time.Time
+}
+
+func newTrackWriterAt(size int, delay time.Duration) *trackWriterAt {
+	return &trackWriterAt{buf: make([]byte, size), delay: delay}
+}
+
+func (w *trackWriterAt) WriteAt(p []byte, off int64) (int, error) {
+	atomic.AddInt32(&w.activeWrites, 1)
+	defer func() {
+		atomic.AddInt32(&w.activeWrites, -1)
+		w.mu.Lock()
+		w.finishedAt = time.Now()
+		w.mu.Unlock()
+	}()
+	if w.delay > 0 {
+		time.Sleep(w.delay)
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if int(off)+len(p) > len(w.buf) {
+		return 0, io.ErrShortWrite
+	}
+	copy(w.buf[off:], p)
+	return len(p), nil
+}
+
+func TestDownloader_SlowWriterDrainedBeforeSlotReused(t *testing.T) {
+	invoker := &fakeInvoker{}
+	pool := &fakePool{invoker: invoker}
+
+	w1 := newTrackWriterAt(1536*1024, 50*time.Millisecond)
+	w2 := newTrackWriterAt(1536*1024, 0)
+
+	elem1 := &fakeElem{
+		file: &fakeFile{size: 1536 * 1024, dc: 4},
+		buf:  w1,
+	}
+	elem2 := &fakeElem{
+		file: &fakeFile{size: 1536 * 1024, dc: 4},
+		buf:  w2,
+	}
+
+	iter := &fakeIter{elems: []*fakeElem{elem1, elem2}}
+	progress := newFakeProgress()
+	fg := gate.NewFloodGate(1000, 100)
+
+	dl := New(Options{
+		Pool:            pool,
+		Threads:         8,
+		DiskWorkers:     2, // strictly 1 large writer slot shared across File 1 then File 2
+		FileConcurrency: 1,
+		Iter:            iter,
+		Progress:        progress,
+		FloodGate:       fg,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Cancel elem1 after 30ms
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		elem1.Cancel()
+	}()
+
+	err := dl.Download(ctx, 8)
+	require.NoError(t, err)
+
+	progress.mu.Lock()
+	defer progress.mu.Unlock()
+
+	// File 1 was canceled
+	assert.Error(t, progress.done[elem1])
+	// File 2 completed successfully
+	assert.NoError(t, progress.done[elem2])
+
+	// Verify that File 1 has zero active writes
+	assert.Equal(t, int32(0), atomic.LoadInt32(&w1.activeWrites))
 }

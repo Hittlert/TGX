@@ -21,6 +21,7 @@ import (
 )
 
 type telegramMediaAccess struct {
+	parentCtx   context.Context
 	pool        dcpool.Pool
 	manager     *peers.Manager
 	syncMu      sync.Mutex
@@ -29,8 +30,11 @@ type telegramMediaAccess struct {
 	syncTimeout time.Duration
 }
 
-func newTelegramMediaAccess(pool dcpool.Pool, manager *peers.Manager, syncTimeout time.Duration) *telegramMediaAccess {
-	return &telegramMediaAccess{pool: pool, manager: manager, syncTimeout: syncTimeout}
+func newTelegramMediaAccess(parentCtx context.Context, pool dcpool.Pool, manager *peers.Manager, syncTimeout time.Duration) *telegramMediaAccess {
+	if parentCtx == nil {
+		parentCtx = context.Background()
+	}
+	return &telegramMediaAccess{parentCtx: parentCtx, pool: pool, manager: manager, syncTimeout: syncTimeout}
 }
 
 func (a *telegramMediaAccess) Resolve(ctx context.Context, peer string, messageID int) (ResolvedMedia, error) {
@@ -65,7 +69,7 @@ func (a *telegramMediaAccess) SyncPeers(ctx context.Context) error {
 	}
 	a.syncMu.Unlock()
 
-	_, err, _ := a.sf.Do("sync_peers", func() (interface{}, error) {
+	ch := a.sf.DoChan("sync_peers", func() (interface{}, error) {
 		a.syncMu.Lock()
 		if !a.lastSync.IsZero() && time.Since(a.lastSync) < 30*time.Second {
 			a.syncMu.Unlock()
@@ -73,8 +77,11 @@ func (a *telegramMediaAccess) SyncPeers(ctx context.Context) error {
 		}
 		a.syncMu.Unlock()
 
-		syncCtx, cancel := context.WithTimeout(context.Background(), a.syncTimeout)
+		syncCtx, cancel := context.WithTimeout(a.parentCtx, a.syncTimeout)
 		defer cancel()
+
+		seenUsers := make(map[int64]tg.UserClass)
+		seenChats := make(map[int64]tg.ChatClass)
 
 		var syncErr error
 		iter := query.GetDialogs(a.pool.Default(syncCtx)).BatchSize(100).Iter()
@@ -84,19 +91,28 @@ func (a *telegramMediaAccess) SyncPeers(ctx context.Context) error {
 			chatsMap := elem.Entities.Chats()
 			channelsMap := elem.Entities.Channels()
 
-			users := make([]tg.UserClass, 0, len(usersMap))
-			for _, u := range usersMap {
-				users = append(users, u)
+			var newUsers []tg.UserClass
+			for id, u := range usersMap {
+				if _, exists := seenUsers[id]; !exists {
+					seenUsers[id] = u
+					newUsers = append(newUsers, u)
+				}
 			}
-			chats := make([]tg.ChatClass, 0, len(chatsMap)+len(channelsMap))
-			for _, c := range chatsMap {
-				chats = append(chats, c)
+			var newChats []tg.ChatClass
+			for id, c := range chatsMap {
+				if _, exists := seenChats[id]; !exists {
+					seenChats[id] = c
+					newChats = append(newChats, c)
+				}
 			}
-			for _, c := range channelsMap {
-				chats = append(chats, c)
+			for id, c := range channelsMap {
+				if _, exists := seenChats[id]; !exists {
+					seenChats[id] = c
+					newChats = append(newChats, c)
+				}
 			}
-			if len(users) > 0 || len(chats) > 0 {
-				if applyErr := a.manager.Apply(syncCtx, users, chats); applyErr != nil {
+			if len(newUsers) > 0 || len(newChats) > 0 {
+				if applyErr := a.manager.Apply(syncCtx, newUsers, newChats); applyErr != nil {
 					syncErr = applyErr
 					break
 				}
@@ -116,10 +132,13 @@ func (a *telegramMediaAccess) SyncPeers(ctx context.Context) error {
 		a.syncMu.Unlock()
 		return nil, nil
 	})
-	if err != nil {
-		return err
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case res := <-ch:
+		return res.Err
 	}
-	return ctx.Err()
 }
 
 type telegramFile struct {

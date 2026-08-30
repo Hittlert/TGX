@@ -43,6 +43,7 @@ type TaskSnapshot struct {
 	FileName      string    `json:"file_name,omitempty"`
 	TotalSize     int64     `json:"total_size"`
 	Downloaded    int64     `json:"downloaded"`
+	NetDownloaded int64     `json:"net_downloaded,omitempty"`
 	Progress      float64   `json:"progress"`
 	Rolling5sBPS  int64     `json:"rolling_5s_bps"`
 	DCID          int       `json:"dc_id,omitempty"`
@@ -599,9 +600,15 @@ func (r *Registry) snapshotTaskLocked(state *taskState, now time.Time) TaskSnaps
 		state.smoothedSpeed = 0.4*float64(currentTaskBPS) + 0.6*state.smoothedSpeed
 	}
 
+	netDownloaded := state.netDownloaded
+	if netDownloaded < state.downloaded {
+		netDownloaded = state.downloaded
+	}
+
 	return TaskSnapshot{
 		TaskRequest: state.request, State: state.state, FileName: state.fileName,
-		TotalSize: state.totalSize, Downloaded: state.downloaded, Progress: progress,
+		TotalSize: state.totalSize, Downloaded: state.downloaded, NetDownloaded: netDownloaded,
+		Progress: progress,
 		Rolling5sBPS: int64(state.smoothedSpeed),
 		DCID:         state.dcID, AlreadyExists: state.alreadyExists, SHA256: state.sha256,
 		ErrorClass: state.errorClass, Error: state.errorText,
