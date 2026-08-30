@@ -865,6 +865,9 @@ func (d *Downloader) fetchLargeChunk(ctx context.Context, workerID int, job *lar
 		if fetchErr == nil {
 			if uf, ok := res.(*tg.UploadFile); ok {
 				chunkData = uf.Bytes
+				if len(chunkData) > expectedBytes {
+					chunkData = chunkData[:expectedBytes]
+				}
 				if len(chunkData) == expectedBytes {
 					break
 				}
@@ -968,21 +971,19 @@ func (d *Downloader) fetchSmallFile(ctx context.Context, workerID int, job *smal
 	var offset int64 = 0
 
 	for offset < job.totalSize {
-		limit := MaxPartSize
-		if offset+int64(limit) > job.totalSize {
-			limit = int(job.totalSize - offset)
+		expectedBytes := MaxPartSize
+		if offset+int64(expectedBytes) > job.totalSize {
+			expectedBytes = int(job.totalSize - offset)
 		}
 
 		req := &tg.UploadGetFileRequest{
 			Precise:  true,
 			Location: job.location,
 			Offset:   offset,
-			Limit:    limit,
+			Limit:    MaxPartSize,
 		}
 
-		var chunkData []byte
-		var fetchErr error
-
+		var chunkSuccess bool
 		for attempt := 0; attempt < 5; attempt++ {
 			select {
 			case <-ctx.Done():
@@ -997,8 +998,7 @@ func (d *Downloader) fetchSmallFile(ctx context.Context, workerID int, job *smal
 			}
 
 			chunkCtx, chunkCancel := context.WithTimeout(elemCtx, 60*time.Second)
-			var res tg.UploadFileClass
-			res, fetchErr = client.UploadGetFile(chunkCtx, req)
+			res, fetchErr := client.UploadGetFile(chunkCtx, req)
 			chunkCancel()
 
 			if errors.Is(fetchErr, context.Canceled) || elemCtx.Err() != nil {
@@ -1009,29 +1009,26 @@ func (d *Downloader) fetchSmallFile(ctx context.Context, workerID int, job *smal
 
 			if fetchErr == nil {
 				if uf, ok := res.(*tg.UploadFile); ok {
-					chunkData = uf.Bytes
-					if len(chunkData) == limit {
+					chunkBytes := uf.Bytes
+					if len(chunkBytes) > expectedBytes {
+						chunkBytes = chunkBytes[:expectedBytes]
+					}
+					if len(chunkBytes) == expectedBytes {
+						fileBuffer = append(fileBuffer, chunkBytes...)
+						offset += int64(len(chunkBytes))
+						chunkSuccess = true
 						break
 					}
-					fetchErr = fmt.Errorf("short read at offset %d: expected %d bytes, got %d", offset, limit, len(chunkData))
+					fetchErr = fmt.Errorf("small file short read at offset %d: expected %d bytes, got %d", offset, expectedBytes, len(chunkBytes))
 				} else {
 					fetchErr = fmt.Errorf("unexpected upload response type: %T", res)
 				}
 			}
 
 			if tgerr.Is(fetchErr, "FILE_REFERENCE_EXPIRED", "FILEREF_UPGRADE_NEEDED", "FILE_REFERENCE_INVALID", "LOCATION_INVALID") {
-				break
-			}
-
-			if dWait, isFlood := tgerr.AsFloodWait(fetchErr); isFlood {
-				logctx.From(ctx).Warn("UploadGetFile small file flood wait triggered",
-					zap.Int("dc", job.dcID),
-					zap.Duration("flood_wait", dWait),
-				)
-				if d.floodGate != nil {
-					d.floodGate.TriggerFloodWait(job.dcID, dWait)
-				}
-				continue
+				d.opts.Progress.OnDone(job.elem, fetchErr)
+				budget.release(job.totalSize)
+				return
 			}
 
 			select {
@@ -1047,17 +1044,11 @@ func (d *Downloader) fetchSmallFile(ctx context.Context, workerID int, job *smal
 			}
 		}
 
-		if fetchErr != nil || len(chunkData) != limit {
-			if fetchErr == nil {
-				fetchErr = fmt.Errorf("chunk size mismatch: expected %d, got %d", limit, len(chunkData))
-			}
-			d.opts.Progress.OnDone(job.elem, fetchErr)
+		if !chunkSuccess {
+			d.opts.Progress.OnDone(job.elem, fmt.Errorf("failed to fetch small file chunk at offset %d", offset))
 			budget.release(job.totalSize)
 			return
 		}
-
-		fileBuffer = append(fileBuffer, chunkData...)
-		offset += int64(len(chunkData))
 
 		d.opts.Progress.OnDownload(job.elem, ProgressState{
 			Downloaded: offset,
