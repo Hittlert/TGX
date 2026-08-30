@@ -210,7 +210,7 @@ func Run(ctx context.Context, client *telegram.Client, kvd storage.Storage, opts
 		return nil
 	})
 	group.Go(func() error {
-		err := dl.Download(groupCtx, opts.FileConcurrency)
+		err := dl.Download(groupCtx, opts.Threads)
 		if errors.Is(err, context.Canceled) {
 			return nil
 		}

@@ -10,6 +10,7 @@ import (
 	"github.com/cenkalti/backoff/v4"
 	"github.com/go-faster/errors"
 	"github.com/gotd/contrib/clock"
+	"github.com/gotd/contrib/middleware/floodwait"
 	tdclock "github.com/gotd/td/clock"
 	"github.com/gotd/td/exchange"
 	"github.com/gotd/td/telegram"
@@ -144,6 +145,7 @@ func NewDefaultMiddlewares(ctx context.Context, timeout time.Duration) []telegra
 	return []telegram.Middleware{
 		recovery.New(ctx, newBackoff(timeout)),
 		retry.New(5),
+		floodwait.NewSimpleWaiter(),
 	}
 }
 

@@ -318,8 +318,20 @@ func (t *Task) SetDownloading() {
 	t.update(func(state *taskState) { state.state = StateDownloading })
 }
 
-func (t *Task) SetPublishing() {
-	t.update(func(state *taskState) { state.state = StatePublishing })
+func (t *Task) IsTerminal() bool {
+	r := t.registry
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return isTerminal(t.state.state)
+}
+
+func (t *Task) SetPublishing() bool {
+	var ok bool
+	t.update(func(state *taskState) {
+		state.state = StatePublishing
+		ok = true
+	})
+	return ok
 }
 
 func (t *Task) Succeed(finalPath string, alreadyExists bool) {

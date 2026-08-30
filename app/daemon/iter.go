@@ -127,6 +127,10 @@ func (p *taskProgress) OnDownload(_ downloader.Elem, _ downloader.ProgressState)
 func (p *taskProgress) OnDone(element downloader.Elem, transferErr error) {
 	taskElement := element.(taskElement)
 	task := taskElement.Task()
+	if task.IsTerminal() {
+		_ = taskElement.Abort()
+		return
+	}
 	if transferErr != nil {
 		_ = taskElement.Abort()
 		class := "transport"
@@ -141,7 +145,10 @@ func (p *taskProgress) OnDone(element downloader.Elem, transferErr error) {
 		task.Fail(class, transferErr.Error(), unavailable)
 		return
 	}
-	task.SetPublishing()
+	if !task.SetPublishing() {
+		_ = taskElement.Abort()
+		return
+	}
 	result, err := taskElement.Publish()
 	if err != nil {
 		task.Fail("publish", err.Error(), false)

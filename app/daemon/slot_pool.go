@@ -15,10 +15,10 @@ type SlotPoolConfig struct {
 
 func DefaultSlotPoolConfig() SlotPoolConfig {
 	return SlotPoolConfig{
-		TotalSlots:      64,
-		MaxActiveFiles:  8,
-		SlotUnitMB:      4,
-		MaxSlotsPerFile: 16,
+		TotalSlots:      32,
+		MaxActiveFiles:  5,
+		SlotUnitMB:      2,
+		MaxSlotsPerFile: 6,
 	}
 }
 
@@ -60,21 +60,14 @@ func (p *GlobalSlotPool) recalculateUsedSlotsLocked() {
 }
 
 func (p *GlobalSlotPool) CalculateRequiredSlots(sizeBytes int64) int {
-	if sizeBytes <= 0 {
+	if p.cfg.MaxActiveFiles <= 0 {
 		return 1
 	}
-	unitBytes := int64(p.cfg.SlotUnitMB) * 1024 * 1024
-	slots := int(math.Ceil(float64(sizeBytes) / float64(unitBytes)))
-	if slots < 1 {
-		slots = 1
+	share := p.cfg.TotalSlots / p.cfg.MaxActiveFiles
+	if share < 1 {
+		share = 1
 	}
-	if slots > p.cfg.MaxSlotsPerFile {
-		slots = p.cfg.MaxSlotsPerFile
-	}
-	if slots > p.cfg.TotalSlots {
-		slots = p.cfg.TotalSlots
-	}
-	return slots
+	return share
 }
 
 func (p *GlobalSlotPool) Acquire(ctx context.Context, taskID string, sizeBytes int64) (int, error) {

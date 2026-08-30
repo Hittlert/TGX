@@ -84,10 +84,18 @@ type activeFileState struct {
 	totalParts      int32
 	remParts        int32
 	downloadedBytes int64
+	canceled        int32
 	firstErr        error
 	errOnce         sync.Once
 	doneOnce        sync.Once
 	doneChan        chan struct{}
+}
+
+func (s *activeFileState) fail(err error) {
+	atomic.StoreInt32(&s.canceled, 1)
+	s.errOnce.Do(func() {
+		s.firstErr = err
+	})
 }
 
 // Download runs the 3-stage Streaming Block Engine:
@@ -131,9 +139,7 @@ func (d *Downloader) Download(ctx context.Context, globalConcurrency int) error 
 					}
 					n, writeErr := wJob.fileState.writer.WriteAt(wJob.data, wJob.offset)
 					if writeErr != nil {
-						wJob.fileState.errOnce.Do(func() {
-							wJob.fileState.firstErr = writeErr
-						})
+						wJob.fileState.fail(writeErr)
 					} else {
 						curr := atomic.AddInt64(&wJob.fileState.downloadedBytes, int64(n))
 						d.opts.Progress.OnDownload(wJob.fileState.elem, ProgressState{
@@ -154,9 +160,12 @@ func (d *Downloader) Download(ctx context.Context, globalConcurrency int) error 
 	}
 
 	// 2. Launch Network Chunk Workers (Stage 2: Strictly 32 Concurrent Workers)
+	var netWg sync.WaitGroup
 	for nw := 0; nw < netWorkers; nw++ {
+		netWg.Add(1)
 		workerID := nw
 		g.Go(func() error {
+			defer netWg.Done()
 			for {
 				select {
 				case <-gctx.Done():
@@ -171,10 +180,15 @@ func (d *Downloader) Download(ctx context.Context, globalConcurrency int) error 
 		})
 	}
 
+	// Safely close writeChan only when all network workers have completely returned
+	go func() {
+		netWg.Wait()
+		close(writeChan)
+	}()
+
 	// 3. Launch Interleaving Chunk Producer (Stage 1: Maintains Active 5 Files & Paves Chunks Round-Robin)
 	g.Go(func() error {
 		defer close(jobChan)
-		defer close(writeChan)
 
 		type fileCursor struct {
 			state      *activeFileState
@@ -300,6 +314,17 @@ func (d *Downloader) Download(ctx context.Context, globalConcurrency int) error 
 }
 
 func (d *Downloader) fetchChunk(ctx context.Context, workerID int, job *chunkJob, writeChan chan<- *writeJob) {
+	// 0. Fail-fast: skip network RPC if file is already cancelled / errored
+	if atomic.LoadInt32(&job.fileState.canceled) == 1 {
+		if atomic.AddInt32(&job.fileState.remParts, -1) == 0 {
+			job.fileState.doneOnce.Do(func() {
+				d.opts.Progress.OnDone(job.fileState.elem, job.fileState.firstErr)
+				close(job.fileState.doneChan)
+			})
+		}
+		return
+	}
+
 	expectedBytes := job.limit
 	if job.offset+int64(job.limit) > job.totalSize {
 		expectedBytes = int(job.totalSize - job.offset)
@@ -323,7 +348,7 @@ func (d *Downloader) fetchChunk(ctx context.Context, workerID int, job *chunkJob
 	for attempt := 0; attempt < 5; attempt++ {
 		select {
 		case <-ctx.Done():
-			job.fileState.errOnce.Do(func() { job.fileState.firstErr = ctx.Err() })
+			job.fileState.fail(ctx.Err())
 			if atomic.AddInt32(&job.fileState.remParts, -1) == 0 {
 				job.fileState.doneOnce.Do(func() {
 					d.opts.Progress.OnDone(job.fileState.elem, job.fileState.firstErr)
@@ -334,9 +359,19 @@ func (d *Downloader) fetchChunk(ctx context.Context, workerID int, job *chunkJob
 		default:
 		}
 
+		if atomic.LoadInt32(&job.fileState.canceled) == 1 {
+			if atomic.AddInt32(&job.fileState.remParts, -1) == 0 {
+				job.fileState.doneOnce.Do(func() {
+					d.opts.Progress.OnDone(job.fileState.elem, job.fileState.firstErr)
+					close(job.fileState.doneChan)
+				})
+			}
+			return
+		}
+
 		if d.floodGate != nil {
 			if err := d.floodGate.Wait(ctx, job.dcID); err != nil {
-				job.fileState.errOnce.Do(func() { job.fileState.firstErr = err })
+				job.fileState.fail(err)
 				if atomic.AddInt32(&job.fileState.remParts, -1) == 0 {
 					job.fileState.doneOnce.Do(func() {
 						d.opts.Progress.OnDone(job.fileState.elem, job.fileState.firstErr)
@@ -381,7 +416,7 @@ func (d *Downloader) fetchChunk(ctx context.Context, workerID int, job *chunkJob
 
 		select {
 		case <-ctx.Done():
-			job.fileState.errOnce.Do(func() { job.fileState.firstErr = ctx.Err() })
+			job.fileState.fail(ctx.Err())
 			if atomic.AddInt32(&job.fileState.remParts, -1) == 0 {
 				job.fileState.doneOnce.Do(func() {
 					d.opts.Progress.OnDone(job.fileState.elem, job.fileState.firstErr)
@@ -397,7 +432,7 @@ func (d *Downloader) fetchChunk(ctx context.Context, workerID int, job *chunkJob
 		if fetchErr == nil {
 			fetchErr = fmt.Errorf("chunk size mismatch at offset %d: expected %d, got %d", job.offset, expectedBytes, len(chunkData))
 		}
-		job.fileState.errOnce.Do(func() { job.fileState.firstErr = fetchErr })
+		job.fileState.fail(fetchErr)
 		if atomic.AddInt32(&job.fileState.remParts, -1) == 0 {
 			job.fileState.doneOnce.Do(func() {
 				d.opts.Progress.OnDone(job.fileState.elem, job.fileState.firstErr)
@@ -410,7 +445,7 @@ func (d *Downloader) fetchChunk(ctx context.Context, workerID int, job *chunkJob
 	// Hand off downloaded chunk to Disk Writer Workers!
 	select {
 	case <-ctx.Done():
-		job.fileState.errOnce.Do(func() { job.fileState.firstErr = ctx.Err() })
+		job.fileState.fail(ctx.Err())
 		if atomic.AddInt32(&job.fileState.remParts, -1) == 0 {
 			job.fileState.doneOnce.Do(func() {
 				d.opts.Progress.OnDone(job.fileState.elem, job.fileState.firstErr)

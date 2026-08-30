@@ -293,3 +293,39 @@ func (p *shortReadPool) Default(ctx context.Context) *tg.Client {
 	return tg.NewClient(p.invoker)
 }
 func (p *shortReadPool) Close() error { return nil }
+
+func TestDownloader_CancellationZeroPanic(t *testing.T) {
+	invoker := &fakeInvoker{}
+	pool := &fakePool{invoker: invoker}
+
+	// Create 10 files with 10MB each
+	elems := make([]*fakeElem, 10)
+	for i := 0; i < 10; i++ {
+		elems[i] = &fakeElem{
+			file: &fakeFile{size: 10 * 1024 * 1024, dc: 4},
+			buf:  newMemWriterAt(10 * 1024 * 1024),
+		}
+	}
+
+	iter := &fakeIter{elems: elems}
+	progress := newFakeProgress()
+	fg := gate.NewFloodGate(1000, 100)
+
+	dl := New(Options{
+		Pool:            pool,
+		Threads:         16,
+		DiskWorkers:     4,
+		FileConcurrency: 5,
+		Iter:            iter,
+		Progress:        progress,
+		FloodGate:       fg,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	// Must cleanly return on context cancellation with ZERO panics or send on closed channel
+	err := dl.Download(ctx, 16)
+	assert.Error(t, err)
+}
+
