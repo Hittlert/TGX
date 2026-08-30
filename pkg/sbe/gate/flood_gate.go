@@ -19,6 +19,7 @@ type FloodGate struct {
 	baseRate    float64
 	currentRate float64
 	burst       int
+	lastRamp    time.Time
 	dcCooldowns map[int]time.Time
 	limiter     *rate.Limiter
 }
@@ -35,9 +36,30 @@ func NewFloodGate(reqPerSec float64, burst int) *FloodGate {
 		baseRate:    reqPerSec,
 		currentRate: reqPerSec,
 		burst:       burst,
+		lastRamp:    time.Now(),
 		dcCooldowns: make(map[int]time.Time),
 		limiter:     rate.NewLimiter(rate.Limit(reqPerSec), burst),
 	}
+}
+
+// CurrentRate returns current adaptive rate.
+func (g *FloodGate) CurrentRate() float64 {
+	if g == nil {
+		return 0
+	}
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.currentRate
+}
+
+// BaseRate returns baseline configured rate.
+func (g *FloodGate) BaseRate() float64 {
+	if g == nil {
+		return 0
+	}
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.baseRate
 }
 
 // Wait blocks until any active flood cooldown for the given DC has expired and the token bucket allows the request.
@@ -47,42 +69,44 @@ func (g *FloodGate) Wait(ctx context.Context, dc int) error {
 	}
 
 	for {
-		// 1. Wait for token bucket first
-		g.mu.RLock()
-		limiter := g.limiter
-		g.mu.RUnlock()
+		g.mu.Lock()
+		now := time.Now()
+		// Clean up expired DC cooldowns
+		for d, nb := range g.dcCooldowns {
+			if now.After(nb) {
+				delete(g.dcCooldowns, d)
+			}
+		}
 
+		// Smooth Additive Increase: if currentRate < baseRate and no active cooldowns, ramp up +2.0 req/s per second
+		if g.currentRate < g.baseRate && len(g.dcCooldowns) == 0 {
+			if now.Sub(g.lastRamp) >= time.Second {
+				g.currentRate += 2.0
+				if g.currentRate > g.baseRate {
+					g.currentRate = g.baseRate
+				}
+				g.limiter.SetLimit(rate.Limit(g.currentRate))
+				g.lastRamp = now
+			}
+		}
+
+		limiter := g.limiter
+		notBefore, hasCooldown := g.dcCooldowns[dc]
+		g.mu.Unlock()
+
+		// 1. Wait for token bucket
 		if limiter != nil {
 			if err := limiter.Wait(ctx); err != nil {
 				return err
 			}
 		}
 
-		// 2. Then check DC cooldown gate right before dispatch
-		g.mu.RLock()
-		notBefore, hasCooldown := g.dcCooldowns[dc]
-		g.mu.RUnlock()
-
-		if !hasCooldown {
+		// 2. Check DC cooldown
+		if !hasCooldown || now.After(notBefore) {
 			return nil
 		}
 
-		now := time.Now()
-		if now.After(notBefore) {
-			g.mu.Lock()
-			if nb, exists := g.dcCooldowns[dc]; exists && time.Now().After(nb) {
-				delete(g.dcCooldowns, dc)
-				// Slowly restore rate toward baseRate
-				if g.currentRate < g.baseRate {
-					g.currentRate = g.baseRate
-					g.limiter.SetLimit(rate.Limit(g.currentRate))
-				}
-			}
-			g.mu.Unlock()
-			return nil
-		}
-
-		// Cooldown is active -> sleep until cooldown expires and loop back to re-check
+		// Cooldown is active -> sleep until cooldown expires and loop back
 		waitTime := notBefore.Sub(now)
 		select {
 		case <-ctx.Done():
@@ -101,13 +125,14 @@ func (g *FloodGate) TriggerFloodWait(dc int, duration time.Duration) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
-	// Adaptively throttle rate limit on flood wait
+	// Adaptively throttle rate limit on flood wait (Multiplicative Decrease: -25%, min 10.0 req/s)
 	if g.currentRate > 10.0 {
 		g.currentRate = g.currentRate * 0.75
 		if g.currentRate < 10.0 {
 			g.currentRate = 10.0
 		}
 		g.limiter.SetLimit(rate.Limit(g.currentRate))
+		g.lastRamp = time.Now()
 	}
 
 	// Add jitter (200ms ~ 1000ms) to prevent lockstep thundering herd on wake-up

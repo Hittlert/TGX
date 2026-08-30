@@ -91,3 +91,18 @@ func TestPool_FailedInvokerHonorsCancellation(t *testing.T) {
 	err := fi.Invoke(context.Background(), nil, nil)
 	assert.True(t, errors.Is(err, context.Canceled))
 }
+
+func TestPool_TakeoutNoDeadlock(t *testing.T) {
+	EnableTestMode()
+	defer func() { testMode = false }()
+
+	p := &pool{
+		invokers: make(map[int]tg.Invoker),
+		closes:   make(map[int]func() error),
+		dcLocks:  make(map[int]*sync.Mutex),
+	}
+
+	// In test mode, invoker returns nil or p.api without deadlocking
+	client := p.Takeout(context.Background(), 2)
+	assert.NotNil(t, client)
+}

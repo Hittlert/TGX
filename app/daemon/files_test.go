@@ -122,3 +122,51 @@ func TestExistingFileRequiresExactSize(t *testing.T) {
 		t.Fatalf("missing path: ok=%v err=%v", ok, err)
 	}
 }
+
+func TestLazySmallFileElement_NoDiskOpsDuringResolveAndPublishesDirectly(t *testing.T) {
+	root := t.TempDir()
+	outputRoot := filepath.Join(root, "hdd")
+	content := []byte("small-image-binary-payload-data")
+
+	registry := NewRegistry(1, 100, nil)
+	request := validRequest("small", 1)
+	request.ExpectedSize = int64(len(content))
+	request.FinalPath = "Photos/2026_08/image.jpg"
+	_, _, _ = registry.Submit(request)
+	task, _ := registry.Next(t.Context())
+
+	// 1. Resolve phase: lazySmallFileElement must NOT touch disk
+	element, err := newLazySmallFileElement(task, fakeDownloadFile{size: int64(len(content)), dc: 4}, outputRoot, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	destDir := filepath.Join(outputRoot, "Photos", "2026_08")
+	if _, err := os.Stat(destDir); !os.IsNotExist(err) {
+		t.Fatalf("destination directory created prematurely during resolve: %v", err)
+	}
+
+	// 2. Download phase: writes to memory buffer
+	if _, err := element.To().WriteAt(content, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// 3. Publish phase: single serial flush, sync, rename, and memory hash
+	result, err := element.Publish()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	wantHash := fmt.Sprintf("%x", sha256.Sum256(content))
+	if result.Path != request.FinalPath || result.SHA256 != wantHash || result.AlreadyExists {
+		t.Fatalf("unexpected publish result: %#v", result)
+	}
+
+	final, err := os.ReadFile(filepath.Join(outputRoot, filepath.FromSlash(request.FinalPath)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(final) != string(content) {
+		t.Fatalf("published bytes=%q, want %q", final, content)
+	}
+}

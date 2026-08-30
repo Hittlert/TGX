@@ -25,8 +25,8 @@ const (
 	SmallFileThreshold  = 1024 * 1024       // <= 1 MiB goes to Small File Lane (whole-file in-memory)
 	DefaultSmallMemory  = 128 * 1024 * 1024 // 128 MiB dedicated in-memory budget for small files
 	MinInflightPerLarge = 4                 // 4 chunk in-flight guarantee per active large file
-	MaxLargeReadyQueue  = 10                // Hard capacity limit on queued ready large files
-	MaxSmallReadyQueue  = 64                // Hard capacity limit on queued ready small files
+	MaxLargeReadyQueue  = 10                // Bounded capacity for ready large files
+	MaxSmallReadyQueue  = 64                // Bounded capacity for ready small files
 )
 
 type Downloader struct {
@@ -188,7 +188,7 @@ type largeFileCursor struct {
 // Download runs the Dual-Lane Streaming Block Engine:
 // 1. Unified 32-worker Network Pool dynamically serving Large and Small lanes.
 // 2. Small File Lane: single-worker whole-file fetch into 128 MiB RAM buffer -> 1 serial disk writer.
-// 3. Large File Lane: 5 concurrent large files with 4-chunk in-flight guarantee -> 5 per-file chunk disk writers.
+// 3. Large File Lane: 5 concurrent large files with 4-chunk in-flight guarantee -> 5 per-file chunk disk writers with strict sequential offset writes.
 func (d *Downloader) Download(ctx context.Context, globalConcurrency int) error {
 	netWorkers := d.opts.Threads
 	if netWorkers <= 0 {
@@ -209,9 +209,12 @@ func (d *Downloader) Download(ctx context.Context, globalConcurrency int) error 
 	}
 
 	jobChan := make(chan networkJob, netWorkers*2)
-	elemChan := make(chan Elem, netWorkers*2)
 
-	// Create per-file sharded write channels for large disk writers to guarantee sequential chunk writes per file
+	// Separate bounded ingestion channels to completely eliminate cross-lane head-of-line blocking
+	largeElemChan := make(chan Elem, MaxLargeReadyQueue)
+	smallElemChan := make(chan Elem, MaxSmallReadyQueue)
+
+	// Create per-file dedicated write channels for large disk writers
 	largeWriteChans := make([]chan *largeWriteJob, largeDiskWorkers)
 	for i := 0; i < largeDiskWorkers; i++ {
 		largeWriteChans[i] = make(chan *largeWriteJob, netWorkers)
@@ -222,18 +225,32 @@ func (d *Downloader) Download(ctx context.Context, globalConcurrency int) error 
 
 	g, gctx := errgroup.WithContext(ctx)
 
-	// 1. Launch Ingestion Worker (Decouples Iter.Next from chunk dispatch loop)
+	// 1. Launch Ingestion Worker (Dispatches independently to largeElemChan / smallElemChan)
 	g.Go(func() error {
-		defer close(elemChan)
+		defer func() {
+			close(largeElemChan)
+			close(smallElemChan)
+		}()
+
 		for d.opts.Iter.Next(gctx) {
 			elem := d.opts.Iter.Value()
 			if elem == nil || elem.File() == nil {
 				continue
 			}
-			select {
-			case <-gctx.Done():
-				return gctx.Err()
-			case elemChan <- elem:
+
+			size := elem.File().Size()
+			if size <= SmallFileThreshold {
+				select {
+				case <-gctx.Done():
+					return gctx.Err()
+				case smallElemChan <- elem:
+				}
+			} else {
+				select {
+				case <-gctx.Done():
+					return gctx.Err()
+				case largeElemChan <- elem:
+				}
 			}
 		}
 		if err := d.opts.Iter.Err(); err != nil {
@@ -242,19 +259,24 @@ func (d *Downloader) Download(ctx context.Context, globalConcurrency int) error 
 		return nil
 	})
 
-	// 2. Launch Large File Disk Writers (5 Dedicated I/O Workers: 1 per active large file)
+	// 2. Launch Large File Disk Writers (Dedicated 1-to-1 Writer per active large file with reorder buffer for sequential offset writes)
 	for dw := 0; dw < largeDiskWorkers; dw++ {
 		workerIdx := dw
 		ch := largeWriteChans[workerIdx]
 		g.Go(func() error {
-			for {
-				select {
-				case <-gctx.Done():
-					return gctx.Err()
-				case wJob, ok := <-ch:
+			// Per-file reorder buffer to ensure chunks are written strictly in ascending offset order
+			nextOffset := int64(0)
+			pendingChunks := make(map[int64]*largeWriteJob)
+			var currentFile *activeLargeFileState
+
+			flushPending := func() {
+				for {
+					wJob, ok := pendingChunks[nextOffset]
 					if !ok {
-						return nil
+						break
 					}
+					delete(pendingChunks, nextOffset)
+
 					n, writeErr := wJob.fileState.writer.WriteAt(wJob.data, wJob.offset)
 					if writeErr != nil {
 						wJob.fileState.fail(writeErr)
@@ -271,12 +293,34 @@ func (d *Downloader) Download(ctx context.Context, globalConcurrency int) error 
 						wJob.fileState.progMu.Unlock()
 					}
 
+					nextOffset += int64(len(wJob.data))
+
 					if atomic.AddInt32(&wJob.fileState.remParts, -1) == 0 {
 						wJob.fileState.doneOnce.Do(func() {
 							d.opts.Progress.OnDone(wJob.fileState.elem, wJob.fileState.firstErr)
 							close(wJob.fileState.doneChan)
 						})
 					}
+				}
+			}
+
+			for {
+				select {
+				case <-gctx.Done():
+					return gctx.Err()
+				case wJob, ok := <-ch:
+					if !ok {
+						return nil
+					}
+
+					if currentFile != wJob.fileState {
+						currentFile = wJob.fileState
+						nextOffset = 0
+						pendingChunks = make(map[int64]*largeWriteJob)
+					}
+
+					pendingChunks[wJob.offset] = wJob
+					flushPending()
 				}
 			}
 		})
@@ -349,119 +393,104 @@ func (d *Downloader) Download(ctx context.Context, globalConcurrency int) error 
 		close(smallWriteChan)
 	}()
 
-	// 5. Launch Priority Dual-Lane Scheduler (Stage 1: Ingests from elemChan and Balances Large & Small Lanes)
+	// 5. Launch Priority Dual-Lane Scheduler
 	g.Go(func() error {
 		defer close(jobChan)
 
 		activeLargeFiles := make([]*largeFileCursor, 0, maxActiveLargeFiles)
 		largeReadyQueue := make([]*largeFileCursor, 0, MaxLargeReadyQueue)
 		smallReadyQueue := make([]*smallFetchJob, 0, MaxSmallReadyQueue)
-		elemChanClosed := false
-		var pendingElem Elem
-		var nextLargeSlot int32
 
-		routeElem := func(elem Elem) bool {
-			totalSize := elem.File().Size()
-			if totalSize <= 0 {
-				d.opts.Progress.OnAdd(elem)
-				d.opts.Progress.OnDone(elem, errors.New("file size is 0 or negative"))
-				return true
-			}
-
-			if totalSize <= SmallFileThreshold {
-				if len(smallReadyQueue) >= MaxSmallReadyQueue {
-					return false
-				}
-				d.opts.Progress.OnAdd(elem)
-				smallReadyQueue = append(smallReadyQueue, &smallFetchJob{
-					elem:      elem,
-					dcID:      elem.File().DC(),
-					location:  elem.File().Location(),
-					totalSize: totalSize,
-					takeout:   elem.AsTakeout(),
-				})
-				return true
-			}
-
-			// Large file check
-			if len(activeLargeFiles) >= maxActiveLargeFiles && len(largeReadyQueue) >= MaxLargeReadyQueue {
-				return false
-			}
-
-			d.opts.Progress.OnAdd(elem)
-
-			partSize := int64(MaxPartSize)
-			numParts := int((totalSize + partSize - 1) / partSize)
-			if numParts < 1 {
-				numParts = 1
-			}
-
-			wIdx := int(atomic.AddInt32(&nextLargeSlot, 1)) % largeDiskWorkers
-			if wIdx < 0 {
-				wIdx = -wIdx
-			}
-
-			fState := &activeLargeFileState{
-				elem:        elem,
-				writer:      elem.To(),
-				writerIndex: wIdx,
-				totalSize:   totalSize,
-				totalParts:  int32(numParts),
-				remParts:    int32(numParts),
-				doneChan:    make(chan struct{}),
-			}
-
-			cursor := &largeFileCursor{
-				state:      fState,
-				nextPart:   0,
-				totalParts: numParts,
-				partSize:   partSize,
-			}
-
-			if len(activeLargeFiles) < maxActiveLargeFiles {
-				activeLargeFiles = append(activeLargeFiles, cursor)
-			} else {
-				largeReadyQueue = append(largeReadyQueue, cursor)
-			}
-			return true
+		// Free pool of large disk writer slots (0..largeDiskWorkers-1)
+		freeWriterSlots := make([]int, largeDiskWorkers)
+		for i := 0; i < largeDiskWorkers; i++ {
+			freeWriterSlots[i] = i
 		}
 
+		largeChanClosed := false
+		smallChanClosed := false
+
 		for {
-			// A. Process pending element if any
-			if pendingElem != nil {
-				if routeElem(pendingElem) {
-					pendingElem = nil
-				}
-			}
-
-			// B. Non-blocking Ingestion from elemChan if ready queues have room
-			if pendingElem == nil && (!elemChanClosed) {
-			IngestLoop:
-				for len(largeReadyQueue) < MaxLargeReadyQueue || len(smallReadyQueue) < MaxSmallReadyQueue {
-					select {
-					case elem, ok := <-elemChan:
-						if !ok {
-							elemChanClosed = true
-							break IngestLoop
-						}
-						if !routeElem(elem) {
-							pendingElem = elem
-							break IngestLoop
-						}
-					default:
-						break IngestLoop
+			// A. Ingest from smallElemChan into smallReadyQueue
+			for len(smallReadyQueue) < MaxSmallReadyQueue && !smallChanClosed {
+				select {
+				case elem, ok := <-smallElemChan:
+					if !ok {
+						smallChanClosed = true
+						break
 					}
+					totalSize := elem.File().Size()
+					if totalSize <= 0 {
+						d.opts.Progress.OnAdd(elem)
+						d.opts.Progress.OnDone(elem, errors.New("file size is 0 or negative"))
+						continue
+					}
+					d.opts.Progress.OnAdd(elem)
+					smallReadyQueue = append(smallReadyQueue, &smallFetchJob{
+						elem:      elem,
+						dcID:      elem.File().DC(),
+						location:  elem.File().Location(),
+						totalSize: totalSize,
+						takeout:   elem.AsTakeout(),
+					})
+				default:
+					goto DoneSmallIngest
 				}
 			}
+		DoneSmallIngest:
 
-			// C. Clean up finished or canceled large files, and promote from largeReadyQueue
+			// B. Ingest from largeElemChan into largeReadyQueue
+			for len(largeReadyQueue) < MaxLargeReadyQueue && !largeChanClosed {
+				select {
+				case elem, ok := <-largeElemChan:
+					if !ok {
+						largeChanClosed = true
+						break
+					}
+					totalSize := elem.File().Size()
+					if totalSize <= 0 {
+						d.opts.Progress.OnAdd(elem)
+						d.opts.Progress.OnDone(elem, errors.New("file size is 0 or negative"))
+						continue
+					}
+					d.opts.Progress.OnAdd(elem)
+
+					partSize := int64(MaxPartSize)
+					numParts := int((totalSize + partSize - 1) / partSize)
+					if numParts < 1 {
+						numParts = 1
+					}
+
+					fState := &activeLargeFileState{
+						elem:        elem,
+						writer:      elem.To(),
+						writerIndex: -1, // Assigned upon promotion to active
+						totalSize:   totalSize,
+						totalParts:  int32(numParts),
+						remParts:    int32(numParts),
+						doneChan:    make(chan struct{}),
+					}
+
+					cursor := &largeFileCursor{
+						state:      fState,
+						nextPart:   0,
+						totalParts: numParts,
+						partSize:   partSize,
+					}
+					largeReadyQueue = append(largeReadyQueue, cursor)
+				default:
+					goto DoneLargeIngest
+				}
+			}
+		DoneLargeIngest:
+
+			// C. Clean up finished or canceled large files, return leased writer slots, and promote from largeReadyQueue
 			filteredLargeFiles := make([]*largeFileCursor, 0, len(activeLargeFiles))
 			for _, fc := range activeLargeFiles {
 				if ce, ok := fc.state.elem.(CancelableElem); ok && ce.IsCanceled() {
 					fc.state.fail(context.Canceled)
 				}
 				if atomic.LoadInt32(&fc.state.canceled) == 1 {
-					// Drain un-dispatched parts from remParts to avoid deadlock
 					undispatched := int32(fc.totalParts - fc.nextPart)
 					if undispatched > 0 {
 						fc.nextPart = fc.totalParts
@@ -475,17 +504,27 @@ func (d *Downloader) Download(ctx context.Context, globalConcurrency int) error 
 				}
 				select {
 				case <-fc.state.doneChan:
-					// File completed/errored -> vacate slot
+					// File finished/errored -> return leased writer slot to pool
+					if fc.state.writerIndex >= 0 {
+						freeWriterSlots = append(freeWriterSlots, fc.state.writerIndex)
+						fc.state.writerIndex = -1
+					}
 				default:
 					filteredLargeFiles = append(filteredLargeFiles, fc)
 				}
 			}
 			activeLargeFiles = filteredLargeFiles
 
-			// Promote from largeReadyQueue up to maxActiveLargeFiles
-			for len(activeLargeFiles) < maxActiveLargeFiles && len(largeReadyQueue) > 0 {
+			// Promote from largeReadyQueue into activeLargeFiles with a dedicated leased writer slot
+			for len(activeLargeFiles) < maxActiveLargeFiles && len(largeReadyQueue) > 0 && len(freeWriterSlots) > 0 {
 				nextLarge := largeReadyQueue[0]
 				largeReadyQueue = largeReadyQueue[1:]
+
+				// Lease slot
+				slot := freeWriterSlots[0]
+				freeWriterSlots = freeWriterSlots[1:]
+				nextLarge.state.writerIndex = slot
+
 				activeLargeFiles = append(activeLargeFiles, nextLarge)
 			}
 
@@ -501,7 +540,7 @@ func (d *Downloader) Download(ctx context.Context, globalConcurrency int) error 
 			smallReadyQueue = filteredSmallQueue
 
 			// Check termination condition
-			if elemChanClosed && pendingElem == nil && len(activeLargeFiles) == 0 && len(largeReadyQueue) == 0 && len(smallReadyQueue) == 0 {
+			if largeChanClosed && smallChanClosed && len(activeLargeFiles) == 0 && len(largeReadyQueue) == 0 && len(smallReadyQueue) == 0 {
 				break
 			}
 
@@ -595,20 +634,12 @@ func (d *Downloader) Download(ctx context.Context, globalConcurrency int) error 
 
 		SleepOrYield:
 			if dispatchedCount == 0 {
-				if elemChanClosed && pendingElem == nil && len(activeLargeFiles) == 0 && len(largeReadyQueue) == 0 && len(smallReadyQueue) == 0 {
+				if largeChanClosed && smallChanClosed && len(activeLargeFiles) == 0 && len(largeReadyQueue) == 0 && len(smallReadyQueue) == 0 {
 					break
 				}
 				select {
 				case <-gctx.Done():
 					return gctx.Err()
-				case elem, ok := <-elemChan:
-					if !ok {
-						elemChanClosed = true
-					} else {
-						if !routeElem(elem) {
-							pendingElem = elem
-						}
-					}
 				case <-smallBudget.wakeCh:
 				case <-time.After(20 * time.Millisecond):
 				}

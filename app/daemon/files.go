@@ -157,9 +157,9 @@ type memBufferWriterAt struct {
 	task *Task
 }
 
-func newMemBufferWriterAt(size int64, task *Task) *memBufferWriterAt {
+func newMemBufferWriterAt(task *Task) *memBufferWriterAt {
 	return &memBufferWriterAt{
-		data: make([]byte, 0, size),
+		data: nil,
 		task: task,
 	}
 }
@@ -167,6 +167,14 @@ func newMemBufferWriterAt(size int64, task *Task) *memBufferWriterAt {
 func (w *memBufferWriterAt) WriteAt(p []byte, offset int64) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	// Zero-copy buffer handoff when writing whole file from offset 0
+	if offset == 0 && len(w.data) == 0 {
+		w.data = p
+		if w.task != nil {
+			w.task.RecordWrite(offset, len(p))
+		}
+		return len(p), nil
+	}
 	end := offset + int64(len(p))
 	if int64(len(w.data)) < end {
 		newSlice := make([]byte, end)
@@ -203,7 +211,7 @@ func newLazySmallFileElement(task *Task, file downloader.File, outputRoot string
 		outputRoot: outputRoot,
 		finalPath:  task.Request().FinalPath,
 		date:       date,
-		buf:        newMemBufferWriterAt(file.Size(), task),
+		buf:        newMemBufferWriterAt(task),
 	}, nil
 }
 

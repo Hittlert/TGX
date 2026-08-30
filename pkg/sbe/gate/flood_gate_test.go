@@ -4,6 +4,9 @@ import (
 	"context"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestFloodGateCoalescing(t *testing.T) {
@@ -51,4 +54,26 @@ func TestFloodGateContextCancellation(t *testing.T) {
 	if err != context.DeadlineExceeded {
 		t.Fatalf("expected DeadlineExceeded, got: %v", err)
 	}
+}
+
+func TestFloodGateAdaptiveRateAIMD(t *testing.T) {
+	gate := NewFloodGate(40.0, 10)
+	assert.Equal(t, 40.0, gate.CurrentRate())
+	assert.Equal(t, 40.0, gate.BaseRate())
+
+	// Multiplicative Decrease on FloodWait
+	gate.TriggerFloodWait(5, 50*time.Millisecond)
+	assert.Equal(t, 30.0, gate.CurrentRate()) // 40 * 0.75 = 30
+
+	gate.TriggerFloodWait(5, 50*time.Millisecond)
+	assert.Equal(t, 22.5, gate.CurrentRate()) // 30 * 0.75 = 22.5
+
+	// Wait for cooldown to expire
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	err := gate.Wait(ctx, 5)
+	require.NoError(t, err)
+
+	// Rate remains throttled right after cooldown
+	assert.LessOrEqual(t, gate.CurrentRate(), 30.0)
 }

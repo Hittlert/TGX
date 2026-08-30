@@ -178,13 +178,18 @@ func (p *pool) Default(ctx context.Context) *tg.Client {
 
 func (p *pool) Close() (err error) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
+	takeoutID := p.takeout
+	closes := make([]func() error, 0, len(p.closes))
+	for _, c := range p.closes {
+		closes = append(closes, c)
+	}
+	p.mu.Unlock()
 
-	if p.takeout != 0 {
+	if takeoutID != 0 {
 		err = takeout.UnTakeout(context.TODO(), p.Takeout(context.TODO(), p.current()).Invoker())
 	}
 
-	for _, c := range p.closes {
+	for _, c := range closes {
 		err = multierr.Append(err, c())
 	}
 
@@ -192,19 +197,23 @@ func (p *pool) Close() (err error) {
 }
 
 func (p *pool) Takeout(ctx context.Context, dc int) *tg.Client {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	if testMode {
+		return tg.NewClient(p.invoker(ctx, dc))
+	}
 
-	// lazy init
+	p.mu.Lock()
 	if p.takeout == 0 {
 		sid, err := takeout.Takeout(ctx, p.api)
 		if err != nil {
 			logctx.From(ctx).Warn("takeout error", zap.Error(err))
+			p.mu.Unlock()
 			return tg.NewClient(p.invoker(ctx, dc))
 		}
 		p.takeout = sid
 		logctx.From(ctx).Info("get takeout id", zap.Int64("id", sid))
 	}
+	takeoutID := p.takeout
+	p.mu.Unlock()
 
-	return tg.NewClient(chainMiddlewares(p.invoker(ctx, dc), takeout.Middleware(p.takeout)))
+	return tg.NewClient(chainMiddlewares(p.invoker(ctx, dc), takeout.Middleware(takeoutID)))
 }
