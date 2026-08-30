@@ -983,6 +983,19 @@ func (d *Downloader) fetchLargeChunk(ctx context.Context, workerID int, job *lar
 			return
 		}
 
+		// Wait for rate limit token and DC cooldown BEFORE acquiring data semaphore.
+		// This ensures waiting for tokens does NOT occupy a data slot.
+		if d.floodGate != nil {
+			if err := d.floodGate.Wait(elemCtx, job.dcID); err != nil {
+				job.fileState.fail(err)
+				select {
+				case <-ctx.Done():
+				case writeChan <- &largeWriteJob{fileState: job.fileState, leaseGen: job.leaseGen, offset: job.offset, isFailed: true, err: err}:
+				}
+				return
+			}
+		}
+
 		// Acquire data semaphore slot immediately before executing data RPC
 		if err := d.floodGate.AcquireDataSlot(elemCtx); err != nil {
 			job.fileState.fail(err)
@@ -1195,6 +1208,15 @@ func (d *Downloader) fetchSmallFile(ctx context.Context, workerID int, job *smal
 				budget.release(job.totalSize)
 				return
 			default:
+			}
+
+			// Wait for rate limit token and DC cooldown BEFORE acquiring data semaphore.
+			if d.floodGate != nil {
+				if err := d.floodGate.Wait(elemCtx, job.dcID); err != nil {
+					d.opts.Progress.OnDone(job.elem, err)
+					budget.release(job.totalSize)
+					return
+				}
 			}
 
 			// Acquire data semaphore slot immediately before executing data RPC

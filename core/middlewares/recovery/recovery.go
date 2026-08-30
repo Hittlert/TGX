@@ -34,7 +34,7 @@ func (r *recovery) Handle(next tg.Invoker) telegram.InvokeFunc {
 		bo := backoff.NewExponentialBackOff()
 		bo.InitialInterval = 500 * time.Millisecond
 		bo.MaxInterval = 5 * time.Second
-		bo.MaxElapsedTime = 30 * time.Second
+		bo.MaxElapsedTime = 10 * time.Second
 
 		return backoff.RetryNotify(func() error {
 			if err := next.Invoke(ctx, input, output); err != nil {

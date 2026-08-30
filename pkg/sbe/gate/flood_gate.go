@@ -2,6 +2,7 @@ package gate
 
 import (
 	"context"
+	"fmt"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -222,8 +223,13 @@ func (g *FloodGate) Wait(ctx context.Context, dc int) error {
 
 // TriggerFloodWait registers a shared cooldown for the given DC across all workers and adaptively lowers rate.
 func (g *FloodGate) TriggerFloodWait(dc int, duration time.Duration) {
-	if g == nil || duration <= 0 {
+	if g == nil {
 		return
+	}
+	// FLOOD_WAIT_0: Telegram signals rate pressure without specifying duration.
+	// Enforce a minimum 1s cooldown to back off.
+	if duration <= 0 {
+		duration = 1 * time.Second
 	}
 
 	g.mu.Lock()
@@ -268,7 +274,8 @@ type floodGateMiddleware struct {
 
 func (m *floodGateMiddleware) Handle(next tg.Invoker) telegram.InvokeFunc {
 	return func(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
-		for {
+		const maxFloodRetries = 5
+		for attempt := 0; ; attempt++ {
 			if m.gate != nil {
 				if err := m.gate.Wait(ctx, m.dc); err != nil {
 					return err
@@ -276,6 +283,9 @@ func (m *floodGateMiddleware) Handle(next tg.Invoker) telegram.InvokeFunc {
 			}
 			err := next.Invoke(ctx, input, output)
 			if d, isFlood := tgerr.AsFloodWait(err); isFlood {
+				if attempt >= maxFloodRetries {
+					return fmt.Errorf("flood wait retry limit (%d) exceeded on DC %d: %w", maxFloodRetries, m.dc, err)
+				}
 				if m.gate != nil {
 					m.gate.TriggerFloodWait(m.dc, d)
 				}

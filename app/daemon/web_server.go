@@ -20,6 +20,7 @@ import (
 	"go.uber.org/zap"
 
 	atomic "github.com/Hittlert/TGX/pkg/sbe/atomic"
+	"github.com/Hittlert/TGX/pkg/sbe/gate"
 )
 
 //go:embed ui/*
@@ -34,6 +35,7 @@ type WebServer struct {
 	registry     *Registry
 	logger       *zap.Logger
 	password     string
+	gate         *gate.FloodGate
 
 	sessionsMu sync.RWMutex
 	sessions   map[string]time.Time
@@ -53,6 +55,7 @@ func NewWebServer(
 	registry *Registry,
 	logger *zap.Logger,
 	password string,
+	fg *gate.FloodGate,
 ) *WebServer {
 	return &WebServer{
 		db:           db,
@@ -63,6 +66,7 @@ func NewWebServer(
 		registry:     registry,
 		logger:       logger,
 		password:     password,
+		gate:         fg,
 		sessions:     make(map[string]time.Time),
 	}
 }
@@ -85,6 +89,21 @@ func (s *WebServer) Handler() http.Handler {
 	// Daemon Status & Tasks
 	r.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, s.registry.Status())
+	}).Methods(http.MethodGet)
+
+	// Gate Diagnostics (live adaptive controller state)
+	r.HandleFunc("/api/gate", func(w http.ResponseWriter, r *http.Request) {
+		resp := map[string]any{
+			"max_data_in_flight":    gate.MaxDataInFlight,
+			"max_control_in_flight": gate.MaxControlInFlight,
+		}
+		if s.gate != nil {
+			resp["current_rate"] = s.gate.CurrentRate()
+			resp["base_rate"] = s.gate.BaseRate()
+			resp["data_in_flight"] = s.gate.DataInFlight()
+			resp["control_in_flight"] = s.gate.ControlInFlight()
+		}
+		writeJSON(w, http.StatusOK, resp)
 	}).Methods(http.MethodGet)
 
 	r.HandleFunc("/api/system/storage", func(w http.ResponseWriter, r *http.Request) {
