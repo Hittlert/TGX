@@ -126,7 +126,14 @@ func TestTaskIteratorCompletesPreexistingFileWithoutDownloader(t *testing.T) {
 	if !iter.Next(context.Background()) || iter.Value() != next {
 		t.Fatalf("iterator did not advance past existing file: err=%v", iter.Err())
 	}
-	snapshot, _ := registry.Task("existing")
+	var snapshot TaskSnapshot
+	for attempt := 0; attempt < 100; attempt++ {
+		snapshot, _ = registry.Task("existing")
+		if snapshot.State == StateSuccess && snapshot.AlreadyExists {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	if snapshot.State != StateSuccess || !snapshot.AlreadyExists {
 		t.Fatalf("existing file not completed: %#v", snapshot)
 	}

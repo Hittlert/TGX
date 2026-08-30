@@ -3,12 +3,14 @@ package downloader
 import (
 	"context"
 	"fmt"
+	"io"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-faster/errors"
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
-	"go.uber.org/atomic"
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 
@@ -36,255 +38,234 @@ func New(opts Options) *Downloader {
 	}
 }
 
-func (d *Downloader) Download(ctx context.Context, limit int) error {
-	wg, wgctx := errgroup.WithContext(ctx)
-	wg.SetLimit(limit)
-
-	for d.opts.Iter.Next(wgctx) {
-		elem := d.opts.Iter.Value()
-
-		wg.Go(func() error {
-			var transferErr error
-			d.opts.Progress.OnAdd(elem)
-			defer func() { d.opts.Progress.OnDone(elem, transferErr) }()
-
-			if err := d.download(wgctx, elem); err != nil {
-				transferErr = err
-				// canceled by user, so we directly return error to stop all
-				if errors.Is(err, context.Canceled) {
-					return errors.Wrap(err, "download")
-				}
-
-				// don't return error to errgroup to keep other downloads running, just log it
-				logctx.
-					From(ctx).
-					Error("Download error",
-						zap.Any("element", elem),
-						zap.Error(err),
-					)
-			}
-
-			return nil
-		})
-	}
-
-	if err := d.opts.Iter.Err(); err != nil {
-		return errors.Wrap(err, "iter")
-	}
-
-	return wg.Wait()
+// chunkJob represents a single atomic 512KB block download task dispatched to the global worker pool.
+type chunkJob struct {
+	elem      Elem
+	dcID      int
+	location  tg.InputFileLocationClass
+	offset    int64
+	limit     int
+	writer    io.WriterAt
+	takeout   bool
+	onSuccess func(n int)
+	onFailure func(err error)
 }
 
-func (d *Downloader) download(ctx context.Context, elem Elem) error {
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	default:
+type fileState struct {
+	elem       Elem
+	totalParts int32
+	remParts   int32
+	firstErr   error
+	errOnce    sync.Once
+	doneOnce   sync.Once
+	doneChan   chan struct{}
+}
+
+// Download runs the global streaming block engine with exactly numWorkers concurrent workers.
+// The Downloader operates purely at the chunk/block level with zero file-level nested concurrency.
+func (d *Downloader) Download(ctx context.Context, globalConcurrency int) error {
+	numWorkers := d.opts.Threads
+	if numWorkers <= 0 {
+		numWorkers = 32
+	}
+	if globalConcurrency > 0 && globalConcurrency < numWorkers {
+		numWorkers = globalConcurrency
 	}
 
-	totalSize := elem.File().Size()
-	if totalSize <= 0 {
-		return errors.New("file size is 0 or negative")
-	}
+	// Buffered channel for global chunk dispatch.
+	// When the queue is full, the feeder automatically blocks on submission,
+	// providing natural, zero-lag backpressure to the upstream file resolver / Iter.
+	jobQueueSize := numWorkers * 2
+	jobChan := make(chan *chunkJob, jobQueueSize)
 
-	timeout := 10*time.Minute + time.Duration(totalSize/(1024*1024))*5*time.Second
-	if timeout > 2*time.Hour {
-		timeout = 2 * time.Hour
-	}
-	dlCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
+	g, gctx := errgroup.WithContext(ctx)
 
-	logctx.From(dlCtx).Debug("Start download elem",
-		zap.Any("elem", elem))
-
-	partSize := int64(MaxPartSize)
-	numParts := int((totalSize + partSize - 1) / partSize)
-	threads := computeOptimalThreads(totalSize, numParts, d.opts.Threads)
-
-	// For single-part files (photos, small audio, small video <= 512KB)
-	if numParts == 1 {
-		client := d.opts.Pool.Client(dlCtx, elem.File().DC())
-		if elem.AsTakeout() {
-			client = d.opts.Pool.Takeout(dlCtx, elem.File().DC())
-		}
-		req := &tg.UploadGetFileRequest{
-			Precise:  true,
-			Location: elem.File().Location(),
-			Offset:   0,
-			Limit:    int(MaxPartSize),
-		}
-		var res tg.UploadFileClass
-		var fetchErr error
-		for attempt := 0; attempt < 8; attempt++ {
-			chunkCtx, chunkCancel := context.WithTimeout(dlCtx, 180*time.Second)
-			res, fetchErr = client.UploadGetFile(chunkCtx, req)
-			chunkCancel()
-			if fetchErr == nil {
-				break
-			}
-			if tgerr.Is(fetchErr, "FILE_REFERENCE_EXPIRED", "FILEREF_UPGRADE_NEEDED", "FILE_REFERENCE_INVALID", "LOCATION_INVALID") {
-				break
-			}
-			if d, isFlood := tgerr.AsFloodWait(fetchErr); isFlood {
-				logctx.From(dlCtx).Info("UploadGetFile single flood wait, backing off", zap.Duration("wait", d))
-				select {
-				case <-dlCtx.Done():
-					return dlCtx.Err()
-				case <-time.After(d + 2*time.Second):
-				}
-				continue
-			}
-			time.Sleep(time.Duration(attempt+1) * 300 * time.Millisecond)
-		}
-		if fetchErr != nil {
-			return errors.Wrap(fetchErr, "upload.getFile single")
-		}
-		var data []byte
-		switch r := res.(type) {
-		case *tg.UploadFile:
-			data = r.Bytes
-		default:
-			return errors.Errorf("unexpected file response: %T", res)
-		}
-		n, err := elem.To().WriteAt(data, 0)
-		if err != nil {
-			return errors.Wrap(err, "write single chunk")
-		}
-		d.opts.Progress.OnDownload(elem, ProgressState{
-			Downloaded: int64(n),
-			Total:      totalSize,
-		})
-		return nil
-	}
-
-	// Multi-part parallel download with deterministic chunk index queue
-	type partJob struct {
-		index  int
-		offset int64
-		limit  int
-	}
-
-	jobs := make(chan partJob, numParts)
-	for i := 0; i < numParts; i++ {
-		offset := int64(i) * partSize
-		limit := int(partSize)
-		jobs <- partJob{index: i, offset: offset, limit: limit}
-	}
-	close(jobs)
-
-	var downloadedBytes atomic.Int64
-	g, gctx := errgroup.WithContext(dlCtx)
-
-	for w := 0; w < threads; w++ {
+	// 1. Launch strictly numWorkers global chunk download workers
+	for w := 0; w < numWorkers; w++ {
+		workerID := w
 		g.Go(func() error {
-			client := d.opts.Pool.Client(gctx, elem.File().DC())
-			if elem.AsTakeout() {
-				client = d.opts.Pool.Takeout(gctx, elem.File().DC())
-			}
-			for job := range jobs {
+			for {
 				select {
 				case <-gctx.Done():
 					return gctx.Err()
-				default:
-				}
-
-				var chunkData []byte
-				var fetchErr error
-				for attempt := 0; attempt < 20; attempt++ {
-					req := &tg.UploadGetFileRequest{
-						Precise:  true,
-						Location: elem.File().Location(),
-						Offset:   job.offset,
-						Limit:    job.limit,
+				case job, ok := <-jobChan:
+					if !ok {
+						return nil
 					}
-					chunkCtx, chunkCancel := context.WithTimeout(gctx, 180*time.Second)
-					var res tg.UploadFileClass
-					res, fetchErr = client.UploadGetFile(chunkCtx, req)
-					chunkCancel()
-					if fetchErr == nil {
-						if uf, ok := res.(*tg.UploadFile); ok {
-							chunkData = uf.Bytes
-							break
-						}
-					} else {
-						logctx.From(gctx).Warn("UploadGetFile attempt failed",
-							zap.Int("part", job.index),
-							zap.Int64("offset", job.offset),
-							zap.Int("attempt", attempt+1),
-							zap.Error(fetchErr))
-						if tgerr.Is(fetchErr, "FILE_REFERENCE_EXPIRED", "FILEREF_UPGRADE_NEEDED", "FILE_REFERENCE_INVALID", "LOCATION_INVALID") {
-							break
-						}
-						if d, isFlood := tgerr.AsFloodWait(fetchErr); isFlood {
-							logctx.From(gctx).Info("UploadGetFile rate limit / flood wait, backing off",
-								zap.Int("part", job.index),
-								zap.Duration("flood_wait", d))
-							jitter := time.Duration(w)*500*time.Millisecond + 2*time.Second
-							select {
-							case <-gctx.Done():
-								return gctx.Err()
-							case <-time.After(d + jitter):
-							}
-							continue
-						}
-					}
-					select {
-					case <-gctx.Done():
-						return gctx.Err()
-					case <-time.After(time.Duration(attempt+1) * 300 * time.Millisecond):
-					}
+					d.executeChunk(gctx, workerID, job)
 				}
-
-				if fetchErr != nil || len(chunkData) == 0 {
-					if fetchErr != nil {
-						return errors.Wrapf(fetchErr, "fetch part %d (offset %d)", job.index, job.offset)
-					}
-					return fmt.Errorf("empty chunk data for part %d", job.index)
-				}
-
-				n, err := elem.To().WriteAt(chunkData, job.offset)
-				if err != nil {
-					return errors.Wrapf(err, "write part %d", job.index)
-				}
-
-				curr := downloadedBytes.Add(int64(n))
-				d.opts.Progress.OnDownload(elem, ProgressState{
-					Downloaded: curr,
-					Total:      totalSize,
-				})
 			}
-			return nil
 		})
 	}
+
+	// 2. Feeder: reads files from Iter and emits individual 512KB chunks into the global jobChan
+	g.Go(func() error {
+		defer close(jobChan)
+
+		for d.opts.Iter.Next(gctx) {
+			elem := d.opts.Iter.Value()
+			if elem == nil || elem.File() == nil {
+				continue
+			}
+
+			totalSize := elem.File().Size()
+			if totalSize <= 0 {
+				d.opts.Progress.OnAdd(elem)
+				d.opts.Progress.OnDone(elem, errors.New("file size is 0 or negative"))
+				continue
+			}
+
+			d.opts.Progress.OnAdd(elem)
+
+			partSize := int64(MaxPartSize)
+			numParts := int((totalSize + partSize - 1) / partSize)
+			if numParts < 1 {
+				numParts = 1
+			}
+
+			fState := &fileState{
+				elem:       elem,
+				totalParts: int32(numParts),
+				remParts:   int32(numParts),
+				doneChan:   make(chan struct{}),
+			}
+
+			var downloadedBytes int64
+
+			for i := 0; i < numParts; i++ {
+				offset := int64(i) * partSize
+				limit := int(partSize)
+
+				job := &chunkJob{
+					elem:     elem,
+					dcID:     elem.File().DC(),
+					location: elem.File().Location(),
+					offset:   offset,
+					limit:    limit,
+					writer:   elem.To(),
+					takeout:  elem.AsTakeout(),
+					onSuccess: func(n int) {
+						curr := atomic.AddInt64(&downloadedBytes, int64(n))
+						d.opts.Progress.OnDownload(elem, ProgressState{
+							Downloaded: curr,
+							Total:      totalSize,
+						})
+						if atomic.AddInt32(&fState.remParts, -1) == 0 {
+							fState.doneOnce.Do(func() {
+								d.opts.Progress.OnDone(elem, fState.firstErr)
+								close(fState.doneChan)
+							})
+						}
+					},
+					onFailure: func(err error) {
+						fState.errOnce.Do(func() {
+							fState.firstErr = err
+						})
+						if atomic.AddInt32(&fState.remParts, -1) == 0 {
+							fState.doneOnce.Do(func() {
+								d.opts.Progress.OnDone(elem, fState.firstErr)
+								close(fState.doneChan)
+							})
+						}
+					},
+				}
+
+				select {
+				case <-gctx.Done():
+					return gctx.Err()
+				case jobChan <- job: // Naturally blocks if queue is full -> Backpressure to upstream Iter
+				}
+			}
+		}
+
+		if err := d.opts.Iter.Err(); err != nil {
+			return errors.Wrap(err, "iter")
+		}
+		return nil
+	})
 
 	return g.Wait()
 }
 
-func computeOptimalThreads(totalSize int64, numParts int, maxThreads int) int {
-	if maxThreads <= 0 {
-		maxThreads = 1
-	}
-	if numParts <= 1 {
-		return 1
-	}
-
-	var targetThreads int
-	switch {
-	case totalSize <= 2*1024*1024: // <= 2MB: strictly sequential 1 thread
-		targetThreads = 1
-	case totalSize <= 20*1024*1024: // 2MB ~ 20MB: max 2 threads
-		targetThreads = min(2, maxThreads)
-	case totalSize <= 100*1024*1024: // 20MB ~ 100MB: max 4 threads
-		targetThreads = min(4, maxThreads)
-	default: // > 100MB: up to configured maxThreads
-		targetThreads = maxThreads
+// executeChunk pulls a single 512KB chunk over the DC connection pool and writes it into the target WriterAt.
+func (d *Downloader) executeChunk(ctx context.Context, workerID int, job *chunkJob) {
+	client := d.opts.Pool.Client(ctx, job.dcID)
+	if job.takeout {
+		client = d.opts.Pool.Takeout(ctx, job.dcID)
 	}
 
-	if targetThreads > numParts {
-		targetThreads = numParts
+	req := &tg.UploadGetFileRequest{
+		Precise:  true,
+		Location: job.location,
+		Offset:   job.offset,
+		Limit:    job.limit,
 	}
-	if targetThreads < 1 {
-		targetThreads = 1
+
+	var chunkData []byte
+	var fetchErr error
+
+	for attempt := 0; attempt < 20; attempt++ {
+		select {
+		case <-ctx.Done():
+			job.onFailure(ctx.Err())
+			return
+		default:
+		}
+
+		chunkCtx, chunkCancel := context.WithTimeout(ctx, 180*time.Second)
+		var res tg.UploadFileClass
+		res, fetchErr = client.UploadGetFile(chunkCtx, req)
+		chunkCancel()
+
+		if fetchErr == nil {
+			if uf, ok := res.(*tg.UploadFile); ok {
+				chunkData = uf.Bytes
+				break
+			}
+		}
+
+		if tgerr.Is(fetchErr, "FILE_REFERENCE_EXPIRED", "FILEREF_UPGRADE_NEEDED", "FILE_REFERENCE_INVALID", "LOCATION_INVALID") {
+			break
+		}
+
+		if dWait, isFlood := tgerr.AsFloodWait(fetchErr); isFlood {
+			jitter := time.Duration(workerID)*200*time.Millisecond + 1*time.Second
+			logctx.From(ctx).Info("UploadGetFile flood wait backoff",
+				zap.Int("dc", job.dcID),
+				zap.Int64("offset", job.offset),
+				zap.Duration("flood_wait", dWait),
+			)
+			select {
+			case <-ctx.Done():
+				job.onFailure(ctx.Err())
+				return
+			case <-time.After(dWait + jitter):
+			}
+			continue
+		}
+
+		select {
+		case <-ctx.Done():
+			job.onFailure(ctx.Err())
+			return
+		case <-time.After(time.Duration(attempt+1) * 300 * time.Millisecond):
+		}
 	}
-	return targetThreads
+
+	if fetchErr != nil || len(chunkData) == 0 {
+		if fetchErr != nil {
+			job.onFailure(fetchErr)
+		} else {
+			job.onFailure(fmt.Errorf("empty chunk data at offset %d", job.offset))
+		}
+		return
+	}
+
+	n, writeErr := job.writer.WriteAt(chunkData, job.offset)
+	if writeErr != nil {
+		job.onFailure(writeErr)
+		return
+	}
+
+	job.onSuccess(n)
 }
