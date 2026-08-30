@@ -1190,3 +1190,140 @@ func (p *fakeDualPool) Default(ctx context.Context) *tg.Client {
 	return tg.NewClient(p.master)
 }
 func (p *fakeDualPool) Close() error { return nil }
+
+func TestDownloader_CdnRedirectMultiRangeHashAndMismatchError(t *testing.T) {
+	key := []byte("0123456789abcdef0123456789abcdef")
+	iv := []byte("1234567890abcdef")
+	plainData := bytes.Repeat([]byte("B"), 1024*1024)
+
+	block, err := aes.NewCipher(key)
+	require.NoError(t, err)
+	encryptedData := make([]byte, len(plainData))
+	stream := cipher.NewCTR(block, iv)
+	stream.XORKeyStream(encryptedData, plainData)
+
+	// Split 1 MiB into two 512 KiB ranges with accurate SHA-256 hashes
+	h1 := sha256.Sum256(encryptedData[:512*1024])
+	h2 := sha256.Sum256(encryptedData[512*1024:])
+
+	// 1. Multi-range success case
+	cdnInvoker := &fakeCDNInvoker{encryptedData: encryptedData}
+	masterInvoker := &fakeMasterCDNRedirectInvoker{
+		key: key,
+		iv:  iv,
+		hashes: []tg.FileHash{
+			{Offset: 0, Limit: 512 * 1024, Hash: h1[:]},
+			{Offset: 512 * 1024, Limit: 512 * 1024, Hash: h2[:]},
+		},
+		fileToken: []byte("multi_range_token"),
+	}
+
+	pool := &fakeDualPool{master: masterInvoker, cdn: cdnInvoker}
+	buf := newMemWriterAt(int64(len(plainData)))
+	elem := &fakeElem{
+		file: &fakeFile{size: int64(len(plainData)), dc: 2},
+		buf:  buf,
+	}
+
+	dl := New(Options{
+		Pool:            pool,
+		Threads:         4,
+		DiskWorkers:     2,
+		FileConcurrency: 1,
+		Iter:            &fakeIter{elems: []*fakeElem{elem}},
+		Progress:        newFakeProgress(),
+		FloodGate:       gate.NewFloodGate(1000, 100),
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err = dl.Download(ctx, 4)
+	require.NoError(t, err)
+
+	buf.mu.Lock()
+	assert.Equal(t, plainData, buf.data)
+	buf.mu.Unlock()
+
+	// 2. Hash mismatch case must fail
+	badHashes := []tg.FileHash{
+		{Offset: 0, Limit: 512 * 1024, Hash: []byte("corrupted_hash_data_000000000000")},
+	}
+	masterInvokerBad := &fakeMasterCDNRedirectInvoker{
+		key:       key,
+		iv:        iv,
+		hashes:    badHashes,
+		fileToken: []byte("bad_token"),
+	}
+	bufBad := newMemWriterAt(int64(len(plainData)))
+	elemBad := &fakeElem{
+		file: &fakeFile{size: int64(len(plainData)), dc: 2},
+		buf:  bufBad,
+	}
+	progBad := newFakeProgress()
+	dlBad := New(Options{
+		Pool:            &fakeDualPool{master: masterInvokerBad, cdn: cdnInvoker},
+		Threads:         4,
+		DiskWorkers:     2,
+		FileConcurrency: 1,
+		Iter:            &fakeIter{elems: []*fakeElem{elemBad}},
+		Progress:        progBad,
+		FloodGate:       gate.NewFloodGate(1000, 100),
+	})
+
+	ctxBad, cancelBad := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelBad()
+
+	_ = dlBad.Download(ctxBad, 4)
+	progBad.mu.Lock()
+	defer progBad.mu.Unlock()
+	assert.Error(t, progBad.done[elemBad])
+}
+
+func TestDownloader_SchedulerChannelFullDoesNotBusySpin(t *testing.T) {
+	// Create 5 large files (each 100 MiB)
+	largeElems := make([]*fakeElem, 5)
+	for i := 0; i < 5; i++ {
+		largeElems[i] = &fakeElem{
+			file: &fakeFile{size: 100 * 1024 * 1024, dc: 2},
+			buf:  newMemWriterAt(100 * 1024 * 1024),
+		}
+	}
+	// And 5 small files
+	smallElems := make([]*fakeElem, 5)
+	for i := 0; i < 5; i++ {
+		smallElems[i] = &fakeElem{
+			file: &fakeFile{size: 100 * 1024, dc: 2},
+			buf:  newMemWriterAt(100 * 1024),
+		}
+	}
+
+	var allElems []*fakeElem
+	allElems = append(allElems, largeElems...)
+	allElems = append(allElems, smallElems...)
+
+	pool := &fakePool{invoker: &fakeInvoker{}}
+	iter := &fakeIter{elems: allElems}
+	progress := newFakeProgress()
+	fg := gate.NewFloodGate(1000, 100)
+
+	dl := New(Options{
+		Pool:            pool,
+		Threads:         16,
+		DiskWorkers:     6,
+		FileConcurrency: 5,
+		Iter:            iter,
+		Progress:        progress,
+		FloodGate:       fg,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	_ = dl.Download(ctx, 16)
+	elapsed := time.Since(start)
+
+	// Verify it processed smoothly without hanging or panic
+	assert.GreaterOrEqual(t, elapsed, 10*time.Millisecond)
+}

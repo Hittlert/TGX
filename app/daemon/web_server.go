@@ -102,6 +102,7 @@ func (s *WebServer) Handler() http.Handler {
 			resp["base_rate"] = s.gate.BaseRate()
 			resp["data_in_flight"] = s.gate.DataInFlight()
 			resp["control_in_flight"] = s.gate.ControlInFlight()
+			resp["max_data_cap"] = s.gate.MaxDataCap()
 		}
 		writeJSON(w, http.StatusOK, resp)
 	}).Methods(http.MethodGet)

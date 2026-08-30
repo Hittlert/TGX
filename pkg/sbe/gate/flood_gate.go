@@ -170,14 +170,19 @@ func (g *FloodGate) Wait(ctx context.Context, dc int) error {
 			}
 		}
 
-		// Smooth Additive Increase: if currentRate < maxRate and no active cooldowns, ramp up +5.0 req/s per second
-		if g.currentRate < g.maxRate && len(g.dcCooldowns) == 0 {
+// Smooth Additive Increase: if currentRate < maxRate and no active cooldowns, ramp up +5.0 req/s per second
+		if len(g.dcCooldowns) == 0 {
 			if now.Sub(g.lastRamp) >= time.Second {
-				g.currentRate += 5.0
-				if g.currentRate > g.maxRate {
-					g.currentRate = g.maxRate
+				if g.currentRate < g.maxRate {
+					g.currentRate += 5.0
+					if g.currentRate > g.maxRate {
+						g.currentRate = g.maxRate
+					}
+					g.limiter.SetLimit(rate.Limit(g.currentRate))
 				}
-				g.limiter.SetLimit(rate.Limit(g.currentRate))
+				if g.maxDataCap < MaxDataInFlight {
+					g.maxDataCap++
+				}
 				g.lastRamp = now
 			}
 		}
@@ -260,7 +265,7 @@ func (g *FloodGate) TriggerFloodWait(dc int, duration time.Duration) {
 	}
 }
 
-// TriggerTransportError adaptively decreases rate on network/transport errors (broken pipe, timeout, EOF).
+// TriggerTransportError adaptively decreases rate and data concurrency cap on network/transport errors.
 func (g *FloodGate) TriggerTransportError(err error) {
 	if g == nil || err == nil {
 		return
@@ -269,15 +274,34 @@ func (g *FloodGate) TriggerTransportError(err error) {
 	defer g.mu.Unlock()
 
 	now := time.Now()
-	if g.currentRate > g.minRate && now.Sub(g.lastRateDrop) >= 500*time.Millisecond {
-		g.currentRate = g.currentRate * 0.85
-		if g.currentRate < g.minRate {
-			g.currentRate = g.minRate
+	if now.Sub(g.lastRateDrop) >= 500*time.Millisecond {
+		if g.currentRate > g.minRate {
+			g.currentRate = g.currentRate * 0.85
+			if g.currentRate < g.minRate {
+				g.currentRate = g.minRate
+			}
+			g.limiter.SetLimit(rate.Limit(g.currentRate))
 		}
-		g.limiter.SetLimit(rate.Limit(g.currentRate))
+		// Dynamic concurrency throttle on transport failure: step down cap by 2, minimum 10
+		if g.maxDataCap > 10 {
+			g.maxDataCap -= 2
+			if g.maxDataCap < 10 {
+				g.maxDataCap = 10
+			}
+		}
 		g.lastRamp = now.Add(2 * time.Second) // Pause ramp-up for 2s after transport error
 		g.lastRateDrop = now
 	}
+}
+
+// MaxDataCap returns the current dynamic concurrency capacity limit.
+func (g *FloodGate) MaxDataCap() int64 {
+	if g == nil {
+		return MaxDataInFlight
+	}
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.maxDataCap
 }
 
 // IsDCCooledDown returns true if the DC is currently undergoing cooldown.
@@ -293,9 +317,14 @@ func (g *FloodGate) IsDCCooledDown(dc int) bool {
 
 type tokenPassedKey struct{}
 
-// WithTokenPassed returns a child context indicating that Gate.Wait has already been passed.
+// WithTokenPassed returns a child context indicating that Gate.Wait has already been passed for the initial attempt.
 func WithTokenPassed(ctx context.Context) context.Context {
 	return context.WithValue(ctx, tokenPassedKey{}, true)
+}
+
+// WithoutTokenPassed returns a child context with the token passed marker cleared.
+func WithoutTokenPassed(ctx context.Context) context.Context {
+	return context.WithValue(ctx, tokenPassedKey{}, false)
 }
 
 // IsTokenPassed checks whether the context has already passed Gate.Wait.
@@ -332,14 +361,19 @@ type floodGateMiddleware struct {
 func (m *floodGateMiddleware) Handle(next tg.Invoker) telegram.InvokeFunc {
 	return func(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
 		const maxFloodRetries = 5
+		firstAttempt := true
 		for attempt := 0; attempt < maxFloodRetries; attempt++ {
-			// If caller already performed Gate.Wait (e.g. data worker before acquiring data semaphore),
-			// skip Wait() to avoid double-token consumption and to avoid holding data semaphore during wait.
-			if m.gate != nil && !IsTokenPassed(ctx) {
-				if err := m.gate.Wait(ctx, m.dc); err != nil {
-					return err
+			// On first attempt, if caller already performed Gate.Wait (one-time ticket), skip Wait().
+			// On any RETRY (e.g. after FloodWait), we MUST execute Wait() to respect cooldown & rate limit!
+			if m.gate != nil {
+				if !(firstAttempt && IsTokenPassed(ctx)) {
+					if err := m.gate.Wait(ctx, m.dc); err != nil {
+						return err
+					}
 				}
 			}
+			firstAttempt = false
+
 			err := next.Invoke(ctx, input, output)
 			if d, isFlood := tgerr.AsFloodWait(err); isFlood {
 				if m.gate != nil {

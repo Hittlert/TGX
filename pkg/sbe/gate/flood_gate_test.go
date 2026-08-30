@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/gotd/td/bin"
+	"github.com/gotd/td/tgerr"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -201,6 +202,33 @@ func TestFloodGate_TransportErrorAdaptiveBackoff(t *testing.T) {
 	// Debounce check: another error within 500ms should not drop rate further
 	g.TriggerTransportError(errors.New("i/o timeout"))
 	assert.Equal(t, 85.0, g.CurrentRate())
+}
+
+func TestFloodGate_MiddlewareRetryEnforcesCooldown(t *testing.T) {
+	g := NewFloodGate(100.0, 40)
+	mw := g.Middleware(3)
+
+	attempts := 0
+	invoker := mw.Handle(fakeInvokerFunc(func(ctx context.Context, in bin.Encoder, out bin.Decoder) error {
+		attempts++
+		if attempts == 1 {
+			// First attempt fails with FLOOD_WAIT_1 (1 second)
+			return tgerr.New(420, "FLOOD_WAIT_1")
+		}
+		return nil
+	}))
+
+	// Pass context with WithTokenPassed
+	ctxPassed := WithTokenPassed(context.Background())
+
+	// Run invoker with 100ms timeout context - should time out during second attempt waiting for 1s cooldown
+	timeoutCtx, cancel := context.WithTimeout(ctxPassed, 100*time.Millisecond)
+	defer cancel()
+
+	err := invoker(timeoutCtx, nil, nil)
+	assert.Error(t, err) // Context canceled while waiting for DC 3 cooldown
+	assert.Equal(t, 1, attempts)
+	assert.True(t, g.IsDCCooledDown(3))
 }
 
 type fakeInvokerFunc func(ctx context.Context, in bin.Encoder, out bin.Decoder) error
