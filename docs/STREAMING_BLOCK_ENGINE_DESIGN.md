@@ -59,7 +59,7 @@ flowchart TD
         end
 
         subgraph DiskStage ["双磁盘通道 (Dual Disk Writers, 1+5 物理并发)"]
-            NetWorkers -->|小文件整文件内存 Buffer| SmallQueue["smallWriteChan (容量 64)"]
+            NetWorkers -->|小文件整文件内存 Buffer| SmallQueue["smallWriteChan (容量 4096 / 128MB 预算)"]
             SmallQueue --> SmallDiskWriter["1 个小文件串行 Disk Writer"]
             SmallDiskWriter -->|内存计算 SHA256 / 顺序写入 / Sync / Rename| DiskStore["NAS 存储"]
 
@@ -79,5 +79,5 @@ flowchart TD
 | **网络 Worker 池** | 32 Goroutines | 64 Network Jobs | 3 级优先级动态平衡 | 纯网络拉流，0 磁盘 I/O |
 | **小文件通道** | 1 网络 Worker / 文件 | 128 MiB 独立内存隔离预算 | 整文件内存缓存 | 1 个专属磁盘 Writer 严格串行落盘/Sync/Rename |
 | **大文件通道** | 4 ~ 32 分片 / 文件 | 5 个最大活跃大文件 | 4 Chunk 保底 + 剩余借调 | 5 个专属磁盘 Writer，每文件 1 对 1 顺序写 |
-| **磁盘总物理并发** | **6 (1 小 + 5 大)** | 有界队列 (10 Large, 64 Small) | 严格分流 | 零寻道冲突，完全规避磁盘随机寻道 |
-| **FloodGate 风控** | 全局统一 Token Bucket | 40.0 req/s, burst 10 | 遇 FloodWait 阶梯降频 | 线程安全、事件驱动 |
+| **磁盘总物理并发** | **6 (1 小 + 5 大)** | 有界队列 (10 Large, 64 Small Ready, 4096 Spool) | 严格分流 | 零寻道冲突，完全规避磁盘随机寻道 |
+| **FloodGate 风控** | 全局统一 Token Bucket | 40.0 req/s, burst 10 | 遇 FloodWait 阶梯降频与防抖 | 线程安全、冷却前置、事件驱动 |

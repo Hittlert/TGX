@@ -2,20 +2,18 @@
 
 ## Supported Versions
 
-Use this section to tell people about which versions of your project are
-currently being supported with security updates.
+Only the latest active release on `main` branch receives active security updates and vulnerability patches.
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 5.1.x   | :white_check_mark: |
-| 5.0.x   | :x:                |
-| 4.0.x   | :white_check_mark: |
-| < 4.0   | :x:                |
+| latest (main) | :white_check_mark: |
+| < latest | :x:                |
 
 ## Reporting a Vulnerability
 
-Use this section to tell people how to report a vulnerability.
+If you discover a security vulnerability within TGX, please report it responsibly:
 
-Tell them where to go, how often they can expect to get an update on a
-reported vulnerability, what to expect if the vulnerability is accepted or
-declined, etc.
+1. **Do not create a public issue** for undisclosed security vulnerabilities.
+2. Submit a report privately via GitHub Security Advisories ([Report a vulnerability](https://github.com/Hittlert/TGX/security/advisories/new)) or email `dyt.sky@gmail.com`.
+3. Provide a clear description, reproduction steps, and potential impact.
+4. You will receive an initial response within 48 hours, and patches will be published promptly upon verification.

@@ -125,17 +125,34 @@ type activeLargeFileState struct {
 	maxProgress       int64
 	progMu            sync.Mutex
 	canceled          int32
+	errMu             sync.Mutex
 	firstErr          error
-	errOnce           sync.Once
 	doneOnce          sync.Once
 	doneChan          chan struct{}
 }
 
 func (s *activeLargeFileState) fail(err error) {
-	atomic.StoreInt32(&s.canceled, 1)
-	s.errOnce.Do(func() {
+	if err == nil {
+		err = context.Canceled
+	}
+	s.errMu.Lock()
+	if s.firstErr == nil {
 		s.firstErr = err
-	})
+	}
+	s.errMu.Unlock()
+	atomic.StoreInt32(&s.canceled, 1)
+}
+
+func (s *activeLargeFileState) error() error {
+	s.errMu.Lock()
+	defer s.errMu.Unlock()
+	if s.firstErr != nil {
+		return s.firstErr
+	}
+	if atomic.LoadInt32(&s.canceled) == 1 {
+		return context.Canceled
+	}
+	return nil
 }
 
 // memoryBudget provides thread-safe, event-driven accounting for small file memory buffer.
@@ -220,7 +237,7 @@ func (d *Downloader) Download(ctx context.Context, globalConcurrency int) error 
 	for i := 0; i < largeDiskWorkers; i++ {
 		largeWriteChans[i] = make(chan *largeWriteJob, netWorkers)
 	}
-	smallWriteChan := make(chan *smallWriteJob, 1024)
+	smallWriteChan := make(chan *smallWriteJob, 4096)
 
 	smallBudget := newMemoryBudget(d.opts.SmallMemBudget)
 
@@ -359,7 +376,7 @@ func (d *Downloader) Download(ctx context.Context, globalConcurrency int) error 
 					if wJob.isFailed {
 						currentFile.fail(wJob.err)
 						currentFile.doneOnce.Do(func() {
-							d.opts.Progress.OnDone(currentFile.elem, currentFile.firstErr)
+							d.opts.Progress.OnDone(currentFile.elem, currentFile.error())
 							close(currentFile.doneChan)
 						})
 						pendingChunks = make(map[int64]*largeWriteJob)
@@ -370,7 +387,7 @@ func (d *Downloader) Download(ctx context.Context, globalConcurrency int) error 
 					if writeErr != nil {
 						wJob.fileState.fail(writeErr)
 						currentFile.doneOnce.Do(func() {
-							d.opts.Progress.OnDone(currentFile.elem, currentFile.firstErr)
+							d.opts.Progress.OnDone(currentFile.elem, currentFile.error())
 							close(currentFile.doneChan)
 						})
 						pendingChunks = make(map[int64]*largeWriteJob)
@@ -382,7 +399,7 @@ func (d *Downloader) Download(ctx context.Context, globalConcurrency int) error 
 
 					if atomic.AddInt32(&wJob.fileState.remParts, -1) == 0 {
 						wJob.fileState.doneOnce.Do(func() {
-							d.opts.Progress.OnDone(wJob.fileState.elem, wJob.fileState.firstErr)
+							d.opts.Progress.OnDone(wJob.fileState.elem, wJob.fileState.error())
 							close(wJob.fileState.doneChan)
 						})
 					}
@@ -413,7 +430,7 @@ func (d *Downloader) Download(ctx context.Context, globalConcurrency int) error 
 					if wJob.isFailed {
 						currentFile.fail(wJob.err)
 						currentFile.doneOnce.Do(func() {
-							d.opts.Progress.OnDone(currentFile.elem, currentFile.firstErr)
+							d.opts.Progress.OnDone(currentFile.elem, currentFile.error())
 							close(currentFile.doneChan)
 						})
 						pendingChunks = make(map[int64]*largeWriteJob)
@@ -614,12 +631,13 @@ func (d *Downloader) Download(ctx context.Context, globalConcurrency int) error 
 					undispatched := int32(fc.totalParts - fc.nextPart)
 					if undispatched > 0 {
 						fc.nextPart = fc.totalParts
-						if atomic.AddInt32(&fc.state.remParts, -undispatched) == 0 {
-							fc.state.doneOnce.Do(func() {
-								d.opts.Progress.OnDone(fc.state.elem, fc.state.firstErr)
-								close(fc.state.doneChan)
-							})
-						}
+						atomic.AddInt32(&fc.state.remParts, -undispatched)
+					}
+					if atomic.LoadInt32(&fc.state.inflight) == 0 {
+						fc.state.doneOnce.Do(func() {
+							d.opts.Progress.OnDone(fc.state.elem, fc.state.error())
+							close(fc.state.doneChan)
+						})
 					}
 				}
 				select {
@@ -810,7 +828,7 @@ func (d *Downloader) fetchLargeChunk(ctx context.Context, workerID int, job *lar
 			leaseGen:  job.leaseGen,
 			offset:    job.offset,
 			isFailed:  true,
-			err:       job.fileState.firstErr,
+			err:       job.fileState.error(),
 		}:
 		}
 		return
@@ -835,7 +853,7 @@ func (d *Downloader) fetchLargeChunk(ctx context.Context, workerID int, job *lar
 			leaseGen:  job.leaseGen,
 			offset:    job.offset,
 			isFailed:  true,
-			err:       context.Canceled,
+			err:       job.fileState.error(),
 		}:
 		}
 		return
@@ -861,15 +879,15 @@ func (d *Downloader) fetchLargeChunk(ctx context.Context, workerID int, job *lar
 		case <-ctx.Done():
 			job.fileState.fail(ctx.Err())
 			select {
+			case <-ctx.Done():
 			case writeChan <- &largeWriteJob{fileState: job.fileState, leaseGen: job.leaseGen, offset: job.offset, isFailed: true, err: ctx.Err()}:
-			default:
 			}
 			return
 		case <-elemCtx.Done():
 			job.fileState.fail(context.Canceled)
 			select {
+			case <-ctx.Done():
 			case writeChan <- &largeWriteJob{fileState: job.fileState, leaseGen: job.leaseGen, offset: job.offset, isFailed: true, err: context.Canceled}:
-			default:
 			}
 			return
 		default:
@@ -877,8 +895,8 @@ func (d *Downloader) fetchLargeChunk(ctx context.Context, workerID int, job *lar
 
 		if atomic.LoadInt32(&job.fileState.canceled) == 1 {
 			select {
-			case writeChan <- &largeWriteJob{fileState: job.fileState, leaseGen: job.leaseGen, offset: job.offset, isFailed: true, err: job.fileState.firstErr}:
-			default:
+			case <-ctx.Done():
+			case writeChan <- &largeWriteJob{fileState: job.fileState, leaseGen: job.leaseGen, offset: job.offset, isFailed: true, err: job.fileState.error()}:
 			}
 			return
 		}
@@ -891,8 +909,8 @@ func (d *Downloader) fetchLargeChunk(ctx context.Context, workerID int, job *lar
 		if errors.Is(fetchErr, context.Canceled) || elemCtx.Err() != nil {
 			job.fileState.fail(context.Canceled)
 			select {
+			case <-ctx.Done():
 			case writeChan <- &largeWriteJob{fileState: job.fileState, leaseGen: job.leaseGen, offset: job.offset, isFailed: true, err: context.Canceled}:
-			default:
 			}
 			return
 		}
@@ -941,15 +959,15 @@ func (d *Downloader) fetchLargeChunk(ctx context.Context, workerID int, job *lar
 		case <-ctx.Done():
 			job.fileState.fail(ctx.Err())
 			select {
+			case <-ctx.Done():
 			case writeChan <- &largeWriteJob{fileState: job.fileState, leaseGen: job.leaseGen, offset: job.offset, isFailed: true, err: ctx.Err()}:
-			default:
 			}
 			return
 		case <-elemCtx.Done():
 			job.fileState.fail(context.Canceled)
 			select {
+			case <-ctx.Done():
 			case writeChan <- &largeWriteJob{fileState: job.fileState, leaseGen: job.leaseGen, offset: job.offset, isFailed: true, err: context.Canceled}:
-			default:
 			}
 			return
 		case <-time.After(time.Duration(attempt+1) * 300 * time.Millisecond):
@@ -968,7 +986,7 @@ func (d *Downloader) fetchLargeChunk(ctx context.Context, workerID int, job *lar
 			leaseGen:  job.leaseGen,
 			offset:    job.offset,
 			isFailed:  true,
-			err:       fetchErr,
+			err:       job.fileState.error(),
 		}:
 		}
 		return
@@ -978,8 +996,8 @@ func (d *Downloader) fetchLargeChunk(ctx context.Context, workerID int, job *lar
 	case <-ctx.Done():
 		job.fileState.fail(ctx.Err())
 		select {
+		case <-ctx.Done():
 		case writeChan <- &largeWriteJob{fileState: job.fileState, leaseGen: job.leaseGen, offset: job.offset, isFailed: true, err: ctx.Err()}:
-		default:
 		}
 	case writeChan <- &largeWriteJob{
 		fileState: job.fileState,

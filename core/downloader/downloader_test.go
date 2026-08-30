@@ -28,7 +28,7 @@ func (f *fakeFile) DC() int                             { return f.dc }
 
 type fakeElem struct {
 	file     *fakeFile
-	buf      *memWriterAt
+	buf      io.WriterAt
 	take     bool
 	canceled bool
 	ctx      context.Context
@@ -626,11 +626,34 @@ func (f *delayedFakeInvoker) Invoke(ctx context.Context, input bin.Encoder, outp
 	return nil
 }
 
+type slowMemWriterAt struct {
+	mu    sync.Mutex
+	buf   []byte
+	delay time.Duration
+}
+
+func newSlowMemWriterAt(size int, delay time.Duration) *slowMemWriterAt {
+	return &slowMemWriterAt{buf: make([]byte, size), delay: delay}
+}
+
+func (m *slowMemWriterAt) WriteAt(p []byte, off int64) (int, error) {
+	if m.delay > 0 {
+		time.Sleep(m.delay)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if int(off)+len(p) > len(m.buf) {
+		return 0, io.ErrShortWrite
+	}
+	copy(m.buf[off:], p)
+	return len(p), nil
+}
+
 func TestDownloader_LateRPCFromOldLeaseGenerationDoesNotCorruptNewFile(t *testing.T) {
 	invoker := &delayedFakeInvoker{
 		failOffset:    0, // fail offset 0 of first file
 		delayOffset:   512 * 1024,
-		delayDuration: 150 * time.Millisecond,
+		delayDuration: 300 * time.Millisecond,
 	}
 	pool := &fakePool{invoker: invoker}
 
@@ -653,7 +676,7 @@ func TestDownloader_LateRPCFromOldLeaseGenerationDoesNotCorruptNewFile(t *testin
 	dl := New(Options{
 		Pool:            pool,
 		Threads:         16,
-		DiskWorkers:     1, // 1 writer slot shared across File 1 then File 2!
+		DiskWorkers:     2, // 1 large disk writer slot (2-1=1) shared across File 1 then File 2!
 		FileConcurrency: 1,
 		Iter:            iter,
 		Progress:        progress,
@@ -680,12 +703,12 @@ func TestDownloader_Massive100SmallFilesWithSlowDiskWriter(t *testing.T) {
 	invoker := &fakeInvoker{}
 	pool := &fakePool{invoker: invoker}
 
-	// 100 small files (50KB each = 5MB total, well within 128MB budget)
+	// 100 small files (50KB each = 5MB total) with 2ms slow disk write delay
 	elems := make([]*fakeElem, 0, 100)
 	for i := 0; i < 100; i++ {
 		elems = append(elems, &fakeElem{
 			file: &fakeFile{size: 50 * 1024, dc: 4},
-			buf:  newMemWriterAt(50 * 1024),
+			buf:  newSlowMemWriterAt(50*1024, 2*time.Millisecond),
 		})
 	}
 

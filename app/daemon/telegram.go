@@ -11,7 +11,6 @@ import (
 	"golang.org/x/sync/singleflight"
 	"github.com/gotd/td/telegram/peers"
 	"github.com/gotd/td/telegram/query"
-	"github.com/gotd/td/telegram/query/dialogs"
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
 
@@ -60,17 +59,27 @@ func (a *telegramMediaAccess) Resolve(ctx context.Context, peer string, messageI
 
 func (a *telegramMediaAccess) SyncPeers(ctx context.Context) error {
 	a.syncMu.Lock()
-	if time.Since(a.lastSync) < 30*time.Second {
+	if !a.lastSync.IsZero() && time.Since(a.lastSync) < 30*time.Second {
 		a.syncMu.Unlock()
 		return nil
 	}
 	a.syncMu.Unlock()
 
 	_, err, _ := a.sf.Do("sync_peers", func() (interface{}, error) {
-		syncCtx, cancel := context.WithTimeout(ctx, a.syncTimeout)
+		a.syncMu.Lock()
+		if !a.lastSync.IsZero() && time.Since(a.lastSync) < 30*time.Second {
+			a.syncMu.Unlock()
+			return nil, nil
+		}
+		a.syncMu.Unlock()
+
+		syncCtx, cancel := context.WithTimeout(context.Background(), a.syncTimeout)
 		defer cancel()
 
-		err := query.GetDialogs(a.pool.Default(syncCtx)).BatchSize(100).ForEach(syncCtx, func(ctx context.Context, elem dialogs.Elem) error {
+		var syncErr error
+		iter := query.GetDialogs(a.pool.Default(syncCtx)).BatchSize(100).Iter()
+		for iter.Next(syncCtx) {
+			elem := iter.Value()
 			usersMap := elem.Entities.Users()
 			chatsMap := elem.Entities.Chats()
 			channelsMap := elem.Entities.Channels()
@@ -87,21 +96,30 @@ func (a *telegramMediaAccess) SyncPeers(ctx context.Context) error {
 				chats = append(chats, c)
 			}
 			if len(users) > 0 || len(chats) > 0 {
-				if applyErr := a.manager.Apply(ctx, users, chats); applyErr != nil {
-					return applyErr
+				if applyErr := a.manager.Apply(syncCtx, users, chats); applyErr != nil {
+					syncErr = applyErr
+					break
 				}
 			}
-			return nil
-		})
-		if err != nil && !errors.Is(err, context.Canceled) {
-			return nil, classifyTelegramError(err, "sync dialogs")
 		}
+
+		if iterErr := iter.Err(); iterErr != nil && syncErr == nil {
+			syncErr = iterErr
+		}
+
+		if syncErr != nil {
+			return nil, classifyTelegramError(syncErr, "sync dialogs")
+		}
+
 		a.syncMu.Lock()
 		a.lastSync = time.Now()
 		a.syncMu.Unlock()
 		return nil, nil
 	})
-	return err
+	if err != nil {
+		return err
+	}
+	return ctx.Err()
 }
 
 type telegramFile struct {

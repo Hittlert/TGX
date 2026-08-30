@@ -96,13 +96,15 @@ type taskState struct {
 	createdAt     time.Time
 	startedAt     time.Time
 	finishedAt    time.Time
-	ranges        []byteRange
-	events        []byteEvent
-	firstByte     time.Time
-	lastByte      time.Time
-	smoothedSpeed float64
-	ctx           context.Context
-	cancel        context.CancelFunc
+	ranges             []byteRange
+	events             []byteEvent
+	hasNetworkProgress bool
+	netDownloaded      int64
+	firstByte          time.Time
+	lastByte           time.Time
+	smoothedSpeed      float64
+	ctx                context.Context
+	cancel             context.CancelFunc
 }
 
 type Registry struct {
@@ -387,16 +389,17 @@ func (t *Task) RecordProgress(downloaded int64) {
 	if isTerminal(t.state.state) {
 		return
 	}
+	t.state.hasNetworkProgress = true
 	if t.state.totalSize > 0 && downloaded > t.state.totalSize {
 		downloaded = t.state.totalSize
 	}
-	diff := downloaded - t.state.downloaded
+	diff := downloaded - t.state.netDownloaded
 	if diff <= 0 {
 		return
 	}
+	t.state.netDownloaded = downloaded
 	now := r.now()
 	event := byteEvent{at: now, bytes: diff}
-	t.state.downloaded = downloaded
 	t.state.events = append(t.state.events, event)
 	r.events = append(r.events, event)
 	if t.state.firstByte.IsZero() {
@@ -430,19 +433,21 @@ func (t *Task) RecordWrite(offset int64, size int) int64 {
 	if unique == 0 {
 		return 0
 	}
-	now := r.now()
-	event := byteEvent{at: now, bytes: unique}
 	t.state.downloaded += unique
-	t.state.events = append(t.state.events, event)
-	r.events = append(r.events, event)
-	if t.state.firstByte.IsZero() {
-		t.state.firstByte = now
+	if !t.state.hasNetworkProgress {
+		now := r.now()
+		event := byteEvent{at: now, bytes: unique}
+		t.state.events = append(t.state.events, event)
+		r.events = append(r.events, event)
+		if t.state.firstByte.IsZero() {
+			t.state.firstByte = now
+		}
+		if r.firstByte.IsZero() {
+			r.firstByte = now
+		}
+		t.state.lastByte = now
+		r.lastByte = now
 	}
-	if r.firstByte.IsZero() {
-		r.firstByte = now
-	}
-	t.state.lastByte = now
-	r.lastByte = now
 	return unique
 }
 
@@ -576,7 +581,7 @@ func (t *Task) Context() context.Context {
 }
 
 func (r *Registry) snapshotTaskLocked(state *taskState, now time.Time) TaskSnapshot {
-	state.events = trimEvents(state.events, now.Add(-3*time.Second))
+	state.events = trimEvents(state.events, now.Add(-5*time.Second))
 	progress := float64(0)
 	if state.totalSize > 0 {
 		progress = float64(state.downloaded) * 100 / float64(state.totalSize)
@@ -653,7 +658,7 @@ func trimEvents(events []byteEvent, cutoff time.Time) []byteEvent {
 }
 
 func rollingRate(events []byteEvent, firstByte, lastByte, now time.Time) int64 {
-	if len(events) == 0 || lastByte.IsZero() || now.Sub(lastByte) > 2*time.Second {
+	if len(events) == 0 || lastByte.IsZero() || now.Sub(lastByte) >= 3*time.Second {
 		return 0
 	}
 	var total int64
@@ -661,12 +666,12 @@ func rollingRate(events []byteEvent, firstByte, lastByte, now time.Time) int64 {
 		total += event.bytes
 	}
 	start := firstByte
-	if cutoff := now.Add(-3 * time.Second); start.Before(cutoff) {
+	if cutoff := now.Add(-5 * time.Second); start.Before(cutoff) {
 		start = cutoff
 	}
 	elapsed := now.Sub(start).Seconds()
-	if elapsed < 0.5 {
-		elapsed = 0.5
+	if elapsed < 1.0 {
+		elapsed = 1.0
 	}
 	return int64(float64(total) / elapsed)
 }
