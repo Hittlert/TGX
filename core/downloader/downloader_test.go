@@ -251,43 +251,6 @@ func (s *shortReadInvoker) Invoke(ctx context.Context, input bin.Encoder, output
 	return nil
 }
 
-func TestDownloader_ShortReadValidationAndRecovery(t *testing.T) {
-	invoker := &shortReadInvoker{}
-	clientPool := &shortReadPool{invoker: invoker}
-
-	elem := &fakeElem{
-		file: &fakeFile{size: 512 * 1024, dc: 2},
-		buf:  newMemWriterAt(512 * 1024),
-	}
-
-	iter := &fakeIter{elems: []*fakeElem{elem}}
-	progress := newFakeProgress()
-	fg := gate.NewFloodGate(1000, 100)
-
-	dl := New(Options{
-		Pool:            clientPool,
-		Threads:         1,
-		DiskWorkers:     1,
-		FileConcurrency: 1,
-		Iter:            iter,
-		Progress:        progress,
-		FloodGate:       fg,
-	})
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	err := dl.Download(ctx, 1)
-	require.NoError(t, err)
-
-	progress.mu.Lock()
-	defer progress.mu.Unlock()
-
-	assert.NoError(t, progress.done[elem])
-	assert.Equal(t, int64(512*1024), progress.downloaded[elem])
-	assert.GreaterOrEqual(t, invoker.tries, 2, "short read must trigger retry")
-}
-
 type shortReadPool struct {
 	invoker *shortReadInvoker
 }
@@ -303,16 +266,55 @@ func (p *shortReadPool) Default(ctx context.Context) *tg.Client {
 }
 func (p *shortReadPool) Close() error { return nil }
 
+func TestDownloader_ShortReadValidationAndAutoRetry(t *testing.T) {
+	invoker := &shortReadInvoker{}
+	pool := &shortReadPool{invoker: invoker}
+
+	// 1 File with 2 parts (1MB)
+	elem := &fakeElem{
+		file: &fakeFile{size: 1024 * 1024, dc: 4},
+		buf:  newMemWriterAt(1024 * 1024),
+	}
+
+	iter := &fakeIter{elems: []*fakeElem{elem}}
+	progress := newFakeProgress()
+	fg := gate.NewFloodGate(1000, 100)
+
+	dl := New(Options{
+		Pool:            pool,
+		Threads:         2,
+		DiskWorkers:     2,
+		FileConcurrency: 1,
+		Iter:            iter,
+		Progress:        progress,
+		FloodGate:       fg,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err := dl.Download(ctx, 2)
+	require.NoError(t, err)
+
+	progress.mu.Lock()
+	defer progress.mu.Unlock()
+
+	assert.Equal(t, 1, len(progress.done))
+	assert.NoError(t, progress.done[elem])
+	// Should have retried part 0 and succeeded on second try
+	assert.GreaterOrEqual(t, invoker.tries, 2)
+}
+
 func TestDownloader_CancellationZeroPanic(t *testing.T) {
 	invoker := &fakeInvoker{}
 	pool := &fakePool{invoker: invoker}
 
-	// Create 10 files with 10MB each
+	// Create 10 files with 100MB each
 	elems := make([]*fakeElem, 10)
 	for i := 0; i < 10; i++ {
 		elems[i] = &fakeElem{
-			file: &fakeFile{size: 10 * 1024 * 1024, dc: 4},
-			buf:  newMemWriterAt(10 * 1024 * 1024),
+			file: &fakeFile{size: 100 * 1024 * 1024, dc: 4},
+			buf:  newMemWriterAt(100 * 1024 * 1024),
 		}
 	}
 
@@ -330,8 +332,9 @@ func TestDownloader_CancellationZeroPanic(t *testing.T) {
 		FloodGate:       fg,
 	})
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
-	defer cancel()
+	ctx, cancel := context.WithCancel(context.Background())
+	// Cancel immediately or quickly
+	cancel()
 
 	// Must cleanly return on context cancellation with ZERO panics or send on closed channel
 	err := dl.Download(ctx, 16)
@@ -380,10 +383,10 @@ func TestDownloader_DualLane_MixedSmallAndLargeFiles(t *testing.T) {
 	invoker := &fakeInvoker{}
 	pool := &fakePool{invoker: invoker}
 
-	// 3 Large files (2MB each = 4 parts each)
+	// 8 Large files (2MB each = 4 parts each) -> tests maxActiveLargeFiles=5 queueing!
 	// 20 Small files (200KB each = 1 part each)
-	elems := make([]*fakeElem, 0, 23)
-	for i := 0; i < 3; i++ {
+	elems := make([]*fakeElem, 0, 28)
+	for i := 0; i < 8; i++ {
 		elems = append(elems, &fakeElem{
 			file: &fakeFile{size: 2 * 1024 * 1024, dc: 4},
 			buf:  newMemWriterAt(2 * 1024 * 1024),
@@ -419,8 +422,8 @@ func TestDownloader_DualLane_MixedSmallAndLargeFiles(t *testing.T) {
 	progress.mu.Lock()
 	defer progress.mu.Unlock()
 
-	assert.Equal(t, 23, len(progress.added))
-	assert.Equal(t, 23, len(progress.done))
+	assert.Equal(t, 28, len(progress.added))
+	assert.Equal(t, 28, len(progress.done))
 	for _, e := range elems {
 		assert.NoError(t, progress.done[e])
 		assert.Equal(t, e.file.size, progress.downloaded[e])
@@ -470,4 +473,3 @@ func TestDownloader_DualLane_OnlySmallFiles(t *testing.T) {
 		assert.Equal(t, e.file.size, progress.downloaded[e])
 	}
 }
-

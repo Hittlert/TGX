@@ -54,7 +54,7 @@ type parser struct {
 }
 
 func Run(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Options) (rerr error) {
-	sharedGate := gate.NewFloodGate(40.0, 10)
+	sharedGate := gate.NewFloodGate(100.0, 32)
 	pool := dcpool.NewPoolWithGate(c,
 		int64(viper.GetInt(consts.FlagPoolSize)),
 		sharedGate,

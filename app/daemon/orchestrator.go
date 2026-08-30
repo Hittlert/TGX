@@ -13,6 +13,7 @@ import (
 	"go.uber.org/zap"
 
 	atomic "github.com/Hittlert/TGX/pkg/sbe/atomic"
+	"github.com/Hittlert/TGX/core/downloader"
 	"github.com/Hittlert/TGX/pkg/texpr"
 )
 
@@ -225,21 +226,13 @@ func (o *Orchestrator) dispatchLoop(ctx context.Context) {
 			continue
 		}
 
-		snapshot := o.slotPool.Snapshot()
-		if snapshot.ActiveFilesCount >= snapshot.MaxActiveFiles || snapshot.AvailableSlots <= 0 {
+		status := o.registry.Status()
+		if status.QueueDepth >= 64 {
 			time.Sleep(200 * time.Millisecond)
 			continue
 		}
 
-		needCount := snapshot.MaxActiveFiles - snapshot.ActiveFilesCount
-		if needCount < 1 {
-			needCount = 1
-		}
-		if needCount > snapshot.MaxActiveFiles {
-			needCount = snapshot.MaxActiveFiles
-		}
-
-		records, err := o.db.GetPendingDownloads(needCount * 2)
+		records, err := o.db.GetPendingDownloads(32)
 		if err != nil || len(records) == 0 {
 			time.Sleep(500 * time.Millisecond)
 			continue
@@ -251,6 +244,7 @@ func (o *Orchestrator) dispatchLoop(ctx context.Context) {
 			}
 			o.dispatchOneRecord(ctx, record)
 		}
+
 		time.Sleep(100 * time.Millisecond)
 	}
 }
@@ -258,7 +252,7 @@ func (o *Orchestrator) dispatchLoop(ctx context.Context) {
 func (o *Orchestrator) dispatchOneRecord(ctx context.Context, record DownloadRecord) {
 	taskID := fmt.Sprintf("%s:%d", record.ChatID, record.MessageID)
 
-	if _, loaded := o.inFlight.LoadOrStore(taskID, true); loaded {
+	if _, loaded := o.inFlight.LoadOrStore(taskID, struct{}{}); loaded {
 		return
 	}
 
@@ -284,12 +278,14 @@ func (o *Orchestrator) dispatchOneRecord(ctx context.Context, record DownloadRec
 			return
 		}
 
-		// Acquire slot
-		_, err = o.slotPool.Acquire(taskCtx, taskID, record.FileSize)
-		if err != nil {
-			return
+		// Acquire slot only for large files (> 1MB / non-photo)
+		if record.FileSize > downloader.SmallFileThreshold || (record.FileSize <= 0 && record.MediaType != "photo") {
+			_, err = o.slotPool.Acquire(taskCtx, taskID, record.FileSize)
+			if err != nil {
+				return
+			}
+			defer o.slotPool.Release(taskID)
 		}
-		defer o.slotPool.Release(taskID)
 
 		folderName := record.TargetTitle
 		if folderName == "" {

@@ -82,43 +82,38 @@ func (p *pool) invoker(ctx context.Context, dc int) tg.Invoker {
 		return i
 	}
 
-	if dc == 0 || dc == p.current() {
-		mws := p.middlewares
-		if p.floodGate != nil {
-			mws = append([]telegram.Middleware{p.floodGate.Middleware(p.current())}, mws...)
-		}
-		p.invokers[dc] = chainMiddlewares(p.api, mws...)
-		return p.invokers[dc]
-	}
-
 	var (
 		invoker telegram.CloseInvoker
 		err     error
 	)
-	for attempt := 0; attempt < 5; attempt++ {
-		if ctx.Err() != nil {
-			return failedInvoker{dc: dc, err: ctx.Err()}
-		}
-		invoker, err = p.api.DC(ctx, dc, p.size)
-		if err == nil {
-			break
-		}
-		if d, isFlood := tgerr.AsFloodWait(err); isFlood {
-			logctx.From(ctx).Warn("DC transfer flood wait, backing off", zap.Int("dc", dc), zap.Duration("wait", d))
-			if p.floodGate != nil {
-				p.floodGate.TriggerFloodWait(dc, d)
+	if dc == 0 || dc == p.current() {
+		invoker, err = p.api.Pool(p.size)
+	} else {
+		for attempt := 0; attempt < 5; attempt++ {
+			if ctx.Err() != nil {
+				return failedInvoker{dc: dc, err: ctx.Err()}
+			}
+			invoker, err = p.api.DC(ctx, dc, p.size)
+			if err == nil {
+				break
+			}
+			if d, isFlood := tgerr.AsFloodWait(err); isFlood {
+				logctx.From(ctx).Warn("DC transfer flood wait, backing off", zap.Int("dc", dc), zap.Duration("wait", d))
+				if p.floodGate != nil {
+					p.floodGate.TriggerFloodWait(dc, d)
+				}
+				select {
+				case <-ctx.Done():
+					return failedInvoker{dc: dc, err: ctx.Err()}
+				case <-time.After(d + 1*time.Second):
+				}
+				continue
 			}
 			select {
 			case <-ctx.Done():
 				return failedInvoker{dc: dc, err: ctx.Err()}
-			case <-time.After(d + 1*time.Second):
+			case <-time.After(time.Duration(attempt+1) * 500 * time.Millisecond):
 			}
-			continue
-		}
-		select {
-		case <-ctx.Done():
-			return failedInvoker{dc: dc, err: ctx.Err()}
-		case <-time.After(time.Duration(attempt+1) * 500 * time.Millisecond):
 		}
 	}
 
@@ -147,7 +142,14 @@ func (f failedInvoker) Invoke(ctx context.Context, input bin.Encoder, output bin
 }
 
 func (p *pool) Default(ctx context.Context) *tg.Client {
-	return p.Client(ctx, p.current())
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	mws := p.middlewares
+	if p.floodGate != nil {
+		mws = append([]telegram.Middleware{p.floodGate.Middleware(p.current())}, mws...)
+	}
+	return tg.NewClient(chainMiddlewares(p.api, mws...))
 }
 
 func (p *pool) Close() (err error) {
