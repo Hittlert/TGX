@@ -14,7 +14,6 @@ import (
 
 	"github.com/Hittlert/TGX/core/dcpool"
 	"github.com/Hittlert/TGX/core/logctx"
-	"github.com/Hittlert/TGX/core/util/tutil"
 )
 
 // MaxPartSize refer to https://core.telegram.org/api/files#downloading-files
@@ -100,12 +99,18 @@ func (d *Downloader) download(ctx context.Context, elem Elem) error {
 
 	partSize := int64(MaxPartSize)
 	numParts := int((totalSize + partSize - 1) / partSize)
-	threads := tutil.BestThreads(totalSize, d.opts.Threads)
-	if threads > numParts {
+	threads := d.opts.Threads
+	if threads <= 0 {
+		threads = 1
+	}
+	if numParts < threads {
 		threads = numParts
 	}
 	if elem.File().DC() != 0 && elem.File().DC() != 4 && threads > 2 {
 		threads = 2
+	}
+	if totalSize <= 10*1024*1024 && threads > 1 {
+		threads = 1
 	}
 	if threads < 1 {
 		threads = 1
@@ -200,7 +205,7 @@ func (d *Downloader) download(ctx context.Context, elem Elem) error {
 
 				var chunkData []byte
 				var fetchErr error
-				for attempt := 0; attempt < 8; attempt++ {
+				for attempt := 0; attempt < 20; attempt++ {
 					req := &tg.UploadGetFileRequest{
 						Precise:  true,
 						Location: elem.File().Location(),
@@ -229,10 +234,11 @@ func (d *Downloader) download(ctx context.Context, elem Elem) error {
 							logctx.From(gctx).Info("UploadGetFile rate limit / flood wait, backing off",
 								zap.Int("part", job.index),
 								zap.Duration("flood_wait", d))
+							jitter := time.Duration(w)*500*time.Millisecond + 2*time.Second
 							select {
 							case <-gctx.Done():
 								return gctx.Err()
-							case <-time.After(d + 2*time.Second):
+							case <-time.After(d + jitter):
 							}
 							continue
 						}

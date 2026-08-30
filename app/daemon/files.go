@@ -197,6 +197,10 @@ func existingFile(path string, expectedSize int64) (bool, error) {
 		return false, fmt.Errorf("destination is not a regular file: %s", path)
 	}
 	if stat.Size() != expectedSize {
+		if stat.Size() == 0 {
+			_ = os.Remove(path)
+			return false, nil
+		}
 		return false, fmt.Errorf("destination collision: size %d does not match expected %d", stat.Size(), expectedSize)
 	}
 	return true, nil
