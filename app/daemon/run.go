@@ -73,10 +73,10 @@ func (o Options) withDefaults() Options {
 		o.FileConcurrency = 5
 	}
 	if o.Threads == 0 {
-		o.Threads = 8
+		o.Threads = 32
 	}
 	if o.PoolSize == 0 {
-		o.PoolSize = 8
+		o.PoolSize = 32
 	}
 	if o.PeerSyncTimeout == 0 {
 		o.PeerSyncTimeout = 3 * time.Minute
@@ -84,7 +84,7 @@ func (o Options) withDefaults() Options {
 	if o == (Options{
 		Namespace: "default", Listen: "0.0.0.0:18080", OutputDir: "/app/downloads", TempDir: "/app/temp/tdl",
 		DBPath: "/app/state/download_records.sqlite3", SingboxURL: "http://127.0.0.1:9090",
-		QueueCapacity: 1000, TerminalLimit: 2000, FileConcurrency: 5, Threads: 8, PoolSize: 8,
+		QueueCapacity: 1000, TerminalLimit: 2000, FileConcurrency: 5, Threads: 32, PoolSize: 32,
 		PeerSyncTimeout: 3 * time.Minute,
 	}) {
 		o.StartPaused = true
@@ -142,7 +142,12 @@ func Run(ctx context.Context, client *telegram.Client, kvd storage.Storage, opts
 	registry.SetPool(PoolSnapshot{Size: opts.PoolSize})
 	iter := newTaskIter(registry, newTaskResolver(access, opts.TempDir, opts.OutputDir))
 	dl := downloader.New(downloader.Options{
-		Pool: pool, Threads: opts.Threads, Iter: iter, Progress: newTaskProgress(),
+		Pool:            pool,
+		Threads:         opts.Threads,
+		DiskWorkers:     6,
+		FileConcurrency: opts.FileConcurrency,
+		Iter:            iter,
+		Progress:        newTaskProgress(),
 	})
 
 	db, err := NewDatabase(opts.DBPath)
@@ -161,10 +166,10 @@ func Run(ctx context.Context, client *telegram.Client, kvd storage.Storage, opts
 	}
 
 	slotCfg := SlotPoolConfig{
-		TotalSlots:      max(256, opts.PoolSize*8),
-		MaxActiveFiles:  max(64, opts.FileConcurrency),
+		TotalSlots:      opts.PoolSize,
+		MaxActiveFiles:  opts.FileConcurrency,
 		SlotUnitMB:      2,
-		MaxSlotsPerFile: max(16, opts.Threads*2),
+		MaxSlotsPerFile: opts.PoolSize,
 	}
 	slotPool := NewGlobalSlotPool(slotCfg)
 	statsFile := ""

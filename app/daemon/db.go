@@ -123,9 +123,6 @@ func (d *Database) initSchema() error {
 		}
 	}
 
-	// Clean any dangling 'downloading' records from crashes back to 'pending'
-	_, _ = d.db.Exec(`UPDATE download_records SET status = 'pending' WHERE status = 'downloading'`)
-
 	// Automatically migrate legacy @username primary keys to canonical numeric IDs
 	d.migrateLegacyUsernameIDs()
 

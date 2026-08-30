@@ -36,27 +36,34 @@ func (g *FloodGate) Wait(ctx context.Context, dc int) error {
 		return nil
 	}
 
-	// 1. Check DC-level cooldown gate
 	for {
+		// 1. Wait for token bucket first
+		if g.limiter != nil {
+			if err := g.limiter.Wait(ctx); err != nil {
+				return err
+			}
+		}
+
+		// 2. Then check DC cooldown gate right before dispatch
 		g.mu.RLock()
 		notBefore, hasCooldown := g.dcCooldowns[dc]
 		g.mu.RUnlock()
 
 		if !hasCooldown {
-			break
+			return nil
 		}
 
 		now := time.Now()
 		if now.After(notBefore) {
 			g.mu.Lock()
-			// Re-check under write lock
 			if nb, exists := g.dcCooldowns[dc]; exists && time.Now().After(nb) {
 				delete(g.dcCooldowns, dc)
 			}
 			g.mu.Unlock()
-			break
+			return nil
 		}
 
+		// Cooldown is active -> sleep until cooldown expires and loop back to re-check
 		waitTime := notBefore.Sub(now)
 		select {
 		case <-ctx.Done():
@@ -64,13 +71,6 @@ func (g *FloodGate) Wait(ctx context.Context, dc int) error {
 		case <-time.After(waitTime):
 		}
 	}
-
-	// 2. Token bucket rate limit check to prevent microsecond bursts
-	if g.limiter != nil {
-		return g.limiter.Wait(ctx)
-	}
-
-	return nil
 }
 
 // TriggerFloodWait registers a shared cooldown for the given DC across all workers.

@@ -378,7 +378,9 @@ func (t *Task) RecordWrite(offset int64, size int) int64 {
 func (t *Task) update(update func(*taskState)) {
 	r := t.registry
 	r.mu.Lock()
-	update(t.state)
+	if !isTerminal(t.state.state) {
+		update(t.state)
+	}
 	r.mu.Unlock()
 }
 
