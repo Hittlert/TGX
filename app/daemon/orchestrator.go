@@ -31,9 +31,10 @@ type Orchestrator struct {
 	logger       *zap.Logger
 	saveDir      string
 
-	runningMu sync.Mutex
-	running   bool
-	inFlight  sync.Map
+	runningMu   sync.Mutex
+	running     bool
+	inFlight    sync.Map
+	taskCancels sync.Map
 }
 
 func NewOrchestrator(db *Database, slotPool *GlobalSlotPool, proxyManager *ProxyManager, access TelegramAccess, registry *Registry, logger *zap.Logger, saveDir string) *Orchestrator {
@@ -261,8 +262,15 @@ func (o *Orchestrator) dispatchOneRecord(ctx context.Context, record DownloadRec
 		return
 	}
 
+	taskCtx, taskCancel := context.WithCancel(ctx)
+	o.taskCancels.Store(taskID, taskCancel)
+
 	go func() {
-		defer o.inFlight.Delete(taskID)
+		defer func() {
+			o.taskCancels.Delete(taskID)
+			taskCancel()
+			o.inFlight.Delete(taskID)
+		}()
 
 		// Disk Guard: ensure at least 5GB or file size + 500MB is free
 		freeSpace, _, err := atomic.GetDiskSpace(o.saveDir)
@@ -277,7 +285,7 @@ func (o *Orchestrator) dispatchOneRecord(ctx context.Context, record DownloadRec
 		}
 
 		// Acquire slot
-		_, err = o.slotPool.Acquire(ctx, taskID, record.FileSize)
+		_, err = o.slotPool.Acquire(taskCtx, taskID, record.FileSize)
 		if err != nil {
 			return
 		}
@@ -333,6 +341,8 @@ func (o *Orchestrator) dispatchOneRecord(ctx context.Context, record DownloadRec
 		startTime := time.Now()
 		for {
 			select {
+			case <-taskCtx.Done():
+				return
 			case <-ctx.Done():
 				return
 			default:
@@ -373,4 +383,38 @@ func (o *Orchestrator) dispatchOneRecord(ctx context.Context, record DownloadRec
 			}
 		}
 	}()
+}
+
+func (o *Orchestrator) CancelTasksByChatID(chatID string) {
+	cleanChatID := strings.TrimPrefix(chatID, "@")
+	
+	// 1. Cancel in-flight worker contexts
+	o.taskCancels.Range(func(key, value any) bool {
+		taskID, ok := key.(string)
+		if !ok {
+			return true
+		}
+		parts := strings.Split(taskID, ":")
+		if len(parts) > 0 {
+			taskPeer := strings.TrimPrefix(parts[0], "@")
+			if taskPeer == cleanChatID || taskPeer == chatID {
+				if cancel, ok := value.(context.CancelFunc); ok && cancel != nil {
+					cancel()
+				}
+				o.slotPool.Release(taskID)
+				o.inFlight.Delete(taskID)
+			}
+		}
+		return true
+	})
+
+	// 2. Abort active tasks in registry
+	if o.registry != nil {
+		o.registry.CancelTasksByChatID(chatID)
+	}
+
+	// 3. Reset database records for this chat from 'downloading' back to 'pending'
+	if o.db != nil {
+		_, _ = o.db.DB().Exec(`UPDATE download_records SET status = 'pending' WHERE chat_id = ? AND status = 'downloading'`, chatID)
+	}
 }

@@ -408,6 +408,25 @@ func (r *Registry) finish(state *taskState, status TaskState, class, message, fi
 	}
 }
 
+func (r *Registry) CancelTasksByChatID(chatID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	cleanChatID := strings.TrimPrefix(chatID, "@")
+	for _, state := range r.tasks {
+		if !isTerminal(state.state) {
+			peer := strings.TrimPrefix(state.request.Peer, "@")
+			if peer == cleanChatID || peer == chatID {
+				state.state = StateFailed
+				state.errorClass = "canceled"
+				state.errorText = "target disabled by user"
+				state.finishedAt = r.now()
+			}
+		}
+	}
+	r.signalLocked()
+}
+
 func (r *Registry) snapshotTaskLocked(state *taskState, now time.Time) TaskSnapshot {
 	state.events = trimEvents(state.events, now.Add(-3*time.Second))
 	progress := float64(0)

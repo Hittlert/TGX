@@ -634,6 +634,12 @@ func (s *WebServer) handleListenTargets(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	for _, t := range targets {
+		if !t.Enabled && s.orchestrator != nil {
+			s.orchestrator.CancelTasksByChatID(t.ChatID)
+		}
+	}
+
 	globalUpdatesStreamMu.RLock()
 	stream := globalUpdatesStream
 	globalUpdatesStreamMu.RUnlock()
