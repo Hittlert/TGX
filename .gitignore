@@ -51,6 +51,10 @@ deployments/
 deploy-staging/
 bin/
 telegram-downloader-*
+import-pyrogram-session-*
+*-linux-amd64*
+*.new
+*.corrupt
 tg-downloader
 tgx
 tdl

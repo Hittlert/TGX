@@ -452,6 +452,48 @@ func (r *Registry) finish(state *taskState, status TaskState, class, message, fi
 	}
 }
 
+func (r *Registry) Cancel(id string, reason string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	var newQueue []*taskState
+	for _, state := range r.queue {
+		if state.request.ID == id {
+			state.state = StateFailed
+			state.errorClass = "canceled"
+			if reason != "" {
+				state.errorText = reason
+			} else {
+				state.errorText = "task canceled"
+			}
+			state.finishedAt = r.now()
+			if state.cancel != nil {
+				state.cancel()
+			}
+		} else {
+			newQueue = append(newQueue, state)
+		}
+	}
+	r.queue = newQueue
+
+	if state, ok := r.tasks[id]; ok {
+		if !isTerminal(state.state) {
+			state.state = StateFailed
+			state.errorClass = "canceled"
+			if reason != "" {
+				state.errorText = reason
+			} else {
+				state.errorText = "task canceled"
+			}
+			state.finishedAt = r.now()
+			if state.cancel != nil {
+				state.cancel()
+			}
+		}
+	}
+	r.signalLocked()
+}
+
 func (r *Registry) CancelTasksByChatID(chatID string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

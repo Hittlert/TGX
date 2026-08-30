@@ -197,12 +197,35 @@ func (d *Downloader) Download(ctx context.Context, globalConcurrency int) error 
 			partSize   int64
 		}
 
-		activeFiles := make([]*fileCursor, 0, maxActiveFiles)
+		activeFiles := make([]*fileCursor, 0, maxActiveFiles*2)
 		iterDone := false
 
+		shouldAdmitMore := func() bool {
+			if iterDone {
+				return false
+			}
+			if len(activeFiles) >= netWorkers*2 {
+				return false
+			}
+			activeLargeFiles := 0
+			pendingChunks := 0
+			for _, fc := range activeFiles {
+				if fc.totalParts > 1 {
+					activeLargeFiles++
+				}
+				if rem := fc.totalParts - fc.nextPart; rem > 0 {
+					pendingChunks += rem
+				}
+			}
+			if activeLargeFiles < maxActiveFiles || pendingChunks < netWorkers {
+				return true
+			}
+			return false
+		}
+
 		for {
-			// A. Fill active window up to maxActiveFiles
-			for len(activeFiles) < maxActiveFiles && !iterDone {
+			// A. Fill active window up to capacity (maxLargeFiles or netWorkers saturation)
+			for shouldAdmitMore() {
 				if !d.opts.Iter.Next(gctx) {
 					iterDone = true
 					break
@@ -338,9 +361,24 @@ func (d *Downloader) fetchChunk(ctx context.Context, workerID int, job *chunkJob
 		expectedBytes = int(job.totalSize - job.offset)
 	}
 
-	client := d.opts.Pool.Client(ctx, job.dcID)
+	elemCtx := ctx
+	if ce, ok := job.fileState.elem.(ContextElem); ok && ce.Context() != nil {
+		elemCtx = ce.Context()
+	}
+
+	if elemCtx.Err() != nil || atomic.LoadInt32(&job.fileState.canceled) == 1 {
+		if atomic.AddInt32(&job.fileState.remParts, -1) == 0 {
+			job.fileState.doneOnce.Do(func() {
+				d.opts.Progress.OnDone(job.fileState.elem, context.Canceled)
+				close(job.fileState.doneChan)
+			})
+		}
+		return
+	}
+
+	client := d.opts.Pool.Client(elemCtx, job.dcID)
 	if job.takeout {
-		client = d.opts.Pool.Takeout(ctx, job.dcID)
+		client = d.opts.Pool.Takeout(elemCtx, job.dcID)
 	}
 
 	req := &tg.UploadGetFileRequest{
@@ -364,6 +402,15 @@ func (d *Downloader) fetchChunk(ctx context.Context, workerID int, job *chunkJob
 				})
 			}
 			return
+		case <-elemCtx.Done():
+			job.fileState.fail(context.Canceled)
+			if atomic.AddInt32(&job.fileState.remParts, -1) == 0 {
+				job.fileState.doneOnce.Do(func() {
+					d.opts.Progress.OnDone(job.fileState.elem, context.Canceled)
+					close(job.fileState.doneChan)
+				})
+			}
+			return
 		default:
 		}
 
@@ -375,11 +422,6 @@ func (d *Downloader) fetchChunk(ctx context.Context, workerID int, job *chunkJob
 				})
 			}
 			return
-		}
-
-		elemCtx := ctx
-		if ce, ok := job.fileState.elem.(ContextElem); ok && ce.Context() != nil {
-			elemCtx = ce.Context()
 		}
 
 		chunkCtx, chunkCancel := context.WithTimeout(elemCtx, 60*time.Second)
@@ -431,6 +473,15 @@ func (d *Downloader) fetchChunk(ctx context.Context, workerID int, job *chunkJob
 			if atomic.AddInt32(&job.fileState.remParts, -1) == 0 {
 				job.fileState.doneOnce.Do(func() {
 					d.opts.Progress.OnDone(job.fileState.elem, job.fileState.firstErr)
+					close(job.fileState.doneChan)
+				})
+			}
+			return
+		case <-elemCtx.Done():
+			job.fileState.fail(context.Canceled)
+			if atomic.AddInt32(&job.fileState.remParts, -1) == 0 {
+				job.fileState.doneOnce.Do(func() {
+					d.opts.Progress.OnDone(job.fileState.elem, context.Canceled)
 					close(job.fileState.doneChan)
 				})
 			}

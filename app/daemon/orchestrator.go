@@ -344,8 +344,10 @@ func (o *Orchestrator) dispatchOneRecord(ctx context.Context, record DownloadRec
 		for {
 			select {
 			case <-taskCtx.Done():
+				o.registry.Cancel(taskID, "task context done")
 				return
 			case <-ctx.Done():
+				o.registry.Cancel(taskID, "orchestrator shutdown")
 				return
 			default:
 			}
@@ -379,6 +381,7 @@ func (o *Orchestrator) dispatchOneRecord(ctx context.Context, record DownloadRec
 			// Watchdog: If actively downloading but no byte progress has been made for 5 minutes, abort and mark failed
 			if snapshot.State == StateDownloading && time.Since(lastProgressTime) > 5*time.Minute {
 				_ = o.db.UpdateDownloadStatus(record.ChatID, record.MessageID, "failed", record.FileName, finalRelPath, record.MediaType, record.FileSize, "download stalled / no progress for 5m")
+				o.registry.Cancel(taskID, "download stalled / no progress for 5m")
 				taskCancel()
 				return
 			}
