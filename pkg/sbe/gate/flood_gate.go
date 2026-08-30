@@ -6,6 +6,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gotd/td/bin"
+	"github.com/gotd/td/telegram"
+	"github.com/gotd/td/tg"
+	"github.com/gotd/td/tgerr"
 	"golang.org/x/time/rate"
 )
 
@@ -100,4 +104,36 @@ func (g *FloodGate) IsDCCooledDown(dc int) bool {
 	defer g.mu.RUnlock()
 	notBefore, exists := g.dcCooldowns[dc]
 	return exists && time.Now().Before(notBefore)
+}
+
+type floodGateMiddleware struct {
+	gate *FloodGate
+	dc   int
+}
+
+func (m *floodGateMiddleware) Handle(next tg.Invoker) telegram.InvokeFunc {
+	return func(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
+		for attempt := 0; attempt < 5; attempt++ {
+			if m.gate != nil {
+				if err := m.gate.Wait(ctx, m.dc); err != nil {
+					return err
+				}
+			}
+			err := next.Invoke(ctx, input, output)
+			if d, isFlood := tgerr.AsFloodWait(err); isFlood {
+				if m.gate != nil {
+					m.gate.TriggerFloodWait(m.dc, d)
+				}
+				continue
+			}
+			return err
+		}
+		return next.Invoke(ctx, input, output)
+	}
+}
+
+// Middleware returns a unified telegram.Middleware that enforces shared DC cooldown,
+// global account rate limiting, and automatic retry for any MTProto invoker.
+func (g *FloodGate) Middleware(dc int) telegram.Middleware {
+	return &floodGateMiddleware{gate: g, dc: dc}
 }

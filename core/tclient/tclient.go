@@ -10,7 +10,6 @@ import (
 	"github.com/cenkalti/backoff/v4"
 	"github.com/go-faster/errors"
 	"github.com/gotd/contrib/clock"
-	"github.com/gotd/contrib/middleware/floodwait"
 	tdclock "github.com/gotd/td/clock"
 	"github.com/gotd/td/exchange"
 	"github.com/gotd/td/telegram"
@@ -21,9 +20,9 @@ import (
 
 	"github.com/Hittlert/TGX/core/logctx"
 	"github.com/Hittlert/TGX/core/middlewares/recovery"
-	"github.com/Hittlert/TGX/core/middlewares/retry"
 	"github.com/Hittlert/TGX/core/util/netutil"
 	"github.com/Hittlert/TGX/core/util/tutil"
+	"github.com/Hittlert/TGX/pkg/sbe/gate"
 )
 
 // dc values can be overridden globally
@@ -142,10 +141,16 @@ func filterIPv4Options(options []tg.DCOption) []tg.DCOption {
 }
 
 func NewDefaultMiddlewares(ctx context.Context, timeout time.Duration) []telegram.Middleware {
+	return NewDefaultMiddlewaresWithGate(ctx, timeout, nil)
+}
+
+func NewDefaultMiddlewaresWithGate(ctx context.Context, timeout time.Duration, fg *gate.FloodGate) []telegram.Middleware {
+	if fg == nil {
+		fg = gate.NewFloodGate(40.0, 10)
+	}
 	return []telegram.Middleware{
 		recovery.New(ctx, newBackoff(timeout)),
-		retry.New(5),
-		floodwait.NewSimpleWaiter(),
+		fg.Middleware(0),
 	}
 }
 

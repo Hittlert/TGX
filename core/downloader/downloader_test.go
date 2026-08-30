@@ -328,4 +328,3 @@ func TestDownloader_CancellationZeroPanic(t *testing.T) {
 	err := dl.Download(ctx, 16)
 	assert.Error(t, err)
 }
-

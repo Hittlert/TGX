@@ -81,6 +81,10 @@ func (e *fileElement) Abort() error {
 }
 
 func (e *fileElement) Publish() (result PublishResult, resultErr error) {
+	if e.task != nil && e.task.IsTerminal() {
+		_ = e.Abort()
+		return result, errors.New("task is terminal, aborting publish")
+	}
 	if err := e.closeTemp(); err != nil {
 		return result, fmt.Errorf("sync temp file: %w", err)
 	}
@@ -111,6 +115,11 @@ func (e *fileElement) Publish() (result PublishResult, resultErr error) {
 	shaHash, err := computeSHA256(e.tempPath)
 	if err != nil {
 		return result, fmt.Errorf("hash temp file: %w", err)
+	}
+
+	if e.task != nil && e.task.IsTerminal() {
+		_ = e.Abort()
+		return result, errors.New("task became terminal during hash calculation, aborting publish")
 	}
 
 	// Zero-copy direct atomic rename in the exact same directory!

@@ -139,7 +139,10 @@ func Run(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Opti
 		}
 	}()
 
-	return downloader.New(options).Download(ctx, limit)
+	if limit > 0 {
+		options.FileConcurrency = limit
+	}
+	return downloader.New(options).Download(ctx, options.Threads)
 }
 
 func collectDialogs(parsers []parser) ([][]*tmessage.Dialog, error) {
