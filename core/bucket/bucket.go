@@ -211,9 +211,15 @@ func (b *bucketImpl) PutObject(key ObjectKey, data []byte) error {
 	}
 
 	b.mu.Lock()
-	// Idempotency check: if object with same key already exists, return nil
+	// Idempotency check: if object with same key already exists, release the
+	// caller's reservation (since it won't become a new ready object) and return nil.
 	if taskMap, ok := b.readyByTask[key.TaskID]; ok {
 		if entry, exists := taskMap[key.Offset]; exists && entry.obj.Key.Gen == key.Gen && entry.obj.Key.Checksum == key.Checksum {
+			// Fix P0-5: Release the reservation that the caller already made
+			if b.reservedBytes >= key.Length {
+				b.reservedBytes -= key.Length
+			}
+			b.notifyWaitersLocked()
 			b.mu.Unlock()
 			return nil
 		}
@@ -436,6 +442,7 @@ func (b *bucketImpl) DeleteObjects(keys []ObjectKey) error {
 
 	var freedBytes int64
 	var freedCount int64
+	var deleteErrs []error
 
 	for _, key := range keys {
 		if b.cfg.Mode == ModeMemory {
@@ -452,6 +459,9 @@ func (b *bucketImpl) DeleteObjects(keys []ObjectKey) error {
 			if err1 == nil || errors.Is(err1, os.ErrNotExist) {
 				freedBytes += key.Length
 				freedCount++
+			} else {
+				// Fix P1-5: Collect SSD delete failures instead of silently ignoring
+				deleteErrs = append(deleteErrs, fmt.Errorf("remove %s: %w", absPath, err1))
 			}
 		}
 	}
@@ -470,6 +480,9 @@ func (b *bucketImpl) DeleteObjects(keys []ObjectKey) error {
 	b.notifyWaitersLocked()
 	b.mu.Unlock()
 
+	if len(deleteErrs) > 0 {
+		return fmt.Errorf("failed to delete %d/%d objects: %w", len(deleteErrs), len(keys), errors.Join(deleteErrs...))
+	}
 	return nil
 }
 

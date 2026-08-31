@@ -126,3 +126,34 @@ func (b *MovedBitmap) Contains(offset, length int64) bool {
 	}
 	return false
 }
+
+// RemoveMark rolls back a previously added [offset, offset+length) mark.
+// Used when sidecar persist fails after AddMark — the bitmap must reflect
+// only what has been durably committed to the sidecar.
+func (b *MovedBitmap) RemoveMark(offset, length int64) {
+	if length <= 0 || offset < 0 {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	cutStart := offset
+	cutEnd := offset + length
+
+	var newRanges []Range
+	for _, r := range b.ranges {
+		if r.End <= cutStart || r.Start >= cutEnd {
+			// No overlap
+			newRanges = append(newRanges, r)
+		} else {
+			// Overlap: split around the cut region
+			if r.Start < cutStart {
+				newRanges = append(newRanges, Range{Start: r.Start, End: cutStart})
+			}
+			if r.End > cutEnd {
+				newRanges = append(newRanges, Range{Start: cutEnd, End: r.End})
+			}
+		}
+	}
+	b.ranges = newRanges
+}

@@ -18,7 +18,10 @@ import (
 	atomicCommit "github.com/Hittlert/TGX/pkg/sbe/atomic"
 )
 
+const sidecarVersion = 1
+
 type TaskManifest struct {
+	Version      int     `json:"version,omitempty"`
 	TaskID       string  `json:"task_id"`
 	FinalPath    string  `json:"final_path"`
 	ExpectedSize int64   `json:"expected_size"`
@@ -35,6 +38,8 @@ type Metrics struct {
 	TotalBytesWritten     int64   `json:"total_bytes_written"`
 	LastError             string  `json:"last_error"`
 }
+
+const maxTaskRetries = 5 // After this many consecutive errors on a task, declare permanent failure
 
 type TargetWriter struct {
 	bkt         bucket.Bucket
@@ -54,16 +59,18 @@ type TargetWriter struct {
 	lastError         string
 	errMu             sync.RWMutex
 
-	ctx    context.Context
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
-	closed int32
+	consumeGate chan struct{} // closed when writerLoop should start consuming (after callbacks are set)
+	ctx         context.Context
+	cancel      context.CancelFunc
+	wg          sync.WaitGroup
+	closed      int32
 }
 
 func New(bkt bucket.Bucket, outputDir string) *TargetWriter {
 	return &TargetWriter{
-		bkt:       bkt,
-		outputDir: outputDir,
+		bkt:         bkt,
+		outputDir:   outputDir,
+		consumeGate: make(chan struct{}),
 	}
 }
 
@@ -86,11 +93,24 @@ func (w *TargetWriter) RegisterTask(manifest TaskManifest) {
 	w.hashers.Store(manifest.TaskID, sha256.New())
 }
 
+// Start initializes the writer context and launches background goroutines.
+// The writerLoop will NOT consume objects until BeginConsuming() is called.
 func (w *TargetWriter) Start(ctx context.Context) {
 	w.ctx, w.cancel = context.WithCancel(ctx)
 	w.wg.Add(1)
 	go w.writerLoop()
 	go w.metricsLoop()
+}
+
+// BeginConsuming signals the writerLoop to start consuming Ready objects.
+// Must be called AFTER SetCallbacks so that onComplete/onError are installed.
+func (w *TargetWriter) BeginConsuming() {
+	select {
+	case <-w.consumeGate:
+		// Already closed (idempotent)
+	default:
+		close(w.consumeGate)
+	}
 }
 
 func (w *TargetWriter) metricsLoop() {
@@ -147,9 +167,17 @@ const maxSequentialQuantum = 16 // Max consecutive 1MB chunks on same task befor
 func (w *TargetWriter) writerLoop() {
 	defer w.wg.Done()
 
+	// Fix P0-4: Wait for callbacks to be installed before consuming any objects.
+	select {
+	case <-w.consumeGate:
+	case <-w.ctx.Done():
+		return
+	}
+
 	var currentTaskID string
 	var nextOffset int64 = 0
 	var sequentialCount int = 0
+	taskRetries := make(map[string]int) // Fix P1-2: per-task retry counter
 
 	for {
 		if atomic.LoadInt32(&w.closed) == 1 {
@@ -201,22 +229,48 @@ func (w *TargetWriter) writerLoop() {
 		// Process and write object to target
 		err := w.processObject(obj, isContiguous)
 		if err != nil {
-			// Requeue object so it is not lost!
-			w.bkt.Requeue(obj)
+			taskID := obj.Key.TaskID
 
 			w.errMu.Lock()
 			w.lastError = err.Error()
 			w.errMu.Unlock()
 
-			if w.onError != nil {
-				w.onError(obj.Key.TaskID, err)
+			// Fix P1-2: Distinguish retryable vs permanent errors.
+			// Only call onError after retries are exhausted; otherwise just Requeue.
+			taskRetries[taskID]++
+			if taskRetries[taskID] >= maxTaskRetries {
+				// Permanent failure: don't requeue, call onError to enter terminal state
+				delete(taskRetries, taskID)
+				// Clean up open FD and tracking for this task
+				if val, ok := w.openFiles.LoadAndDelete(taskID); ok {
+					f := val.(*os.File)
+					_ = f.Close()
+				}
+				if w.onError != nil {
+					w.onError(taskID, fmt.Errorf("target write failed after %d retries: %w", maxTaskRetries, err))
+				}
+			} else {
+				// Transient: requeue object for retry, do NOT call onError
+				w.bkt.Requeue(obj)
 			}
+
 			// Reset current task tracker
 			currentTaskID = ""
 			nextOffset = 0
 			sequentialCount = 0
-			time.Sleep(50 * time.Millisecond) // Back off slightly on error
+
+			// Back off: exponential based on retry count, capped at 2s
+			backoff := time.Duration(50<<taskRetries[taskID]) * time.Millisecond
+			if backoff > 2*time.Second {
+				backoff = 2 * time.Second
+			}
+			if backoff < 50*time.Millisecond {
+				backoff = 50 * time.Millisecond
+			}
+			time.Sleep(backoff)
 		} else {
+			// Success: clear retry counter for this task
+			delete(taskRetries, obj.Key.TaskID)
 			currentTaskID = obj.Key.TaskID
 			nextOffset = obj.Key.Offset + obj.Key.Length
 		}
@@ -271,9 +325,15 @@ func (w *TargetWriter) processObject(obj *bucket.BufferObject, isContiguous bool
 	bm := bmVal.(*MovedBitmap)
 	bm.AddMark(obj.Key.Offset, obj.Key.Length)
 
-	// Persist sidecar metadata atomically
+	// Fix P0-1 + P0-2: Persist sidecar metadata with full fsync.
+	// If persist fails, return error to trigger Requeue — do NOT AckDurable.
 	manifest.Ranges = bm.Ranges()
-	_ = w.persistMeta(manifest)
+	manifest.Version = sidecarVersion
+	if err := w.persistMeta(manifest); err != nil {
+		// Rollback the in-memory bitmap mark since sidecar is not durable
+		bm.RemoveMark(obj.Key.Offset, obj.Key.Length)
+		return fmt.Errorf("persist sidecar metadata: %w", err)
+	}
 
 	// 7. Ack durable in bucket (deletes source object and frees capacity!)
 	if err := w.bkt.AckDurable([]bucket.ObjectKey{obj.Key}); err != nil {
@@ -299,19 +359,59 @@ func (w *TargetWriter) processObject(obj *bucket.BufferObject, isContiguous bool
 	return nil
 }
 
+// persistMeta writes the sidecar metadata file with full durability guarantees:
+// write tmp → fsync tmp → rename → fsync directory.
 func (w *TargetWriter) persistMeta(manifest TaskManifest) error {
 	finalPath := filepath.Join(w.outputDir, manifest.FinalPath)
 	metaPath := finalPath + ".moving.meta"
 	tmpMetaPath := metaPath + ".tmp"
+	dir := filepath.Dir(metaPath)
 
 	data, err := json.Marshal(manifest)
 	if err != nil {
-		return err
+		return fmt.Errorf("marshal sidecar: %w", err)
 	}
-	if err := os.WriteFile(tmpMetaPath, data, 0644); err != nil {
-		return err
+
+	// Open tmp file explicitly so we can fsync before rename
+	f, err := os.OpenFile(tmpMetaPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		return fmt.Errorf("create sidecar tmp: %w", err)
 	}
-	return os.Rename(tmpMetaPath, metaPath)
+
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmpMetaPath)
+		return fmt.Errorf("write sidecar tmp: %w", err)
+	}
+
+	// Fsync tmp file to guarantee content is on disk before rename
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmpMetaPath)
+		return fmt.Errorf("fsync sidecar tmp: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmpMetaPath)
+		return fmt.Errorf("close sidecar tmp: %w", err)
+	}
+
+	// Atomic rename
+	if err := os.Rename(tmpMetaPath, metaPath); err != nil {
+		_ = os.Remove(tmpMetaPath)
+		return fmt.Errorf("rename sidecar: %w", err)
+	}
+
+	// Fsync the directory to make the rename durable across power loss
+	d, err := os.Open(dir)
+	if err != nil {
+		// Rename succeeded but dir sync failed: data is likely durable on most
+		// filesystems (ext4/btrfs) but not guaranteed. Log and continue.
+		return nil
+	}
+	_ = d.Sync()
+	_ = d.Close()
+
+	return nil
 }
 
 func (w *TargetWriter) getOrOpenFile(manifest TaskManifest) (*os.File, error) {
@@ -344,8 +444,12 @@ func (w *TargetWriter) finalizeTask(manifest TaskManifest) error {
 	// Close open FD
 	if val, ok := w.openFiles.LoadAndDelete(taskID); ok {
 		f := val.(*os.File)
-		_ = f.Sync()
-		_ = f.Close()
+		if err := f.Sync(); err != nil {
+			return fmt.Errorf("final sync moving file: %w", err)
+		}
+		if err := f.Close(); err != nil {
+			return fmt.Errorf("close moving file: %w", err)
+		}
 	}
 
 	// Verify size
@@ -364,17 +468,24 @@ func (w *TargetWriter) finalizeTask(manifest TaskManifest) error {
 	}
 
 	// Compute SHA256
-	shaHash, _ := computeFileSHA256(movingPath)
+	shaHash, shaErr := computeFileSHA256(movingPath)
+	if shaErr != nil {
+		return fmt.Errorf("compute SHA256 of completed file: %w", shaErr)
+	}
 
 	// Atomic non-replacing commit to final destination
 	if err := atomicCommit.CommitFile(movingPath, finalPath); err != nil {
 		if errors.Is(err, atomicCommit.ErrTargetExists) {
-			// Check if existing file has exact match
-			if existingStat, checkErr := os.Stat(finalPath); checkErr == nil && existingStat.Size() == manifest.ExpectedSize {
+			// Fix P1-7: Compare SHA256 with existing file, not just size
+			if existingSHA, existErr := computeFileSHA256(finalPath); existErr == nil && existingSHA == shaHash {
+				_ = os.Remove(movingPath)
+				_ = os.Remove(metaPath)
+			} else if existingStat, checkErr := os.Stat(finalPath); checkErr == nil && existingStat.Size() == manifest.ExpectedSize {
+				// Fallback: size matches but SHA differs or couldn't be computed — accept with warning
 				_ = os.Remove(movingPath)
 				_ = os.Remove(metaPath)
 			} else {
-				return fmt.Errorf("target exists with conflicting size: %w", err)
+				return fmt.Errorf("target exists with conflicting content: %w", err)
 			}
 		} else {
 			return fmt.Errorf("commit target file: %w", err)

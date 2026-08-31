@@ -86,6 +86,7 @@ type byteEvent struct {
 type taskState struct {
 	request       TaskRequest
 	state         TaskState
+	attemptGen    string // generation ID for this attempt, set once at Submit time
 	fileName      string
 	totalSize     int64
 	downloaded    int64
@@ -189,8 +190,10 @@ func (r *Registry) Submit(request TaskRequest) (TaskSnapshot, bool, error) {
 			}
 			now := r.now()
 			taskCtx, taskCancel := context.WithCancel(pCtx)
+			// Fix P1-1: Generate a unique attemptGen for this retry attempt
 			*existing = taskState{
 				request: request, state: StateQueued, totalSize: request.ExpectedSize, createdAt: now,
+				attemptGen: fmt.Sprintf("retry_%d", now.UnixNano()),
 				ctx: taskCtx, cancel: taskCancel,
 			}
 			r.removeTerminalLocked(request.ID)
@@ -207,6 +210,7 @@ func (r *Registry) Submit(request TaskRequest) (TaskSnapshot, bool, error) {
 	taskCtx, taskCancel := context.WithCancel(pCtx)
 	state := &taskState{
 		request: request, state: StateQueued, totalSize: request.ExpectedSize, createdAt: now,
+		attemptGen: "1", // First attempt always uses generation "1"
 		ctx: taskCtx, cancel: taskCancel,
 	}
 	r.tasks[request.ID] = state
@@ -321,6 +325,16 @@ func (r *Registry) Status() StatusSnapshot {
 
 func (t *Task) Request() TaskRequest {
 	return t.state.request
+}
+
+// AttemptGen returns the generation ID for this task attempt.
+// Set once at Submit time: "1" for first attempt, "retry_<nanos>" for retries.
+func (t *Task) AttemptGen() string {
+	gen := t.state.attemptGen
+	if gen == "" {
+		return "1"
+	}
+	return gen
 }
 
 func (t *Task) Snapshot() TaskSnapshot {

@@ -76,10 +76,8 @@ func newBucketFileElement(
 	bkt bucket.Bucket,
 	tw *targetwriter.TargetWriter,
 ) (*bucketFileElement, error) {
-	gen := "1"
-	if task.Request().Retry {
-		gen = fmt.Sprintf("retry_%d", time.Now().UnixNano())
-	}
+	// Fix P1-1: Use generation from task state, not the cleared Retry bool
+	gen := task.AttemptGen()
 	manifest := targetwriter.TaskManifest{
 		TaskID:       task.Request().ID,
 		FinalPath:    task.Request().FinalPath,
@@ -341,10 +339,8 @@ func newLazySmallFileElement(
 	bkt bucket.Bucket,
 	tw *targetwriter.TargetWriter,
 ) (*lazySmallFileElement, error) {
-	gen := "1"
-	if task.Request().Retry {
-		gen = fmt.Sprintf("retry_%d", time.Now().UnixNano())
-	}
+	// Fix P1-1: Use generation from task state, not the cleared Retry bool
+	gen := task.AttemptGen()
 	if tw != nil {
 		manifest := targetwriter.TaskManifest{
 			TaskID:       task.Request().ID,
@@ -399,10 +395,8 @@ func (e *lazySmallFileElement) Publish() (result PublishResult, resultErr error)
 	shaHash := hex.EncodeToString(hashBytes[:])
 
 	if e.bkt != nil && e.tw != nil {
-		gen := "1"
-		if e.task.Request().Retry {
-			gen = fmt.Sprintf("retry_%d", time.Now().UnixNano())
-		}
+		// Fix P1-1: Use generation from task state
+		gen := e.task.AttemptGen()
 		key := bucket.ObjectKey{
 			TaskID:           e.task.Request().ID,
 			Gen:              gen,

@@ -255,7 +255,13 @@ func Run(ctx context.Context, client *telegram.Client, kvd storage.Storage, opts
 		orchestrator.SetBufferDir(opts.BufferDir)
 		orchestrator.SetBucket(bkt)
 		orchestrator.SetTargetWriter(tw)
-		orchestrator.Start(groupCtx)
+		orchestrator.Start(groupCtx) // This installs TargetWriter callbacks
+
+		// Fix P0-4: Only now allow TargetWriter to start consuming objects,
+		// after callbacks are installed by orchestrator.Start().
+		if tw != nil {
+			tw.BeginConsuming()
+		}
 
 		// Start MTProto Real-Time Push Updates Streaming Engine
 		updatesStream := NewUpdatesStream(db, orchestrator, logctx.From(ctx))

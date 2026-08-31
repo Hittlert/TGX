@@ -262,12 +262,18 @@ func (o *Orchestrator) dispatchOneRecord(ctx context.Context, record DownloadRec
 		}
 
 		// 3. Acquire slot only for large files (> 1MB / non-photo)
-		if record.FileSize > downloader.SmallFileThreshold || (record.FileSize <= 0 && record.MediaType != "photo") {
+		isLargeFile := record.FileSize > downloader.SmallFileThreshold || (record.FileSize <= 0 && record.MediaType != "photo")
+		var slotOnce sync.Once
+		releaseSlot := func() {} // no-op for small files
+		if isLargeFile {
 			_, err = o.slotPool.Acquire(taskCtx, taskID, record.FileSize)
 			if err != nil {
 				return
 			}
-			defer o.slotPool.Release(taskID)
+			// Fix P1-3: Use sync.Once to release slot exactly once.
+			// Slot is released when task enters moving (AsyncMoving) OR on return.
+			releaseSlot = func() { slotOnce.Do(func() { o.slotPool.Release(taskID) }) }
+			defer releaseSlot()
 		}
 
 		folderName := record.TargetTitle
@@ -346,6 +352,11 @@ func (o *Orchestrator) dispatchOneRecord(ctx context.Context, record DownloadRec
 			if snapshot.State == StatePublishing && !recordedMoving {
 				recordedMoving = true
 				_ = o.db.UpdateDownloadStatus(record.ChatID, record.MessageID, "moving", record.FileName, finalRelPath, record.MediaType, record.FileSize, "")
+				// Fix P1-3: Release network/file slot immediately when entering moving.
+				// TargetWriter will handle the rest; network can serve other files now.
+				if isLargeFile {
+					releaseSlot()
+				}
 			}
 
 			if snapshot.State == StateSuccess {

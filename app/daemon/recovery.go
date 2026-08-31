@@ -127,14 +127,64 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) ([]TaskRecoveryResult, er
 			if metaErr == nil {
 				var manifest targetwriter.TaskManifest
 				if json.Unmarshal(metaData, &manifest) == nil && r.tw != nil {
-					r.tw.RegisterTask(manifest)
-					results = append(results, TaskRecoveryResult{
-						FileKey:     fileKey,
-						PrevState:   rec.Status,
-						NextState:   "moving",
-						ActionTaken: "SSD_BUFFER_RESUMED_IN_TARGET_WRITER",
-					})
-					continue
+					// Fix P0-3: Validate .moving file and sidecar ranges consistency
+					valid := true
+					reason := ""
+
+					// 1. TaskID must match
+					if manifest.TaskID != fileKey {
+						valid = false
+						reason = "taskID mismatch"
+					}
+
+					// 2. .moving file must exist
+					movingStat, movingStatErr := os.Stat(movingPath)
+					if movingStatErr != nil {
+						valid = false
+						reason = ".moving file missing"
+					}
+
+					// 3. Validate ranges
+					if valid {
+						var maxEnd int64
+						for _, rng := range manifest.Ranges {
+							if rng.Start < 0 || rng.End <= rng.Start {
+								valid = false
+								reason = "invalid range bounds"
+								break
+							}
+							if manifest.ExpectedSize > 0 && rng.End > manifest.ExpectedSize {
+								valid = false
+								reason = "range exceeds expected size"
+								break
+							}
+							if rng.End > maxEnd {
+								maxEnd = rng.End
+							}
+						}
+						// .moving must be at least as large as the highest durable range
+						if valid && movingStat.Size() < maxEnd {
+							valid = false
+							reason = fmt.Sprintf(".moving size %d < max range end %d", movingStat.Size(), maxEnd)
+						}
+					}
+
+					if valid {
+						r.tw.RegisterTask(manifest)
+						results = append(results, TaskRecoveryResult{
+							FileKey:     fileKey,
+							PrevState:   rec.Status,
+							NextState:   "moving",
+							ActionTaken: "SSD_BUFFER_RESUMED_IN_TARGET_WRITER",
+						})
+						continue
+					}
+
+					// Invalid sidecar: clean up and fall through to reset
+					r.logger.Warn("invalid sidecar metadata, resetting task",
+						zap.String("task", fileKey), zap.String("reason", reason))
+					_ = os.Remove(movingPath)
+					_ = os.Remove(metaPath)
 				}
 			}
 

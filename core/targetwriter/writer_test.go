@@ -34,6 +34,7 @@ func TestTargetWriter_OutOfOrderAndContiguous(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	tw.Start(ctx)
+	tw.BeginConsuming()
 	defer tw.Close()
 
 	// 1. Prepare 3 chunks for a 3MB file

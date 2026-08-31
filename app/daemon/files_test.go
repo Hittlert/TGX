@@ -180,6 +180,7 @@ func TestBucketFileElement_BucketAndTargetWriterIntegration(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	tw.Start(ctx)
+	tw.BeginConsuming()
 	defer tw.Close()
 
 	registry := NewRegistry(1, 100, nil)
