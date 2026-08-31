@@ -504,18 +504,47 @@ func (r *Registry) finish(state *taskState, status TaskState, class, message, fi
 	}
 }
 
-func (r *Registry) FinishTask(id, gen string, status TaskState, class, message, finalPath string, already bool, sha256 string) {
+// FinishTask attempts to transition a task to terminal state.
+// Returns true if the transition was accepted (generation matches current attempt).
+// Returns false if rejected (stale generation or unknown task).
+// The generation check and state transition happen atomically under the same lock.
+func (r *Registry) FinishTask(id, gen string, status TaskState, class, message, finalPath string, already bool, sha256 string) bool {
 	r.mu.Lock()
+	defer r.mu.Unlock()
 	state, ok := r.tasks[id]
-	r.mu.Unlock()
-	if ok && state != nil {
-		// Generation guard: only allow the current attempt to reach terminal state.
-		// Stale generation callbacks (from old pendingFinalize) are silently rejected.
-		if gen != "" && state.attemptGen != gen {
-			return
-		}
-		r.finish(state, status, class, message, finalPath, already, sha256)
+	if !ok || state == nil {
+		return false
 	}
+	// Generation guard: reject stale attempt callbacks.
+	// Empty gen in callback is never accepted (would bypass the guard).
+	if gen == "" || state.attemptGen != gen {
+		return false
+	}
+	if isTerminal(state.state) {
+		return false
+	}
+	state.state = status
+	state.errorClass = class
+	state.errorText = message
+	state.alreadyExists = already
+	state.sha256 = sha256
+	state.finishedAt = r.now()
+	if isTerminal(status) && state.cancel != nil {
+		state.cancel()
+	}
+	if finalPath != "" {
+		state.request.FinalPath = finalPath
+	}
+	if message != "" {
+		r.lastError = message
+	}
+	r.terminalOrder = append(r.terminalOrder, state.request.ID)
+	for len(r.terminalOrder) > r.terminalLimit {
+		oldest := r.terminalOrder[0]
+		r.terminalOrder = r.terminalOrder[1:]
+		delete(r.tasks, oldest)
+	}
+	return true
 }
 
 func (r *Registry) Cancel(id string, reason string) {

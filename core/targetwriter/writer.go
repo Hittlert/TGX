@@ -10,7 +10,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -19,7 +18,15 @@ import (
 	atomicCommit "github.com/Hittlert/TGX/pkg/sbe/atomic"
 )
 
-const sidecarVersion = 1
+const SidecarVersion = 1
+
+// Permanent finalize errors — these will never succeed on retry.
+var (
+	// ErrContentConflict indicates target exists with different SHA256.
+	ErrContentConflict = errors.New("target content conflict")
+	// ErrSizeMismatch indicates .moving file size does not match expected.
+	ErrSizeMismatch = errors.New("moving file size mismatch")
+)
 
 type TaskManifest struct {
 	Version      int     `json:"version,omitempty"`
@@ -51,7 +58,7 @@ const (
 	phaseDurableOK         processPhase = iota // Object durable, source deleted, all good
 	phaseObjectRetryable                       // Error before AckDurable: source exists, safe to Requeue
 	phaseFinalizeRetryable                     // Error after AckDurable (in finalize): must not Requeue source
-	phaseStaleDiscarded                        // Object from old generation: silently consumed
+	phaseStaleDiscarded                        // Object from old generation or completed task: silently consumed
 )
 
 type processResult struct {
@@ -63,10 +70,12 @@ type TargetWriter struct {
 	bkt       bucket.Bucket
 	outputDir string
 
-	manifests       sync.Map // taskID → TaskManifest (exactly one generation per taskID)
-	bitmaps         sync.Map // taskID → *MovedBitmap
-	openFiles       sync.Map // taskID → *os.File
-	pendingFinalize sync.Map // taskID → TaskManifest (complete bitmap awaiting finalize)
+	manifests            sync.Map // taskID → TaskManifest (exactly one generation per taskID)
+	bitmaps              sync.Map // taskID → *MovedBitmap
+	openFiles            sync.Map // taskID → *os.File
+	pendingFinalize      sync.Map // taskID → TaskManifest (complete bitmap awaiting finalize)
+	pendingFinalizeNext  sync.Map // taskID → time.Time (next allowed retry for transient finalize)
+	completedTasks       sync.Map // taskID → gen (tasks finalized, leftover Ready objects can be safely Acked)
 
 	onComplete func(taskID, gen, finalPath string, shaHash string)
 	onProgress func(taskID string, movedBytes, totalBytes int64)
@@ -105,6 +114,12 @@ func (w *TargetWriter) SetCallbacks(
 	w.onError = onError
 }
 
+// MarkTaskCompleted marks a task as finalized so any leftover buffer objects
+// for this task can be safely acknowledged and discarded without infinite requeue.
+func (w *TargetWriter) MarkTaskCompleted(taskID, gen string) {
+	w.completedTasks.Store(taskID, gen)
+}
+
 // RegisterTask registers or re-registers a task manifest for target writing.
 //
 // Generation isolation: if a manifest already exists with a different generation,
@@ -116,6 +131,8 @@ func (w *TargetWriter) SetCallbacks(
 // This handles the crash-after-last-Ack-before-finalize recovery case where
 // no more Ready objects will arrive to trigger finalize.
 func (w *TargetWriter) RegisterTask(manifest TaskManifest) {
+	w.completedTasks.Delete(manifest.TaskID)
+
 	// Generation isolation: clear stale state from previous attempt
 	if val, ok := w.manifests.Load(manifest.TaskID); ok {
 		old := val.(TaskManifest)
@@ -126,11 +143,23 @@ func (w *TargetWriter) RegisterTask(manifest TaskManifest) {
 				_ = fVal.(*os.File).Close()
 			}
 			w.pendingFinalize.Delete(manifest.TaskID)
+			w.pendingFinalizeNext.Delete(manifest.TaskID)
 		} else {
-			// Same generation re-register: update manifest but do NOT rebuild bitmap.
-			// This preserves durable ranges recovered from sidecar or written since first register.
-			w.manifests.Store(manifest.TaskID, manifest)
-			return
+			// Same generation re-register:
+			// If FinalPath or ExpectedSize changed (unexpected identity conflict), clean up old state and rebuild.
+			if old.FinalPath != manifest.FinalPath || old.ExpectedSize != manifest.ExpectedSize {
+				w.bitmaps.Delete(manifest.TaskID)
+				if fVal, fOk := w.openFiles.LoadAndDelete(manifest.TaskID); fOk {
+					_ = fVal.(*os.File).Close()
+				}
+				w.pendingFinalize.Delete(manifest.TaskID)
+				w.pendingFinalizeNext.Delete(manifest.TaskID)
+			} else {
+				// Same identity: update manifest but do NOT rebuild bitmap.
+				// This preserves durable ranges recovered from sidecar or written since first register.
+				w.manifests.Store(manifest.TaskID, manifest)
+				return
+			}
 		}
 	}
 
@@ -317,42 +346,52 @@ func (w *TargetWriter) writerLoop() {
 // drainPendingFinalizes attempts to finalize all tasks that have complete
 // bitmaps but haven't been finalized yet.
 // Permanent errors (content conflict, size mismatch) trigger onError and removal.
-// Transient errors (IO, sync) leave the task in the queue for the next iteration.
+// Transient errors use per-task backoff to avoid tight-loop SHA recomputation.
 func (w *TargetWriter) drainPendingFinalizes() {
+	now := time.Now()
 	w.pendingFinalize.Range(func(key, value any) bool {
 		taskID := key.(string)
 		manifest := value.(TaskManifest)
+
+		// Per-task backoff: skip if not yet eligible for retry
+		if nextVal, ok := w.pendingFinalizeNext.Load(taskID); ok {
+			if now.Before(nextVal.(time.Time)) {
+				return true // skip, still in backoff
+			}
+		}
+
 		if err := w.finalizeTask(manifest); err != nil {
 			w.setLastError(err)
 			if isFinalizePermError(err) {
 				// Permanent: content conflict or irrecoverable. Enter terminal state.
 				w.pendingFinalize.Delete(taskID)
+				w.pendingFinalizeNext.Delete(taskID)
 				w.manifests.Delete(taskID)
 				w.bitmaps.Delete(taskID)
 				if w.onError != nil {
 					w.onError(taskID, manifest.Gen, fmt.Errorf("permanent finalize error: %w", err))
 				}
+			} else {
+				// Transient: backoff 5s before next retry to avoid tight-loop SHA
+				w.pendingFinalizeNext.Store(taskID, now.Add(5*time.Second))
 			}
-			// Transient: leave in pendingFinalize for retry
 		} else {
 			w.pendingFinalize.Delete(taskID)
+			w.pendingFinalizeNext.Delete(taskID)
 		}
 		return true
 	})
 }
 
 // isFinalizePermError returns true for errors that will never succeed on retry.
+// Uses typed sentinel errors instead of string matching for reliable classification.
 func isFinalizePermError(err error) bool {
-	msg := err.Error()
-	// Content conflict: SHA mismatch with existing target
-	if strings.Contains(msg, "different content") {
+	if errors.Is(err, ErrContentConflict) {
 		return true
 	}
-	// Size mismatch: .moving file corrupted
-	if strings.Contains(msg, "does not match expected") {
+	if errors.Is(err, ErrSizeMismatch) {
 		return true
 	}
-	// Permission denied
 	if errors.Is(err, os.ErrPermission) {
 		return true
 	}
@@ -370,6 +409,11 @@ func (w *TargetWriter) processObject(obj *bucket.BufferObject, isContiguous bool
 	// Phase 1: Look up task manifest
 	val, ok := w.manifests.Load(taskID)
 	if !ok {
+		// If task was already completed and finalized, safely consume and delete leftover object
+		if _, completed := w.completedTasks.Load(taskID); completed {
+			_ = w.bkt.AckDurable([]bucket.ObjectKey{obj.Key})
+			return processResult{phase: phaseStaleDiscarded}
+		}
 		return processResult{phaseObjectRetryable, errors.New("task manifest not registered yet")}
 	}
 	manifest := val.(TaskManifest)
@@ -422,7 +466,7 @@ func (w *TargetWriter) processObject(obj *bucket.BufferObject, isContiguous bool
 	bm.AddMark(obj.Key.Offset, obj.Key.Length)
 
 	manifest.Ranges = bm.Ranges()
-	manifest.Version = sidecarVersion
+	manifest.Version = SidecarVersion
 	if err := w.persistMeta(manifest); err != nil {
 		// Sidecar not durable: restore bitmap to match the persisted state
 		bm.Restore(snapshot)
@@ -563,7 +607,7 @@ func (w *TargetWriter) finalizeTask(manifest TaskManifest) error {
 		return fmt.Errorf("stat completed moving file: %w", err)
 	}
 	if manifest.ExpectedSize > 0 && stat.Size() != manifest.ExpectedSize {
-		return fmt.Errorf("final size %d does not match expected %d", stat.Size(), manifest.ExpectedSize)
+		return fmt.Errorf("final size %d does not match expected %d: %w", stat.Size(), manifest.ExpectedSize, ErrSizeMismatch)
 	}
 
 	// Set modification time
@@ -588,8 +632,8 @@ func (w *TargetWriter) finalizeTask(manifest TaskManifest) error {
 				_ = os.Remove(movingPath)
 				_ = os.Remove(metaPath)
 			} else {
-				return fmt.Errorf("target exists with different content (existing_sha=%s, new_sha=%s): %w",
-					existingSHA, shaHash, err)
+			return fmt.Errorf("existing_sha=%s, new_sha=%s: %w",
+					existingSHA, shaHash, ErrContentConflict)
 			}
 		} else {
 			return fmt.Errorf("commit target file: %w", err)
@@ -598,10 +642,19 @@ func (w *TargetWriter) finalizeTask(manifest TaskManifest) error {
 
 	_ = os.Remove(metaPath)
 
-	// Clean tracking state
-	w.manifests.Delete(taskID)
-	w.bitmaps.Delete(taskID)
-	w.pendingFinalize.Delete(taskID)
+	// Clean tracking state — only if current generation still matches.
+	// A concurrent RegisterTask may have installed a new generation;
+	// deleting that state would corrupt the new attempt.
+	if curVal, ok := w.manifests.Load(taskID); ok {
+		cur := curVal.(TaskManifest)
+		if cur.Gen == manifest.Gen {
+			w.manifests.Delete(taskID)
+			w.bitmaps.Delete(taskID)
+			w.pendingFinalize.Delete(taskID)
+			w.pendingFinalizeNext.Delete(taskID)
+			w.completedTasks.Store(taskID, manifest.Gen)
+		}
+	}
 
 	if w.onComplete != nil {
 		w.onComplete(taskID, manifest.Gen, manifest.FinalPath, shaHash)

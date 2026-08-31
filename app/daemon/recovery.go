@@ -99,6 +99,9 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) ([]TaskRecoveryResult, er
 		_, movingExists := os.Stat(movingPath)
 		if err == nil && stat.Size() == rec.FileSize && rec.FileSize > 0 && movingExists != nil {
 			_ = os.Remove(metaPath)
+			if r.tw != nil {
+				r.tw.MarkTaskCompleted(fileKey, "")
+			}
 			_, _ = r.db.ExecContext(ctx, `UPDATE download_records SET status = 'success', error = '' WHERE chat_id = ? AND message_id = ?`, rec.ChatID, rec.MessageID)
 			results = append(results, TaskRecoveryResult{
 				FileKey:     fileKey,
@@ -133,8 +136,14 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) ([]TaskRecoveryResult, er
 					valid := true
 					reason := ""
 
+					// Version: must match sidecar version
+					if manifest.Version > 0 && manifest.Version != targetwriter.SidecarVersion {
+						valid = false
+						reason = fmt.Sprintf("unsupported sidecar version %d", manifest.Version)
+					}
+
 					// Identity: taskID, finalPath and expectedSize must match DB record
-					if manifest.TaskID != fileKey {
+					if valid && manifest.TaskID != fileKey {
 						valid = false
 						reason = "taskID mismatch"
 					}

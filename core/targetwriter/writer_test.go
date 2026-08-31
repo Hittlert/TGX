@@ -84,3 +84,108 @@ func TestTargetWriter_OutOfOrderAndContiguous(t *testing.T) {
 	assert.Equal(t, totalSize, m.TotalBytesWritten)
 	assert.Empty(t, m.LastError)
 }
+
+func TestTargetWriter_LeftoverObjectAfterComplete(t *testing.T) {
+	tempDir := t.TempDir()
+	outDir := filepath.Join(tempDir, "output")
+	require.NoError(t, os.MkdirAll(outDir, 0755))
+
+	bkt, err := bucket.New(bucket.Config{Mode: bucket.ModeMemory, MaxCapacity: 10 * 1024 * 1024})
+	require.NoError(t, err)
+	defer bkt.Close()
+
+	tw := New(bkt, outDir)
+
+	completeChan := make(chan string, 1)
+	tw.SetCallbacks(func(taskID, gen, finalPath, shaHash string) {
+		completeChan <- finalPath
+	}, nil, nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	tw.Start(ctx)
+	tw.BeginConsuming()
+	defer tw.Close()
+
+	totalSize := int64(1024 * 1024)
+	data := make([]byte, totalSize)
+	_, _ = rand.Read(data)
+
+	manifest := TaskManifest{
+		TaskID:       "task-completed",
+		FinalPath:    "doc.bin",
+		ExpectedSize: totalSize,
+		Gen:          "1",
+	}
+	tw.RegisterTask(manifest)
+
+	key0 := bucket.ObjectKey{TaskID: manifest.TaskID, Gen: "1", Offset: 0, Length: totalSize}
+	require.NoError(t, bkt.Reserve(ctx, totalSize))
+	require.NoError(t, bkt.PutObject(key0, data))
+
+	select {
+	case <-completeChan:
+	case <-time.After(3 * time.Second):
+		t.Fatal("task did not complete in time")
+	}
+
+	// Now put a leftover object for the completed task
+	leftoverData := make([]byte, 512)
+	keyLeftover := bucket.ObjectKey{TaskID: manifest.TaskID, Gen: "1", Offset: 0, Length: int64(len(leftoverData))}
+	require.NoError(t, bkt.Reserve(ctx, keyLeftover.Length))
+	require.NoError(t, bkt.PutObject(keyLeftover, leftoverData))
+
+	// Leftover object should be consumed and deleted by TargetWriter without blocking
+	require.Eventually(t, func() bool {
+		m := bkt.Metrics()
+		return m.ReadyBytes == 0 && m.PendingDeleteBytes == 0
+	}, 2*time.Second, 20*time.Millisecond)
+}
+
+func TestTargetWriter_ContentConflict(t *testing.T) {
+	tempDir := t.TempDir()
+	outDir := filepath.Join(tempDir, "output")
+	require.NoError(t, os.MkdirAll(outDir, 0755))
+
+	// Pre-create destination file with different content
+	finalPath := filepath.Join(outDir, "conflict.bin")
+	require.NoError(t, os.WriteFile(finalPath, []byte("existing-different-content"), 0644))
+
+	bkt, err := bucket.New(bucket.Config{Mode: bucket.ModeMemory, MaxCapacity: 10 * 1024 * 1024})
+	require.NoError(t, err)
+	defer bkt.Close()
+
+	tw := New(bkt, outDir)
+
+	errChan := make(chan error, 1)
+	tw.SetCallbacks(nil, nil, func(taskID, gen string, err error) {
+		errChan <- err
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	tw.Start(ctx)
+	tw.BeginConsuming()
+	defer tw.Close()
+
+	data := []byte("new-different-content-12345")
+	manifest := TaskManifest{
+		TaskID:       "task-conflict",
+		FinalPath:    "conflict.bin",
+		ExpectedSize: int64(len(data)),
+		Gen:          "1",
+	}
+	tw.RegisterTask(manifest)
+
+	key := bucket.ObjectKey{TaskID: manifest.TaskID, Gen: "1", Offset: 0, Length: int64(len(data))}
+	require.NoError(t, bkt.Reserve(ctx, key.Length))
+	require.NoError(t, bkt.PutObject(key, data))
+
+	select {
+	case err := <-errChan:
+		require.ErrorIs(t, err, ErrContentConflict)
+	case <-time.After(3 * time.Second):
+		t.Fatal("expected content conflict error callback")
+	}
+}
+

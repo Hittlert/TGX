@@ -107,6 +107,103 @@ func TestBucket_SSDPutReadAndRecovery(t *testing.T) {
 	assert.Equal(t, chunkData, data)
 }
 
+func TestBucket_LateOlderGenerationRejected(t *testing.T) {
+	b, err := New(Config{Mode: ModeMemory, MaxCapacity: 10 * 1024 * 1024})
+	require.NoError(t, err)
+	defer b.Close()
+
+	ctx := context.Background()
+	dataNew := []byte("new-generation-data")
+	dataOld := []byte("old-generation-data")
+
+	keyNew := ObjectKey{
+		TaskID:   "task-gen",
+		Gen:      "retry_2000",
+		Offset:   0,
+		Length:   int64(len(dataNew)),
+		Checksum: crc32.ChecksumIEEE(dataNew),
+	}
+
+	keyOld := ObjectKey{
+		TaskID:   "task-gen",
+		Gen:      "retry_1000",
+		Offset:   0,
+		Length:   int64(len(dataOld)),
+		Checksum: crc32.ChecksumIEEE(dataOld),
+	}
+
+	// 1. Put newer generation object first
+	require.NoError(t, b.Reserve(ctx, keyNew.Length))
+	require.NoError(t, b.PutObject(keyNew, dataNew))
+
+	m := b.Metrics()
+	assert.Equal(t, int64(0), m.ReservedBytes)
+	assert.Equal(t, keyNew.Length, m.ReadyBytes)
+	assert.Equal(t, int64(1), m.ObjectCount)
+
+	// 2. Late older generation object arrives
+	require.NoError(t, b.Reserve(ctx, keyOld.Length))
+	require.NoError(t, b.PutObject(keyOld, dataOld))
+
+	// Metrics should show reserved bytes released, and keyNew still in place
+	m = b.Metrics()
+	assert.Equal(t, int64(0), m.ReservedBytes)
+	assert.Equal(t, keyNew.Length, m.ReadyBytes)
+	assert.Equal(t, int64(1), m.ObjectCount)
+
+	// 3. TakeReady should return the newer object
+	obj, ok := b.TakeReady()
+	require.True(t, ok)
+	assert.Equal(t, keyNew.Gen, obj.Key.Gen)
+	assert.Equal(t, dataNew, obj.Data)
+}
+
+func TestBucket_MultiGenRecovery(t *testing.T) {
+	tempDir := t.TempDir()
+	b, err := New(Config{Mode: ModeSSD, RootDir: tempDir, MaxCapacity: 50 * 1024 * 1024})
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	data1 := []byte("chunk-gen-1")
+	key1 := ObjectKey{
+		TaskID:   "task-multigen",
+		Gen:      "1",
+		Offset:   0,
+		Length:   int64(len(data1)),
+		Checksum: crc32.ChecksumIEEE(data1),
+	}
+
+	data2 := []byte("chunk-gen-retry")
+	key2 := ObjectKey{
+		TaskID:   "task-multigen",
+		Gen:      "retry_5000",
+		Offset:   0,
+		Length:   int64(len(data2)),
+		Checksum: crc32.ChecksumIEEE(data2),
+	}
+
+	require.NoError(t, b.Reserve(ctx, key1.Length))
+	require.NoError(t, b.PutObject(key1, data1))
+	require.NoError(t, b.Reserve(ctx, key2.Length))
+	require.NoError(t, b.PutObject(key2, data2))
+
+	require.NoError(t, b.Close())
+
+	// Recover
+	b2, err := New(Config{Mode: ModeSSD, RootDir: tempDir, MaxCapacity: 50 * 1024 * 1024})
+	require.NoError(t, err)
+	defer b2.Close()
+
+	require.NoError(t, b2.Recover(ctx))
+	m := b2.Metrics()
+	assert.Equal(t, int64(1), m.ObjectCount)
+	assert.Equal(t, key2.Length, m.ReadyBytes)
+
+	obj, ok := b2.TakeReady()
+	require.True(t, ok)
+	assert.Equal(t, key2.Gen, obj.Key.Gen)
+}
+
 func TestBucket_CapacityBackpressure(t *testing.T) {
 	b, err := New(Config{Mode: ModeMemory, MaxCapacity: 2 * 1024 * 1024}) // 2MB
 	require.NoError(t, err)
@@ -136,3 +233,5 @@ func TestBucket_CapacityBackpressure(t *testing.T) {
 		t.Fatal("backpressure reserve did not unblock")
 	}
 }
+
+

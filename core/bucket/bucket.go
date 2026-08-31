@@ -7,6 +7,7 @@ import (
 	"hash/crc32"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -211,17 +212,28 @@ func (b *bucketImpl) PutObject(key ObjectKey, data []byte) error {
 	}
 
 	b.mu.Lock()
-	// Idempotency check: if object with same key already exists, release the
-	// caller's reservation (since it won't become a new ready object) and return nil.
+	// Idempotency & generation check:
 	if taskMap, ok := b.readyByTask[key.TaskID]; ok {
-		if entry, exists := taskMap[key.Offset]; exists && entry.obj.Key.Gen == key.Gen && entry.obj.Key.Checksum == key.Checksum {
-			// Duplicate object: release the caller's reservation to prevent capacity leak
-			if b.reservedBytes >= key.Length {
-				b.reservedBytes -= key.Length
+		if entry, exists := taskMap[key.Offset]; exists {
+			// 1. Exact duplicate object: release caller's reservation and return nil.
+			if entry.obj.Key.Gen == key.Gen && entry.obj.Key.Checksum == key.Checksum {
+				if b.reservedBytes >= key.Length {
+					b.reservedBytes -= key.Length
+				}
+				b.notifyWaitersLocked()
+				b.mu.Unlock()
+				return nil
 			}
-			b.notifyWaitersLocked()
-			b.mu.Unlock()
-			return nil
+			// 2. Late older-generation object: do not overwrite newer valid object.
+			// Release caller's reservation and drop the stale object.
+			if isNewerGeneration(entry.obj.Key.Gen, key.Gen) {
+				if b.reservedBytes >= key.Length {
+					b.reservedBytes -= key.Length
+				}
+				b.notifyWaitersLocked()
+				b.mu.Unlock()
+				return nil
+			}
 		}
 	}
 	b.mu.Unlock()
@@ -571,6 +583,25 @@ func (b *bucketImpl) Recover(ctx context.Context) error {
 			b.readyByTask[taskID] = taskMap
 			b.taskOrder = append(b.taskOrder, taskID)
 		}
+
+		if existing, exists := taskMap[offset]; exists {
+			if isNewerGeneration(gen, existing.obj.Key.Gen) {
+				// Scanned file is from a newer generation than previously encountered entry:
+				// Delete older file on disk and replace entry in index
+				_ = os.Remove(existing.obj.DiskPath)
+				b.readyBytes -= existing.obj.Key.Length
+				b.readyBytes += length
+				taskMap[offset] = &readyEntry{
+					obj:     obj,
+					addedAt: info.ModTime(),
+				}
+			} else {
+				// Scanned file is older or duplicate: remove orphan file
+				_ = os.Remove(path)
+			}
+			return nil
+		}
+
 		taskMap[offset] = &readyEntry{
 			obj:     obj,
 			addedAt: info.ModTime(),
@@ -579,6 +610,32 @@ func (b *bucketImpl) Recover(ctx context.Context) error {
 		b.objectCount++
 		return nil
 	})
+}
+
+// isNewerGeneration returns true if generation a is newer than generation b.
+func isNewerGeneration(a, b string) bool {
+	if a == b {
+		return false
+	}
+	if a == "" {
+		return false
+	}
+	if b == "" {
+		return true
+	}
+	if a == "1" && strings.HasPrefix(b, "retry_") {
+		return false
+	}
+	if b == "1" && strings.HasPrefix(a, "retry_") {
+		return true
+	}
+	var tsA, tsB int64
+	if n, _ := fmt.Sscanf(a, "retry_%d", &tsA); n == 1 {
+		if n2, _ := fmt.Sscanf(b, "retry_%d", &tsB); n2 == 1 {
+			return tsA > tsB
+		}
+	}
+	return a > b
 }
 
 func splitPath(path string) []string {
