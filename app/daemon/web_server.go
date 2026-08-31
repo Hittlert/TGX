@@ -19,7 +19,9 @@ import (
 	"github.com/gorilla/mux"
 	"go.uber.org/zap"
 
+	"github.com/Hittlert/TGX/core/bucket"
 	"github.com/Hittlert/TGX/core/mover"
+	"github.com/Hittlert/TGX/core/targetwriter"
 	atomic "github.com/Hittlert/TGX/pkg/sbe/atomic"
 	"github.com/Hittlert/TGX/pkg/sbe/gate"
 )
@@ -38,6 +40,8 @@ type WebServer struct {
 	password     string
 	gate         *gate.FloodGate
 	mover        *mover.Mover
+	bkt          bucket.Bucket
+	tw           *targetwriter.TargetWriter
 
 	sessionsMu sync.RWMutex
 	sessions   map[string]time.Time
@@ -50,6 +54,14 @@ func (s *WebServer) SetAuthWizard(w *AuthWizard) {
 
 func (s *WebServer) SetMover(m *mover.Mover) {
 	s.mover = m
+}
+
+func (s *WebServer) SetBucket(b bucket.Bucket) {
+	s.bkt = b
+}
+
+func (s *WebServer) SetTargetWriter(tw *targetwriter.TargetWriter) {
+	s.tw = tw
 }
 
 func NewWebServer(
@@ -142,13 +154,41 @@ func (s *WebServer) Handler() http.Handler {
 			"used_human":   formatBytes(int64(usedBytes)),
 			"percent_used": fmt.Sprintf("%.1f%%", percent),
 		}
-		if s.mover != nil {
+		if s.bkt != nil {
+			m := s.bkt.Metrics()
+			resp["buffer"] = map[string]any{
+				"mode":                 m.Mode,
+				"max_bytes":            m.MaxCapacity,
+				"reserved_bytes":       m.ReservedBytes,
+				"ready_bytes":          m.ReadyBytes,
+				"pending_delete_bytes": m.PendingDeleteBytes,
+				"used_bytes":           m.UsedBytes,
+				"object_count":         m.ObjectCount,
+				"backpressured":        m.Backpressured,
+				"max_human":            formatBytes(m.MaxCapacity),
+				"used_human":           formatBytes(m.UsedBytes),
+				"ready_human":          formatBytes(m.ReadyBytes),
+			}
+		} else if s.mover != nil {
 			resp["buffer"] = map[string]any{
 				"used_bytes":    s.mover.UsedBytes(),
 				"max_bytes":     s.mover.MaxCapacity(),
 				"active_moving": s.mover.ActiveMoving(),
 				"used_human":    formatBytes(s.mover.UsedBytes()),
 				"max_human":     formatBytes(s.mover.MaxCapacity()),
+			}
+		}
+
+		if s.tw != nil {
+			m := s.tw.Metrics()
+			resp["target_writer"] = map[string]any{
+				"active":                 m.Active,
+				"bytes_per_second":       m.BytesPerSecond,
+				"bytes_per_second_human": formatBytes(int64(m.BytesPerSecond)) + "/s",
+				"contiguous_write_ratio": fmt.Sprintf("%.1f%%", m.ContiguousWriteRatio),
+				"active_files_count":     m.ActiveFilesCount,
+				"total_bytes_written":    m.TotalBytesWritten,
+				"last_error":             m.LastError,
 			}
 		}
 		writeJSON(w, http.StatusOK, resp)

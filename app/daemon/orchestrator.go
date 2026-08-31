@@ -11,8 +11,9 @@ import (
 	"github.com/flytam/filenamify"
 	"go.uber.org/zap"
 
+	"github.com/Hittlert/TGX/core/bucket"
 	"github.com/Hittlert/TGX/core/downloader"
-	"github.com/Hittlert/TGX/core/mover"
+	"github.com/Hittlert/TGX/core/targetwriter"
 	atomic "github.com/Hittlert/TGX/pkg/sbe/atomic"
 )
 
@@ -25,7 +26,8 @@ type Orchestrator struct {
 	logger       *zap.Logger
 	saveDir      string
 	bufferDir    string
-	mover        *mover.Mover
+	bkt          bucket.Bucket
+	tw           *targetwriter.TargetWriter
 
 	runningMu   sync.Mutex
 	running     bool
@@ -46,8 +48,12 @@ func NewOrchestrator(db *Database, slotPool *GlobalSlotPool, proxyManager *Proxy
 	}
 }
 
-func (o *Orchestrator) SetMover(m *mover.Mover) {
-	o.mover = m
+func (o *Orchestrator) SetBucket(bkt bucket.Bucket) {
+	o.bkt = bkt
+}
+
+func (o *Orchestrator) SetTargetWriter(tw *targetwriter.TargetWriter) {
+	o.tw = tw
 }
 
 func (o *Orchestrator) SetBufferDir(dir string) {
@@ -55,6 +61,35 @@ func (o *Orchestrator) SetBufferDir(dir string) {
 }
 
 func (o *Orchestrator) Start(ctx context.Context) {
+	if o.tw != nil {
+		o.tw.SetCallbacks(
+			func(taskID, finalPath, shaHash string) {
+				parts := strings.Split(taskID, ":")
+				if len(parts) == 2 {
+					var msgID int
+					_, _ = fmt.Sscanf(parts[1], "%d", &msgID)
+					_ = o.db.UpdateDownloadStatus(parts[0], msgID, "success", filepath.Base(finalPath), finalPath, "", 0, "")
+				}
+				if o.registry != nil {
+					o.registry.FinishTask(taskID, StateSuccess, "", "", finalPath, false, shaHash)
+				}
+			},
+			func(taskID string, movedBytes, totalBytes int64) {
+			},
+			func(taskID string, err error) {
+				parts := strings.Split(taskID, ":")
+				if len(parts) == 2 {
+					var msgID int
+					_, _ = fmt.Sscanf(parts[1], "%d", &msgID)
+					_ = o.db.UpdateDownloadStatus(parts[0], msgID, "failed", "", "", "", 0, err.Error())
+				}
+				if o.registry != nil {
+					o.registry.FinishTask(taskID, StateFailed, "write_error", err.Error(), "", false, "")
+				}
+			},
+		)
+	}
+
 	go o.scanLoop(ctx)
 	go o.dispatchLoop(ctx)
 	go o.metricsLoop(ctx)
@@ -107,7 +142,6 @@ func (o *Orchestrator) TriggerStreamDispatch(ctx context.Context, record Downloa
 }
 
 func (o *Orchestrator) scanLoop(ctx context.Context) {
-	// Fallback gap-recovery loop (low frequency: 60s) since real-time events drive streaming downloads
 	ticker := time.NewTicker(60 * time.Second)
 	defer ticker.Stop()
 
@@ -202,7 +236,7 @@ func (o *Orchestrator) dispatchOneRecord(ctx context.Context, record DownloadRec
 			o.inFlight.Delete(taskID)
 		}()
 
-		// 1. Disk Guard: ensure target saveDir has sufficient free space
+		// 1. Target Disk Guard
 		freeSpace, _, err := atomic.GetDiskSpace(o.saveDir)
 		if err == nil && (freeSpace < 5*1024*1024*1024 || (record.FileSize > 0 && freeSpace < uint64(record.FileSize)+500*1024*1024)) {
 			o.logger.Warn("⚠️ [Disk Guard] Insufficient target disk space, postponing task",
@@ -214,7 +248,7 @@ func (o *Orchestrator) dispatchOneRecord(ctx context.Context, record DownloadRec
 			return
 		}
 
-		// 2. Buffer Disk Guard (if separate bufferDir is configured)
+		// 2. Buffer Disk Guard
 		if o.bufferDir != "" && o.bufferDir != o.saveDir {
 			bufFree, _, bufErr := atomic.GetDiskSpace(o.bufferDir)
 			if bufErr == nil && (bufFree < 1*1024*1024*1024 || (record.FileSize > 0 && bufFree < uint64(record.FileSize)+100*1024*1024)) {
@@ -228,9 +262,9 @@ func (o *Orchestrator) dispatchOneRecord(ctx context.Context, record DownloadRec
 			}
 		}
 
-		// 3. Buffer Capacity Backpressure (if Mover is active)
-		if o.mover != nil && record.FileSize > 0 {
-			if err := o.mover.WaitBackpressure(taskCtx, record.FileSize); err != nil {
+		// 3. Buffer Capacity Backpressure (if Bucket is active)
+		if o.bkt != nil && record.FileSize > 0 {
+			if err := o.bkt.Reserve(taskCtx, record.FileSize); err != nil {
 				return
 			}
 		}
@@ -239,8 +273,8 @@ func (o *Orchestrator) dispatchOneRecord(ctx context.Context, record DownloadRec
 		if record.FileSize > downloader.SmallFileThreshold || (record.FileSize <= 0 && record.MediaType != "photo") {
 			_, err = o.slotPool.Acquire(taskCtx, taskID, record.FileSize)
 			if err != nil {
-				if o.mover != nil && record.FileSize > 0 {
-					o.mover.Release(record.FileSize)
+				if o.bkt != nil && record.FileSize > 0 {
+					o.bkt.ReleaseReservation(record.FileSize)
 				}
 				return
 			}
@@ -289,8 +323,8 @@ func (o *Orchestrator) dispatchOneRecord(ctx context.Context, record DownloadRec
 
 		snapshot, _, err := o.registry.Submit(submitReq)
 		if err != nil {
-			if o.mover != nil && record.FileSize > 0 {
-				o.mover.Release(record.FileSize)
+			if o.bkt != nil && record.FileSize > 0 {
+				o.bkt.ReleaseReservation(record.FileSize)
 			}
 			_ = o.db.UpdateDownloadStatus(record.ChatID, record.MessageID, "failed", record.FileName, finalRelPath, record.MediaType, record.FileSize, err.Error())
 			return

@@ -7,8 +7,9 @@ import (
 	"strings"
 
 	"github.com/flytam/filenamify"
+	"github.com/Hittlert/TGX/core/bucket"
 	"github.com/Hittlert/TGX/core/downloader"
-	"github.com/Hittlert/TGX/core/mover"
+	"github.com/Hittlert/TGX/core/targetwriter"
 )
 
 type ResolvedMedia struct {
@@ -27,15 +28,21 @@ type taskResolver struct {
 	access     MediaAccess
 	tempRoot   string
 	outputRoot string
-	mover      *mover.Mover
+	bkt        bucket.Bucket
+	tw         *targetwriter.TargetWriter
 }
 
-func newTaskResolver(access MediaAccess, tempRoot, outputRoot string, optMover ...*mover.Mover) *taskResolver {
-	var m *mover.Mover
-	if len(optMover) > 0 {
-		m = optMover[0]
+func newTaskResolver(access MediaAccess, tempRoot, outputRoot string, optArgs ...any) *taskResolver {
+	r := &taskResolver{access: access, tempRoot: tempRoot, outputRoot: outputRoot}
+	for _, arg := range optArgs {
+		switch v := arg.(type) {
+		case bucket.Bucket:
+			r.bkt = v
+		case *targetwriter.TargetWriter:
+			r.tw = v
+		}
 	}
-	return &taskResolver{access: access, tempRoot: tempRoot, outputRoot: outputRoot, mover: m}
+	return r
 }
 
 func (r *taskResolver) Resolve(ctx context.Context, task *Task) (taskElement, error) {
@@ -71,14 +78,22 @@ func (r *taskResolver) Resolve(ctx context.Context, task *Task) (taskElement, er
 	}
 
 	if media.Size <= downloader.SmallFileThreshold {
-		lazyElem, err := newLazySmallFileElement(task, media.File, r.outputRoot, media.Date, r.mover)
+		lazyElem, err := newLazySmallFileElement(task, media.File, r.outputRoot, media.Date, r.bkt, r.tw)
 		if err != nil {
 			return nil, NewTaskError("memory", false, err)
 		}
 		return lazyElem, nil
 	}
 
-	element, err := newFileElement(task, media.File, r.tempRoot, r.outputRoot, media.Date, r.mover)
+	if r.bkt != nil && r.tw != nil {
+		bucketElem, err := newBucketFileElement(task, media.File, r.outputRoot, media.Date, r.bkt, r.tw)
+		if err != nil {
+			return nil, NewTaskError("bucket", false, err)
+		}
+		return bucketElem, nil
+	}
+
+	element, err := newFileElement(task, media.File, r.tempRoot, r.outputRoot, media.Date)
 	if err != nil {
 		return nil, NewTaskError("filesystem", false, err)
 	}
@@ -86,7 +101,7 @@ func (r *taskResolver) Resolve(ctx context.Context, task *Task) (taskElement, er
 }
 
 func normalizePeer(peer string) string {
-	peer = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(peer), "@"))
+	peer = strings.TrimPrefix(strings.TrimSpace(peer), "@")
 	if strings.HasPrefix(peer, "-100") && len(peer) > 4 {
 		return peer[4:]
 	}

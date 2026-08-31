@@ -54,9 +54,6 @@ func NewReconcilerWithBuffer(db *sql.DB, outputDir, tempDir, bufferType string, 
 
 // ReconcileAll runs the differential crash recovery matrix on all non-terminal tasks.
 func (r *Reconciler) ReconcileAll(ctx context.Context) ([]TaskRecoveryResult, error) {
-	// Clean up any stale .moving leftover files in outputDir
-	r.cleanStaleMovingFiles(r.outputDir)
-
 	query := `SELECT chat_id, message_id, status, COALESCE(file_name, ''), COALESCE(save_path, ''), COALESCE(file_size, 0)
 	          FROM download_records WHERE status IN ('downloading', 'moving')`
 	rows, err := r.db.QueryContext(ctx, query)
@@ -92,6 +89,9 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) ([]TaskRecoveryResult, er
 	for _, rec := range records {
 		fileKey := CanonicalTaskID(rec.ChatID, rec.MessageID)
 		finalPath := filepath.Join(r.outputDir, rec.SavePath)
+
+		// Clean up any stale .moving file for this specific target path
+		_ = os.Remove(finalPath + ".moving")
 
 		// 1. Check if final file already exists with exact size in target directory
 		stat, err := os.Stat(finalPath)
@@ -207,13 +207,4 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) ([]TaskRecoveryResult, er
 	}
 
 	return results, nil
-}
-
-func (r *Reconciler) cleanStaleMovingFiles(dir string) {
-	_ = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
-		if err == nil && !info.IsDir() && filepath.Ext(path) == ".moving" {
-			_ = os.Remove(path)
-		}
-		return nil
-	})
 }

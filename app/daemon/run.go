@@ -15,11 +15,12 @@ import (
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/Hittlert/TGX/core/bucket"
 	"github.com/Hittlert/TGX/core/dcpool"
 	"github.com/Hittlert/TGX/core/downloader"
 	"github.com/Hittlert/TGX/core/logctx"
-	"github.com/Hittlert/TGX/core/mover"
 	"github.com/Hittlert/TGX/core/storage"
+	"github.com/Hittlert/TGX/core/targetwriter"
 	"github.com/Hittlert/TGX/core/tclient"
 	"github.com/Hittlert/TGX/pkg/sbe/gate"
 )
@@ -179,18 +180,34 @@ func Run(ctx context.Context, client *telegram.Client, kvd storage.Storage, opts
 		diskWorkers = 32
 	}
 
-	// Initialize background sequential mover if staging buffer is separate from target
-	var seqMover *mover.Mover
-	if opts.BufferType != "none" && opts.BufferDir != opts.OutputDir {
-		seqMover = mover.New(1, opts.BufferSize)
-		seqMover.Start(ctx)
-		defer func() { _ = seqMover.Close() }()
+	// Initialize Object Bucket & Single TargetWriter
+	var bkt bucket.Bucket
+	var tw *targetwriter.TargetWriter
+	if opts.BufferType != "none" {
+		bktCfg := bucket.Config{
+			Mode:        bucket.Mode(opts.BufferType),
+			RootDir:     opts.BufferDir,
+			MaxCapacity: opts.BufferSize,
+		}
+		var err error
+		bkt, err = bucket.New(bktCfg)
+		if err != nil {
+			return fmt.Errorf("init bucket: %w", err)
+		}
+		if opts.BufferType == "ssd" {
+			_ = bkt.Recover(ctx)
+		}
+		defer func() { _ = bkt.Close() }()
+
+		tw = targetwriter.New(bkt, opts.OutputDir)
+		tw.Start(ctx)
+		defer func() { _ = tw.Close() }()
 	}
 
 	registry := NewRegistryWithContext(ctx, opts.QueueCapacity, opts.TerminalLimit, time.Now)
 	registry.SetPaused(opts.StartPaused)
 	registry.SetPool(PoolSnapshot{Size: effectivePoolSize})
-	iter := newTaskIter(registry, newTaskResolver(access, opts.BufferDir, opts.OutputDir, seqMover))
+	iter := newTaskIter(registry, newTaskResolver(access, opts.BufferDir, opts.OutputDir, bkt, tw))
 	dl := downloader.New(downloader.Options{
 		Pool:            pool,
 		Threads:         opts.Threads,
@@ -208,7 +225,7 @@ func Run(ctx context.Context, client *telegram.Client, kvd storage.Storage, opts
 	if db != nil {
 		defer db.Close()
 		// Execute SBE Startup Crash Recovery Matrix with buffer awareness
-		reconciler := NewReconcilerWithBuffer(db.DB(), opts.OutputDir, opts.BufferDir, opts.BufferType, seqMover, logctx.From(ctx))
+		reconciler := NewReconcilerWithBuffer(db.DB(), opts.OutputDir, opts.BufferDir, opts.BufferType, nil, logctx.From(ctx))
 		if recResults, err := reconciler.ReconcileAll(ctx); err != nil {
 			logctx.From(ctx).Error("startup crash recovery failed", zap.Error(err))
 		} else if len(recResults) > 0 {
@@ -235,9 +252,8 @@ func Run(ctx context.Context, client *telegram.Client, kvd storage.Storage, opts
 	if db != nil {
 		orchestrator = NewOrchestrator(db, slotPool, proxyManager, access, registry, logctx.From(ctx), opts.OutputDir)
 		orchestrator.SetBufferDir(opts.BufferDir)
-		if seqMover != nil {
-			orchestrator.SetMover(seqMover)
-		}
+		orchestrator.SetBucket(bkt)
+		orchestrator.SetTargetWriter(tw)
 		orchestrator.Start(groupCtx)
 
 		// Start MTProto Real-Time Push Updates Streaming Engine
@@ -248,9 +264,8 @@ func Run(ctx context.Context, client *telegram.Client, kvd storage.Storage, opts
 	authWizard := NewAuthWizard(db, client, kvd, logctx.From(ctx), opts.Namespace)
 	webServer := NewWebServer(db, slotPool, proxyManager, orchestrator, access, registry, logctx.From(ctx), opts.Password, sharedGate)
 	webServer.SetAuthWizard(authWizard)
-	if seqMover != nil {
-		webServer.SetMover(seqMover)
-	}
+	webServer.SetBucket(bkt)
+	webServer.SetTargetWriter(tw)
 
 	server := &http.Server{
 		Addr: opts.Listen, Handler: webServer.Handler(),

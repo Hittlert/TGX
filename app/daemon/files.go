@@ -13,10 +13,116 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Hittlert/TGX/core/bucket"
 	"github.com/Hittlert/TGX/core/downloader"
-	"github.com/Hittlert/TGX/core/mover"
+	"github.com/Hittlert/TGX/core/targetwriter"
 	atomic "github.com/Hittlert/TGX/pkg/sbe/atomic"
 )
+
+// bucketWriterAt writes immutable chunk objects directly to bucket.Bucket.
+type bucketWriterAt struct {
+	bkt      bucket.Bucket
+	task     *Task
+	taskID   string
+	gen      string
+	fileSize int64
+}
+
+func (w *bucketWriterAt) WriteAt(p []byte, offset int64) (int, error) {
+	key := bucket.ObjectKey{
+		TaskID:           w.taskID,
+		Gen:              w.gen,
+		Offset:           offset,
+		Length:           int64(len(p)),
+		ExpectedFileSize: w.fileSize,
+	}
+	if err := w.bkt.PutObject(key, p); err != nil {
+		return 0, err
+	}
+	if w.task != nil {
+		w.task.RecordWrite(offset, len(p))
+	}
+	return len(p), nil
+}
+
+type bucketFileElement struct {
+	task       *Task
+	file       downloader.File
+	bkt        bucket.Bucket
+	tw         *targetwriter.TargetWriter
+	writer     *bucketWriterAt
+	outputRoot string
+	finalPath  string
+	date       int64
+}
+
+func newBucketFileElement(
+	task *Task,
+	file downloader.File,
+	outputRoot string,
+	date int64,
+	bkt bucket.Bucket,
+	tw *targetwriter.TargetWriter,
+) (*bucketFileElement, error) {
+	manifest := targetwriter.TaskManifest{
+		TaskID:       task.Request().ID,
+		FinalPath:    task.Request().FinalPath,
+		ExpectedSize: file.Size(),
+		Date:         date,
+	}
+	if tw != nil {
+		tw.RegisterTask(manifest)
+	}
+
+	elem := &bucketFileElement{
+		task:       task,
+		file:       file,
+		bkt:        bkt,
+		tw:         tw,
+		outputRoot: outputRoot,
+		finalPath:  task.Request().FinalPath,
+		date:       date,
+	}
+	elem.writer = &bucketWriterAt{
+		bkt:      bkt,
+		task:     task,
+		taskID:   task.Request().ID,
+		gen:      "1",
+		fileSize: file.Size(),
+	}
+	return elem, nil
+}
+
+func (e *bucketFileElement) File() downloader.File   { return e.file }
+func (e *bucketFileElement) To() io.WriterAt         { return e.writer }
+func (e *bucketFileElement) AsTakeout() bool         { return false }
+func (e *bucketFileElement) Task() *Task             { return e.task }
+func (e *bucketFileElement) Context() context.Context {
+	if e.task != nil {
+		return e.task.Context()
+	}
+	return context.Background()
+}
+func (e *bucketFileElement) IsCanceled() bool {
+	return e.task != nil && e.task.IsTerminal()
+}
+func (e *bucketFileElement) AlreadyComplete() (string, bool) {
+	return "", false
+}
+func (e *bucketFileElement) Abort() error {
+	return nil
+}
+
+func (e *bucketFileElement) Publish() (PublishResult, error) {
+	if e.task != nil && e.task.IsTerminal() {
+		return PublishResult{}, errors.New("task is terminal, aborting publish")
+	}
+	// Network chunk downloading is 100% complete!
+	// TargetWriter handles async background target streaming and final atomic non-replacing commit.
+	return PublishResult{
+		Path: e.finalPath,
+	}, nil
+}
 
 type trackedWriterAt struct {
 	file *os.File
@@ -41,12 +147,11 @@ type fileElement struct {
 	outputRoot string
 	finalPath  string
 	date       int64
-	mover      *mover.Mover
 	closeOnce  sync.Once
 	closeErr   error
 }
 
-func newFileElement(task *Task, file downloader.File, tempRoot, outputRoot string, date int64, optMover ...*mover.Mover) (*fileElement, error) {
+func newFileElement(task *Task, file downloader.File, tempRoot, outputRoot string, date int64) (*fileElement, error) {
 	absolute, err := safeOutputPath(outputRoot, task.Request().FinalPath)
 	if err != nil {
 		return nil, err
@@ -70,24 +175,19 @@ func newFileElement(task *Task, file downloader.File, tempRoot, outputRoot strin
 		return nil, fmt.Errorf("create part file: %w", err)
 	}
 
-	var m *mover.Mover
-	if len(optMover) > 0 {
-		m = optMover[0]
-	}
-
 	element := &fileElement{
 		task: task, file: file, writer: writer, tempPath: tempPath,
 		tempRoot: tempRoot, outputRoot: outputRoot, finalPath: task.Request().FinalPath,
-		date: date, mover: m,
+		date: date,
 	}
 	element.tracked = &trackedWriterAt{file: writer, task: task}
 	return element, nil
 }
 
-func (e *fileElement) File() downloader.File { return e.file }
-func (e *fileElement) To() io.WriterAt       { return e.tracked }
-func (e *fileElement) AsTakeout() bool       { return false }
-func (e *fileElement) Task() *Task           { return e.task }
+func (e *fileElement) File() downloader.File   { return e.file }
+func (e *fileElement) To() io.WriterAt         { return e.tracked }
+func (e *fileElement) AsTakeout() bool         { return false }
+func (e *fileElement) Task() *Task             { return e.task }
 func (e *fileElement) Context() context.Context {
 	if e.task != nil {
 		return e.task.Context()
@@ -149,47 +249,16 @@ func (e *fileElement) Publish() (result PublishResult, resultErr error) {
 		return result, errors.New("task became terminal during hash calculation, aborting publish")
 	}
 
-	if e.mover != nil && e.tempRoot != "" && e.tempRoot != e.outputRoot {
-		doneChan := make(chan error, 1)
-		job := &mover.MoveJob{
-			ID:      e.task.Request().ID,
-			SrcPath: e.tempPath,
-			DstPath: absolute,
-			Size:    e.file.Size(),
-			OnDone: func(err error) {
-				doneChan <- err
-			},
-		}
-		if err := e.mover.Enqueue(job); err != nil {
-			return result, fmt.Errorf("enqueue mover: %w", err)
-		}
-		select {
-		case <-e.task.Context().Done():
-			return result, e.task.Context().Err()
-		case err := <-doneChan:
-			if err != nil {
-				if errors.Is(err, atomic.ErrTargetExists) {
-					if exists, checkErr := existingFile(absolute, e.file.Size()); checkErr == nil && exists {
-						_ = os.Remove(e.tempPath)
-						return PublishResult{Path: e.finalPath, SHA256: shaHash, AlreadyExists: true, absolutePath: absolute}, nil
-					}
-					return result, fmt.Errorf("publish destination without overwrite: %w", err)
-				}
-				return result, fmt.Errorf("mover copy: %w", err)
+	// Zero-copy direct atomic rename in the exact same directory / volume!
+	if err := atomic.CommitFile(e.tempPath, absolute); err != nil {
+		if errors.Is(err, atomic.ErrTargetExists) {
+			if exists, checkErr := existingFile(absolute, e.file.Size()); checkErr == nil && exists {
+				_ = os.Remove(e.tempPath)
+				return PublishResult{Path: e.finalPath, SHA256: shaHash, AlreadyExists: true, absolutePath: absolute}, nil
 			}
+			return result, fmt.Errorf("publish destination without overwrite: %w", err)
 		}
-	} else {
-		// Zero-copy direct atomic rename in the exact same directory / volume!
-		if err := atomic.CommitFile(e.tempPath, absolute); err != nil {
-			if errors.Is(err, atomic.ErrTargetExists) {
-				if exists, checkErr := existingFile(absolute, e.file.Size()); checkErr == nil && exists {
-					_ = os.Remove(e.tempPath)
-					return PublishResult{Path: e.finalPath, SHA256: shaHash, AlreadyExists: true, absolutePath: absolute}, nil
-				}
-				return result, fmt.Errorf("publish destination without overwrite: %w", err)
-			}
-			return result, fmt.Errorf("publish destination atomic rename: %w", err)
-		}
+		return result, fmt.Errorf("publish destination atomic rename: %w", err)
 	}
 
 	if err := syncDirectory(dir); err != nil {
@@ -243,13 +312,26 @@ type lazySmallFileElement struct {
 	finalPath  string
 	date       int64
 	buf        *memBufferWriterAt
-	mover      *mover.Mover
+	bkt        bucket.Bucket
+	tw         *targetwriter.TargetWriter
 }
 
-func newLazySmallFileElement(task *Task, file downloader.File, outputRoot string, date int64, optMover ...*mover.Mover) (*lazySmallFileElement, error) {
-	var m *mover.Mover
-	if len(optMover) > 0 {
-		m = optMover[0]
+func newLazySmallFileElement(
+	task *Task,
+	file downloader.File,
+	outputRoot string,
+	date int64,
+	bkt bucket.Bucket,
+	tw *targetwriter.TargetWriter,
+) (*lazySmallFileElement, error) {
+	if tw != nil {
+		manifest := targetwriter.TaskManifest{
+			TaskID:       task.Request().ID,
+			FinalPath:    task.Request().FinalPath,
+			ExpectedSize: file.Size(),
+			Date:         date,
+		}
+		tw.RegisterTask(manifest)
 	}
 	return &lazySmallFileElement{
 		task:       task,
@@ -258,14 +340,15 @@ func newLazySmallFileElement(task *Task, file downloader.File, outputRoot string
 		finalPath:  task.Request().FinalPath,
 		date:       date,
 		buf:        newMemBufferWriterAt(task),
-		mover:      m,
+		bkt:        bkt,
+		tw:         tw,
 	}, nil
 }
 
-func (e *lazySmallFileElement) File() downloader.File { return e.file }
-func (e *lazySmallFileElement) To() io.WriterAt       { return e.buf }
-func (e *lazySmallFileElement) AsTakeout() bool       { return false }
-func (e *lazySmallFileElement) Task() *Task           { return e.task }
+func (e *lazySmallFileElement) File() downloader.File   { return e.file }
+func (e *lazySmallFileElement) To() io.WriterAt         { return e.buf }
+func (e *lazySmallFileElement) AsTakeout() bool         { return false }
+func (e *lazySmallFileElement) Task() *Task             { return e.task }
 func (e *lazySmallFileElement) Context() context.Context {
 	if e.task != nil {
 		return e.task.Context()
@@ -290,9 +373,26 @@ func (e *lazySmallFileElement) Publish() (result PublishResult, resultErr error)
 		return result, fmt.Errorf("in-memory file size %d does not match expected %d", len(data), e.file.Size())
 	}
 
-	// Compute SHA256 directly in memory - 0 disk reads!
+	// Compute SHA256 in memory
 	hashBytes := sha256.Sum256(data)
 	shaHash := hex.EncodeToString(hashBytes[:])
+
+	if e.bkt != nil && e.tw != nil {
+		key := bucket.ObjectKey{
+			TaskID:           e.task.Request().ID,
+			Gen:              "1",
+			Offset:           0,
+			Length:           int64(len(data)),
+			ExpectedFileSize: e.file.Size(),
+		}
+		if err := e.bkt.PutObject(key, data); err != nil {
+			return result, fmt.Errorf("put small file to bucket: %w", err)
+		}
+		return PublishResult{
+			Path:   e.finalPath,
+			SHA256: shaHash,
+		}, nil
+	}
 
 	absolute, err := safeOutputPath(e.outputRoot, e.finalPath)
 	if err != nil {
@@ -309,70 +409,40 @@ func (e *lazySmallFileElement) Publish() (result PublishResult, resultErr error)
 		return result, fmt.Errorf("create destination directory: %w", err)
 	}
 
-	if e.mover != nil {
-		doneChan := make(chan error, 1)
-		job := &mover.MoveJob{
-			ID:      e.task.Request().ID,
-			SrcData: data,
-			DstPath: absolute,
-			Size:    e.file.Size(),
-			OnDone: func(err error) {
-				doneChan <- err
-			},
-		}
-		if err := e.mover.Enqueue(job); err != nil {
-			return result, fmt.Errorf("enqueue mover: %w", err)
-		}
-		select {
-		case <-e.task.Context().Done():
-			return result, e.task.Context().Err()
-		case err := <-doneChan:
-			if err != nil {
-				if errors.Is(err, atomic.ErrTargetExists) {
-					if exists, checkErr := existingFile(absolute, e.file.Size()); checkErr == nil && exists {
-						return PublishResult{Path: e.finalPath, SHA256: shaHash, AlreadyExists: true, absolutePath: absolute}, nil
-					}
-					return result, fmt.Errorf("publish destination without overwrite: %w", err)
-				}
-				return result, fmt.Errorf("mover write: %w", err)
-			}
-		}
-	} else {
-		tempPath := CanonicalPartPath(dir, e.task.Request().ID)
-		f, err := os.OpenFile(tempPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
-		if err != nil {
-			return result, fmt.Errorf("create part file: %w", err)
-		}
-		if _, err := f.Write(data); err != nil {
-			_ = f.Close()
-			_ = os.Remove(tempPath)
-			return result, fmt.Errorf("write part file: %w", err)
-		}
-		if err := f.Sync(); err != nil {
-			_ = f.Close()
-			_ = os.Remove(tempPath)
-			return result, fmt.Errorf("sync part file: %w", err)
-		}
-		if err := f.Close(); err != nil {
-			_ = os.Remove(tempPath)
-			return result, fmt.Errorf("close part file: %w", err)
-		}
+	tempPath := CanonicalPartPath(dir, e.task.Request().ID)
+	f, err := os.OpenFile(tempPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	if err != nil {
+		return result, fmt.Errorf("create part file: %w", err)
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tempPath)
+		return result, fmt.Errorf("write part file: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tempPath)
+		return result, fmt.Errorf("sync part file: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tempPath)
+		return result, fmt.Errorf("close part file: %w", err)
+	}
 
-		if e.date > 0 {
-			when := time.Unix(e.date, 0)
-			_ = os.Chtimes(tempPath, when, when)
-		}
+	if e.date > 0 {
+		when := time.Unix(e.date, 0)
+		_ = os.Chtimes(tempPath, when, when)
+	}
 
-		if err := atomic.CommitFile(tempPath, absolute); err != nil {
-			if errors.Is(err, atomic.ErrTargetExists) {
-				if exists, checkErr := existingFile(absolute, e.file.Size()); checkErr == nil && exists {
-					_ = os.Remove(tempPath)
-					return PublishResult{Path: e.finalPath, SHA256: shaHash, AlreadyExists: true, absolutePath: absolute}, nil
-				}
-				return result, fmt.Errorf("publish destination without overwrite: %w", err)
+	if err := atomic.CommitFile(tempPath, absolute); err != nil {
+		if errors.Is(err, atomic.ErrTargetExists) {
+			if exists, checkErr := existingFile(absolute, e.file.Size()); checkErr == nil && exists {
+				_ = os.Remove(tempPath)
+				return PublishResult{Path: e.finalPath, SHA256: shaHash, AlreadyExists: true, absolutePath: absolute}, nil
 			}
-			return result, fmt.Errorf("publish destination atomic rename: %w", err)
+			return result, fmt.Errorf("publish destination without overwrite: %w", err)
 		}
+		return result, fmt.Errorf("publish destination atomic rename: %w", err)
 	}
 
 	if err := syncDirectory(dir); err != nil {
@@ -403,10 +473,10 @@ type existingElement struct {
 	path string
 }
 
-func (e *existingElement) File() downloader.File { return e.file }
-func (e *existingElement) To() io.WriterAt       { return discardWriterAt{} }
-func (e *existingElement) AsTakeout() bool       { return false }
-func (e *existingElement) Task() *Task           { return e.task }
+func (e *existingElement) File() downloader.File   { return e.file }
+func (e *existingElement) To() io.WriterAt         { return discardWriterAt{} }
+func (e *existingElement) AsTakeout() bool         { return false }
+func (e *existingElement) Task() *Task             { return e.task }
 func (e *existingElement) Context() context.Context {
 	if e.task != nil {
 		return e.task.Context()

@@ -490,6 +490,15 @@ func (r *Registry) finish(state *taskState, status TaskState, class, message, fi
 	}
 }
 
+func (r *Registry) FinishTask(id string, status TaskState, class, message, finalPath string, already bool, sha256 string) {
+	r.mu.Lock()
+	state, ok := r.tasks[id]
+	r.mu.Unlock()
+	if ok && state != nil {
+		r.finish(state, status, class, message, finalPath, already, sha256)
+	}
+}
+
 func (r *Registry) Cancel(id string, reason string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
