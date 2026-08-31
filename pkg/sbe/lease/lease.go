@@ -10,9 +10,9 @@ import (
 )
 
 var (
-	ErrPoolClosed   = errors.New("lease pool is closed")
-	ErrLeaseZero    = errors.New("cannot acquire zero or negative lease bytes")
-	ErrLeaseTooBig  = errors.New("requested lease exceeds total pool budget")
+	ErrPoolClosed  = errors.New("lease pool is closed")
+	ErrLeaseZero   = errors.New("cannot acquire zero or negative lease bytes")
+	ErrLeaseTooBig = errors.New("requested lease exceeds total pool budget")
 )
 
 const (

@@ -9,10 +9,10 @@ import (
 )
 
 const (
-	MetaMagic        uint32 = 0x53424D31 // "SBM1" in ASCII BigEndian
-	MetaVersion      uint32 = 1
-	MetaHeaderSize   int64  = 128
-	SlotHeaderSize   int64  = 32
+	MetaMagic         uint32 = 0x53424D31 // "SBM1" in ASCII BigEndian
+	MetaVersion       uint32 = 1
+	MetaHeaderSize    int64  = 128
+	SlotHeaderSize    int64  = 32
 	StandardBlockSize uint32 = 2 * 1024 * 1024 // 2 MiB
 )
 
@@ -24,12 +24,12 @@ const (
 )
 
 var (
-	ErrInvalidMagic      = errors.New("invalid meta header magic number")
+	ErrInvalidMagic       = errors.New("invalid meta header magic number")
 	ErrUnsupportedVersion = errors.New("unsupported meta header version")
-	ErrHeaderCRCMismatch = errors.New("meta header CRC32 checksum mismatch")
-	ErrSlotCRCMismatch   = errors.New("slot CRC32 checksum mismatch")
-	ErrInvalidAttempt    = errors.New("attempt ID mismatch in meta file")
-	ErrInvalidFileKey    = errors.New("file key hash mismatch in meta file")
+	ErrHeaderCRCMismatch  = errors.New("meta header CRC32 checksum mismatch")
+	ErrSlotCRCMismatch    = errors.New("slot CRC32 checksum mismatch")
+	ErrInvalidAttempt     = errors.New("attempt ID mismatch in meta file")
+	ErrInvalidFileKey     = errors.New("file key hash mismatch in meta file")
 )
 
 // MetaHeader represents the fixed 128-byte header of a .meta sidecar file.

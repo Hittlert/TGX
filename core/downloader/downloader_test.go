@@ -1078,7 +1078,7 @@ func TestDownloader_100SmallFilesBurstLargeThroughputProtected(t *testing.T) {
 
 func TestDownloader_CdnRedirectDecryptionAndHashVerification(t *testing.T) {
 	key := []byte("0123456789abcdef0123456789abcdef") // 32 bytes
-	iv := []byte("1234567890abcdef")                 // 16 bytes
+	iv := []byte("1234567890abcdef")                  // 16 bytes
 	plainData := bytes.Repeat([]byte("A"), 1024*1024)
 
 	// Encrypt plainData with AES-CTR

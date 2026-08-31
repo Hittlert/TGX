@@ -71,12 +71,12 @@ type TargetWriter struct {
 	bkt       bucket.Bucket
 	outputDir string
 
-	manifests            sync.Map // taskID → TaskManifest (exactly one generation per taskID)
-	bitmaps              sync.Map // taskID → *MovedBitmap
-	openFiles            sync.Map // taskID → *os.File
-	pendingFinalize      sync.Map // taskID → TaskManifest (complete bitmap awaiting finalize)
-	pendingFinalizeNext  sync.Map // taskID → time.Time (next allowed retry for transient finalize)
-	completedTasks       sync.Map // taskID → gen (tasks finalized, leftover Ready objects can be safely Acked)
+	manifests           sync.Map // taskID → TaskManifest (exactly one generation per taskID)
+	bitmaps             sync.Map // taskID → *MovedBitmap
+	openFiles           sync.Map // taskID → *os.File
+	pendingFinalize     sync.Map // taskID → TaskManifest (complete bitmap awaiting finalize)
+	pendingFinalizeNext sync.Map // taskID → time.Time (next allowed retry for transient finalize)
+	completedTasks      sync.Map // taskID → gen (tasks finalized, leftover Ready objects can be safely Acked)
 
 	onComplete func(taskID, gen, finalPath string, shaHash string)
 	onProgress func(taskID string, movedBytes, totalBytes int64)
@@ -158,7 +158,16 @@ func isOlderGeneration(newGen, currentGen string) bool {
 // This handles the crash-after-last-Ack-before-finalize recovery case where
 // no more Ready objects will arrive to trigger finalize.
 func (w *TargetWriter) RegisterTask(manifest TaskManifest) {
-	w.completedTasks.Delete(manifest.TaskID)
+	// If task was already completed and finalized:
+	if compVal, ok := w.completedTasks.Load(manifest.TaskID); ok {
+		compGen := compVal.(string)
+		if isOlderGeneration(manifest.Gen, compGen) || manifest.Gen == compGen {
+			// Stale or duplicate attempt trying to re-register an already finalized task: reject!
+			return
+		}
+		// New retry generation registering after completion: delete tombstone
+		w.completedTasks.Delete(manifest.TaskID)
+	}
 
 	// Generation isolation: clear stale state from previous attempt
 	if val, ok := w.manifests.Load(manifest.TaskID); ok {

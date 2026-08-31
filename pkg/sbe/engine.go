@@ -55,9 +55,9 @@ type Engine struct {
 
 	fetcher BlockFetcherFunc
 
-	isDraining   uint32
-	ctx          context.Context
-	cancel       context.CancelFunc
+	isDraining uint32
+	ctx        context.Context
+	cancel     context.CancelFunc
 
 	schedWg sync.WaitGroup
 	netWg   sync.WaitGroup
@@ -330,10 +330,10 @@ func (e *Engine) CommitCompletedFile(ctx context.Context, fc *coordinator.FileCo
 
 // Stats returns live SBE performance statistics for Web UI.
 type EngineStats struct {
-	LeaseStats      lease.Stats `json:"lease_stats"`
-	ActiveFiles     int         `json:"active_files"`
-	NetworkWorkers  int         `json:"network_workers"`
-	DiskWorkers     int         `json:"disk_workers"`
+	LeaseStats     lease.Stats `json:"lease_stats"`
+	ActiveFiles    int         `json:"active_files"`
+	NetworkWorkers int         `json:"network_workers"`
+	DiskWorkers    int         `json:"disk_workers"`
 }
 
 // Stats returns current engine metrics.

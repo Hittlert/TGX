@@ -471,7 +471,15 @@ func (d *Database) UpdateDownloadStatus(chatID string, messageID int, status str
 	var nextRetryAt int64 = 0
 	if status == "failed" {
 		lowerErr := strings.ToLower(errMsg)
-		if strings.Contains(lowerErr, "deleted") || strings.Contains(lowerErr, "unavailable") || strings.Contains(lowerErr, "message_id_invalid") {
+		// Lifecycle/shutdown cancellation is NOT a download failure:
+		// Reset status to 'pending', do NOT increment attempts, do NOT freeze for 7 days!
+		if strings.Contains(lowerErr, "context canceled") ||
+			strings.Contains(lowerErr, "context deadline exceeded") ||
+			lowerErr == "canceled" || lowerErr == "task canceled" ||
+			strings.Contains(lowerErr, "engine forcibly closed") {
+			status = "pending"
+			errMsg = ""
+		} else if strings.Contains(lowerErr, "deleted") || strings.Contains(lowerErr, "unavailable") || strings.Contains(lowerErr, "message_id_invalid") {
 			nextRetryAt = now + 86400*7
 		} else {
 			var attempts int

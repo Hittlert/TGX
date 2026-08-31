@@ -104,9 +104,9 @@ func New(ctx context.Context, o Options) (*telegram.Client, error) {
 		ReconnectionBackoff: func() backoff.BackOff {
 			return newBackoff(o.ReconnectTimeout)
 		},
-		UpdateHandler:  o.UpdateHandler,
-		Device:         tutil.Device,
-		SessionStorage: sessionStorage,
+		UpdateHandler:   o.UpdateHandler,
+		Device:          tutil.Device,
+		SessionStorage:  sessionStorage,
 		RetryInterval:   5 * time.Second,
 		MaxRetries:      5,
 		DialTimeout:     15 * time.Second,

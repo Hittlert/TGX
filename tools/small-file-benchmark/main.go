@@ -15,9 +15,9 @@ import (
 	"syscall"
 	"time"
 
-	_ "modernc.org/sqlite"
 	"github.com/gotd/td/telegram/peers"
 	"github.com/gotd/td/tg"
+	_ "modernc.org/sqlite"
 
 	"github.com/Hittlert/TGX/core/dcpool"
 	"github.com/Hittlert/TGX/core/storage"

@@ -61,19 +61,19 @@ func NewFloodGate(reqPerSec float64, burst int) *FloodGate {
 	}
 	now := time.Now()
 	return &FloodGate{
-		baseRate:       reqPerSec,
-		currentRate:    reqPerSec,
-		maxRate:        MaxStartRate,
-		minRate:        MinRate,
-		burst:          burst,
-		lastRamp:       now,
-		lastRateDrop:   now.Add(-10 * time.Second),
-		dcCooldowns:    make(map[int]time.Time),
-		limiter:        rate.NewLimiter(rate.Limit(reqPerSec), burst),
-		dataSem:        semaphore.NewWeighted(MaxDataInFlight),
-		dataWakeCh:     make(chan struct{}),
-		maxDataCap:     MaxDataInFlight,
-		controlSem:     semaphore.NewWeighted(MaxControlInFlight),
+		baseRate:     reqPerSec,
+		currentRate:  reqPerSec,
+		maxRate:      MaxStartRate,
+		minRate:      MinRate,
+		burst:        burst,
+		lastRamp:     now,
+		lastRateDrop: now.Add(-10 * time.Second),
+		dcCooldowns:  make(map[int]time.Time),
+		limiter:      rate.NewLimiter(rate.Limit(reqPerSec), burst),
+		dataSem:      semaphore.NewWeighted(MaxDataInFlight),
+		dataWakeCh:   make(chan struct{}),
+		maxDataCap:   MaxDataInFlight,
+		controlSem:   semaphore.NewWeighted(MaxControlInFlight),
 	}
 }
 

@@ -84,20 +84,20 @@ type byteEvent struct {
 }
 
 type taskState struct {
-	request       TaskRequest
-	state         TaskState
-	attemptGen    string // generation ID for this attempt, set once at Submit time
-	fileName      string
-	totalSize     int64
-	downloaded    int64
-	dcID          int
-	alreadyExists bool
-	sha256        string
-	errorClass    string
-	errorText     string
-	createdAt     time.Time
-	startedAt     time.Time
-	finishedAt    time.Time
+	request            TaskRequest
+	state              TaskState
+	attemptGen         string // generation ID for this attempt, set once at Submit time
+	fileName           string
+	totalSize          int64
+	downloaded         int64
+	dcID               int
+	alreadyExists      bool
+	sha256             string
+	errorClass         string
+	errorText          string
+	createdAt          time.Time
+	startedAt          time.Time
+	finishedAt         time.Time
 	ranges             []byteRange
 	events             []byteEvent
 	hasNetworkProgress bool
@@ -196,7 +196,7 @@ func (r *Registry) Submit(request TaskRequest) (TaskSnapshot, bool, error) {
 			newState := &taskState{
 				request: request, state: StateQueued, totalSize: request.ExpectedSize, createdAt: now,
 				attemptGen: fmt.Sprintf("retry_%d", now.UnixNano()),
-				ctx: taskCtx, cancel: taskCancel,
+				ctx:        taskCtx, cancel: taskCancel,
 			}
 			r.tasks[request.ID] = newState
 			r.removeTerminalLocked(request.ID)
@@ -214,7 +214,7 @@ func (r *Registry) Submit(request TaskRequest) (TaskSnapshot, bool, error) {
 	state := &taskState{
 		request: request, state: StateQueued, totalSize: request.ExpectedSize, createdAt: now,
 		attemptGen: "1", // First attempt always uses generation "1"
-		ctx: taskCtx, cancel: taskCancel,
+		ctx:        taskCtx, cancel: taskCancel,
 	}
 	r.tasks[request.ID] = state
 	r.queue = append(r.queue, state)
@@ -725,7 +725,7 @@ func (r *Registry) snapshotTaskLocked(state *taskState, now time.Time) TaskSnaps
 	return TaskSnapshot{
 		TaskRequest: state.request, State: state.state, FileName: state.fileName,
 		TotalSize: state.totalSize, Downloaded: state.downloaded, NetDownloaded: netDownloaded,
-		Progress: progress,
+		Progress:     progress,
 		Rolling5sBPS: int64(state.smoothedSpeed),
 		DCID:         state.dcID, AlreadyExists: state.alreadyExists, SHA256: state.sha256,
 		ErrorClass: state.errorClass, Error: state.errorText,

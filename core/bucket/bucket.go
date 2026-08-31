@@ -30,15 +30,15 @@ type Config struct {
 
 // Bucket Metrics snapshot.
 type Metrics struct {
-	Mode               Mode   `json:"mode"`
-	MaxCapacity        int64  `json:"max_capacity"`
-	ReservedBytes      int64  `json:"reserved_bytes"`
-	ReadyBytes         int64  `json:"ready_bytes"`
-	PendingDeleteBytes int64  `json:"pending_delete_bytes"`
-	UsedBytes          int64  `json:"used_bytes"`
-	ObjectCount        int64  `json:"object_count"`
-	ReadyTasksCount    int    `json:"ready_tasks_count"`
-	Backpressured      bool   `json:"backpressured"`
+	Mode               Mode  `json:"mode"`
+	MaxCapacity        int64 `json:"max_capacity"`
+	ReservedBytes      int64 `json:"reserved_bytes"`
+	ReadyBytes         int64 `json:"ready_bytes"`
+	PendingDeleteBytes int64 `json:"pending_delete_bytes"`
+	UsedBytes          int64 `json:"used_bytes"`
+	ObjectCount        int64 `json:"object_count"`
+	ReadyTasksCount    int   `json:"ready_tasks_count"`
+	Backpressured      bool  `json:"backpressured"`
 }
 
 // Bucket interface manages local object storage for Telegram chunk buffers.
@@ -65,8 +65,8 @@ type readyEntry struct {
 }
 
 type bucketImpl struct {
-	cfg   Config
-	mu    sync.RWMutex
+	cfg Config
+	mu  sync.RWMutex
 
 	reservedBytes      int64
 	readyBytes         int64
@@ -77,11 +77,11 @@ type bucketImpl struct {
 	currentTaskGen map[string]string
 
 	// Index: taskID -> map[offset]*readyEntry
-	readyByTask   map[string]map[int64]*readyEntry
+	readyByTask map[string]map[int64]*readyEntry
 	// FIFO / priority list of tasks
-	taskOrder     []string
-	memData       map[string][]byte // For ModeMemory: key.String() -> []byte
-	waiters       []chan struct{}
+	taskOrder []string
+	memData   map[string][]byte // For ModeMemory: key.String() -> []byte
+	waiters   []chan struct{}
 
 	closed int32
 }

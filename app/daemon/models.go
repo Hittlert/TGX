@@ -1,18 +1,18 @@
 package daemon
 
 type ListenTarget struct {
-	ChatID                string `json:"chat_id"`
-	Enabled               bool   `json:"enabled"`
-	Title                 string `json:"title"`
-	Username              string `json:"username"`
-	ChatType              string `json:"type"`
-	DownloadFilter        string `json:"download_filter"`
-	UploadTelegramChatID  string `json:"upload_telegram_chat_id"`
-	Priority              int    `json:"priority"`
-	LastReadMessageID     int    `json:"last_read_message_id"`
-	CreatedAt             int64  `json:"created_at,omitempty"`
-	UpdatedAt             int64  `json:"updated_at,omitempty"`
-	Revision              int    `json:"revision,omitempty"`
+	ChatID               string `json:"chat_id"`
+	Enabled              bool   `json:"enabled"`
+	Title                string `json:"title"`
+	Username             string `json:"username"`
+	ChatType             string `json:"type"`
+	DownloadFilter       string `json:"download_filter"`
+	UploadTelegramChatID string `json:"upload_telegram_chat_id"`
+	Priority             int    `json:"priority"`
+	LastReadMessageID    int    `json:"last_read_message_id"`
+	CreatedAt            int64  `json:"created_at,omitempty"`
+	UpdatedAt            int64  `json:"updated_at,omitempty"`
+	Revision             int    `json:"revision,omitempty"`
 }
 
 type ChatMessage struct {

@@ -24,14 +24,14 @@ type NodeHealth struct {
 
 // Watchdog manages health probes, statistics, and automatic failover.
 type Watchdog struct {
-	probeTarget string
-	nodes       []string
+	probeTarget  string
+	nodes        []string
 	currentIndex int
-	healthMap   map[string]*NodeHealth
+	healthMap    map[string]*NodeHealth
 
-	interval    time.Duration
-	hook        ReconnectHook
-	provider    *ExternalProxyProvider
+	interval time.Duration
+	hook     ReconnectHook
+	provider *ExternalProxyProvider
 
 	mu       sync.RWMutex
 	stopChan chan struct{}

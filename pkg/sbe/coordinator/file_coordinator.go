@@ -10,9 +10,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	atomicHelper "github.com/Hittlert/TGX/pkg/sbe/atomic"
 	"github.com/Hittlert/TGX/pkg/sbe/lease"
 	"github.com/Hittlert/TGX/pkg/sbe/meta"
-	atomicHelper "github.com/Hittlert/TGX/pkg/sbe/atomic"
 	"github.com/bits-and-blooms/bitset"
 )
 

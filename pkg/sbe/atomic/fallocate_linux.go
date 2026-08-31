@@ -3,9 +3,9 @@
 package atomic
 
 import (
+	"golang.org/x/sys/unix"
 	"os"
 	"syscall"
-	"golang.org/x/sys/unix"
 )
 
 func preallocate(file *os.File, size int64) error {

@@ -3,8 +3,8 @@
 package atomic
 
 import (
-	"os"
 	"golang.org/x/sys/unix"
+	"os"
 )
 
 func preallocate(file *os.File, size int64) error {

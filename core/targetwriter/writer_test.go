@@ -229,3 +229,32 @@ func TestTargetWriter_RegisterTaskRejectsOlderGenerationRollback(t *testing.T) {
 	bm = bmVal.(*MovedBitmap)
 	assert.Equal(t, int64(512), bm.DurableBytes())
 }
+
+func TestTargetWriter_CompletedTaskRejectsLateResolver(t *testing.T) {
+	bkt, err := bucket.New(bucket.Config{Mode: bucket.ModeMemory, MaxCapacity: 10 * 1024 * 1024})
+	require.NoError(t, err)
+	defer bkt.Close()
+
+	outDir := t.TempDir()
+	tw := New(bkt, outDir)
+
+	// Mark task completed with generation retry_2000
+	tw.MarkTaskCompleted("task-comp", "retry_2000")
+
+	// Late resolver attempts to re-register with older generation "1" or same generation "retry_2000"
+	manifestStale := TaskManifest{
+		TaskID:       "task-comp",
+		FinalPath:    "file.bin",
+		ExpectedSize: 1024,
+		Gen:          "1",
+	}
+	tw.RegisterTask(manifestStale)
+
+	// Verify completed tombstone was NOT deleted and task was NOT registered
+	compVal, ok := tw.completedTasks.Load("task-comp")
+	require.True(t, ok)
+	assert.Equal(t, "retry_2000", compVal.(string))
+
+	_, manifestExists := tw.manifests.Load("task-comp")
+	assert.False(t, manifestExists)
+}

@@ -7,12 +7,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Hittlert/TGX/core/tmedia"
+	"github.com/Hittlert/TGX/core/util/tutil"
 	"github.com/gotd/td/telegram/peers"
 	"github.com/gotd/td/telegram/query"
 	"github.com/gotd/td/telegram/query/dialogs"
 	"github.com/gotd/td/tg"
-	"github.com/Hittlert/TGX/core/tmedia"
-	"github.com/Hittlert/TGX/core/util/tutil"
 )
 
 type DialogDTO struct {

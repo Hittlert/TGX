@@ -31,7 +31,7 @@ type Options struct {
 	TempDir          string
 	BufferType       string // "memory" (default), "ssd", "none"
 	BufferDir        string
-	BufferSize       int64  // capacity in bytes
+	BufferSize       int64 // capacity in bytes
 	DBPath           string
 	Password         string
 	SingboxURL       string

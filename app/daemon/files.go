@@ -116,10 +116,10 @@ func newBucketFileElement(
 	return elem, nil
 }
 
-func (e *bucketFileElement) File() downloader.File   { return e.file }
-func (e *bucketFileElement) To() io.WriterAt         { return e.writer }
-func (e *bucketFileElement) AsTakeout() bool         { return false }
-func (e *bucketFileElement) Task() *Task             { return e.task }
+func (e *bucketFileElement) File() downloader.File { return e.file }
+func (e *bucketFileElement) To() io.WriterAt       { return e.writer }
+func (e *bucketFileElement) AsTakeout() bool       { return false }
+func (e *bucketFileElement) Task() *Task           { return e.task }
 func (e *bucketFileElement) Context() context.Context {
 	if e.task != nil {
 		return e.task.Context()
@@ -208,10 +208,10 @@ func newFileElement(task *Task, file downloader.File, tempRoot, outputRoot strin
 	return element, nil
 }
 
-func (e *fileElement) File() downloader.File   { return e.file }
-func (e *fileElement) To() io.WriterAt         { return e.tracked }
-func (e *fileElement) AsTakeout() bool         { return false }
-func (e *fileElement) Task() *Task             { return e.task }
+func (e *fileElement) File() downloader.File { return e.file }
+func (e *fileElement) To() io.WriterAt       { return e.tracked }
+func (e *fileElement) AsTakeout() bool       { return false }
+func (e *fileElement) Task() *Task           { return e.task }
 func (e *fileElement) Context() context.Context {
 	if e.task != nil {
 		return e.task.Context()
@@ -379,10 +379,10 @@ func newLazySmallFileElement(
 	}, nil
 }
 
-func (e *lazySmallFileElement) File() downloader.File   { return e.file }
-func (e *lazySmallFileElement) To() io.WriterAt         { return e.buf }
-func (e *lazySmallFileElement) AsTakeout() bool         { return false }
-func (e *lazySmallFileElement) Task() *Task             { return e.task }
+func (e *lazySmallFileElement) File() downloader.File { return e.file }
+func (e *lazySmallFileElement) To() io.WriterAt       { return e.buf }
+func (e *lazySmallFileElement) AsTakeout() bool       { return false }
+func (e *lazySmallFileElement) Task() *Task           { return e.task }
 func (e *lazySmallFileElement) Context() context.Context {
 	if e.task != nil {
 		return e.task.Context()
@@ -513,10 +513,10 @@ type existingElement struct {
 	path string
 }
 
-func (e *existingElement) File() downloader.File   { return e.file }
-func (e *existingElement) To() io.WriterAt         { return discardWriterAt{} }
-func (e *existingElement) AsTakeout() bool         { return false }
-func (e *existingElement) Task() *Task             { return e.task }
+func (e *existingElement) File() downloader.File { return e.file }
+func (e *existingElement) To() io.WriterAt       { return discardWriterAt{} }
+func (e *existingElement) AsTakeout() bool       { return false }
+func (e *existingElement) Task() *Task           { return e.task }
 func (e *existingElement) Context() context.Context {
 	if e.task != nil {
 		return e.task.Context()

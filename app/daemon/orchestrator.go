@@ -302,7 +302,7 @@ func (o *Orchestrator) dispatchOneRecord(ctx context.Context, record DownloadRec
 		if safeFolder == "" {
 			safeFolder = record.ChatID
 		}
-		
+
 		msgTime := record.CreatedAt
 		if msgTime <= 86400 {
 			msgTime = time.Now().Unix()
@@ -319,7 +319,7 @@ func (o *Orchestrator) dispatchOneRecord(ctx context.Context, record DownloadRec
 			rawName = fmt.Sprintf("%d%s", record.MessageID, ext)
 		}
 		safeFileName, _ := filenamify.Filenamify(rawName, filenamify.Options{Replacement: "_"})
-		
+
 		finalRelPath := filepath.Join(safeFolder, yearMonth, fmt.Sprintf("%d - %s", record.MessageID, safeFileName))
 		finalRelPath = strings.ReplaceAll(finalRelPath, "\\", "/")
 
@@ -408,7 +408,7 @@ func (o *Orchestrator) dispatchOneRecord(ctx context.Context, record DownloadRec
 
 func (o *Orchestrator) CancelTasksByChatID(chatID string) {
 	cleanChatID := strings.TrimPrefix(chatID, "@")
-	
+
 	o.taskCancels.Range(func(key, value any) bool {
 		taskID, ok := key.(string)
 		if !ok {

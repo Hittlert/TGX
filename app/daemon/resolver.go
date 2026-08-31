@@ -6,10 +6,10 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/flytam/filenamify"
 	"github.com/Hittlert/TGX/core/bucket"
 	"github.com/Hittlert/TGX/core/downloader"
 	"github.com/Hittlert/TGX/core/targetwriter"
+	"github.com/flytam/filenamify"
 )
 
 type ResolvedMedia struct {

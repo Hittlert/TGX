@@ -17,10 +17,10 @@ import (
 	"github.com/Hittlert/TGX/pkg/sbe/meta"
 	"github.com/Hittlert/TGX/pkg/sbe/scheduler"
 	"github.com/bits-and-blooms/bitset"
-	_ "modernc.org/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+	_ "modernc.org/sqlite"
 )
 
 func setupMemoryDB(t *testing.T) *sql.DB {

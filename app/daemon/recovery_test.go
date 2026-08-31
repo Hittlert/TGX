@@ -10,11 +10,12 @@ import (
 	"testing"
 	"time"
 
-	_ "modernc.org/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+	_ "modernc.org/sqlite"
 
+	"github.com/Hittlert/TGX/core/bucket"
 	"github.com/Hittlert/TGX/core/mover"
 	"github.com/Hittlert/TGX/core/targetwriter"
 )
@@ -34,6 +35,9 @@ func setupTestDB(t *testing.T) *sql.DB {
 			media_type TEXT,
 			file_size INTEGER,
 			error TEXT,
+			attempts INTEGER NOT NULL DEFAULT 0,
+			next_retry_at INTEGER NOT NULL DEFAULT 0,
+			downloaded_at INTEGER,
 			created_at INTEGER NOT NULL DEFAULT 0,
 			updated_at INTEGER NOT NULL DEFAULT 0,
 			PRIMARY KEY (chat_id, message_id)
@@ -359,4 +363,112 @@ func TestRecovery_PartialSidecarDoesNotRegisterPublishingTask(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, ok)
 	assert.Equal(t, StateQueued, snap.State)
+}
+
+func TestRecovery_UnfreezesCanceledFailedTasks(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+
+	outDir := t.TempDir()
+	tempDir := t.TempDir()
+
+	// Insert record that failed due to shutdown cancellation with attempts=4 and next_retry_at 7 days out
+	futureRetry := time.Now().Add(7 * 24 * time.Hour).Unix()
+	_, err := db.Exec(`INSERT INTO download_records (chat_id, message_id, status, file_name, save_path, file_size, error, attempts, next_retry_at) VALUES ('-1002313319912', 101, 'failed', 'video.mp4', 'video.mp4', 50000000, 'context canceled', 4, ?)`, futureRetry)
+	require.NoError(t, err)
+
+	reconciler := NewReconcilerWithBuffer(db, outDir, tempDir, "memory", nil, zap.NewNop())
+	results, err := reconciler.ReconcileAll(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 1, len(results))
+	assert.Equal(t, "pending", results[0].NextState)
+
+	// Verify DB record is reset to pending with attempts=0 and next_retry_at=0
+	var status string
+	var attempts int
+	var nextRetry int64
+	err = db.QueryRow(`SELECT status, attempts, next_retry_at FROM download_records WHERE chat_id = '-1002313319912' AND message_id = 101`).Scan(&status, &attempts, &nextRetry)
+	require.NoError(t, err)
+	assert.Equal(t, "pending", status)
+	assert.Equal(t, 0, attempts)
+	assert.Equal(t, int64(0), nextRetry)
+}
+
+func TestRecovery_MemoryModeRecoversTargetStorageSidecars(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+
+	outDir := t.TempDir()
+	tempDir := t.TempDir()
+
+	fileKey := CanonicalTaskID("123", 77)
+	finalPath := filepath.Join(outDir, "complete.bin")
+	movingPath := finalPath + ".moving"
+	metaPath := finalPath + ".moving.meta"
+
+	// Create complete .moving (size 1000) and sidecar with ExpectedSize 1000 and range [0, 1000)
+	testContent := make([]byte, 1000)
+	require.NoError(t, os.WriteFile(movingPath, testContent, 0644))
+
+	manifest := targetwriter.TaskManifest{
+		Version:      targetwriter.SidecarVersion,
+		TaskID:       fileKey,
+		FinalPath:    "complete.bin",
+		ExpectedSize: 1000,
+		Gen:          "1",
+		Ranges: []targetwriter.Range{
+			{Start: 0, End: 1000},
+		},
+	}
+	metaBytes, err := json.Marshal(manifest)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(metaPath, metaBytes, 0644))
+
+	_, err = db.Exec(`INSERT INTO download_records (chat_id, message_id, status, file_name, save_path, file_size) VALUES ('123', 77, 'moving', 'complete.bin', 'complete.bin', 1000)`)
+	require.NoError(t, err)
+
+	bkt, err := bucket.New(bucket.Config{Mode: bucket.ModeMemory, MaxCapacity: 10 * 1024 * 1024})
+	require.NoError(t, err)
+	defer bkt.Close()
+
+	tw := targetwriter.New(bkt, outDir)
+	reconciler := NewReconcilerWithBuffer(db, outDir, tempDir, "memory", nil, zap.NewNop())
+	reconciler.SetTargetWriter(tw)
+
+	results, err := reconciler.ReconcileAll(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 1, len(results))
+	assert.Equal(t, "moving", results[0].NextState)
+	assert.Equal(t, "SSD_BUFFER_COMPLETE_FINALIZE_PENDING", results[0].ActionTaken)
+
+	// Verify .moving and .moving.meta were NOT destroyed in memory buffer mode
+	_, err = os.Stat(movingPath)
+	assert.NoError(t, err)
+	_, err = os.Stat(metaPath)
+	assert.NoError(t, err)
+}
+
+func TestDatabase_UpdateDownloadStatus_ContextCanceledDoesNotIncrementAttemptsOrFreeze(t *testing.T) {
+	rawDB := setupTestDB(t)
+	defer rawDB.Close()
+
+	d := &Database{db: rawDB}
+
+	// Insert initial record
+	_, err := rawDB.Exec(`INSERT INTO download_records (chat_id, message_id, status, file_name, save_path, file_size, attempts) VALUES ('chat1', 10, 'downloading', 'file.bin', 'file.bin', 1024, 0)`)
+	require.NoError(t, err)
+
+	// Simulate shutdown / context cancellation
+	err = d.UpdateDownloadStatus("chat1", 10, "failed", "file.bin", "file.bin", "", 1024, "context canceled")
+	require.NoError(t, err)
+
+	// Verify status became 'pending', attempts remains 0, next_retry_at is 0
+	var status string
+	var attempts int
+	var nextRetry int64
+	err = rawDB.QueryRow(`SELECT status, attempts, next_retry_at FROM download_records WHERE chat_id = 'chat1' AND message_id = 10`).Scan(&status, &attempts, &nextRetry)
+	require.NoError(t, err)
+	assert.Equal(t, "pending", status)
+	assert.Equal(t, 0, attempts)
+	assert.Equal(t, int64(0), nextRetry)
 }

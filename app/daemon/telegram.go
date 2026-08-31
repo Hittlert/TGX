@@ -9,11 +9,11 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/sync/singleflight"
 	"github.com/gotd/td/telegram/peers"
 	"github.com/gotd/td/telegram/query"
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
+	"golang.org/x/sync/singleflight"
 
 	"github.com/Hittlert/TGX/core/dcpool"
 	"github.com/Hittlert/TGX/core/downloader"
