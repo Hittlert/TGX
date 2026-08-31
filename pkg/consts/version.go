@@ -6,3 +6,13 @@ var (
 	Commit     = "unknown"
 	CommitDate = "unknown"
 )
+
+const FallbackVersion = "v4.4.13"
+
+// EffectiveVersion returns the current runtime version string.
+func EffectiveVersion() string {
+	if Version != "" && Version != "dev" {
+		return Version
+	}
+	return FallbackVersion
+}

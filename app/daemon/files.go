@@ -75,7 +75,7 @@ func newBucketFileElement(
 	date int64,
 	bkt bucket.Bucket,
 	tw *targetwriter.TargetWriter,
-) (*bucketFileElement, error) {
+) (taskElement, error) {
 	// Guard against stale/canceled Task attempt after slow resolve
 	if task.IsTerminal() || (task.Context() != nil && task.Context().Err() != nil) {
 		return nil, errors.New("task attempt is no longer active")
@@ -95,8 +95,19 @@ func newBucketFileElement(
 	}
 	if tw != nil {
 		res := tw.RegisterTask(manifest)
-		if res == targetwriter.RegisterStale || res == targetwriter.RegisterConflict {
-			return nil, fmt.Errorf("target writer rejected attempt: %s", res)
+		switch res {
+		case targetwriter.RegisterAccepted:
+			// Normal download path
+		case targetwriter.RegisterAlreadyFinalized:
+			finalFile := filepath.Join(outputRoot, manifest.FinalPath)
+			if stat, statErr := os.Stat(finalFile); statErr == nil && stat.Size() == file.Size() {
+				return &existingElement{task: task, file: file, path: manifest.FinalPath}, nil
+			}
+			return nil, fmt.Errorf("task already finalized in writer but target file missing: %s", manifest.FinalPath)
+		case targetwriter.RegisterStale:
+			return nil, fmt.Errorf("target writer rejected attempt: STALE")
+		case targetwriter.RegisterConflict:
+			return nil, fmt.Errorf("target writer rejected attempt: CONFLICT")
 		}
 	}
 
@@ -349,7 +360,7 @@ func newLazySmallFileElement(
 	date int64,
 	bkt bucket.Bucket,
 	tw *targetwriter.TargetWriter,
-) (*lazySmallFileElement, error) {
+) (taskElement, error) {
 	// Guard against stale/canceled Task attempt after slow resolve
 	if task.IsTerminal() || (task.Context() != nil && task.Context().Err() != nil) {
 		return nil, errors.New("task attempt is no longer active")
@@ -369,8 +380,19 @@ func newLazySmallFileElement(
 			Gen:          gen,
 		}
 		res := tw.RegisterTask(manifest)
-		if res == targetwriter.RegisterStale || res == targetwriter.RegisterConflict {
-			return nil, fmt.Errorf("target writer rejected small file attempt: %s", res)
+		switch res {
+		case targetwriter.RegisterAccepted:
+			// Normal download path
+		case targetwriter.RegisterAlreadyFinalized:
+			finalFile := filepath.Join(outputRoot, manifest.FinalPath)
+			if stat, statErr := os.Stat(finalFile); statErr == nil && stat.Size() == file.Size() {
+				return &existingElement{task: task, file: file, path: manifest.FinalPath}, nil
+			}
+			return nil, fmt.Errorf("small file already finalized in writer but target file missing: %s", manifest.FinalPath)
+		case targetwriter.RegisterStale:
+			return nil, fmt.Errorf("target writer rejected small file attempt: STALE")
+		case targetwriter.RegisterConflict:
+			return nil, fmt.Errorf("target writer rejected small file attempt: CONFLICT")
 		}
 	}
 	return &lazySmallFileElement{

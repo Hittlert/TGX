@@ -472,3 +472,62 @@ func TestDatabase_UpdateDownloadStatus_ContextCanceledDoesNotIncrementAttemptsOr
 	assert.Equal(t, 0, attempts)
 	assert.Equal(t, int64(0), nextRetry)
 }
+
+func TestRecovery_LegacyPart_ContentConflictDifferentSHA(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+
+	outDir := t.TempDir()
+	tempDir := t.TempDir()
+
+	fileKeyConflict := CanonicalTaskID("chat_conf", 1)
+	finalPathConf := filepath.Join(outDir, "conf.bin")
+	tempPartPathConf := CanonicalPartPath(tempDir, fileKeyConflict)
+
+	// Create target and temp part with SAME SIZE but DIFFERENT CONTENT
+	partData := []byte("part-data-12345")
+	diffData := []byte("diff-data-67890")
+	require.Equal(t, len(partData), len(diffData))
+
+	require.NoError(t, os.WriteFile(finalPathConf, diffData, 0644))
+	require.NoError(t, os.WriteFile(tempPartPathConf, partData, 0644))
+
+	_, err := db.Exec(`INSERT INTO download_records (chat_id, message_id, status, file_name, save_path, file_size) VALUES ('chat_conf', 1, 'moving', 'conf.bin', 'conf.bin', ?)`, len(partData))
+	require.NoError(t, err)
+
+	rec := NewReconciler(db, outDir, tempDir, zap.NewNop())
+	results, err := rec.ReconcileAll(context.Background())
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+
+	// Result should be reset to pending because SHAs do not match
+	assert.Equal(t, "pending", results[0].NextState)
+	assert.Equal(t, "LEGACY_PART_RESET_TO_PENDING", results[0].ActionTaken)
+
+	// Temp part must NOT have been deleted
+	_, err = os.Stat(tempPartPathConf)
+	assert.NoError(t, err)
+
+	// Now test identical SHA:
+	fileKeyIdentical := CanonicalTaskID("chat_ident", 2)
+	finalPathIdent := filepath.Join(outDir, "ident.bin")
+	tempPartPathIdent := CanonicalPartPath(tempDir, fileKeyIdentical)
+
+	require.NoError(t, os.WriteFile(finalPathIdent, partData, 0644))
+	require.NoError(t, os.WriteFile(tempPartPathIdent, partData, 0644))
+
+	_, err = db.Exec(`INSERT INTO download_records (chat_id, message_id, status, file_name, save_path, file_size) VALUES ('chat_ident', 2, 'moving', 'ident.bin', 'ident.bin', ?)`, len(partData))
+	require.NoError(t, err)
+
+	results, err = rec.ReconcileAll(context.Background())
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+
+	assert.Equal(t, fileKeyIdentical, results[0].FileKey)
+	assert.Equal(t, "success", results[0].NextState)
+	assert.Equal(t, "LEGACY_PART_TARGET_ALREADY_EXISTS_PROMOTED", results[0].ActionTaken)
+
+	// Temp part should be cleaned up on verified identical content
+	_, err = os.Stat(tempPartPathIdent)
+	assert.True(t, os.IsNotExist(err))
+}

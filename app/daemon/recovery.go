@@ -2,10 +2,13 @@ package daemon
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 
@@ -103,10 +106,14 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) ([]TaskRecoveryResult, er
 		metaPath := finalPath + ".moving.meta"
 
 		// 1. Check if final file was already committed via our SHA-verified CommitFile.
-		// Accept only if: final exists with exact size AND .moving explicitly does NOT exist.
+		// Accept only if: final exists with exact size, .moving does NOT exist, and no temp part exists.
 		stat, err := os.Stat(finalPath)
 		_, movingErr := os.Stat(movingPath)
-		if err == nil && stat.Size() == rec.FileSize && rec.FileSize > 0 && errors.Is(movingErr, os.ErrNotExist) {
+		tempPartPath := CanonicalPartPath(r.tempDir, fileKey)
+		_, partErr := os.Stat(tempPartPath)
+		hasTempPart := (partErr == nil)
+
+		if err == nil && stat.Size() == rec.FileSize && rec.FileSize > 0 && errors.Is(movingErr, os.ErrNotExist) && !hasTempPart {
 			_ = os.Remove(metaPath)
 			_, _ = r.db.ExecContext(ctx, `UPDATE download_records SET status = 'success', error = '' WHERE chat_id = ? AND message_id = ?`, rec.ChatID, rec.MessageID)
 			results = append(results, TaskRecoveryResult{
@@ -194,18 +201,49 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) ([]TaskRecoveryResult, er
 						// Complete bitmap: TargetWriter will finalize via pendingFinalize queue
 						if r.tw != nil {
 							res := r.tw.RegisterTask(manifest)
-							if res == targetwriter.RegisterAccepted || res == targetwriter.RegisterAlreadyFinalized {
+							switch res {
+							case targetwriter.RegisterAccepted:
 								if r.registry != nil {
 									r.registry.RegisterRecoveredTask(manifest.TaskID, manifest.Gen, rec.SavePath, manifest.ExpectedSize)
 								}
+								results = append(results, TaskRecoveryResult{
+									FileKey:     fileKey,
+									PrevState:   rec.Status,
+									NextState:   "moving",
+									ActionTaken: "SSD_BUFFER_COMPLETE_FINALIZE_PENDING",
+								})
+							case targetwriter.RegisterAlreadyFinalized:
+								if stat, err := os.Stat(finalPath); err == nil && stat.Size() == manifest.ExpectedSize {
+									_ = os.Remove(metaPath)
+									_ = os.Remove(movingPath)
+									_, _ = r.db.ExecContext(ctx, `UPDATE download_records SET status = 'success', error = '' WHERE chat_id = ? AND message_id = ?`, rec.ChatID, rec.MessageID)
+									results = append(results, TaskRecoveryResult{
+										FileKey:     fileKey,
+										PrevState:   rec.Status,
+										NextState:   "success",
+										ActionTaken: "ALREADY_FINALIZED_PROMOTED_TO_SUCCESS",
+									})
+								} else {
+									_, _ = r.db.ExecContext(ctx, `UPDATE download_records SET status = 'pending', attempts = 0, next_retry_at = 0, error = '' WHERE chat_id = ? AND message_id = ?`, rec.ChatID, rec.MessageID)
+									results = append(results, TaskRecoveryResult{
+										FileKey:     fileKey,
+										PrevState:   rec.Status,
+										NextState:   "pending",
+										ActionTaken: "ALREADY_FINALIZED_TARGET_MISSING_RESET",
+									})
+								}
+							case targetwriter.RegisterStale, targetwriter.RegisterConflict:
+								_ = os.Remove(metaPath)
+								_ = os.Remove(movingPath)
+								_, _ = r.db.ExecContext(ctx, `UPDATE download_records SET status = 'pending', attempts = 0, next_retry_at = 0, error = '' WHERE chat_id = ? AND message_id = ?`, rec.ChatID, rec.MessageID)
+								results = append(results, TaskRecoveryResult{
+									FileKey:     fileKey,
+									PrevState:   rec.Status,
+									NextState:   "pending",
+									ActionTaken: "SSD_BUFFER_REJECTED_RESET_TO_PENDING",
+								})
 							}
 						}
-						results = append(results, TaskRecoveryResult{
-							FileKey:     fileKey,
-							PrevState:   rec.Status,
-							NextState:   "moving",
-							ActionTaken: "SSD_BUFFER_COMPLETE_FINALIZE_PENDING",
-						})
 					} else {
 						// Incomplete bitmap: reset DB to pending with 0 attempts / next_retry_at
 						// so pending scanner re-dispatches the task cleanly.
@@ -230,7 +268,7 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) ([]TaskRecoveryResult, er
 		}
 
 		// 3. Fallback: check legacy part file or reset to pending
-		tempPartPath := CanonicalPartPath(r.tempDir, fileKey)
+		tempPartPath = CanonicalPartPath(r.tempDir, fileKey)
 		partStat, partErr := os.Stat(tempPartPath)
 		if partErr == nil && partStat.Size() == rec.FileSize && rec.FileSize > 0 {
 			if r.mover != nil {
@@ -267,7 +305,9 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) ([]TaskRecoveryResult, er
 					})
 				} else {
 					if errors.Is(err, atomicCommit.ErrTargetExists) {
-						if stat, statErr := os.Stat(finalPath); statErr == nil && stat.Size() == rec.FileSize {
+						partSHA, err1 := computeRecoverySHA256(tempPartPath)
+						finalSHA, err2 := computeRecoverySHA256(finalPath)
+						if err1 == nil && err2 == nil && partSHA == finalSHA {
 							_ = os.Remove(tempPartPath)
 							_, _ = r.db.ExecContext(ctx, `UPDATE download_records SET status = 'success', error = '' WHERE chat_id = ? AND message_id = ?`, rec.ChatID, rec.MessageID)
 							results = append(results, TaskRecoveryResult{
@@ -317,4 +357,19 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) ([]TaskRecoveryResult, er
 	}
 
 	return results, nil
+}
+
+func computeRecoverySHA256(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	hasher := sha256.New()
+	buf := make([]byte, 1024*1024)
+	if _, err := io.CopyBuffer(hasher, f, buf); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(hasher.Sum(nil)), nil
 }

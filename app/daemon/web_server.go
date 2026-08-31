@@ -328,10 +328,7 @@ func (s *WebServer) handleIndex(w http.ResponseWriter, r *http.Request) {
 		state = "paused"
 	}
 
-	ver := consts.Version
-	if ver == "" || ver == "dev" {
-		ver = "v4.4.12"
-	}
+	ver := consts.EffectiveVersion()
 
 	content := strings.ReplaceAll(string(data), "{{ download_state }}", state)
 	content = strings.ReplaceAll(content, "{{ app_version }}", ver)
@@ -435,10 +432,7 @@ func (s *WebServer) decryptFrontendPassword(encryptedB64 string) string {
 
 func (s *WebServer) handleGetAppVersion(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	ver := consts.Version
-	if ver == "" || ver == "dev" {
-		ver = "v4.4.12"
-	}
+	ver := consts.EffectiveVersion()
 	_, _ = w.Write([]byte(ver))
 }
 
@@ -512,7 +506,7 @@ func (s *WebServer) handleGetDownloadStatus(w http.ResponseWriter, r *http.Reque
 			"files":        filesMap,
 		},
 		"sbe_stats": map[string]any{
-			"engine_version":  consts.Version,
+			"engine_version":  consts.EffectiveVersion(),
 			"buffer_used_mb":  bufferUsedMB,
 			"buffer_limit_mb": bufferLimitMB,
 			"dirty_used_mb":   bufferUsedMB,
