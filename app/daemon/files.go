@@ -85,6 +85,9 @@ func newBucketFileElement(
 		Date:         date,
 		Gen:          gen,
 	}
+	if bkt != nil {
+		bkt.SetTaskGeneration(task.Request().ID, gen)
+	}
 	if tw != nil {
 		tw.RegisterTask(manifest)
 	}
@@ -341,6 +344,9 @@ func newLazySmallFileElement(
 ) (*lazySmallFileElement, error) {
 	// Generation determined once at task submission, not derived at download time
 	gen := task.AttemptGen()
+	if bkt != nil {
+		bkt.SetTaskGeneration(task.Request().ID, gen)
+	}
 	if tw != nil {
 		manifest := targetwriter.TaskManifest{
 			TaskID:       task.Request().ID,

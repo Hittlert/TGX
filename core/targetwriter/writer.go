@@ -146,20 +146,14 @@ func (w *TargetWriter) RegisterTask(manifest TaskManifest) {
 			w.pendingFinalizeNext.Delete(manifest.TaskID)
 		} else {
 			// Same generation re-register:
-			// If FinalPath or ExpectedSize changed (unexpected identity conflict), clean up old state and rebuild.
+			// If FinalPath or ExpectedSize changed, reject inconsistent identity for same generation
 			if old.FinalPath != manifest.FinalPath || old.ExpectedSize != manifest.ExpectedSize {
-				w.bitmaps.Delete(manifest.TaskID)
-				if fVal, fOk := w.openFiles.LoadAndDelete(manifest.TaskID); fOk {
-					_ = fVal.(*os.File).Close()
-				}
-				w.pendingFinalize.Delete(manifest.TaskID)
-				w.pendingFinalizeNext.Delete(manifest.TaskID)
-			} else {
-				// Same identity: update manifest but do NOT rebuild bitmap.
-				// This preserves durable ranges recovered from sidecar or written since first register.
-				w.manifests.Store(manifest.TaskID, manifest)
 				return
 			}
+			// Same identity: update manifest but do NOT rebuild bitmap.
+			// This preserves durable ranges recovered from sidecar or written since first register.
+			w.manifests.Store(manifest.TaskID, manifest)
+			return
 		}
 	}
 
@@ -409,10 +403,14 @@ func (w *TargetWriter) processObject(obj *bucket.BufferObject, isContiguous bool
 	// Phase 1: Look up task manifest
 	val, ok := w.manifests.Load(taskID)
 	if !ok {
-		// If task was already completed and finalized, safely consume and delete leftover object
-		if _, completed := w.completedTasks.Load(taskID); completed {
-			_ = w.bkt.AckDurable([]bucket.ObjectKey{obj.Key})
-			return processResult{phase: phaseStaleDiscarded}
+		// If task was already completed and finalized with matching generation, safely consume and delete leftover object
+		if compGen, completed := w.completedTasks.Load(taskID); completed {
+			if compGen.(string) == obj.Key.Gen {
+				if err := w.bkt.AckDurable([]bucket.ObjectKey{obj.Key}); err != nil {
+					return processResult{phaseObjectRetryable, fmt.Errorf("ack completed task leftover object: %w", err)}
+				}
+				return processResult{phase: phaseStaleDiscarded}
+			}
 		}
 		return processResult{phaseObjectRetryable, errors.New("task manifest not registered yet")}
 	}
@@ -631,8 +629,11 @@ func (w *TargetWriter) finalizeTask(manifest TaskManifest) error {
 			if existErr == nil && existingSHA == shaHash {
 				_ = os.Remove(movingPath)
 				_ = os.Remove(metaPath)
+			} else if existErr != nil {
+				// Transient IO error reading existing target file
+				return fmt.Errorf("read existing target file for sha verification: %w", existErr)
 			} else {
-			return fmt.Errorf("existing_sha=%s, new_sha=%s: %w",
+				return fmt.Errorf("existing_sha=%s, new_sha=%s: %w",
 					existingSHA, shaHash, ErrContentConflict)
 			}
 		} else {

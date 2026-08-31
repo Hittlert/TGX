@@ -66,11 +66,17 @@ func (o *Orchestrator) Start(ctx context.Context) {
 			func(taskID, gen, finalPath, shaHash string) {
 				// Registry validates generation atomically before any persistent side effects.
 				// If rejected (stale gen), DB is NOT updated — prevents false terminal state.
-				accepted := false
+				// If accepted or not found (e.g. startup recovery task), DB is updated.
+				updateDB := false
 				if o.registry != nil {
-					accepted = o.registry.FinishTask(taskID, gen, StateSuccess, "", "", finalPath, false, shaHash)
+					res := o.registry.FinishTask(taskID, gen, StateSuccess, "", "", finalPath, false, shaHash)
+					if res == FinishAccepted || res == FinishNotFound {
+						updateDB = true
+					}
+				} else {
+					updateDB = true
 				}
-				if accepted {
+				if updateDB {
 					parts := strings.Split(taskID, ":")
 					if len(parts) == 2 {
 						var msgID int
@@ -82,11 +88,16 @@ func (o *Orchestrator) Start(ctx context.Context) {
 			func(taskID string, movedBytes, totalBytes int64) {
 			},
 			func(taskID, gen string, err error) {
-				accepted := false
+				updateDB := false
 				if o.registry != nil {
-					accepted = o.registry.FinishTask(taskID, gen, StateFailed, "write_error", err.Error(), "", false, "")
+					res := o.registry.FinishTask(taskID, gen, StateFailed, "write_error", err.Error(), "", false, "")
+					if res == FinishAccepted || res == FinishNotFound {
+						updateDB = true
+					}
+				} else {
+					updateDB = true
 				}
-				if accepted {
+				if updateDB {
 					parts := strings.Split(taskID, ":")
 					if len(parts) == 2 {
 						var msgID int

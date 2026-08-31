@@ -188,4 +188,3 @@ func TestTargetWriter_ContentConflict(t *testing.T) {
 		t.Fatal("expected content conflict error callback")
 	}
 }
-

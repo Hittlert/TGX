@@ -54,6 +54,7 @@ type Bucket interface {
 	Requeue(obj *BufferObject)
 	AckDurable(keys []ObjectKey) error
 	DeleteObjects(keys []ObjectKey) error
+	SetTaskGeneration(taskID, gen string)
 	Recover(ctx context.Context) error
 	Close() error
 }
@@ -71,6 +72,9 @@ type bucketImpl struct {
 	readyBytes         int64
 	pendingDeleteBytes int64
 	objectCount        int64
+
+	// Authoritative generation per task: taskID -> activeGen
+	currentTaskGen map[string]string
 
 	// Index: taskID -> map[offset]*readyEntry
 	readyByTask   map[string]map[int64]*readyEntry
@@ -97,9 +101,10 @@ func New(cfg Config) (Bucket, error) {
 	}
 
 	b := &bucketImpl{
-		cfg:         cfg,
-		readyByTask: make(map[string]map[int64]*readyEntry),
-		memData:     make(map[string][]byte),
+		cfg:            cfg,
+		currentTaskGen: make(map[string]string),
+		readyByTask:    make(map[string]map[int64]*readyEntry),
+		memData:        make(map[string][]byte),
 	}
 	return b, nil
 }
@@ -199,6 +204,46 @@ func (b *bucketImpl) ReleaseReservation(bytes int64) {
 	b.mu.Unlock()
 }
 
+// SetTaskGeneration establishes the authoritative active generation for a task.
+// Any buffered objects from prior generations for this task are purged to release capacity.
+func (b *bucketImpl) SetTaskGeneration(taskID, gen string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	b.currentTaskGen[taskID] = gen
+
+	taskMap, ok := b.readyByTask[taskID]
+	if !ok {
+		return
+	}
+
+	var toDelete []int64
+	for offset, entry := range taskMap {
+		if entry.obj.Key.Gen != gen {
+			if b.readyBytes >= entry.obj.Key.Length {
+				b.readyBytes -= entry.obj.Key.Length
+			}
+			if b.objectCount > 0 {
+				b.objectCount--
+			}
+			if b.cfg.Mode == ModeSSD && entry.obj.DiskPath != "" {
+				_ = os.Remove(entry.obj.DiskPath)
+			} else if b.cfg.Mode == ModeMemory {
+				delete(b.memData, entry.obj.Key.String())
+			}
+			toDelete = append(toDelete, offset)
+		}
+	}
+	for _, offset := range toDelete {
+		delete(taskMap, offset)
+	}
+	if len(taskMap) == 0 {
+		delete(b.readyByTask, taskID)
+		b.removeTaskOrderLocked(taskID)
+	}
+	b.notifyWaitersLocked()
+}
+
 func (b *bucketImpl) PutObject(key ObjectKey, data []byte) error {
 	if int64(len(data)) != key.Length {
 		return fmt.Errorf("data length %d does not match key length %d", len(data), key.Length)
@@ -212,28 +257,25 @@ func (b *bucketImpl) PutObject(key ObjectKey, data []byte) error {
 	}
 
 	b.mu.Lock()
-	// Idempotency & generation check:
+	// 1. Authoritative generation guard: reject stale generation chunks immediately
+	if currentGen, ok := b.currentTaskGen[key.TaskID]; ok && currentGen != "" && key.Gen != currentGen {
+		if b.reservedBytes >= key.Length {
+			b.reservedBytes -= key.Length
+		}
+		b.notifyWaitersLocked()
+		b.mu.Unlock()
+		return nil
+	}
+
+	// 2. Idempotency check: if exact duplicate already exists, release reservation and return
 	if taskMap, ok := b.readyByTask[key.TaskID]; ok {
-		if entry, exists := taskMap[key.Offset]; exists {
-			// 1. Exact duplicate object: release caller's reservation and return nil.
-			if entry.obj.Key.Gen == key.Gen && entry.obj.Key.Checksum == key.Checksum {
-				if b.reservedBytes >= key.Length {
-					b.reservedBytes -= key.Length
-				}
-				b.notifyWaitersLocked()
-				b.mu.Unlock()
-				return nil
+		if entry, exists := taskMap[key.Offset]; exists && entry.obj.Key.Gen == key.Gen && entry.obj.Key.Checksum == key.Checksum {
+			if b.reservedBytes >= key.Length {
+				b.reservedBytes -= key.Length
 			}
-			// 2. Late older-generation object: do not overwrite newer valid object.
-			// Release caller's reservation and drop the stale object.
-			if isNewerGeneration(entry.obj.Key.Gen, key.Gen) {
-				if b.reservedBytes >= key.Length {
-					b.reservedBytes -= key.Length
-				}
-				b.notifyWaitersLocked()
-				b.mu.Unlock()
-				return nil
-			}
+			b.notifyWaitersLocked()
+			b.mu.Unlock()
+			return nil
 		}
 	}
 	b.mu.Unlock()
@@ -268,6 +310,17 @@ func (b *bucketImpl) PutObject(key ObjectKey, data []byte) error {
 
 	b.mu.Lock()
 	defer b.mu.Unlock()
+
+	// Double-check authoritative generation to eliminate TOCTOU race:
+	if currentGen, ok := b.currentTaskGen[key.TaskID]; ok && currentGen != "" && key.Gen != currentGen {
+		if b.cfg.Mode == ModeSSD && obj.DiskPath != "" {
+			_ = os.Remove(obj.DiskPath)
+		} else if b.cfg.Mode == ModeMemory {
+			delete(b.memData, key.String())
+		}
+		b.notifyWaitersLocked()
+		return nil
+	}
 
 	if b.reservedBytes >= key.Length {
 		b.reservedBytes -= key.Length

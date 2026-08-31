@@ -129,8 +129,9 @@ type Registry struct {
 }
 
 type Task struct {
-	registry *Registry
-	state    *taskState
+	registry   *Registry
+	state      *taskState
+	attemptGen string
 }
 
 func NewRegistry(queueCapacity, terminalLimit int, now func() time.Time) *Registry {
@@ -238,7 +239,7 @@ func (r *Registry) Next(ctx context.Context) (*Task, error) {
 			state.state = StateResolving
 			state.startedAt = r.now()
 			r.mu.Unlock()
-			return &Task{registry: r, state: state}, nil
+			return &Task{registry: r, state: state, attemptGen: state.attemptGen}, nil
 		}
 		r.mu.Unlock()
 		select {
@@ -327,14 +328,24 @@ func (t *Task) Request() TaskRequest {
 	return t.state.request
 }
 
+type FinishResult int
+
+const (
+	FinishAccepted FinishResult = iota + 1
+	FinishRejectedStale
+	FinishNotFound
+)
+
 // AttemptGen returns the generation ID for this task attempt.
-// Set once at Submit time: "1" for first attempt, "retry_<nanos>" for retries.
+// Set once at Task creation time: "1" for first attempt, "retry_<nanos>" for retries.
 func (t *Task) AttemptGen() string {
-	gen := t.state.attemptGen
-	if gen == "" {
-		return "1"
+	if t.attemptGen != "" {
+		return t.attemptGen
 	}
-	return gen
+	if t.state != nil && t.state.attemptGen != "" {
+		return t.state.attemptGen
+	}
+	return "1"
 }
 
 func (t *Task) Snapshot() TaskSnapshot {
@@ -366,6 +377,9 @@ func (t *Task) IsTerminal() bool {
 	r := t.registry
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if t.attemptGen != "" && t.state.attemptGen != t.attemptGen {
+		return true // stale attempt is effectively terminal/discarded
+	}
 	return isTerminal(t.state.state)
 }
 
@@ -383,7 +397,7 @@ func (t *Task) Succeed(finalPath string, alreadyExists bool) {
 }
 
 func (t *Task) SucceedResult(result PublishResult) {
-	t.registry.finish(t.state, StateSuccess, "", "", result.Path, result.AlreadyExists, result.SHA256)
+	t.registry.finishWithGen(t.state, t.attemptGen, StateSuccess, "", "", result.Path, result.AlreadyExists, result.SHA256)
 }
 
 func (t *Task) Fail(class, message string, unavailable bool) {
@@ -391,7 +405,7 @@ func (t *Task) Fail(class, message string, unavailable bool) {
 	if unavailable {
 		state = StateUnavailable
 	}
-	t.registry.finish(t.state, state, class, message, "", false, "")
+	t.registry.finishWithGen(t.state, t.attemptGen, state, class, message, "", false, "")
 }
 
 func (t *Task) RecordProgress(downloaded int64) {
@@ -401,6 +415,9 @@ func (t *Task) RecordProgress(downloaded int64) {
 	r := t.registry
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if t.attemptGen != "" && t.state.attemptGen != t.attemptGen {
+		return
+	}
 	if isTerminal(t.state.state) {
 		return
 	}
@@ -434,6 +451,9 @@ func (t *Task) RecordWrite(offset int64, size int) int64 {
 	r := t.registry
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if t.attemptGen != "" && t.state.attemptGen != t.attemptGen {
+		return 0
+	}
 	end := offset + int64(size)
 	if end < offset {
 		return 0
@@ -469,55 +489,19 @@ func (t *Task) RecordWrite(offset int64, size int) int64 {
 func (t *Task) update(update func(*taskState)) {
 	r := t.registry
 	r.mu.Lock()
+	defer r.mu.Unlock()
+	if t.attemptGen != "" && t.state.attemptGen != t.attemptGen {
+		return
+	}
 	if !isTerminal(t.state.state) {
 		update(t.state)
 	}
-	r.mu.Unlock()
 }
 
-func (r *Registry) finish(state *taskState, status TaskState, class, message, finalPath string, already bool, sha256 string) {
+func (r *Registry) finishWithGen(state *taskState, gen string, status TaskState, class, message, finalPath string, already bool, sha256 string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if isTerminal(state.state) {
-		return
-	}
-	state.state = status
-	state.errorClass = class
-	state.errorText = message
-	state.alreadyExists = already
-	state.sha256 = sha256
-	state.finishedAt = r.now()
-	if isTerminal(status) && state.cancel != nil {
-		state.cancel()
-	}
-	if finalPath != "" {
-		state.request.FinalPath = finalPath
-	}
-	if message != "" {
-		r.lastError = message
-	}
-	r.terminalOrder = append(r.terminalOrder, state.request.ID)
-	for len(r.terminalOrder) > r.terminalLimit {
-		oldest := r.terminalOrder[0]
-		r.terminalOrder = r.terminalOrder[1:]
-		delete(r.tasks, oldest)
-	}
-}
-
-// FinishTask attempts to transition a task to terminal state.
-// Returns true if the transition was accepted (generation matches current attempt).
-// Returns false if rejected (stale generation or unknown task).
-// The generation check and state transition happen atomically under the same lock.
-func (r *Registry) FinishTask(id, gen string, status TaskState, class, message, finalPath string, already bool, sha256 string) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	state, ok := r.tasks[id]
-	if !ok || state == nil {
-		return false
-	}
-	// Generation guard: reject stale attempt callbacks.
-	// Empty gen in callback is never accepted (would bypass the guard).
-	if gen == "" || state.attemptGen != gen {
+	if gen != "" && state.attemptGen != gen {
 		return false
 	}
 	if isTerminal(state.state) {
@@ -545,6 +529,49 @@ func (r *Registry) FinishTask(id, gen string, status TaskState, class, message, 
 		delete(r.tasks, oldest)
 	}
 	return true
+}
+
+// FinishTask attempts to transition a task to terminal state.
+// Returns FinishAccepted if generation matches current attempt.
+// Returns FinishRejectedStale if generation does not match (stale callback).
+// Returns FinishNotFound if task is not in active registry (e.g. startup recovery task).
+func (r *Registry) FinishTask(id, gen string, status TaskState, class, message, finalPath string, already bool, sha256 string) FinishResult {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	state, ok := r.tasks[id]
+	if !ok || state == nil {
+		return FinishNotFound
+	}
+	// Generation guard: reject stale attempt callbacks.
+	// Empty gen in callback is never accepted (would bypass the guard).
+	if gen == "" || state.attemptGen != gen {
+		return FinishRejectedStale
+	}
+	if isTerminal(state.state) {
+		return FinishAccepted
+	}
+	state.state = status
+	state.errorClass = class
+	state.errorText = message
+	state.alreadyExists = already
+	state.sha256 = sha256
+	state.finishedAt = r.now()
+	if isTerminal(status) && state.cancel != nil {
+		state.cancel()
+	}
+	if finalPath != "" {
+		state.request.FinalPath = finalPath
+	}
+	if message != "" {
+		r.lastError = message
+	}
+	r.terminalOrder = append(r.terminalOrder, state.request.ID)
+	for len(r.terminalOrder) > r.terminalLimit {
+		oldest := r.terminalOrder[0]
+		r.terminalOrder = r.terminalOrder[1:]
+		delete(r.tasks, oldest)
+	}
+	return FinishAccepted
 }
 
 func (r *Registry) Cancel(id string, reason string) {

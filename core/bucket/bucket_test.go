@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/rand"
 	"hash/crc32"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -132,6 +134,8 @@ func TestBucket_LateOlderGenerationRejected(t *testing.T) {
 		Checksum: crc32.ChecksumIEEE(dataOld),
 	}
 
+	b.SetTaskGeneration("task-gen", "retry_2000")
+
 	// 1. Put newer generation object first
 	require.NoError(t, b.Reserve(ctx, keyNew.Length))
 	require.NoError(t, b.PutObject(keyNew, dataNew))
@@ -160,10 +164,7 @@ func TestBucket_LateOlderGenerationRejected(t *testing.T) {
 
 func TestBucket_MultiGenRecovery(t *testing.T) {
 	tempDir := t.TempDir()
-	b, err := New(Config{Mode: ModeSSD, RootDir: tempDir, MaxCapacity: 50 * 1024 * 1024})
-	require.NoError(t, err)
 
-	ctx := context.Background()
 	data1 := []byte("chunk-gen-1")
 	key1 := ObjectKey{
 		TaskID:   "task-multigen",
@@ -182,19 +183,21 @@ func TestBucket_MultiGenRecovery(t *testing.T) {
 		Checksum: crc32.ChecksumIEEE(data2),
 	}
 
-	require.NoError(t, b.Reserve(ctx, key1.Length))
-	require.NoError(t, b.PutObject(key1, data1))
-	require.NoError(t, b.Reserve(ctx, key2.Length))
-	require.NoError(t, b.PutObject(key2, data2))
+	// Write both files directly onto disk to simulate real crash with multi-generation files on disk
+	path1 := filepath.Join(tempDir, key1.RelPath(".ready"))
+	require.NoError(t, os.MkdirAll(filepath.Dir(path1), 0755))
+	require.NoError(t, os.WriteFile(path1, data1, 0644))
 
-	require.NoError(t, b.Close())
+	path2 := filepath.Join(tempDir, key2.RelPath(".ready"))
+	require.NoError(t, os.MkdirAll(filepath.Dir(path2), 0755))
+	require.NoError(t, os.WriteFile(path2, data2, 0644))
 
-	// Recover
+	// Recover with new bucket
 	b2, err := New(Config{Mode: ModeSSD, RootDir: tempDir, MaxCapacity: 50 * 1024 * 1024})
 	require.NoError(t, err)
 	defer b2.Close()
 
-	require.NoError(t, b2.Recover(ctx))
+	require.NoError(t, b2.Recover(context.Background()))
 	m := b2.Metrics()
 	assert.Equal(t, int64(1), m.ObjectCount)
 	assert.Equal(t, key2.Length, m.ReadyBytes)
@@ -233,5 +236,3 @@ func TestBucket_CapacityBackpressure(t *testing.T) {
 		t.Fatal("backpressure reserve did not unblock")
 	}
 }
-
-

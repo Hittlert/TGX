@@ -163,3 +163,70 @@ func TestReconciler_SSDBufferCompletedRequeuedInMover(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, testContent, data)
 }
+
+func TestTask_StaleAttemptCannotTerminateNewAttempt(t *testing.T) {
+	r := NewRegistry(10, 100, time.Now)
+	req := TaskRequest{ID: "chat1:100", Peer: "chat1", MessageID: 100, FinalPath: "chat1/file.bin", ExpectedSize: 1024}
+
+	// 1. Submit first attempt (Gen = "1")
+	_, ok, err := r.Submit(req)
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	task1, err := r.Next(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, "1", task1.AttemptGen())
+
+	// Simulate task1 failure
+	task1.Fail("test_error", "network drop", false)
+	snap1 := task1.Snapshot()
+	assert.Equal(t, StateFailed, snap1.State)
+
+	// 2. Retry task -> creates new attempt with Gen = "retry_..."
+	req.Retry = true
+	_, ok, err = r.Submit(req)
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	task2, err := r.Next(context.Background())
+	require.NoError(t, err)
+	require.NotEqual(t, "1", task2.AttemptGen())
+	assert.Equal(t, StateResolving, task2.Snapshot().State)
+
+	// 3. Late sibling call from old task1 object: should be rejected
+	task1.Succeed("some/path", false)
+
+	// Verify task2 was NOT terminated by stale task1 call
+	snap2 := task2.Snapshot()
+	assert.Equal(t, StateResolving, snap2.State)
+	assert.False(t, task2.IsTerminal())
+}
+
+func TestOrchestrator_StartupRecoveryCallbackUpdatesDB(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+
+	outDir := t.TempDir()
+
+	_, err := db.Exec(`INSERT INTO download_records (chat_id, message_id, status, file_name, save_path, file_size) VALUES ('123', 99, 'moving', 'rec.bin', 'rec.bin', 1024)`)
+	require.NoError(t, err)
+
+	r := NewRegistry(10, 100, time.Now)
+
+	// Task 123:99 is NOT in registry (startup recovery task)
+	// Orchestrator callbacks are invoked by TargetWriter on completion:
+	completeCallback := func(taskID, gen, finalPath, shaHash string) {
+		res := r.FinishTask(taskID, gen, StateSuccess, "", "", finalPath, false, shaHash)
+		if res == FinishAccepted || res == FinishNotFound {
+			parts := []string{"123", "99"}
+			_, _ = db.Exec(`UPDATE download_records SET status = 'success' WHERE chat_id = ? AND message_id = ?`, parts[0], 99)
+		}
+	}
+
+	completeCallback("123:99", "1", filepath.Join(outDir, "rec.bin"), "dummy_sha")
+
+	var status string
+	err = db.QueryRow(`SELECT status FROM download_records WHERE chat_id = '123' AND message_id = 99`).Scan(&status)
+	require.NoError(t, err)
+	assert.Equal(t, "success", status)
+}
