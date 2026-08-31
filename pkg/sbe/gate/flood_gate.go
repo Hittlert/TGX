@@ -139,6 +139,28 @@ func (g *FloodGate) AcquireDataPermit(ctx context.Context, dc int) (func(), *Adm
 				delete(g.dcCooldowns, d)
 			}
 		}
+
+		// Smooth Additive Increase: if currentRate < maxRate and no active cooldowns, ramp up +5.0 req/s per second
+		if len(g.dcCooldowns) == 0 {
+			if now.Sub(g.lastRamp) >= time.Second {
+				if g.currentRate < g.maxRate {
+					g.currentRate += 5.0
+					if g.currentRate > g.maxRate {
+						g.currentRate = g.maxRate
+					}
+					g.limiter.SetLimit(rate.Limit(g.currentRate))
+				}
+				if g.maxDataCap < MaxDataInFlight {
+					g.maxDataCap++
+					if g.dataWakeCh != nil {
+						close(g.dataWakeCh)
+						g.dataWakeCh = make(chan struct{})
+					}
+				}
+				g.lastRamp = now
+			}
+		}
+
 		notBefore, hasCooldown := g.dcCooldowns[dc]
 		var waitTime time.Duration
 		if hasCooldown && now.Before(notBefore) {

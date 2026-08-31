@@ -472,13 +472,13 @@ func (s *WebServer) handleGetDownloadStatus(w http.ResponseWriter, r *http.Reque
 		state = "paused"
 	}
 
-	var totalBufferBytes int64
-	for _, f := range daemonStatus.ActiveFiles {
-		if f.NetDownloaded > f.Downloaded {
-			totalBufferBytes += (f.NetDownloaded - f.Downloaded)
-		}
+	bufferUsedMB := float64(0)
+	bufferLimitMB := float64(512)
+	if s.bkt != nil {
+		m := s.bkt.Metrics()
+		bufferUsedMB = float64(m.UsedBytes) / (1024 * 1024)
+		bufferLimitMB = float64(m.MaxCapacity) / (1024 * 1024)
 	}
-	bufferUsedMB := float64(totalBufferBytes) / (1024 * 1024)
 
 	resp := map[string]any{
 		"download_speed": speedStr,
@@ -501,13 +501,11 @@ func (s *WebServer) handleGetDownloadStatus(w http.ResponseWriter, r *http.Reque
 			"files":        filesMap,
 		},
 		"sbe_stats": map[string]any{
-			"engine_version":  "TGX-DualLane",
+			"engine_version":  "v4.4.0-UnifiedStorageBuffer",
 			"buffer_used_mb":  bufferUsedMB,
-			"buffer_limit_mb": 208, // 16MB * 5 large + 128MB small pool
+			"buffer_limit_mb": bufferLimitMB,
 			"dirty_used_mb":   bufferUsedMB,
-			"dirty_limit_mb":  80,
-			"net_workers":     32,
-			"disk_workers":    6,
+			"target_writer":   s.tw != nil && s.tw.Metrics().Active,
 		},
 		"total_download_task": 0,
 		"total_download_byte": formatBytes(0),

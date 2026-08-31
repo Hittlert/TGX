@@ -68,7 +68,7 @@ func (o *Orchestrator) Start(ctx context.Context) {
 				if len(parts) == 2 {
 					var msgID int
 					_, _ = fmt.Sscanf(parts[1], "%d", &msgID)
-					_ = o.db.UpdateDownloadStatus(parts[0], msgID, "success", filepath.Base(finalPath), finalPath, "", 0, "")
+					_ = o.db.UpdateDownloadStatus(parts[0], msgID, "success", "", finalPath, "", 0, "")
 				}
 				if o.registry != nil {
 					o.registry.FinishTask(taskID, StateSuccess, "", "", finalPath, false, shaHash)
@@ -248,34 +248,23 @@ func (o *Orchestrator) dispatchOneRecord(ctx context.Context, record DownloadRec
 			return
 		}
 
-		// 2. Buffer Disk Guard
+		// 2. Buffer Disk Guard (only requires 500MB safe buffer space, sliding window handles big files)
 		if o.bufferDir != "" && o.bufferDir != o.saveDir {
 			bufFree, _, bufErr := atomic.GetDiskSpace(o.bufferDir)
-			if bufErr == nil && (bufFree < 1*1024*1024*1024 || (record.FileSize > 0 && bufFree < uint64(record.FileSize)+100*1024*1024)) {
+			if bufErr == nil && bufFree < 500*1024*1024 {
 				o.logger.Warn("⚠️ [Disk Guard] Insufficient buffer disk space, postponing task",
 					zap.String("task_id", taskID),
 					zap.Uint64("free_bytes", bufFree),
-					zap.Int64("required_bytes", record.FileSize),
 				)
 				_ = o.db.UpdateDownloadStatus(record.ChatID, record.MessageID, "pending", record.FileName, "", record.MediaType, record.FileSize, "buffer disk space below safe threshold")
 				return
 			}
 		}
 
-		// 3. Buffer Capacity Backpressure (if Bucket is active)
-		if o.bkt != nil && record.FileSize > 0 {
-			if err := o.bkt.Reserve(taskCtx, record.FileSize); err != nil {
-				return
-			}
-		}
-
-		// 4. Acquire slot only for large files (> 1MB / non-photo)
+		// 3. Acquire slot only for large files (> 1MB / non-photo)
 		if record.FileSize > downloader.SmallFileThreshold || (record.FileSize <= 0 && record.MediaType != "photo") {
 			_, err = o.slotPool.Acquire(taskCtx, taskID, record.FileSize)
 			if err != nil {
-				if o.bkt != nil && record.FileSize > 0 {
-					o.bkt.ReleaseReservation(record.FileSize)
-				}
 				return
 			}
 			defer o.slotPool.Release(taskID)
@@ -323,14 +312,10 @@ func (o *Orchestrator) dispatchOneRecord(ctx context.Context, record DownloadRec
 
 		snapshot, _, err := o.registry.Submit(submitReq)
 		if err != nil {
-			if o.bkt != nil && record.FileSize > 0 {
-				o.bkt.ReleaseReservation(record.FileSize)
-			}
 			_ = o.db.UpdateDownloadStatus(record.ChatID, record.MessageID, "failed", record.FileName, finalRelPath, record.MediaType, record.FileSize, err.Error())
 			return
 		}
 
-		// Wait for completion via registry polling
 		lastProgressTime := time.Now()
 		lastDownloaded := int64(0)
 		lastNetDownloaded := int64(0)
@@ -364,15 +349,6 @@ func (o *Orchestrator) dispatchOneRecord(ctx context.Context, record DownloadRec
 			}
 
 			if snapshot.State == StateSuccess {
-				realFileName := snapshot.FileName
-				if realFileName == "" {
-					realFileName = record.FileName
-				}
-				finalSavedPath := snapshot.FinalPath
-				if finalSavedPath == "" {
-					finalSavedPath = finalRelPath
-				}
-				_ = o.db.UpdateDownloadStatus(record.ChatID, record.MessageID, "success", realFileName, finalSavedPath, record.MediaType, snapshot.TotalSize, "")
 				return
 			}
 			if snapshot.State == StateFailed || snapshot.State == StateUnavailable {
@@ -405,7 +381,6 @@ func (o *Orchestrator) dispatchOneRecord(ctx context.Context, record DownloadRec
 func (o *Orchestrator) CancelTasksByChatID(chatID string) {
 	cleanChatID := strings.TrimPrefix(chatID, "@")
 	
-	// 1. Cancel in-flight worker contexts
 	o.taskCancels.Range(func(key, value any) bool {
 		taskID, ok := key.(string)
 		if !ok {
@@ -425,7 +400,6 @@ func (o *Orchestrator) CancelTasksByChatID(chatID string) {
 		return true
 	})
 
-	// 2. Mark pending tasks in registry as canceled
 	if o.registry != nil {
 		o.registry.CancelTasksByChatID(chatID)
 	}

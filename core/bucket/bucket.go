@@ -36,6 +36,7 @@ type Metrics struct {
 	PendingDeleteBytes int64  `json:"pending_delete_bytes"`
 	UsedBytes          int64  `json:"used_bytes"`
 	ObjectCount        int64  `json:"object_count"`
+	ReadyTasksCount    int    `json:"ready_tasks_count"`
 	Backpressured      bool   `json:"backpressured"`
 }
 
@@ -49,6 +50,7 @@ type Bucket interface {
 	ReadObject(key ObjectKey) ([]byte, error)
 	TryTakeNext(taskID string, nextOffset int64) (*BufferObject, bool)
 	TakeReady() (*BufferObject, bool)
+	Requeue(obj *BufferObject)
 	AckDurable(keys []ObjectKey) error
 	DeleteObjects(keys []ObjectKey) error
 	Recover(ctx context.Context) error
@@ -63,7 +65,6 @@ type readyEntry struct {
 type bucketImpl struct {
 	cfg   Config
 	mu    sync.RWMutex
-	cond  *sync.Cond
 
 	reservedBytes      int64
 	readyBytes         int64
@@ -75,6 +76,7 @@ type bucketImpl struct {
 	// FIFO / priority list of tasks
 	taskOrder     []string
 	memData       map[string][]byte // For ModeMemory: key.String() -> []byte
+	waiters       []chan struct{}
 
 	closed int32
 }
@@ -98,7 +100,6 @@ func New(cfg Config) (Bucket, error) {
 		readyByTask: make(map[string]map[int64]*readyEntry),
 		memData:     make(map[string][]byte),
 	}
-	b.cond = sync.NewCond(&b.mu)
 	return b, nil
 }
 
@@ -119,6 +120,7 @@ func (b *bucketImpl) Metrics() Metrics {
 		PendingDeleteBytes: b.pendingDeleteBytes,
 		UsedBytes:          used,
 		ObjectCount:        b.objectCount,
+		ReadyTasksCount:    len(b.readyByTask),
 		Backpressured:      used >= b.cfg.MaxCapacity,
 	}
 }
@@ -128,27 +130,58 @@ func (b *bucketImpl) Reserve(ctx context.Context, bytes int64) error {
 		return nil
 	}
 	b.mu.Lock()
-	defer b.mu.Unlock()
 
 	for {
 		if atomic.LoadInt32(&b.closed) == 1 {
+			b.mu.Unlock()
 			return errors.New("bucket is closed")
 		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
+		if err := ctx.Err(); err != nil {
+			b.mu.Unlock()
+			return err
 		}
 
 		currentUsed := b.reservedBytes + b.readyBytes + b.pendingDeleteBytes
-		if currentUsed+bytes <= b.cfg.MaxCapacity || currentUsed == 0 {
+		// Strict hard capacity without currentUsed == 0 bypass
+		if currentUsed+bytes <= b.cfg.MaxCapacity {
 			b.reservedBytes += bytes
+			b.mu.Unlock()
 			return nil
 		}
 
-		// Wait for TargetWriter to flush durable objects and release capacity
-		b.cond.Wait()
+		waitCh := make(chan struct{}, 1)
+		b.waiters = append(b.waiters, waitCh)
+
+		b.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			b.mu.Lock()
+			b.removeWaiterLocked(waitCh)
+			b.mu.Unlock()
+			return ctx.Err()
+		case <-waitCh:
+			b.mu.Lock()
+		}
 	}
+}
+
+func (b *bucketImpl) removeWaiterLocked(ch chan struct{}) {
+	for i, w := range b.waiters {
+		if w == ch {
+			b.waiters = append(b.waiters[:i], b.waiters[i+1:]...)
+			return
+		}
+	}
+}
+
+func (b *bucketImpl) notifyWaitersLocked() {
+	for _, ch := range b.waiters {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+	b.waiters = nil
 }
 
 func (b *bucketImpl) ReleaseReservation(bytes int64) {
@@ -161,7 +194,7 @@ func (b *bucketImpl) ReleaseReservation(bytes int64) {
 	} else {
 		b.reservedBytes = 0
 	}
-	b.cond.Broadcast()
+	b.notifyWaitersLocked()
 	b.mu.Unlock()
 }
 
@@ -170,13 +203,22 @@ func (b *bucketImpl) PutObject(key ObjectKey, data []byte) error {
 		return fmt.Errorf("data length %d does not match key length %d", len(data), key.Length)
 	}
 
-	// Verify checksum
 	computedCRC := crc32.ChecksumIEEE(data)
 	if key.Checksum == 0 {
 		key.Checksum = computedCRC
 	} else if key.Checksum != computedCRC {
 		return fmt.Errorf("crc32 checksum mismatch: got %08x, expected %08x", computedCRC, key.Checksum)
 	}
+
+	b.mu.Lock()
+	// Idempotency check: if object with same key already exists, return nil
+	if taskMap, ok := b.readyByTask[key.TaskID]; ok {
+		if entry, exists := taskMap[key.Offset]; exists && entry.obj.Key.Gen == key.Gen && entry.obj.Key.Checksum == key.Checksum {
+			b.mu.Unlock()
+			return nil
+		}
+	}
+	b.mu.Unlock()
 
 	obj := BufferObject{
 		Key: key,
@@ -196,7 +238,6 @@ func (b *bucketImpl) PutObject(key ObjectKey, data []byte) error {
 			return fmt.Errorf("create object dir: %w", err)
 		}
 
-		// Write to .partial then atomic rename to .ready
 		if err := os.WriteFile(partPath, data, 0644); err != nil {
 			return fmt.Errorf("write partial object: %w", err)
 		}
@@ -210,7 +251,6 @@ func (b *bucketImpl) PutObject(key ObjectKey, data []byte) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	// Move capacity from reservedBytes -> readyBytes
 	if b.reservedBytes >= key.Length {
 		b.reservedBytes -= key.Length
 	} else {
@@ -219,7 +259,6 @@ func (b *bucketImpl) PutObject(key ObjectKey, data []byte) error {
 	b.readyBytes += key.Length
 	b.objectCount++
 
-	// Index object
 	taskMap, ok := b.readyByTask[key.TaskID]
 	if !ok {
 		taskMap = make(map[int64]*readyEntry)
@@ -231,7 +270,7 @@ func (b *bucketImpl) PutObject(key ObjectKey, data []byte) error {
 		addedAt: time.Now(),
 	}
 
-	b.cond.Broadcast()
+	b.notifyWaitersLocked()
 	return nil
 }
 
@@ -281,7 +320,6 @@ func (b *bucketImpl) TryTakeNext(taskID string, nextOffset int64) (*BufferObject
 		b.removeTaskOrderLocked(taskID)
 	}
 
-	// Move readyBytes -> pendingDeleteBytes
 	if b.readyBytes >= entry.obj.Key.Length {
 		b.readyBytes -= entry.obj.Key.Length
 	}
@@ -298,16 +336,35 @@ func (b *bucketImpl) TakeReady() (*BufferObject, bool) {
 		return nil, false
 	}
 
-	// Selection Policy:
-	// 1. Task that has complete single-chunk or lowest frontier offset
-	// 2. FIFO task order
+	// Priority 1: Check for single-chunk complete small files
+	for _, taskID := range b.taskOrder {
+		taskMap, ok := b.readyByTask[taskID]
+		if !ok || len(taskMap) == 0 {
+			continue
+		}
+		for _, entry := range taskMap {
+			if entry.obj.Key.ExpectedFileSize > 0 && entry.obj.Key.Length == entry.obj.Key.ExpectedFileSize {
+				delete(taskMap, entry.obj.Key.Offset)
+				if len(taskMap) == 0 {
+					delete(b.readyByTask, taskID)
+					b.removeTaskOrderLocked(taskID)
+				}
+				if b.readyBytes >= entry.obj.Key.Length {
+					b.readyBytes -= entry.obj.Key.Length
+				}
+				b.pendingDeleteBytes += entry.obj.Key.Length
+				return &entry.obj, true
+			}
+		}
+	}
+
+	// Priority 2: FIFO task with lowest offset
 	for _, taskID := range b.taskOrder {
 		taskMap, ok := b.readyByTask[taskID]
 		if !ok || len(taskMap) == 0 {
 			continue
 		}
 
-		// Find lowest offset in this task
 		var lowestOffset int64 = -1
 		for off := range taskMap {
 			if lowestOffset == -1 || off < lowestOffset {
@@ -333,6 +390,32 @@ func (b *bucketImpl) TakeReady() (*BufferObject, bool) {
 	return nil, false
 }
 
+func (b *bucketImpl) Requeue(obj *BufferObject) {
+	if obj == nil {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.pendingDeleteBytes >= obj.Key.Length {
+		b.pendingDeleteBytes -= obj.Key.Length
+	}
+	b.readyBytes += obj.Key.Length
+
+	taskMap, ok := b.readyByTask[obj.Key.TaskID]
+	if !ok {
+		taskMap = make(map[int64]*readyEntry)
+		b.readyByTask[obj.Key.TaskID] = taskMap
+		b.taskOrder = append(b.taskOrder, obj.Key.TaskID)
+	}
+	taskMap[obj.Key.Offset] = &readyEntry{
+		obj:     *obj,
+		addedAt: time.Now(),
+	}
+
+	b.notifyWaitersLocked()
+}
+
 func (b *bucketImpl) removeTaskOrderLocked(taskID string) {
 	for i, id := range b.taskOrder {
 		if id == taskID {
@@ -351,33 +434,40 @@ func (b *bucketImpl) DeleteObjects(keys []ObjectKey) error {
 		return nil
 	}
 
-	var totalFreed int64
+	var freedBytes int64
+	var freedCount int64
+
 	for _, key := range keys {
-		totalFreed += key.Length
 		if b.cfg.Mode == ModeMemory {
 			b.mu.Lock()
 			delete(b.memData, key.String())
 			b.mu.Unlock()
+			freedBytes += key.Length
+			freedCount++
 		} else if b.cfg.Mode == ModeSSD {
 			absPath := filepath.Join(b.cfg.RootDir, key.RelPath(".ready"))
-			_ = os.Remove(absPath)
+			err1 := os.Remove(absPath)
 			partPath := filepath.Join(b.cfg.RootDir, key.RelPath(".partial"))
 			_ = os.Remove(partPath)
+			if err1 == nil || errors.Is(err1, os.ErrNotExist) {
+				freedBytes += key.Length
+				freedCount++
+			}
 		}
 	}
 
 	b.mu.Lock()
-	if b.pendingDeleteBytes >= totalFreed {
-		b.pendingDeleteBytes -= totalFreed
+	if b.pendingDeleteBytes >= freedBytes {
+		b.pendingDeleteBytes -= freedBytes
 	} else {
 		b.pendingDeleteBytes = 0
 	}
-	if b.objectCount >= int64(len(keys)) {
-		b.objectCount -= int64(len(keys))
+	if b.objectCount >= freedCount {
+		b.objectCount -= freedCount
 	} else {
 		b.objectCount = 0
 	}
-	b.cond.Broadcast()
+	b.notifyWaitersLocked()
 	b.mu.Unlock()
 
 	return nil
@@ -391,13 +481,11 @@ func (b *bucketImpl) Recover(ctx context.Context) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	// Walk root dir and load valid .ready objects into index
 	return filepath.Walk(b.cfg.RootDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil || info.IsDir() {
 			return nil
 		}
 		if filepath.Ext(path) == ".partial" {
-			// Clean stale uncommitted partials
 			_ = os.Remove(path)
 			return nil
 		}
@@ -405,7 +493,6 @@ func (b *bucketImpl) Recover(ctx context.Context) error {
 			return nil
 		}
 
-		// Read and verify object
 		data, err := os.ReadFile(path)
 		if err != nil {
 			_ = os.Remove(path)
@@ -421,8 +508,6 @@ func (b *bucketImpl) Recover(ctx context.Context) error {
 			return nil
 		}
 
-		// Parse TaskID and Gen from parent directories
-		// Path: RootDir/<TaskID>/<Gen>/group_X/<file>.ready
 		rel, _ := filepath.Rel(b.cfg.RootDir, path)
 		parts := splitPath(rel)
 		if len(parts) < 4 {
@@ -476,7 +561,7 @@ func splitPath(path string) []string {
 func (b *bucketImpl) Close() error {
 	atomic.StoreInt32(&b.closed, 1)
 	b.mu.Lock()
-	b.cond.Broadcast()
+	b.notifyWaitersLocked()
 	b.mu.Unlock()
 	return nil
 }

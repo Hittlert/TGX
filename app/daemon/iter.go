@@ -13,6 +13,7 @@ type PublishResult struct {
 	Path          string `json:"path"`
 	SHA256        string `json:"sha256,omitempty"`
 	AlreadyExists bool   `json:"already_exists,omitempty"`
+	AsyncMoving   bool   `json:"async_moving,omitempty"`
 	absolutePath  string
 }
 
@@ -158,5 +159,7 @@ func (p *taskProgress) OnDone(element downloader.Elem, transferErr error) {
 		task.Fail("publish", err.Error(), false)
 		return
 	}
-	task.SucceedResult(result)
+	if !result.AsyncMoving {
+		task.SucceedResult(result)
+	}
 }

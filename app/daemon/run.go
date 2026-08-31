@@ -226,6 +226,7 @@ func Run(ctx context.Context, client *telegram.Client, kvd storage.Storage, opts
 		defer db.Close()
 		// Execute SBE Startup Crash Recovery Matrix with buffer awareness
 		reconciler := NewReconcilerWithBuffer(db.DB(), opts.OutputDir, opts.BufferDir, opts.BufferType, nil, logctx.From(ctx))
+		reconciler.SetTargetWriter(tw)
 		if recResults, err := reconciler.ReconcileAll(ctx); err != nil {
 			logctx.From(ctx).Error("startup crash recovery failed", zap.Error(err))
 		} else if len(recResults) > 0 {

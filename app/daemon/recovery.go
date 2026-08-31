@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,38 +11,33 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/Hittlert/TGX/core/mover"
+	"github.com/Hittlert/TGX/core/targetwriter"
 )
 
-// TaskRecoveryResult describes the action taken for a task during startup reconciliation.
+// TaskRecoveryResult encapsulates differential actions performed per task.
 type TaskRecoveryResult struct {
 	FileKey     string
-	AttemptID   string
 	PrevState   string
 	NextState   string
 	ActionTaken string
-	Error       error
 }
 
-// Reconciler performs startup crash recovery against SQLite and physical filesystem state.
+// Reconciler performs differential crash recovery on non-terminal tasks at boot.
 type Reconciler struct {
 	db         *sql.DB
 	outputDir  string
 	tempDir    string
 	bufferType string
 	mover      *mover.Mover
+	tw         *targetwriter.TargetWriter
 	logger     *zap.Logger
 }
 
-// NewReconciler creates a startup reconciler with buffer awareness.
 func NewReconciler(db *sql.DB, outputDir, tempDir string, logger *zap.Logger) *Reconciler {
 	return NewReconcilerWithBuffer(db, outputDir, tempDir, "memory", nil, logger)
 }
 
-// NewReconcilerWithBuffer creates a startup reconciler with specific buffer type and mover.
 func NewReconcilerWithBuffer(db *sql.DB, outputDir, tempDir, bufferType string, seqMover *mover.Mover, logger *zap.Logger) *Reconciler {
-	if bufferType == "" {
-		bufferType = "memory"
-	}
 	return &Reconciler{
 		db:         db,
 		outputDir:  outputDir,
@@ -50,6 +46,10 @@ func NewReconcilerWithBuffer(db *sql.DB, outputDir, tempDir, bufferType string, 
 		mover:      seqMover,
 		logger:     logger,
 	}
+}
+
+func (r *Reconciler) SetTargetWriter(tw *targetwriter.TargetWriter) {
+	r.tw = tw
 }
 
 // ReconcileAll runs the differential crash recovery matrix on all non-terminal tasks.
@@ -89,13 +89,14 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) ([]TaskRecoveryResult, er
 	for _, rec := range records {
 		fileKey := CanonicalTaskID(rec.ChatID, rec.MessageID)
 		finalPath := filepath.Join(r.outputDir, rec.SavePath)
-
-		// Clean up any stale .moving file for this specific target path
-		_ = os.Remove(finalPath + ".moving")
+		movingPath := finalPath + ".moving"
+		metaPath := finalPath + ".moving.meta"
 
 		// 1. Check if final file already exists with exact size in target directory
 		stat, err := os.Stat(finalPath)
 		if err == nil && stat.Size() == rec.FileSize && rec.FileSize > 0 {
+			_ = os.Remove(movingPath)
+			_ = os.Remove(metaPath)
 			_, _ = r.db.ExecContext(ctx, `UPDATE download_records SET status = 'success', error = '' WHERE chat_id = ? AND message_id = ?`, rec.ChatID, rec.MessageID)
 			results = append(results, TaskRecoveryResult{
 				FileKey:     fileKey,
@@ -106,17 +107,12 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) ([]TaskRecoveryResult, er
 			continue
 		}
 
-		// 2. Compute canonical part file path in tempDir or outputDir
-		tempPartPath := CanonicalPartPath(r.tempDir, fileKey)
-		if r.bufferType == "none" {
-			tempPartPath = CanonicalPartPath(filepath.Dir(finalPath), fileKey)
-		}
-
-		// 3. Medium-aware recovery logic
+		// 2. Medium-aware recovery logic
 		switch r.bufferType {
 		case "memory":
-			// Volatile memory: wipe any stale temp reference and reset to pending for full fresh download
-			_ = os.Remove(tempPartPath)
+			// Volatile memory: clean stale .moving and sidecar meta, reset to pending
+			_ = os.Remove(movingPath)
+			_ = os.Remove(metaPath)
 			_, _ = r.db.ExecContext(ctx, `UPDATE download_records SET status = 'pending' WHERE chat_id = ? AND message_id = ?`, rec.ChatID, rec.MessageID)
 			results = append(results, TaskRecoveryResult{
 				FileKey:     fileKey,
@@ -126,47 +122,52 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) ([]TaskRecoveryResult, er
 			})
 
 		case "ssd":
-			// Non-volatile persistent SSD: check if temp file exists
+			// Check if sidecar .moving.meta exists to resume target moving
+			metaData, metaErr := os.ReadFile(metaPath)
+			if metaErr == nil {
+				var manifest targetwriter.TaskManifest
+				if json.Unmarshal(metaData, &manifest) == nil && r.tw != nil {
+					r.tw.RegisterTask(manifest)
+					results = append(results, TaskRecoveryResult{
+						FileKey:     fileKey,
+						PrevState:   rec.Status,
+						NextState:   "moving",
+						ActionTaken: "SSD_BUFFER_RESUMED_IN_TARGET_WRITER",
+					})
+					continue
+				}
+			}
+
+			// Fallback: check legacy part file or reset to pending
+			tempPartPath := CanonicalPartPath(r.tempDir, fileKey)
 			partStat, partErr := os.Stat(tempPartPath)
 			if partErr == nil && partStat.Size() == rec.FileSize && rec.FileSize > 0 {
-				// Completed on SSD buffer: if mover is available, re-enqueue for zero-network moving!
 				if r.mover != nil {
 					chatID := rec.ChatID
 					msgID := rec.MessageID
-					fileSize := rec.FileSize
-					job := &mover.MoveJob{
+					_ = r.mover.Enqueue(&mover.MoveJob{
 						ID:      fileKey,
 						SrcPath: tempPartPath,
 						DstPath: finalPath,
-						Size:    fileSize,
-						OnDone: func(moveErr error) {
-							if moveErr == nil {
+						Size:    rec.FileSize,
+						OnDone: func(err error) {
+							if err == nil {
 								_, _ = r.db.Exec(`UPDATE download_records SET status = 'success', error = '' WHERE chat_id = ? AND message_id = ?`, chatID, msgID)
 							} else {
-								_, _ = r.db.Exec(`UPDATE download_records SET status = 'failed', error = ? WHERE chat_id = ? AND message_id = ?`, moveErr.Error(), chatID, msgID)
+								_, _ = r.db.Exec(`UPDATE download_records SET status = 'failed', error = ? WHERE chat_id = ? AND message_id = ?`, err.Error(), chatID, msgID)
 							}
 						},
-					}
-					if err := r.mover.Enqueue(job); err == nil {
-						_, _ = r.db.ExecContext(ctx, `UPDATE download_records SET status = 'moving' WHERE chat_id = ? AND message_id = ?`, rec.ChatID, rec.MessageID)
-						results = append(results, TaskRecoveryResult{
-							FileKey:     fileKey,
-							PrevState:   rec.Status,
-							NextState:   "moving",
-							ActionTaken: "SSD_BUFFER_COMPLETED_REQUEUED_IN_MOVER",
-						})
-						continue
-					}
+					})
 				}
-				_, _ = r.db.ExecContext(ctx, `UPDATE download_records SET status = 'pending' WHERE chat_id = ? AND message_id = ?`, rec.ChatID, rec.MessageID)
+				_, _ = r.db.ExecContext(ctx, `UPDATE download_records SET status = 'moving' WHERE chat_id = ? AND message_id = ?`, rec.ChatID, rec.MessageID)
 				results = append(results, TaskRecoveryResult{
 					FileKey:     fileKey,
 					PrevState:   rec.Status,
-					NextState:   "pending",
-					ActionTaken: "SSD_BUFFER_COMPLETED_RETAINED_FOR_MOVING",
+					NextState:   "moving",
+					ActionTaken: "SSD_BUFFER_COMPLETED_REQUEUED_IN_MOVER",
 				})
+				continue
 			} else if partErr == nil && partStat.Size() > 0 {
-				// Partial .part on SSD: keep file for resumable block download
 				_, _ = r.db.ExecContext(ctx, `UPDATE download_records SET status = 'pending' WHERE chat_id = ? AND message_id = ?`, rec.ChatID, rec.MessageID)
 				results = append(results, TaskRecoveryResult{
 					FileKey:     fileKey,
@@ -174,35 +175,27 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) ([]TaskRecoveryResult, er
 					NextState:   "pending",
 					ActionTaken: "SSD_BUFFER_PARTIAL_RETAINED_FOR_RESUME",
 				})
-			} else {
-				_, _ = r.db.ExecContext(ctx, `UPDATE download_records SET status = 'pending' WHERE chat_id = ? AND message_id = ?`, rec.ChatID, rec.MessageID)
-				results = append(results, TaskRecoveryResult{
-					FileKey:     fileKey,
-					PrevState:   rec.Status,
-					NextState:   "pending",
-					ActionTaken: "SSD_BUFFER_NO_PART_RESET_TO_PENDING",
-				})
+				continue
 			}
 
-		default: // "none"
-			partStat, partErr := os.Stat(tempPartPath)
-			if partErr == nil && partStat.Size() > 0 {
-				_, _ = r.db.ExecContext(ctx, `UPDATE download_records SET status = 'pending' WHERE chat_id = ? AND message_id = ?`, rec.ChatID, rec.MessageID)
-				results = append(results, TaskRecoveryResult{
-					FileKey:     fileKey,
-					PrevState:   rec.Status,
-					NextState:   "pending",
-					ActionTaken: "DIRECT_TARGET_PARTIAL_RETAINED_FOR_RESUME",
-				})
-			} else {
-				_, _ = r.db.ExecContext(ctx, `UPDATE download_records SET status = 'pending' WHERE chat_id = ? AND message_id = ?`, rec.ChatID, rec.MessageID)
-				results = append(results, TaskRecoveryResult{
-					FileKey:     fileKey,
-					PrevState:   rec.Status,
-					NextState:   "pending",
-					ActionTaken: "DIRECT_TARGET_RESET_TO_PENDING",
-				})
-			}
+			_, _ = r.db.ExecContext(ctx, `UPDATE download_records SET status = 'pending' WHERE chat_id = ? AND message_id = ?`, rec.ChatID, rec.MessageID)
+			results = append(results, TaskRecoveryResult{
+				FileKey:     fileKey,
+				PrevState:   rec.Status,
+				NextState:   "pending",
+				ActionTaken: "SSD_BUFFER_RESET_TO_PENDING",
+			})
+
+		default:
+			_ = os.Remove(movingPath)
+			_ = os.Remove(metaPath)
+			_, _ = r.db.ExecContext(ctx, `UPDATE download_records SET status = 'pending' WHERE chat_id = ? AND message_id = ?`, rec.ChatID, rec.MessageID)
+			results = append(results, TaskRecoveryResult{
+				FileKey:     fileKey,
+				PrevState:   rec.Status,
+				NextState:   "pending",
+				ActionTaken: "DIRECT_TARGET_RESET_TO_PENDING",
+			})
 		}
 	}
 

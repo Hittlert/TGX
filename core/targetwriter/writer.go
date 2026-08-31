@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -18,10 +19,12 @@ import (
 )
 
 type TaskManifest struct {
-	TaskID       string
-	FinalPath    string
-	ExpectedSize int64
-	Date         int64
+	TaskID       string  `json:"task_id"`
+	FinalPath    string  `json:"final_path"`
+	ExpectedSize int64   `json:"expected_size"`
+	Date         int64   `json:"date"`
+	Gen          string  `json:"gen"`
+	Ranges       []Range `json:"ranges"`
 }
 
 type Metrics struct {
@@ -39,6 +42,7 @@ type TargetWriter struct {
 	manifests   sync.Map // taskID -> TaskManifest
 	bitmaps     sync.Map // taskID -> *MovedBitmap
 	openFiles   sync.Map // taskID -> *os.File
+	hashers     sync.Map // taskID -> hash.Hash
 	onComplete  func(taskID, finalPath string, shaHash string)
 	onProgress  func(taskID string, movedBytes, totalBytes int64)
 	onError     func(taskID string, err error)
@@ -46,7 +50,7 @@ type TargetWriter struct {
 	writtenBytes      int64
 	contiguousWrites  int64
 	totalWrites       int64
-	lastBPS           float64
+	lastBPSBits       uint64 // atomic float64
 	lastError         string
 	errMu             sync.RWMutex
 
@@ -76,8 +80,10 @@ func (w *TargetWriter) SetCallbacks(
 func (w *TargetWriter) RegisterTask(manifest TaskManifest) {
 	w.manifests.Store(manifest.TaskID, manifest)
 	if _, ok := w.bitmaps.Load(manifest.TaskID); !ok {
-		w.bitmaps.Store(manifest.TaskID, NewMovedBitmap(manifest.ExpectedSize))
+		bm := NewMovedBitmapWithRanges(manifest.ExpectedSize, manifest.Ranges)
+		w.bitmaps.Store(manifest.TaskID, bm)
 	}
+	w.hashers.Store(manifest.TaskID, sha256.New())
 }
 
 func (w *TargetWriter) Start(ctx context.Context) {
@@ -100,7 +106,8 @@ func (w *TargetWriter) metricsLoop() {
 			current := atomic.LoadInt64(&w.writtenBytes)
 			diff := current - prevBytes
 			prevBytes = current
-			w.lastBPS = float64(diff)
+			bps := float64(diff)
+			atomic.StoreUint64(&w.lastBPSBits, uint64(bps))
 		}
 	}
 }
@@ -123,9 +130,11 @@ func (w *TargetWriter) Metrics() Metrics {
 		return true
 	})
 
+	bps := float64(atomic.LoadUint64(&w.lastBPSBits))
+
 	return Metrics{
 		Active:               atomic.LoadInt32(&w.closed) == 0,
-		BytesPerSecond:       w.lastBPS,
+		BytesPerSecond:       bps,
 		ContiguousWriteRatio: ratio,
 		ActiveFilesCount:     activeFiles,
 		TotalBytesWritten:    atomic.LoadInt64(&w.writtenBytes),
@@ -133,11 +142,14 @@ func (w *TargetWriter) Metrics() Metrics {
 	}
 }
 
+const maxSequentialQuantum = 16 // Max consecutive 1MB chunks on same task before fair yield
+
 func (w *TargetWriter) writerLoop() {
 	defer w.wg.Done()
 
 	var currentTaskID string
 	var nextOffset int64 = 0
+	var sequentialCount int = 0
 
 	for {
 		if atomic.LoadInt32(&w.closed) == 1 {
@@ -152,21 +164,27 @@ func (w *TargetWriter) writerLoop() {
 		var obj *bucket.BufferObject
 		var isContiguous bool
 
-		// 1. Try to continue current file sequentially
-		if currentTaskID != "" {
+		// 1. Try to continue current file sequentially within quantum
+		if currentTaskID != "" && sequentialCount < maxSequentialQuantum {
 			if nextObj, ok := w.bkt.TryTakeNext(currentTaskID, nextOffset); ok {
 				obj = nextObj
 				isContiguous = true
+				sequentialCount++
 			}
 		}
 
-		// 2. If no contiguous object for current task, take any ready object
+		// 2. If quantum exhausted or no contiguous object, take highest-priority ready object
 		if obj == nil {
 			if readyObj, ok := w.bkt.TakeReady(); ok {
 				obj = readyObj
 				isContiguous = false
 				currentTaskID = obj.Key.TaskID
 				nextOffset = obj.Key.Offset
+				sequentialCount = 1
+			} else {
+				currentTaskID = ""
+				nextOffset = 0
+				sequentialCount = 0
 			}
 		}
 
@@ -183,15 +201,21 @@ func (w *TargetWriter) writerLoop() {
 		// Process and write object to target
 		err := w.processObject(obj, isContiguous)
 		if err != nil {
+			// Requeue object so it is not lost!
+			w.bkt.Requeue(obj)
+
 			w.errMu.Lock()
 			w.lastError = err.Error()
 			w.errMu.Unlock()
+
 			if w.onError != nil {
 				w.onError(obj.Key.TaskID, err)
 			}
 			// Reset current task tracker
 			currentTaskID = ""
 			nextOffset = 0
+			sequentialCount = 0
+			time.Sleep(50 * time.Millisecond) // Back off slightly on error
 		} else {
 			currentTaskID = obj.Key.TaskID
 			nextOffset = obj.Key.Offset + obj.Key.Length
@@ -202,7 +226,15 @@ func (w *TargetWriter) writerLoop() {
 func (w *TargetWriter) processObject(obj *bucket.BufferObject, isContiguous bool) error {
 	taskID := obj.Key.TaskID
 
-	// 1. Fetch data from Buffer
+	// 1. Look up task manifest
+	val, ok := w.manifests.Load(taskID)
+	if !ok {
+		// Task manifest not registered yet (e.g. during startup before task resolve). Requeue!
+		return errors.New("task manifest not registered yet")
+	}
+	manifest := val.(TaskManifest)
+
+	// 2. Fetch data from Buffer
 	var data []byte
 	if len(obj.Data) > 0 {
 		data = obj.Data
@@ -213,15 +245,6 @@ func (w *TargetWriter) processObject(obj *bucket.BufferObject, isContiguous bool
 		}
 		data = readData
 	}
-
-	// 2. Look up task manifest
-	val, ok := w.manifests.Load(taskID)
-	if !ok {
-		// Task not registered, discard buffer object
-		_ = w.bkt.AckDurable([]bucket.ObjectKey{obj.Key})
-		return nil
-	}
-	manifest := val.(TaskManifest)
 
 	// 3. Get or open target.moving file descriptor
 	f, err := w.getOrOpenFile(manifest)
@@ -248,6 +271,10 @@ func (w *TargetWriter) processObject(obj *bucket.BufferObject, isContiguous bool
 	bm := bmVal.(*MovedBitmap)
 	bm.AddMark(obj.Key.Offset, obj.Key.Length)
 
+	// Persist sidecar metadata atomically
+	manifest.Ranges = bm.Ranges()
+	_ = w.persistMeta(manifest)
+
 	// 7. Ack durable in bucket (deletes source object and frees capacity!)
 	if err := w.bkt.AckDurable([]bucket.ObjectKey{obj.Key}); err != nil {
 		return fmt.Errorf("ack durable object: %w", err)
@@ -270,6 +297,21 @@ func (w *TargetWriter) processObject(obj *bucket.BufferObject, isContiguous bool
 	}
 
 	return nil
+}
+
+func (w *TargetWriter) persistMeta(manifest TaskManifest) error {
+	finalPath := filepath.Join(w.outputDir, manifest.FinalPath)
+	metaPath := finalPath + ".moving.meta"
+	tmpMetaPath := metaPath + ".tmp"
+
+	data, err := json.Marshal(manifest)
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(tmpMetaPath, data, 0644); err != nil {
+		return err
+	}
+	return os.Rename(tmpMetaPath, metaPath)
 }
 
 func (w *TargetWriter) getOrOpenFile(manifest TaskManifest) (*os.File, error) {
@@ -297,6 +339,7 @@ func (w *TargetWriter) finalizeTask(manifest TaskManifest) error {
 	taskID := manifest.TaskID
 	finalPath := filepath.Join(w.outputDir, manifest.FinalPath)
 	movingPath := finalPath + ".moving"
+	metaPath := finalPath + ".moving.meta"
 
 	// Close open FD
 	if val, ok := w.openFiles.LoadAndDelete(taskID); ok {
@@ -326,15 +369,24 @@ func (w *TargetWriter) finalizeTask(manifest TaskManifest) error {
 	// Atomic non-replacing commit to final destination
 	if err := atomicCommit.CommitFile(movingPath, finalPath); err != nil {
 		if errors.Is(err, atomicCommit.ErrTargetExists) {
-			_ = os.Remove(movingPath)
+			// Check if existing file has exact match
+			if existingStat, checkErr := os.Stat(finalPath); checkErr == nil && existingStat.Size() == manifest.ExpectedSize {
+				_ = os.Remove(movingPath)
+				_ = os.Remove(metaPath)
+			} else {
+				return fmt.Errorf("target exists with conflicting size: %w", err)
+			}
 		} else {
 			return fmt.Errorf("commit target file: %w", err)
 		}
 	}
 
+	_ = os.Remove(metaPath)
+
 	// Clean tracking state
 	w.manifests.Delete(taskID)
 	w.bitmaps.Delete(taskID)
+	w.hashers.Delete(taskID)
 
 	if w.onComplete != nil {
 		w.onComplete(taskID, manifest.FinalPath, shaHash)
@@ -364,7 +416,6 @@ func (w *TargetWriter) Close() error {
 	}
 	w.wg.Wait()
 
-	// Close any open file descriptors
 	w.openFiles.Range(func(key, val any) bool {
 		if f, ok := val.(*os.File); ok {
 			_ = f.Sync()

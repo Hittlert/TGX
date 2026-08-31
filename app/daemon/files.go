@@ -19,7 +19,7 @@ import (
 	atomic "github.com/Hittlert/TGX/pkg/sbe/atomic"
 )
 
-// bucketWriterAt writes immutable chunk objects directly to bucket.Bucket.
+// bucketWriterAt writes immutable chunk objects directly to bucket.Bucket with object-level reservation.
 type bucketWriterAt struct {
 	bkt      bucket.Bucket
 	task     *Task
@@ -36,7 +36,19 @@ func (w *bucketWriterAt) WriteAt(p []byte, offset int64) (int, error) {
 		Length:           int64(len(p)),
 		ExpectedFileSize: w.fileSize,
 	}
+	if w.bkt != nil {
+		ctx := context.Background()
+		if w.task != nil {
+			ctx = w.task.Context()
+		}
+		if err := w.bkt.Reserve(ctx, int64(len(p))); err != nil {
+			return 0, err
+		}
+	}
 	if err := w.bkt.PutObject(key, p); err != nil {
+		if w.bkt != nil {
+			w.bkt.ReleaseReservation(int64(len(p)))
+		}
 		return 0, err
 	}
 	if w.task != nil {
@@ -64,11 +76,16 @@ func newBucketFileElement(
 	bkt bucket.Bucket,
 	tw *targetwriter.TargetWriter,
 ) (*bucketFileElement, error) {
+	gen := "1"
+	if task.Request().Retry {
+		gen = fmt.Sprintf("retry_%d", time.Now().UnixNano())
+	}
 	manifest := targetwriter.TaskManifest{
 		TaskID:       task.Request().ID,
 		FinalPath:    task.Request().FinalPath,
 		ExpectedSize: file.Size(),
 		Date:         date,
+		Gen:          gen,
 	}
 	if tw != nil {
 		tw.RegisterTask(manifest)
@@ -87,7 +104,7 @@ func newBucketFileElement(
 		bkt:      bkt,
 		task:     task,
 		taskID:   task.Request().ID,
-		gen:      "1",
+		gen:      gen,
 		fileSize: file.Size(),
 	}
 	return elem, nil
@@ -120,7 +137,8 @@ func (e *bucketFileElement) Publish() (PublishResult, error) {
 	// Network chunk downloading is 100% complete!
 	// TargetWriter handles async background target streaming and final atomic non-replacing commit.
 	return PublishResult{
-		Path: e.finalPath,
+		Path:        e.finalPath,
+		AsyncMoving: true,
 	}, nil
 }
 
@@ -249,7 +267,6 @@ func (e *fileElement) Publish() (result PublishResult, resultErr error) {
 		return result, errors.New("task became terminal during hash calculation, aborting publish")
 	}
 
-	// Zero-copy direct atomic rename in the exact same directory / volume!
 	if err := atomic.CommitFile(e.tempPath, absolute); err != nil {
 		if errors.Is(err, atomic.ErrTargetExists) {
 			if exists, checkErr := existingFile(absolute, e.file.Size()); checkErr == nil && exists {
@@ -324,12 +341,17 @@ func newLazySmallFileElement(
 	bkt bucket.Bucket,
 	tw *targetwriter.TargetWriter,
 ) (*lazySmallFileElement, error) {
+	gen := "1"
+	if task.Request().Retry {
+		gen = fmt.Sprintf("retry_%d", time.Now().UnixNano())
+	}
 	if tw != nil {
 		manifest := targetwriter.TaskManifest{
 			TaskID:       task.Request().ID,
 			FinalPath:    task.Request().FinalPath,
 			ExpectedSize: file.Size(),
 			Date:         date,
+			Gen:          gen,
 		}
 		tw.RegisterTask(manifest)
 	}
@@ -373,24 +395,32 @@ func (e *lazySmallFileElement) Publish() (result PublishResult, resultErr error)
 		return result, fmt.Errorf("in-memory file size %d does not match expected %d", len(data), e.file.Size())
 	}
 
-	// Compute SHA256 in memory
 	hashBytes := sha256.Sum256(data)
 	shaHash := hex.EncodeToString(hashBytes[:])
 
 	if e.bkt != nil && e.tw != nil {
+		gen := "1"
+		if e.task.Request().Retry {
+			gen = fmt.Sprintf("retry_%d", time.Now().UnixNano())
+		}
 		key := bucket.ObjectKey{
 			TaskID:           e.task.Request().ID,
-			Gen:              "1",
+			Gen:              gen,
 			Offset:           0,
 			Length:           int64(len(data)),
 			ExpectedFileSize: e.file.Size(),
 		}
+		if err := e.bkt.Reserve(e.Context(), int64(len(data))); err != nil {
+			return result, fmt.Errorf("reserve small file in bucket: %w", err)
+		}
 		if err := e.bkt.PutObject(key, data); err != nil {
+			e.bkt.ReleaseReservation(int64(len(data)))
 			return result, fmt.Errorf("put small file to bucket: %w", err)
 		}
 		return PublishResult{
-			Path:   e.finalPath,
-			SHA256: shaHash,
+			Path:        e.finalPath,
+			SHA256:      shaHash,
+			AsyncMoving: true,
 		}, nil
 	}
 

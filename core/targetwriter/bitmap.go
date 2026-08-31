@@ -6,8 +6,8 @@ import (
 
 // Range represents a [Start, End) byte range.
 type Range struct {
-	Start int64
-	End   int64
+	Start int64 `json:"start"`
+	End   int64 `json:"end"`
 }
 
 // MovedBitmap tracks durable written byte ranges for a task being written to target storage.
@@ -22,6 +22,17 @@ func NewMovedBitmap(expectedSize int64) *MovedBitmap {
 		expectedSize: expectedSize,
 		ranges:       make([]Range, 0, 8),
 	}
+}
+
+func NewMovedBitmapWithRanges(expectedSize int64, ranges []Range) *MovedBitmap {
+	bm := &MovedBitmap{
+		expectedSize: expectedSize,
+		ranges:       make([]Range, 0, len(ranges)),
+	}
+	for _, r := range ranges {
+		bm.AddMark(r.Start, r.End-r.Start)
+	}
+	return bm
 }
 
 // AddMark adds [offset, offset+length) to durable ranges and coalesces adjacent ranges.
@@ -52,7 +63,6 @@ func (b *MovedBitmap) AddMark(offset, length int64) {
 		} else if newStart > r.End {
 			newRanges = append(newRanges, r)
 		} else {
-			// Overlap or adjacent, merge
 			if r.Start < newStart {
 				newStart = r.Start
 			}
@@ -66,6 +76,15 @@ func (b *MovedBitmap) AddMark(offset, length int64) {
 		newRanges = append(newRanges, Range{Start: newStart, End: newEnd})
 	}
 	b.ranges = newRanges
+}
+
+// Ranges returns a copy of current durable ranges.
+func (b *MovedBitmap) Ranges() []Range {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	res := make([]Range, len(b.ranges))
+	copy(res, b.ranges)
+	return res
 }
 
 // IsComplete returns true if [0, expectedSize) has been fully and contiguously made durable.
