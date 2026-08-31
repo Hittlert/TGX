@@ -305,6 +305,45 @@ func TestFloodGate_ConcurrentAcquireReleaseAndDataInFlightRace(t *testing.T) {
 	assert.Equal(t, int64(0), g.DataInFlight())
 }
 
+func TestFloodGate_AcquireDataPermitAtomicAndNoHOLBlocking(t *testing.T) {
+	g := NewFloodGate(100.0, 40)
+
+	// Trigger 1s FloodWait on DC 2
+	g.TriggerFloodWait(2, 500*time.Millisecond)
+	assert.True(t, g.IsDCCooledDown(2))
+	assert.False(t, g.IsDCCooledDown(5))
+
+	// DC 5 permit should acquire IMMEDIATELY and not be blocked by DC 2
+	ctx := context.Background()
+	release5, ticket5, err := g.AcquireDataPermit(ctx, 5)
+	require.NoError(t, err)
+	assert.NotNil(t, ticket5)
+	assert.Equal(t, 5, ticket5.DC())
+	assert.Equal(t, int64(1), g.DataInFlight())
+
+	// Invoker for DC 5 consumes ticket
+	invoked := false
+	mw5 := g.Middleware(5)
+	invoker5 := mw5.Handle(fakeInvokerFunc(func(ctx context.Context, in bin.Encoder, out bin.Decoder) error {
+		invoked = true
+		return nil
+	}))
+	err = invoker5(WithTicket(ctx, ticket5), nil, nil)
+	require.NoError(t, err)
+	assert.True(t, invoked)
+
+	// Release DC 5 slot
+	release5()
+	assert.Equal(t, int64(0), g.DataInFlight())
+
+	// DC 2 permit with short timeout must time out waiting for cooldown WITHOUT incrementing DataInFlight
+	timeoutCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancel()
+	_, _, err = g.AcquireDataPermit(timeoutCtx, 2)
+	assert.Error(t, err)
+	assert.Equal(t, int64(0), g.DataInFlight()) // Slot was NOT consumed while waiting for cooldown!
+}
+
 type fakeInvokerFunc func(ctx context.Context, in bin.Encoder, out bin.Decoder) error
 
 func (f fakeInvokerFunc) Invoke(ctx context.Context, in bin.Encoder, out bin.Decoder) error {

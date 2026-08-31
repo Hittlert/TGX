@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -57,20 +58,26 @@ func newTelegramMediaAccess(parentCtx context.Context, pool dcpool.Pool, manager
 const maxMsgCacheEntries = 1000
 
 func (a *telegramMediaAccess) cleanExpiredCacheLocked(now time.Time) {
-	if len(a.msgCache) > maxMsgCacheEntries {
-		for k, v := range a.msgCache {
-			if now.After(v.expires) {
-				delete(a.msgCache, k)
-			}
+	for k, v := range a.msgCache {
+		if now.After(v.expires) {
+			delete(a.msgCache, k)
 		}
 	}
-	if len(a.msgCache) > maxMsgCacheEntries {
-		// If still over cap, prune oldest entries
-		for k := range a.msgCache {
-			delete(a.msgCache, k)
-			if len(a.msgCache) <= maxMsgCacheEntries/2 {
-				break
-			}
+	if len(a.msgCache) >= maxMsgCacheEntries {
+		type entryItem struct {
+			key string
+			exp time.Time
+		}
+		entries := make([]entryItem, 0, len(a.msgCache))
+		for k, v := range a.msgCache {
+			entries = append(entries, entryItem{key: k, exp: v.expires})
+		}
+		sort.Slice(entries, func(i, j int) bool {
+			return entries[i].exp.Before(entries[j].exp)
+		})
+		toRemove := len(a.msgCache) - (maxMsgCacheEntries - 100)
+		for i := 0; i < toRemove && i < len(entries); i++ {
+			delete(a.msgCache, entries[i].key)
 		}
 	}
 }
@@ -108,26 +115,35 @@ func (a *telegramMediaAccess) Resolve(ctx context.Context, peer string, messageI
 		return ResolvedMedia{}, classifyTelegramError(err, "resolve peer")
 	}
 
-	// SingleFlight batch fetch starting at messageID
-	batchKey := fmt.Sprintf("batch:%s:%d", peer, (messageID/50)*50)
-	_, batchErr, _ := a.sf.Do(batchKey, func() (interface{}, error) {
+	// Deterministic bucket key: bucketStart is aligned to 50-message boundary
+	bucketStart := (messageID / 50) * 50
+	if bucketStart == 0 {
+		bucketStart = 1
+	}
+	batchKey := fmt.Sprintf("batch:%s:%d", peer, bucketStart)
+
+	// SingleFlight DoChan with daemon-owned context to isolate followers from leader cancellation
+	ch := a.sf.DoChan(batchKey, func() (interface{}, error) {
+		fetchCtx, fetchCancel := context.WithTimeout(a.parentCtx, 15*time.Second)
+		defer fetchCancel()
+
 		if a.gate != nil {
-			if err := a.gate.AcquireControlSlot(ctx); err != nil {
+			if err := a.gate.AcquireControlSlot(fetchCtx); err != nil {
 				return nil, err
 			}
 			defer a.gate.ReleaseControlSlot()
 		}
 
-		// Prefetch window of up to 50 adjacent message IDs
+		// Prefetch entire 50-message bucket starting at bucketStart
 		ids := make([]int, 0, 50)
 		for i := 0; i < 50; i++ {
-			ids = append(ids, messageID+i)
+			ids = append(ids, bucketStart+i)
 		}
 
-		messages, fetchErr := tutil.GetMessagesBatch(ctx, a.pool.Default(ctx), resolvedPeer.InputPeer(), ids)
+		messages, fetchErr := tutil.GetMessagesBatch(fetchCtx, a.pool.Default(fetchCtx), resolvedPeer.InputPeer(), ids)
 		if fetchErr != nil {
-			// If batch fails, fallback to single message
-			singleMsg, sErr := tutil.GetSingleMessage(ctx, a.pool.Default(ctx), resolvedPeer.InputPeer(), messageID)
+			// Fallback to single message
+			singleMsg, sErr := tutil.GetSingleMessage(fetchCtx, a.pool.Default(fetchCtx), resolvedPeer.InputPeer(), messageID)
 			if sErr != nil {
 				return nil, sErr
 			}
@@ -151,8 +167,10 @@ func (a *telegramMediaAccess) Resolve(ctx context.Context, peer string, messageI
 		return nil, nil
 	})
 
-	if batchErr != nil {
-		return ResolvedMedia{}, classifyTelegramError(batchErr, "resolve message")
+	select {
+	case <-ctx.Done():
+		return ResolvedMedia{}, ctx.Err()
+	case <-ch:
 	}
 
 	// Read from populated cache

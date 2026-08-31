@@ -120,6 +120,78 @@ func (g *FloodGate) ReleaseDataSlot() {
 	g.dataSem.Release(1)
 }
 
+// AcquireDataPermit atomically:
+// 1. Checks and waits for DC cooldown (WITHOUT occupying any data slot).
+// 2. Waits for global token bucket rate limiting.
+// 3. Atomically acquires a dynamic data slot (activeDataRPC < maxDataCap && dataSem).
+// 4. Returns a release function and fresh DC-bound single-use AdmissionTicket.
+func (g *FloodGate) AcquireDataPermit(ctx context.Context, dc int) (func(), *AdmissionTicket, error) {
+	if g == nil {
+		return func() {}, &AdmissionTicket{dcID: dc}, nil
+	}
+
+	for {
+		// 1. Check and wait for DC cooldown without holding any data slot
+		g.mu.Lock()
+		now := time.Now()
+		for d, nb := range g.dcCooldowns {
+			if now.After(nb) {
+				delete(g.dcCooldowns, d)
+			}
+		}
+		notBefore, hasCooldown := g.dcCooldowns[dc]
+		var waitTime time.Duration
+		if hasCooldown && now.Before(notBefore) {
+			waitTime = notBefore.Sub(now)
+		}
+		limiter := g.limiter
+		g.mu.Unlock()
+
+		if waitTime > 0 {
+			select {
+			case <-ctx.Done():
+				return nil, nil, ctx.Err()
+			case <-time.After(waitTime):
+			}
+			continue
+		}
+
+		// 2. Wait for global rate limiter token
+		if limiter != nil {
+			if err := limiter.Wait(ctx); err != nil {
+				return nil, nil, err
+			}
+		}
+
+		// 3. Quick post-token verification under lock in case another worker triggered cooldown while waiting for token
+		g.mu.Lock()
+		now = time.Now()
+		notBefore, hasCooldown = g.dcCooldowns[dc]
+		if hasCooldown && now.Before(notBefore) {
+			waitTime = notBefore.Sub(now)
+			g.mu.Unlock()
+			select {
+			case <-ctx.Done():
+				return nil, nil, ctx.Err()
+			case <-time.After(waitTime):
+			}
+			continue
+		}
+		g.mu.Unlock()
+
+		// 4. Acquire dynamic data slot immediately before RPC
+		if err := g.AcquireDataSlot(ctx); err != nil {
+			return nil, nil, err
+		}
+
+		ticket := &AdmissionTicket{dcID: dc}
+		release := func() {
+			g.ReleaseDataSlot()
+		}
+		return release, ticket, nil
+	}
+}
+
 // DataInFlight returns the number of actively executing data RPCs.
 func (g *FloodGate) DataInFlight() int64 {
 	if g == nil {
@@ -363,6 +435,13 @@ type AdmissionTicket struct {
 	consumed int32
 }
 
+func (t *AdmissionTicket) DC() int {
+	if t == nil {
+		return 0
+	}
+	return t.dcID
+}
+
 func (t *AdmissionTicket) TryConsume(dc int) bool {
 	if t == nil || t.dcID != dc {
 		return false
@@ -372,9 +451,14 @@ func (t *AdmissionTicket) TryConsume(dc int) bool {
 
 type ticketKey struct{}
 
-// WithAdmissionTicket attaches a single-use admission ticket for the given DC ID to the context.
+// WithAdmissionTicket attaches a new single-use admission ticket for the given DC ID to the context.
 func WithAdmissionTicket(ctx context.Context, dc int) context.Context {
 	return context.WithValue(ctx, ticketKey{}, &AdmissionTicket{dcID: dc})
+}
+
+// WithTicket attaches an existing single-use admission ticket to the context.
+func WithTicket(ctx context.Context, t *AdmissionTicket) context.Context {
+	return context.WithValue(ctx, ticketKey{}, t)
 }
 
 // ConsumeTicketForDC attempts to consume a single-use admission ticket specifically for dc.

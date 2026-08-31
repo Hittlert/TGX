@@ -1110,9 +1110,13 @@ func (d *Downloader) fetchLargeChunk(ctx context.Context, workerID int, job *lar
 			return
 		}
 
-		// 1. Acquire dynamic data slot FIRST (blocks until capacity within maxDataCap is available)
+		// Atomic admission: checks DC cooldown without holding slot, takes rate token, then acquires dynamic slot.
+		var releaseSlot func()
+		var ticket *gate.AdmissionTicket
 		if d.floodGate != nil {
-			if err := d.floodGate.AcquireDataSlot(elemCtx); err != nil {
+			var err error
+			releaseSlot, ticket, err = d.floodGate.AcquireDataPermit(elemCtx, job.dcID)
+			if err != nil {
 				job.fileState.fail(err)
 				select {
 				case <-ctx.Done():
@@ -1120,28 +1124,15 @@ func (d *Downloader) fetchLargeChunk(ctx context.Context, workerID int, job *lar
 				}
 				return
 			}
+		} else {
+			releaseSlot = func() {}
+			ticket = &gate.AdmissionTicket{}
 		}
 
 		atomic.AddInt32(&job.fileState.activeRPC, 1)
 		atomic.AddInt64(&d.activeLargeRPC, 1)
 
-		// 2. Immediately before executing RPC, wait for rate limit token and DC cooldown
-		if d.floodGate != nil {
-			if err := d.floodGate.Wait(elemCtx, job.dcID); err != nil {
-				d.floodGate.ReleaseDataSlot()
-				atomic.AddInt32(&job.fileState.activeRPC, -1)
-				atomic.AddInt64(&d.activeLargeRPC, -1)
-				job.fileState.fail(err)
-				select {
-				case <-ctx.Done():
-				case writeChan <- &largeWriteJob{fileState: job.fileState, leaseGen: job.leaseGen, offset: job.offset, isFailed: true, err: err}:
-				}
-				return
-			}
-		}
-
-		// 3. Mark context with fresh WithAdmissionTicket bound to job.dcID
-		chunkCtx, chunkCancel := context.WithTimeout(gate.WithAdmissionTicket(elemCtx, job.dcID), 60*time.Second)
+		chunkCtx, chunkCancel := context.WithTimeout(gate.WithTicket(elemCtx, ticket), 60*time.Second)
 		var res tg.UploadFileClass
 		res, fetchErr = client.UploadGetFile(chunkCtx, req)
 		chunkCancel()
@@ -1199,7 +1190,7 @@ func (d *Downloader) fetchLargeChunk(ctx context.Context, workerID int, job *lar
 
 		atomic.AddInt32(&job.fileState.activeRPC, -1)
 		atomic.AddInt64(&d.activeLargeRPC, -1)
-		d.floodGate.ReleaseDataSlot()
+		releaseSlot()
 
 		if errors.Is(fetchErr, context.Canceled) || elemCtx.Err() != nil {
 			job.fileState.fail(context.Canceled)
@@ -1346,30 +1337,24 @@ func (d *Downloader) fetchSmallFile(ctx context.Context, workerID int, job *smal
 			default:
 			}
 
-			// 1. Acquire dynamic data slot FIRST
+			var releaseSlot func()
+			var ticket *gate.AdmissionTicket
 			if d.floodGate != nil {
-				if err := d.floodGate.AcquireDataSlot(elemCtx); err != nil {
+				var err error
+				releaseSlot, ticket, err = d.floodGate.AcquireDataPermit(elemCtx, job.dcID)
+				if err != nil {
 					d.opts.Progress.OnDone(job.elem, err)
 					budget.release(job.totalSize)
 					return
 				}
+			} else {
+				releaseSlot = func() {}
+				ticket = &gate.AdmissionTicket{}
 			}
 
 			atomic.AddInt64(&d.activeSmallRPC, 1)
 
-			// 2. Immediately before executing RPC, wait for rate limit token and DC cooldown
-			if d.floodGate != nil {
-				if err := d.floodGate.Wait(elemCtx, job.dcID); err != nil {
-					d.floodGate.ReleaseDataSlot()
-					atomic.AddInt64(&d.activeSmallRPC, -1)
-					d.opts.Progress.OnDone(job.elem, err)
-					budget.release(job.totalSize)
-					return
-				}
-			}
-
-			// 3. Mark context with fresh WithAdmissionTicket bound to job.dcID
-			chunkCtx, chunkCancel := context.WithTimeout(gate.WithAdmissionTicket(elemCtx, job.dcID), 60*time.Second)
+			chunkCtx, chunkCancel := context.WithTimeout(gate.WithTicket(elemCtx, ticket), 60*time.Second)
 			res, fetchErr := client.UploadGetFile(chunkCtx, req)
 			chunkCancel()
 
@@ -1409,7 +1394,7 @@ func (d *Downloader) fetchSmallFile(ctx context.Context, workerID int, job *smal
 			}
 
 			atomic.AddInt64(&d.activeSmallRPC, -1)
-			d.floodGate.ReleaseDataSlot()
+			releaseSlot()
 
 			if errors.Is(fetchErr, context.Canceled) || elemCtx.Err() != nil {
 				d.opts.Progress.OnDone(job.elem, context.Canceled)
