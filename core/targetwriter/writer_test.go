@@ -27,7 +27,7 @@ func TestTargetWriter_OutOfOrderAndContiguous(t *testing.T) {
 	tw := New(bkt, outDir)
 
 	completeChan := make(chan string, 1)
-	tw.SetCallbacks(func(taskID, finalPath, shaHash string) {
+	tw.SetCallbacks(func(taskID, gen, finalPath, shaHash string) {
 		completeChan <- finalPath
 	}, nil, nil)
 

@@ -66,7 +66,7 @@ func copyAndRemove(tempPath, finalPath string) error {
 		return fmt.Errorf("stat src: %w", err)
 	}
 
-	dstTmp := finalPath + ".moving"
+	dstTmp := finalPath + ".commit_tmp"
 	// Truncate/create temp dst (safe because finalPath has not been created yet)
 	dst, err := os.OpenFile(dstTmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {

@@ -92,17 +92,19 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) ([]TaskRecoveryResult, er
 		movingPath := finalPath + ".moving"
 		metaPath := finalPath + ".moving.meta"
 
-		// 1. Check if final file already exists with exact size in target directory
+		// 1. Check if final file was already committed via our SHA-verified CommitFile.
+		// Accept only if: final exists with exact size AND .moving does NOT exist
+		// (presence of .moving indicates CommitFile did not complete successfully).
 		stat, err := os.Stat(finalPath)
-		if err == nil && stat.Size() == rec.FileSize && rec.FileSize > 0 {
-			_ = os.Remove(movingPath)
+		_, movingExists := os.Stat(movingPath)
+		if err == nil && stat.Size() == rec.FileSize && rec.FileSize > 0 && movingExists != nil {
 			_ = os.Remove(metaPath)
 			_, _ = r.db.ExecContext(ctx, `UPDATE download_records SET status = 'success', error = '' WHERE chat_id = ? AND message_id = ?`, rec.ChatID, rec.MessageID)
 			results = append(results, TaskRecoveryResult{
 				FileKey:     fileKey,
 				PrevState:   rec.Status,
 				NextState:   "success",
-				ActionTaken: "FINAL_FILE_EXISTS_PROMOTED_TO_SUCCESS",
+				ActionTaken: "FINAL_FILE_COMMITTED_PROMOTED_TO_SUCCESS",
 			})
 			continue
 		}

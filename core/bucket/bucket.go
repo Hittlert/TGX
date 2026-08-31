@@ -275,14 +275,22 @@ func (b *bucketImpl) PutObject(key ObjectKey, data []byte) error {
 	// If overwriting an existing entry (different gen/checksum at same offset),
 	// reclaim the old entry's capacity and remove orphaned SSD file.
 	if oldEntry, exists := taskMap[key.Offset]; exists {
-		if b.readyBytes >= oldEntry.obj.Key.Length {
-			b.readyBytes -= oldEntry.obj.Key.Length
-		}
-		if b.objectCount > 0 {
-			b.objectCount--
-		}
+		canRelease := true
 		if b.cfg.Mode == ModeSSD && oldEntry.obj.DiskPath != "" {
-			_ = os.Remove(oldEntry.obj.DiskPath)
+			if err := os.Remove(oldEntry.obj.DiskPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+				// Delete failed: keep capacity accounted to avoid phantom free space
+				canRelease = false
+			}
+		} else if b.cfg.Mode == ModeMemory {
+			delete(b.memData, oldEntry.obj.Key.String())
+		}
+		if canRelease {
+			if b.readyBytes >= oldEntry.obj.Key.Length {
+				b.readyBytes -= oldEntry.obj.Key.Length
+			}
+			if b.objectCount > 0 {
+				b.objectCount--
+			}
 		}
 	}
 

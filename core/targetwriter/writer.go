@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -67,9 +68,9 @@ type TargetWriter struct {
 	openFiles       sync.Map // taskID → *os.File
 	pendingFinalize sync.Map // taskID → TaskManifest (complete bitmap awaiting finalize)
 
-	onComplete func(taskID, finalPath string, shaHash string)
+	onComplete func(taskID, gen, finalPath string, shaHash string)
 	onProgress func(taskID string, movedBytes, totalBytes int64)
-	onError    func(taskID string, err error)
+	onError    func(taskID, gen string, err error)
 
 	writtenBytes     int64
 	contiguousWrites int64
@@ -95,9 +96,9 @@ func New(bkt bucket.Bucket, outputDir string) *TargetWriter {
 }
 
 func (w *TargetWriter) SetCallbacks(
-	onComplete func(taskID, finalPath string, shaHash string),
+	onComplete func(taskID, gen, finalPath string, shaHash string),
 	onProgress func(taskID string, movedBytes, totalBytes int64),
-	onError func(taskID string, err error),
+	onError func(taskID, gen string, err error),
 ) {
 	w.onComplete = onComplete
 	w.onProgress = onProgress
@@ -119,11 +120,17 @@ func (w *TargetWriter) RegisterTask(manifest TaskManifest) {
 	if val, ok := w.manifests.Load(manifest.TaskID); ok {
 		old := val.(TaskManifest)
 		if old.Gen != manifest.Gen {
+			// New generation: clean up old state entirely
 			w.bitmaps.Delete(manifest.TaskID)
 			if fVal, fOk := w.openFiles.LoadAndDelete(manifest.TaskID); fOk {
 				_ = fVal.(*os.File).Close()
 			}
 			w.pendingFinalize.Delete(manifest.TaskID)
+		} else {
+			// Same generation re-register: update manifest but do NOT rebuild bitmap.
+			// This preserves durable ranges recovered from sidecar or written since first register.
+			w.manifests.Store(manifest.TaskID, manifest)
+			return
 		}
 	}
 
@@ -308,20 +315,48 @@ func (w *TargetWriter) writerLoop() {
 }
 
 // drainPendingFinalizes attempts to finalize all tasks that have complete
-// bitmaps but haven't been finalized yet. On failure, the task remains in
-// the queue for the next iteration.
+// bitmaps but haven't been finalized yet.
+// Permanent errors (content conflict, size mismatch) trigger onError and removal.
+// Transient errors (IO, sync) leave the task in the queue for the next iteration.
 func (w *TargetWriter) drainPendingFinalizes() {
 	w.pendingFinalize.Range(func(key, value any) bool {
 		taskID := key.(string)
 		manifest := value.(TaskManifest)
 		if err := w.finalizeTask(manifest); err != nil {
 			w.setLastError(err)
-			// Leave in pendingFinalize for retry on next loop iteration
+			if isFinalizePermError(err) {
+				// Permanent: content conflict or irrecoverable. Enter terminal state.
+				w.pendingFinalize.Delete(taskID)
+				w.manifests.Delete(taskID)
+				w.bitmaps.Delete(taskID)
+				if w.onError != nil {
+					w.onError(taskID, manifest.Gen, fmt.Errorf("permanent finalize error: %w", err))
+				}
+			}
+			// Transient: leave in pendingFinalize for retry
 		} else {
 			w.pendingFinalize.Delete(taskID)
 		}
 		return true
 	})
+}
+
+// isFinalizePermError returns true for errors that will never succeed on retry.
+func isFinalizePermError(err error) bool {
+	msg := err.Error()
+	// Content conflict: SHA mismatch with existing target
+	if strings.Contains(msg, "different content") {
+		return true
+	}
+	// Size mismatch: .moving file corrupted
+	if strings.Contains(msg, "does not match expected") {
+		return true
+	}
+	// Permission denied
+	if errors.Is(err, os.ErrPermission) {
+		return true
+	}
+	return false
 }
 
 // processObject writes a single buffer object to the target .moving file.
@@ -342,7 +377,10 @@ func (w *TargetWriter) processObject(obj *bucket.BufferObject, isContiguous bool
 	// Generation guard: reject objects from stale attempts.
 	// Release buffer capacity for the stale object without writing.
 	if obj.Key.Gen != manifest.Gen {
-		_ = w.bkt.AckDurable([]bucket.ObjectKey{obj.Key})
+		if err := w.bkt.AckDurable([]bucket.ObjectKey{obj.Key}); err != nil {
+			// Ack failed: object is still in pending-delete. Requeue to avoid capacity leak.
+			return processResult{phaseObjectRetryable, fmt.Errorf("ack stale object: %w", err)}
+		}
 		return processResult{phase: phaseStaleDiscarded}
 	}
 
@@ -505,14 +543,17 @@ func (w *TargetWriter) finalizeTask(manifest TaskManifest) error {
 	movingPath := finalPath + ".moving"
 	metaPath := finalPath + ".moving.meta"
 
-	// Close open FD
-	if val, ok := w.openFiles.LoadAndDelete(taskID); ok {
+	// Close open FD — must Close even if Sync fails to avoid FD leak
+	if val, ok := w.openFiles.Load(taskID); ok {
 		f := val.(*os.File)
-		if err := f.Sync(); err != nil {
-			return fmt.Errorf("final sync moving file: %w", err)
+		syncErr := f.Sync()
+		closeErr := f.Close()
+		w.openFiles.Delete(taskID)
+		if syncErr != nil {
+			return fmt.Errorf("final sync moving file: %w", syncErr)
 		}
-		if err := f.Close(); err != nil {
-			return fmt.Errorf("close moving file: %w", err)
+		if closeErr != nil {
+			return fmt.Errorf("close moving file: %w", closeErr)
 		}
 	}
 
@@ -563,7 +604,7 @@ func (w *TargetWriter) finalizeTask(manifest TaskManifest) error {
 	w.pendingFinalize.Delete(taskID)
 
 	if w.onComplete != nil {
-		w.onComplete(taskID, manifest.FinalPath, shaHash)
+		w.onComplete(taskID, manifest.Gen, manifest.FinalPath, shaHash)
 	}
 	return nil
 }

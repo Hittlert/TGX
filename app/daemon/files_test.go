@@ -173,7 +173,7 @@ func TestBucketFileElement_BucketAndTargetWriterIntegration(t *testing.T) {
 
 	tw := targetwriter.New(bkt, outputRoot)
 	completeChan := make(chan string, 1)
-	tw.SetCallbacks(func(taskID, finalPath, shaHash string) {
+	tw.SetCallbacks(func(taskID, gen, finalPath, shaHash string) {
 		completeChan <- finalPath
 	}, nil, nil)
 

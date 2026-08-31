@@ -129,7 +129,7 @@ func TestChaos_PowerCut_After_Complete_Meta(t *testing.T) {
 	require.Equal(t, 1, len(results))
 
 	assert.Equal(t, "success", results[0].NextState)
-	assert.Equal(t, "FINAL_FILE_EXISTS_PROMOTED_TO_SUCCESS", results[0].ActionTaken)
+	assert.Equal(t, "FINAL_FILE_COMMITTED_PROMOTED_TO_SUCCESS", results[0].ActionTaken)
 	assert.FileExists(t, finalPath)
 }
 
@@ -159,7 +159,7 @@ func TestChaos_Linkat_Unlink_Crash(t *testing.T) {
 	require.Equal(t, 1, len(results))
 
 	assert.Equal(t, "success", results[0].NextState)
-	assert.Equal(t, "FINAL_FILE_EXISTS_PROMOTED_TO_SUCCESS", results[0].ActionTaken)
+	assert.Equal(t, "FINAL_FILE_COMMITTED_PROMOTED_TO_SUCCESS", results[0].ActionTaken)
 	assert.FileExists(t, finalPath)
 }
 

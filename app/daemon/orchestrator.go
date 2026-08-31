@@ -63,7 +63,7 @@ func (o *Orchestrator) SetBufferDir(dir string) {
 func (o *Orchestrator) Start(ctx context.Context) {
 	if o.tw != nil {
 		o.tw.SetCallbacks(
-			func(taskID, finalPath, shaHash string) {
+			func(taskID, gen, finalPath, shaHash string) {
 				parts := strings.Split(taskID, ":")
 				if len(parts) == 2 {
 					var msgID int
@@ -71,12 +71,12 @@ func (o *Orchestrator) Start(ctx context.Context) {
 					_ = o.db.UpdateDownloadStatus(parts[0], msgID, "success", "", finalPath, "", 0, "")
 				}
 				if o.registry != nil {
-					o.registry.FinishTask(taskID, StateSuccess, "", "", finalPath, false, shaHash)
+					o.registry.FinishTask(taskID, gen, StateSuccess, "", "", finalPath, false, shaHash)
 				}
 			},
 			func(taskID string, movedBytes, totalBytes int64) {
 			},
-			func(taskID string, err error) {
+			func(taskID, gen string, err error) {
 				parts := strings.Split(taskID, ":")
 				if len(parts) == 2 {
 					var msgID int
@@ -84,7 +84,7 @@ func (o *Orchestrator) Start(ctx context.Context) {
 					_ = o.db.UpdateDownloadStatus(parts[0], msgID, "failed", "", "", "", 0, err.Error())
 				}
 				if o.registry != nil {
-					o.registry.FinishTask(taskID, StateFailed, "write_error", err.Error(), "", false, "")
+					o.registry.FinishTask(taskID, gen, StateFailed, "write_error", err.Error(), "", false, "")
 				}
 			},
 		)
