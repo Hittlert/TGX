@@ -1,11 +1,18 @@
 package daemon
 
 import (
+	"context"
 	"crypto/sha256"
 	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/Hittlert/TGX/core/mover"
 )
 
 func TestFileElementPublishesVerifiedContentAndHash(t *testing.T) {
@@ -169,4 +176,97 @@ func TestLazySmallFileElement_NoDiskOpsDuringResolveAndPublishesDirectly(t *test
 	if string(final) != string(content) {
 		t.Fatalf("published bytes=%q, want %q", final, content)
 	}
+}
+
+func TestFileElement_MoverIntegration(t *testing.T) {
+	root := t.TempDir()
+	bufRoot := filepath.Join(root, "buffer")
+	outputRoot := filepath.Join(root, "hdd")
+	content := []byte("large-file-chunk-data-stream-content")
+
+	m := mover.New(1, 100*1024*1024)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	m.Start(ctx)
+	defer m.Close()
+
+	registry := NewRegistry(1, 100, nil)
+	request := validRequest("mover-test", 1)
+	request.ExpectedSize = int64(len(content))
+	request.FinalPath = "Movies/2026_08/video.mp4"
+	_, _, _ = registry.Submit(request)
+	task, _ := registry.Next(t.Context())
+
+	// Create fileElement with staging tempRoot and mover
+	element, err := newFileElement(task, fakeDownloadFile{size: int64(len(content)), dc: 4}, bufRoot, outputRoot, 0, m)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Write content to buffer
+	if _, err := element.To().WriteAt(content, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// Pre-reserve capacity
+	require.True(t, m.Reserve(int64(len(content))))
+	assert.Equal(t, int64(len(content)), m.UsedBytes())
+
+	// Publish delegates to mover
+	result, err := element.Publish()
+	require.NoError(t, err)
+
+	wantHash := fmt.Sprintf("%x", sha256.Sum256(content))
+	assert.Equal(t, wantHash, result.SHA256)
+	assert.Equal(t, request.FinalPath, result.Path)
+
+	// Verify target disk file
+	final, err := os.ReadFile(filepath.Join(outputRoot, filepath.FromSlash(request.FinalPath)))
+	require.NoError(t, err)
+	assert.Equal(t, content, final)
+
+	// Verify buffer file was removed
+	_, err = os.Stat(element.tempPath)
+	assert.True(t, os.IsNotExist(err))
+
+	// Verify buffer capacity was automatically released
+	assert.Equal(t, int64(0), m.UsedBytes())
+}
+
+func TestLazySmallFileElement_MoverIntegration(t *testing.T) {
+	root := t.TempDir()
+	outputRoot := filepath.Join(root, "hdd")
+	content := []byte("small-image-mover-data")
+
+	m := mover.New(1, 100*1024*1024)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	m.Start(ctx)
+	defer m.Close()
+
+	registry := NewRegistry(1, 100, nil)
+	request := validRequest("small-mover", 1)
+	request.ExpectedSize = int64(len(content))
+	request.FinalPath = "Photos/2026_08/photo.jpg"
+	_, _, _ = registry.Submit(request)
+	task, _ := registry.Next(t.Context())
+
+	element, err := newLazySmallFileElement(task, fakeDownloadFile{size: int64(len(content)), dc: 4}, outputRoot, 0, m)
+	require.NoError(t, err)
+
+	// Write to memory
+	_, err = element.To().WriteAt(content, 0)
+	require.NoError(t, err)
+
+	// Publish delegates to mover
+	result, err := element.Publish()
+	require.NoError(t, err)
+
+	wantHash := fmt.Sprintf("%x", sha256.Sum256(content))
+	assert.Equal(t, wantHash, result.SHA256)
+
+	// Verify target disk file
+	final, err := os.ReadFile(filepath.Join(outputRoot, filepath.FromSlash(request.FinalPath)))
+	require.NoError(t, err)
+	assert.Equal(t, content, final)
 }

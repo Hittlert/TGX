@@ -184,6 +184,23 @@ func (g *FloodGate) AcquireDataPermit(ctx context.Context, dc int) (func(), *Adm
 			return nil, nil, err
 		}
 
+		// Post-slot cooldown verification: ensure DC didn't get cooled down while waiting for dynamic slot
+		g.mu.Lock()
+		now = time.Now()
+		notBefore, hasCooldown = g.dcCooldowns[dc]
+		if hasCooldown && now.Before(notBefore) {
+			waitTime = notBefore.Sub(now)
+			g.mu.Unlock()
+			g.ReleaseDataSlot() // Release slot immediately so we do not block other DCs while in cooldown
+			select {
+			case <-ctx.Done():
+				return nil, nil, ctx.Err()
+			case <-time.After(waitTime):
+			}
+			continue
+		}
+		g.mu.Unlock()
+
 		ticket := &AdmissionTicket{dcID: dc}
 		release := func() {
 			g.ReleaseDataSlot()

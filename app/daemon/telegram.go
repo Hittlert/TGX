@@ -22,6 +22,15 @@ import (
 	"github.com/Hittlert/TGX/pkg/sbe/gate"
 )
 
+type TelegramAccess interface {
+	GetDialogs(ctx context.Context) ([]DialogDTO, error)
+	GetHistory(ctx context.Context, req HistoryRequest) ([]MessageDTO, error)
+	ResolvePeerInfo(ctx context.Context, queryStr string) (DialogDTO, error)
+	Resolve(ctx context.Context, peer string, messageID int) (ResolvedMedia, error)
+	ResolveBatch(ctx context.Context, peer string, messageIDs []int) (map[int]ResolvedMedia, error)
+	SyncPeers(ctx context.Context) error
+}
+
 type messageCacheEntry struct {
 	msg     *tg.Message
 	expires time.Time

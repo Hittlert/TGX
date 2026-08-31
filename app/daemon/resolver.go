@@ -8,6 +8,7 @@ import (
 
 	"github.com/flytam/filenamify"
 	"github.com/Hittlert/TGX/core/downloader"
+	"github.com/Hittlert/TGX/core/mover"
 )
 
 type ResolvedMedia struct {
@@ -26,10 +27,15 @@ type taskResolver struct {
 	access     MediaAccess
 	tempRoot   string
 	outputRoot string
+	mover      *mover.Mover
 }
 
-func newTaskResolver(access MediaAccess, tempRoot, outputRoot string) *taskResolver {
-	return &taskResolver{access: access, tempRoot: tempRoot, outputRoot: outputRoot}
+func newTaskResolver(access MediaAccess, tempRoot, outputRoot string, optMover ...*mover.Mover) *taskResolver {
+	var m *mover.Mover
+	if len(optMover) > 0 {
+		m = optMover[0]
+	}
+	return &taskResolver{access: access, tempRoot: tempRoot, outputRoot: outputRoot, mover: m}
 }
 
 func (r *taskResolver) Resolve(ctx context.Context, task *Task) (taskElement, error) {
@@ -65,14 +71,14 @@ func (r *taskResolver) Resolve(ctx context.Context, task *Task) (taskElement, er
 	}
 
 	if media.Size <= downloader.SmallFileThreshold {
-		lazyElem, err := newLazySmallFileElement(task, media.File, r.outputRoot, media.Date)
+		lazyElem, err := newLazySmallFileElement(task, media.File, r.outputRoot, media.Date, r.mover)
 		if err != nil {
 			return nil, NewTaskError("memory", false, err)
 		}
 		return lazyElem, nil
 	}
 
-	element, err := newFileElement(task, media.File, r.tempRoot, r.outputRoot, media.Date)
+	element, err := newFileElement(task, media.File, r.tempRoot, r.outputRoot, media.Date, r.mover)
 	if err != nil {
 		return nil, NewTaskError("filesystem", false, err)
 	}

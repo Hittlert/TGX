@@ -51,26 +51,39 @@ func copyAndRemove(tempPath, finalPath string) error {
 		return fmt.Errorf("create parent dir: %w", err)
 	}
 
+	if _, err := os.Stat(finalPath); err == nil {
+		return ErrTargetExists
+	}
+
 	src, err := os.Open(tempPath)
 	if err != nil {
 		return fmt.Errorf("open src %s: %w", tempPath, err)
 	}
 	defer src.Close()
 
-	dstTmp := finalPath + ".moving"
-	dst, err := os.OpenFile(dstTmp, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0644)
+	srcStat, err := src.Stat()
 	if err != nil {
-		if errors.Is(err, os.ErrExist) {
-			return ErrTargetExists
-		}
+		return fmt.Errorf("stat src: %w", err)
+	}
+
+	dstTmp := finalPath + ".moving"
+	// Truncate/create temp dst (safe because finalPath has not been created yet)
+	dst, err := os.OpenFile(dstTmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
 		return fmt.Errorf("open dst tmp: %w", err)
 	}
 
 	buf := make([]byte, 4*1024*1024) // 4MB sequential buffer
-	if _, err := io.CopyBuffer(dst, src, buf); err != nil {
+	written, err := io.CopyBuffer(dst, src, buf)
+	if err != nil {
 		_ = dst.Close()
 		_ = os.Remove(dstTmp)
 		return fmt.Errorf("copy buffer: %w", err)
+	}
+	if written != srcStat.Size() {
+		_ = dst.Close()
+		_ = os.Remove(dstTmp)
+		return fmt.Errorf("short copy: wrote %d of %d bytes", written, srcStat.Size())
 	}
 
 	if err := dst.Sync(); err != nil {
@@ -84,9 +97,10 @@ func copyAndRemove(tempPath, finalPath string) error {
 	}
 	_ = src.Close()
 
-	if err := os.Rename(dstTmp, finalPath); err != nil {
+	// Atomic non-replacing commit from dstTmp to finalPath (same directory)
+	if err := commitFile(dstTmp, finalPath); err != nil {
 		_ = os.Remove(dstTmp)
-		return fmt.Errorf("rename dst tmp to final: %w", err)
+		return err
 	}
 
 	_ = os.Remove(tempPath)

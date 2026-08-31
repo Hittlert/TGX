@@ -65,17 +65,22 @@ func (o Options) withDefaults() Options {
 	if o.BufferType == "" {
 		o.BufferType = "memory"
 	}
-	if o.BufferDir == "" {
-		o.BufferDir = o.TempDir
-	}
-	if o.BufferSize == 0 {
-		switch o.BufferType {
-		case "ssd":
-			o.BufferSize = 5 * 1024 * 1024 * 1024 // 5 GiB
-		case "none":
-			o.BufferSize = 0
-		default:
-			o.BufferSize = 512 * 1024 * 1024 // 512 MiB
+	if o.BufferType == "none" {
+		if o.BufferDir == "" {
+			o.BufferDir = o.OutputDir
+		}
+		o.BufferSize = 0
+	} else {
+		if o.BufferDir == "" {
+			o.BufferDir = o.TempDir
+		}
+		if o.BufferSize == 0 {
+			switch o.BufferType {
+			case "ssd":
+				o.BufferSize = 5 * 1024 * 1024 * 1024 // 5 GiB
+			default:
+				o.BufferSize = 512 * 1024 * 1024 // 512 MiB
+			}
 		}
 	}
 	if o.DBPath == "" {
@@ -185,7 +190,7 @@ func Run(ctx context.Context, client *telegram.Client, kvd storage.Storage, opts
 	registry := NewRegistryWithContext(ctx, opts.QueueCapacity, opts.TerminalLimit, time.Now)
 	registry.SetPaused(opts.StartPaused)
 	registry.SetPool(PoolSnapshot{Size: effectivePoolSize})
-	iter := newTaskIter(registry, newTaskResolver(access, opts.BufferDir, opts.OutputDir))
+	iter := newTaskIter(registry, newTaskResolver(access, opts.BufferDir, opts.OutputDir, seqMover))
 	dl := downloader.New(downloader.Options{
 		Pool:            pool,
 		Threads:         opts.Threads,
@@ -203,7 +208,7 @@ func Run(ctx context.Context, client *telegram.Client, kvd storage.Storage, opts
 	if db != nil {
 		defer db.Close()
 		// Execute SBE Startup Crash Recovery Matrix with buffer awareness
-		reconciler := NewReconcilerWithBuffer(db.DB(), opts.OutputDir, opts.BufferDir, opts.BufferType, logctx.From(ctx))
+		reconciler := NewReconcilerWithBuffer(db.DB(), opts.OutputDir, opts.BufferDir, opts.BufferType, seqMover, logctx.From(ctx))
 		if recResults, err := reconciler.ReconcileAll(ctx); err != nil {
 			logctx.From(ctx).Error("startup crash recovery failed", zap.Error(err))
 		} else if len(recResults) > 0 {
@@ -229,6 +234,10 @@ func Run(ctx context.Context, client *telegram.Client, kvd storage.Storage, opts
 	var orchestrator *Orchestrator
 	if db != nil {
 		orchestrator = NewOrchestrator(db, slotPool, proxyManager, access, registry, logctx.From(ctx), opts.OutputDir)
+		orchestrator.SetBufferDir(opts.BufferDir)
+		if seqMover != nil {
+			orchestrator.SetMover(seqMover)
+		}
 		orchestrator.Start(groupCtx)
 
 		// Start MTProto Real-Time Push Updates Streaming Engine

@@ -36,6 +36,10 @@ func TestMover_SingleFileMove(t *testing.T) {
 	m.Start(ctx)
 	defer m.Close()
 
+	// Pre-reserve
+	require.True(t, m.Reserve(int64(len(testData))))
+	assert.Equal(t, int64(len(testData)), m.UsedBytes())
+
 	done := make(chan error, 1)
 	var progressCalled bool
 	var lastMoved int64
@@ -76,10 +80,52 @@ func TestMover_SingleFileMove(t *testing.T) {
 	_, err = os.Stat(srcPath)
 	assert.True(t, os.IsNotExist(err))
 
+	// Verify capacity was automatically released
+	assert.Equal(t, int64(0), m.UsedBytes())
+
 	mu.Lock()
 	assert.True(t, progressCalled)
 	assert.Equal(t, int64(len(testData)), lastMoved)
 	mu.Unlock()
+}
+
+func TestMover_MemorySmallFileMove(t *testing.T) {
+	targetDir := filepath.Join(t.TempDir(), "target")
+	require.NoError(t, os.MkdirAll(targetDir, 0755))
+
+	testData := []byte("small image payload")
+	dstPath := filepath.Join(targetDir, "img.jpg")
+
+	m := New(1, 10*1024*1024)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	m.Start(ctx)
+	defer m.Close()
+
+	done := make(chan error, 1)
+	job := &MoveJob{
+		ID:      "task-img",
+		SrcData: testData,
+		DstPath: dstPath,
+		Size:    int64(len(testData)),
+		OnDone: func(err error) {
+			done <- err
+		},
+	}
+
+	require.NoError(t, m.Enqueue(job))
+
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("mover timeout")
+	}
+
+	dstContent, err := os.ReadFile(dstPath)
+	require.NoError(t, err)
+	assert.True(t, bytes.Equal(testData, dstContent))
 }
 
 func TestMover_BackpressureWaiting(t *testing.T) {

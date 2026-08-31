@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Hittlert/TGX/core/downloader"
+	"github.com/Hittlert/TGX/core/mover"
 	atomic "github.com/Hittlert/TGX/pkg/sbe/atomic"
 )
 
@@ -36,14 +37,16 @@ type fileElement struct {
 	writer     *os.File
 	tracked    *trackedWriterAt
 	tempPath   string
+	tempRoot   string
 	outputRoot string
 	finalPath  string
 	date       int64
+	mover      *mover.Mover
 	closeOnce  sync.Once
 	closeErr   error
 }
 
-func newFileElement(task *Task, file downloader.File, tempRoot, outputRoot string, date int64) (*fileElement, error) {
+func newFileElement(task *Task, file downloader.File, tempRoot, outputRoot string, date int64, optMover ...*mover.Mover) (*fileElement, error) {
 	absolute, err := safeOutputPath(outputRoot, task.Request().FinalPath)
 	if err != nil {
 		return nil, err
@@ -61,15 +64,21 @@ func newFileElement(task *Task, file downloader.File, tempRoot, outputRoot strin
 		}
 	}
 
-	hash := sha256.Sum256([]byte(task.Request().ID))
-	tempPath := filepath.Join(tempDir, fmt.Sprintf(".tdl-part-%s.part", hex.EncodeToString(hash[:8])))
+	tempPath := CanonicalPartPath(tempDir, task.Request().ID)
 	writer, err := os.OpenFile(tempPath, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return nil, fmt.Errorf("create part file: %w", err)
 	}
+
+	var m *mover.Mover
+	if len(optMover) > 0 {
+		m = optMover[0]
+	}
+
 	element := &fileElement{
 		task: task, file: file, writer: writer, tempPath: tempPath,
-		outputRoot: outputRoot, finalPath: task.Request().FinalPath, date: date,
+		tempRoot: tempRoot, outputRoot: outputRoot, finalPath: task.Request().FinalPath,
+		date: date, mover: m,
 	}
 	element.tracked = &trackedWriterAt{file: writer, task: task}
 	return element, nil
@@ -140,17 +149,49 @@ func (e *fileElement) Publish() (result PublishResult, resultErr error) {
 		return result, errors.New("task became terminal during hash calculation, aborting publish")
 	}
 
-	// Zero-copy direct atomic rename in the exact same directory!
-	if err := atomic.CommitFile(e.tempPath, absolute); err != nil {
-		if errors.Is(err, atomic.ErrTargetExists) {
-			if exists, checkErr := existingFile(absolute, e.file.Size()); checkErr == nil && exists {
-				_ = os.Remove(e.tempPath)
-				return PublishResult{Path: e.finalPath, SHA256: shaHash, AlreadyExists: true, absolutePath: absolute}, nil
-			}
-			return result, fmt.Errorf("publish destination without overwrite: %w", err)
+	if e.mover != nil && e.tempRoot != "" && e.tempRoot != e.outputRoot {
+		doneChan := make(chan error, 1)
+		job := &mover.MoveJob{
+			ID:      e.task.Request().ID,
+			SrcPath: e.tempPath,
+			DstPath: absolute,
+			Size:    e.file.Size(),
+			OnDone: func(err error) {
+				doneChan <- err
+			},
 		}
-		return result, fmt.Errorf("publish destination atomic rename: %w", err)
+		if err := e.mover.Enqueue(job); err != nil {
+			return result, fmt.Errorf("enqueue mover: %w", err)
+		}
+		select {
+		case <-e.task.Context().Done():
+			return result, e.task.Context().Err()
+		case err := <-doneChan:
+			if err != nil {
+				if errors.Is(err, atomic.ErrTargetExists) {
+					if exists, checkErr := existingFile(absolute, e.file.Size()); checkErr == nil && exists {
+						_ = os.Remove(e.tempPath)
+						return PublishResult{Path: e.finalPath, SHA256: shaHash, AlreadyExists: true, absolutePath: absolute}, nil
+					}
+					return result, fmt.Errorf("publish destination without overwrite: %w", err)
+				}
+				return result, fmt.Errorf("mover copy: %w", err)
+			}
+		}
+	} else {
+		// Zero-copy direct atomic rename in the exact same directory / volume!
+		if err := atomic.CommitFile(e.tempPath, absolute); err != nil {
+			if errors.Is(err, atomic.ErrTargetExists) {
+				if exists, checkErr := existingFile(absolute, e.file.Size()); checkErr == nil && exists {
+					_ = os.Remove(e.tempPath)
+					return PublishResult{Path: e.finalPath, SHA256: shaHash, AlreadyExists: true, absolutePath: absolute}, nil
+				}
+				return result, fmt.Errorf("publish destination without overwrite: %w", err)
+			}
+			return result, fmt.Errorf("publish destination atomic rename: %w", err)
+		}
 	}
+
 	if err := syncDirectory(dir); err != nil {
 		return result, err
 	}
@@ -166,29 +207,20 @@ type memBufferWriterAt struct {
 }
 
 func newMemBufferWriterAt(task *Task) *memBufferWriterAt {
-	return &memBufferWriterAt{
-		data: nil,
-		task: task,
-	}
+	return &memBufferWriterAt{task: task}
 }
 
 func (w *memBufferWriterAt) WriteAt(p []byte, offset int64) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	// Zero-copy buffer handoff when writing whole file from offset 0
-	if offset == 0 && len(w.data) == 0 {
-		w.data = p
-		if w.task != nil {
-			w.task.RecordWrite(offset, len(p))
-		}
-		return len(p), nil
+
+	required := int(offset) + len(p)
+	if required > len(w.data) {
+		newData := make([]byte, required)
+		copy(newData, w.data)
+		w.data = newData
 	}
-	end := offset + int64(len(p))
-	if int64(len(w.data)) < end {
-		newSlice := make([]byte, end)
-		copy(newSlice, w.data)
-		w.data = newSlice
-	}
+
 	copy(w.data[offset:], p)
 	if w.task != nil {
 		w.task.RecordWrite(offset, len(p))
@@ -199,10 +231,11 @@ func (w *memBufferWriterAt) WriteAt(p []byte, offset int64) (int, error) {
 func (w *memBufferWriterAt) Bytes() []byte {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return w.data
+	res := make([]byte, len(w.data))
+	copy(res, w.data)
+	return res
 }
 
-// lazySmallFileElement handles <= 1 MiB files completely in memory with zero disk ops during resolve.
 type lazySmallFileElement struct {
 	task       *Task
 	file       downloader.File
@@ -210,9 +243,14 @@ type lazySmallFileElement struct {
 	finalPath  string
 	date       int64
 	buf        *memBufferWriterAt
+	mover      *mover.Mover
 }
 
-func newLazySmallFileElement(task *Task, file downloader.File, outputRoot string, date int64) (*lazySmallFileElement, error) {
+func newLazySmallFileElement(task *Task, file downloader.File, outputRoot string, date int64, optMover ...*mover.Mover) (*lazySmallFileElement, error) {
+	var m *mover.Mover
+	if len(optMover) > 0 {
+		m = optMover[0]
+	}
 	return &lazySmallFileElement{
 		task:       task,
 		file:       file,
@@ -220,6 +258,7 @@ func newLazySmallFileElement(task *Task, file downloader.File, outputRoot string
 		finalPath:  task.Request().FinalPath,
 		date:       date,
 		buf:        newMemBufferWriterAt(task),
+		mover:      m,
 	}, nil
 }
 
@@ -270,70 +309,90 @@ func (e *lazySmallFileElement) Publish() (result PublishResult, resultErr error)
 		return result, fmt.Errorf("create destination directory: %w", err)
 	}
 
-	tempHash := sha256.Sum256([]byte(e.task.Request().ID))
-	tempPath := filepath.Join(dir, fmt.Sprintf(".tdl-part-%s.part", hex.EncodeToString(tempHash[:8])))
-
-	f, err := os.OpenFile(tempPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
-	if err != nil {
-		return result, fmt.Errorf("create part file: %w", err)
-	}
-	if _, err := f.Write(data); err != nil {
-		_ = f.Close()
-		_ = os.Remove(tempPath)
-		return result, fmt.Errorf("write part file: %w", err)
-	}
-	if err := f.Sync(); err != nil {
-		_ = f.Close()
-		_ = os.Remove(tempPath)
-		return result, fmt.Errorf("sync part file: %w", err)
-	}
-	if err := f.Close(); err != nil {
-		_ = os.Remove(tempPath)
-		return result, fmt.Errorf("close part file: %w", err)
-	}
-
-	if e.date > 0 {
-		when := time.Unix(e.date, 0)
-		_ = os.Chtimes(tempPath, when, when)
-	}
-
-	if err := atomic.CommitFile(tempPath, absolute); err != nil {
-		if errors.Is(err, atomic.ErrTargetExists) {
-			if exists, checkErr := existingFile(absolute, e.file.Size()); checkErr == nil && exists {
-				_ = os.Remove(tempPath)
-				return PublishResult{Path: e.finalPath, SHA256: shaHash, AlreadyExists: true, absolutePath: absolute}, nil
-			}
-			return result, fmt.Errorf("publish destination without overwrite: %w", err)
+	if e.mover != nil {
+		doneChan := make(chan error, 1)
+		job := &mover.MoveJob{
+			ID:      e.task.Request().ID,
+			SrcData: data,
+			DstPath: absolute,
+			Size:    e.file.Size(),
+			OnDone: func(err error) {
+				doneChan <- err
+			},
 		}
-		return result, fmt.Errorf("publish destination atomic rename: %w", err)
+		if err := e.mover.Enqueue(job); err != nil {
+			return result, fmt.Errorf("enqueue mover: %w", err)
+		}
+		select {
+		case <-e.task.Context().Done():
+			return result, e.task.Context().Err()
+		case err := <-doneChan:
+			if err != nil {
+				if errors.Is(err, atomic.ErrTargetExists) {
+					if exists, checkErr := existingFile(absolute, e.file.Size()); checkErr == nil && exists {
+						return PublishResult{Path: e.finalPath, SHA256: shaHash, AlreadyExists: true, absolutePath: absolute}, nil
+					}
+					return result, fmt.Errorf("publish destination without overwrite: %w", err)
+				}
+				return result, fmt.Errorf("mover write: %w", err)
+			}
+		}
+	} else {
+		tempPath := CanonicalPartPath(dir, e.task.Request().ID)
+		f, err := os.OpenFile(tempPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+		if err != nil {
+			return result, fmt.Errorf("create part file: %w", err)
+		}
+		if _, err := f.Write(data); err != nil {
+			_ = f.Close()
+			_ = os.Remove(tempPath)
+			return result, fmt.Errorf("write part file: %w", err)
+		}
+		if err := f.Sync(); err != nil {
+			_ = f.Close()
+			_ = os.Remove(tempPath)
+			return result, fmt.Errorf("sync part file: %w", err)
+		}
+		if err := f.Close(); err != nil {
+			_ = os.Remove(tempPath)
+			return result, fmt.Errorf("close part file: %w", err)
+		}
+
+		if e.date > 0 {
+			when := time.Unix(e.date, 0)
+			_ = os.Chtimes(tempPath, when, when)
+		}
+
+		if err := atomic.CommitFile(tempPath, absolute); err != nil {
+			if errors.Is(err, atomic.ErrTargetExists) {
+				if exists, checkErr := existingFile(absolute, e.file.Size()); checkErr == nil && exists {
+					_ = os.Remove(tempPath)
+					return PublishResult{Path: e.finalPath, SHA256: shaHash, AlreadyExists: true, absolutePath: absolute}, nil
+				}
+				return result, fmt.Errorf("publish destination without overwrite: %w", err)
+			}
+			return result, fmt.Errorf("publish destination atomic rename: %w", err)
+		}
 	}
 
 	if err := syncDirectory(dir); err != nil {
 		return result, err
 	}
-
 	return PublishResult{
 		Path: e.finalPath, SHA256: shaHash, absolutePath: absolute,
 	}, nil
 }
 
-func computeSHA256(path string) (string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(h.Sum(nil)), nil
-}
-
 func (e *fileElement) closeTemp() error {
 	e.closeOnce.Do(func() {
-		e.closeErr = errors.Join(e.writer.Sync(), e.writer.Close())
+		if e.writer != nil {
+			if err := e.writer.Sync(); err != nil && e.closeErr == nil {
+				e.closeErr = err
+			}
+			if err := e.writer.Close(); err != nil && e.closeErr == nil {
+				e.closeErr = err
+			}
+		}
 	})
 	return e.closeErr
 }
@@ -348,63 +407,75 @@ func (e *existingElement) File() downloader.File { return e.file }
 func (e *existingElement) To() io.WriterAt       { return discardWriterAt{} }
 func (e *existingElement) AsTakeout() bool       { return false }
 func (e *existingElement) Task() *Task           { return e.task }
+func (e *existingElement) Context() context.Context {
+	if e.task != nil {
+		return e.task.Context()
+	}
+	return context.Background()
+}
+func (e *existingElement) IsCanceled() bool {
+	return e.task != nil && e.task.IsTerminal()
+}
 func (e *existingElement) AlreadyComplete() (string, bool) {
 	return e.path, true
 }
+func (e *existingElement) Abort() error { return nil }
 func (e *existingElement) Publish() (PublishResult, error) {
 	return PublishResult{Path: e.path, AlreadyExists: true}, nil
 }
-func (e *existingElement) Abort() error { return nil }
 
 type discardWriterAt struct{}
 
-func (discardWriterAt) WriteAt(p []byte, _ int64) (int, error) { return len(p), nil }
+func (discardWriterAt) WriteAt(p []byte, _ int64) (int, error) {
+	return len(p), nil
+}
+
+func safeOutputPath(root, relative string) (string, error) {
+	cleaned := filepath.Clean(relative)
+	if strings.HasPrefix(cleaned, "..") || filepath.IsAbs(cleaned) {
+		return "", errors.New("unsafe relative path")
+	}
+	combined := filepath.Join(root, cleaned)
+	return combined, nil
+}
 
 func existingFile(path string, expectedSize int64) (bool, error) {
 	stat, err := os.Stat(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return false, nil
-	}
 	if err != nil {
-		return false, fmt.Errorf("stat destination: %w", err)
-	}
-	if !stat.Mode().IsRegular() {
-		return false, fmt.Errorf("destination is not a regular file: %s", path)
-	}
-	if stat.Size() != expectedSize {
-		if stat.Size() == 0 {
-			_ = os.Remove(path)
+		if errors.Is(err, os.ErrNotExist) {
 			return false, nil
 		}
-		return false, fmt.Errorf("destination collision: size %d does not match expected %d", stat.Size(), expectedSize)
+		return false, err
+	}
+	if stat.IsDir() {
+		return false, errors.New("destination exists as a directory")
+	}
+	if stat.Size() != expectedSize {
+		return false, fmt.Errorf("destination exists with conflicting size %d (expected %d)", stat.Size(), expectedSize)
 	}
 	return true, nil
 }
 
-func safeOutputPath(root, relative string) (string, error) {
-	if root == "" {
-		return "", errors.New("output root is required")
-	}
-	absoluteRoot, err := filepath.Abs(root)
+func computeSHA256(path string) (string, error) {
+	file, err := os.Open(path)
 	if err != nil {
-		return "", fmt.Errorf("resolve output root: %w", err)
+		return "", err
 	}
-	joined := filepath.Join(absoluteRoot, filepath.FromSlash(relative))
-	rel, err := filepath.Rel(absoluteRoot, joined)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return "", fmt.Errorf("destination escapes output root: %q", relative)
+	defer file.Close()
+
+	hasher := sha256.New()
+	buf := make([]byte, 1024*1024)
+	if _, err := io.CopyBuffer(hasher, file, buf); err != nil {
+		return "", err
 	}
-	return joined, nil
+	return hex.EncodeToString(hasher.Sum(nil)), nil
 }
 
-func syncDirectory(path string) error {
-	dir, err := os.Open(path)
+func syncDirectory(dir string) error {
+	f, err := os.Open(dir)
 	if err != nil {
-		return fmt.Errorf("open destination directory: %w", err)
+		return err
 	}
-	defer dir.Close()
-	if err := dir.Sync(); err != nil {
-		return fmt.Errorf("sync destination directory: %w", err)
-	}
-	return nil
+	defer f.Close()
+	return f.Sync()
 }

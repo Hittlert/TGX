@@ -41,9 +41,10 @@ type pool struct {
 	middlewares []telegram.Middleware
 	floodGate   *gate.FloodGate
 
-	invokers map[int]tg.Invoker
-	closes   map[int]func() error
-	takeout  int64
+	invokers   map[int]tg.Invoker
+	closes     map[int]func() error
+	dcFailures map[int]time.Time
+	takeout    int64
 }
 
 func NewPool(c *telegram.Client, size int64, middlewares ...telegram.Middleware) Pool {
@@ -59,6 +60,7 @@ func NewPoolWithGate(c *telegram.Client, size int64, fg *gate.FloodGate, middlew
 		floodGate:   fg,
 		invokers:    make(map[int]tg.Invoker),
 		closes:      make(map[int]func() error),
+		dcFailures:  make(map[int]time.Time),
 	}
 }
 
@@ -93,6 +95,10 @@ func (p *pool) invoker(ctx context.Context, dc int) tg.Invoker {
 		p.mu.RUnlock()
 		return i
 	}
+	if failTime, ok := p.dcFailures[dc]; ok && time.Since(failTime) < 5*time.Second {
+		p.mu.RUnlock()
+		return failedInvoker{dc: dc, err: fmt.Errorf("foreign DC %d in connection cooldown", dc)}
+	}
 	p.mu.RUnlock()
 
 	dcLock := p.getDCLock(dc)
@@ -103,6 +109,10 @@ func (p *pool) invoker(ctx context.Context, dc int) tg.Invoker {
 	if i, ok := p.invokers[dc]; ok {
 		p.mu.RUnlock()
 		return i
+	}
+	if failTime, ok := p.dcFailures[dc]; ok && time.Since(failTime) < 5*time.Second {
+		p.mu.RUnlock()
+		return failedInvoker{dc: dc, err: fmt.Errorf("foreign DC %d in connection cooldown", dc)}
 	}
 	p.mu.RUnlock()
 
@@ -145,6 +155,9 @@ func (p *pool) invoker(ctx context.Context, dc int) tg.Invoker {
 	}
 
 	if err != nil {
+		p.mu.Lock()
+		p.dcFailures[dc] = time.Now()
+		p.mu.Unlock()
 		if p.floodGate != nil {
 			p.floodGate.TriggerTransportError(err)
 		}
@@ -153,6 +166,7 @@ func (p *pool) invoker(ctx context.Context, dc int) tg.Invoker {
 	}
 
 	p.mu.Lock()
+	delete(p.dcFailures, dc)
 	p.closes[dc] = invoker.Close
 	mws := p.middlewares
 	if p.floodGate != nil {

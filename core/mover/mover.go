@@ -4,19 +4,21 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+
+	atomicCommit "github.com/Hittlert/TGX/pkg/sbe/atomic"
 )
 
 // MoveJob defines a single background file transfer from buffer to target.
 type MoveJob struct {
 	ID         string
-	SrcPath    string
-	DstPath    string
-	Size       int64
+	SrcPath    string // Path on staging disk (for large files)
+	SrcData    []byte // In-memory data (for small files)
+	DstPath    string // Final destination path
+	Size       int64  // Total size in bytes
 	OnProgress func(bytesMoved, totalBytes int64)
 	OnDone     func(err error)
 }
@@ -33,6 +35,7 @@ type Mover struct {
 	ctx         context.Context
 	cancel      context.CancelFunc
 	activeCount int64
+	closed      int32
 }
 
 // New creates a new sequential mover with specified worker count (typically 1-2 for HDD protection) and max buffer capacity.
@@ -46,7 +49,7 @@ func New(workers int, maxCapacity int64) *Mover {
 	return &Mover{
 		workers:     workers,
 		maxCapacity: maxCapacity,
-		queue:       make(chan *MoveJob, 1024),
+		queue:       make(chan *MoveJob, 2048),
 		wakeCh:      make(chan struct{}),
 	}
 }
@@ -62,20 +65,22 @@ func (m *Mover) Start(ctx context.Context) {
 
 func (m *Mover) workerLoop() {
 	defer m.wg.Done()
-	const bufferSize = 4 * 1024 * 1024 // 4 MiB sequential streaming buffer
 
-	buf := make([]byte, bufferSize)
 	for {
 		select {
 		case <-m.ctx.Done():
+			// Drain remaining queued jobs with canceled error on shutdown
+			m.drainRemaining(m.ctx.Err())
 			return
 		case job, ok := <-m.queue:
 			if !ok {
 				return
 			}
 			atomic.AddInt64(&m.activeCount, 1)
-			err := m.processJob(job, buf)
+			err := m.processJob(job)
 			atomic.AddInt64(&m.activeCount, -1)
+			// Always ensure reservation is released
+			m.Release(job.Size)
 			if job.OnDone != nil {
 				job.OnDone(err)
 			}
@@ -83,8 +88,24 @@ func (m *Mover) workerLoop() {
 	}
 }
 
-func (m *Mover) processJob(job *MoveJob, buf []byte) (retErr error) {
-	src := job.SrcPath
+func (m *Mover) drainRemaining(err error) {
+	for {
+		select {
+		case job, ok := <-m.queue:
+			if !ok {
+				return
+			}
+			m.Release(job.Size)
+			if job.OnDone != nil {
+				job.OnDone(err)
+			}
+		default:
+			return
+		}
+	}
+}
+
+func (m *Mover) processJob(job *MoveJob) error {
 	dst := job.DstPath
 
 	// Ensure destination parent directory exists
@@ -93,79 +114,67 @@ func (m *Mover) processJob(job *MoveJob, buf []byte) (retErr error) {
 		return fmt.Errorf("create target dir %s: %w", dstDir, err)
 	}
 
-	// Try atomic rename first (instant if on same filesystem mount)
-	if err := os.Rename(src, dst); err == nil {
-		m.Release(job.Size)
+	// Case 1: In-memory small file payload
+	if len(job.SrcData) > 0 {
+		if _, err := os.Stat(dst); err == nil {
+			return atomicCommit.ErrTargetExists
+		}
+		tempHash := fmt.Sprintf(".tdl-mover-%s.tmp", job.ID)
+		tempPath := filepath.Join(dstDir, tempHash)
+		f, err := os.OpenFile(tempPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
+		if err != nil {
+			return fmt.Errorf("create temp target: %w", err)
+		}
+		nw, writeErr := f.Write(job.SrcData)
+		if writeErr != nil {
+			_ = f.Close()
+			_ = os.Remove(tempPath)
+			return fmt.Errorf("write temp target: %w", writeErr)
+		}
+		if int64(nw) != int64(len(job.SrcData)) {
+			_ = f.Close()
+			_ = os.Remove(tempPath)
+			return fmt.Errorf("short write: %d of %d", nw, len(job.SrcData))
+		}
+		if err := f.Sync(); err != nil {
+			_ = f.Close()
+			_ = os.Remove(tempPath)
+			return fmt.Errorf("sync temp target: %w", err)
+		}
+		_ = f.Close()
+
+		if err := atomicCommit.CommitFile(tempPath, dst); err != nil {
+			_ = os.Remove(tempPath)
+			return err
+		}
 		if job.OnProgress != nil {
 			job.OnProgress(job.Size, job.Size)
 		}
 		return nil
 	}
 
-	// Cross-filesystem move: stream with 4MB sequential buffer to target
-	dstTmp := dst + ".moving"
-	srcFile, err := os.Open(src)
+	// Case 2: File on staging disk (.part file)
+	src := job.SrcPath
+	if src == "" {
+		return errors.New("empty src in move job")
+	}
+
+	srcStat, err := os.Stat(src)
 	if err != nil {
-		return fmt.Errorf("open buffer src %s: %w", src, err)
+		return fmt.Errorf("stat buffer src %s: %w", src, err)
 	}
-	defer srcFile.Close()
-
-	dstFile, err := os.OpenFile(dstTmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
-	if err != nil {
-		return fmt.Errorf("open target dst %s: %w", dstTmp, err)
+	if job.Size > 0 && srcStat.Size() != job.Size {
+		return fmt.Errorf("buffer file size %d does not match job size %d", srcStat.Size(), job.Size)
 	}
 
-	var written int64
-	defer func() {
-		_ = dstFile.Close()
-		if retErr != nil {
-			_ = os.Remove(dstTmp)
-		}
-	}()
-
-	for {
-		select {
-		case <-m.ctx.Done():
-			return m.ctx.Err()
-		default:
-		}
-
-		nr, readErr := srcFile.Read(buf)
-		if nr > 0 {
-			nw, writeErr := dstFile.Write(buf[:nr])
-			if writeErr != nil {
-				return fmt.Errorf("write target file: %w", writeErr)
-			}
-			written += int64(nw)
-			if job.OnProgress != nil {
-				job.OnProgress(written, job.Size)
-			}
-		}
-		if readErr != nil {
-			if errors.Is(readErr, io.EOF) {
-				break
-			}
-			return fmt.Errorf("read buffer file: %w", readErr)
-		}
+	// Use atomicCommit.CommitFile for non-replacing atomic rename or sequential copy
+	if err := atomicCommit.CommitFile(src, dst); err != nil {
+		return err
 	}
 
-	// Final sync to HDD platters
-	if err := dstFile.Sync(); err != nil {
-		return fmt.Errorf("sync target file: %w", err)
+	if job.OnProgress != nil {
+		job.OnProgress(job.Size, job.Size)
 	}
-	if err := dstFile.Close(); err != nil {
-		return fmt.Errorf("close target file: %w", err)
-	}
-	_ = srcFile.Close()
-
-	// Atomic rename to final path
-	if err := os.Rename(dstTmp, dst); err != nil {
-		return fmt.Errorf("rename target tmp %s to %s: %w", dstTmp, dst, err)
-	}
-
-	// Remove source file from buffer
-	_ = os.Remove(src)
-	m.Release(job.Size)
 	return nil
 }
 
@@ -173,6 +182,9 @@ func (m *Mover) processJob(job *MoveJob, buf []byte) (retErr error) {
 func (m *Mover) Enqueue(job *MoveJob) error {
 	if m == nil {
 		return nil
+	}
+	if atomic.LoadInt32(&m.closed) == 1 {
+		return errors.New("mover is closed")
 	}
 	select {
 	case <-m.ctx.Done():
@@ -184,7 +196,7 @@ func (m *Mover) Enqueue(job *MoveJob) error {
 
 // Reserve attempts to allocate buffer space. Returns false if capacity is exceeded.
 func (m *Mover) Reserve(bytes int64) bool {
-	if m == nil {
+	if m == nil || bytes <= 0 {
 		return true
 	}
 	m.mu.Lock()
@@ -266,6 +278,7 @@ func (m *Mover) Close() error {
 	if m == nil {
 		return nil
 	}
+	atomic.StoreInt32(&m.closed, 1)
 	if m.cancel != nil {
 		m.cancel()
 	}
