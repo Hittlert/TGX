@@ -19,6 +19,7 @@ import (
 	"github.com/gorilla/mux"
 	"go.uber.org/zap"
 
+	"github.com/Hittlert/TGX/core/mover"
 	atomic "github.com/Hittlert/TGX/pkg/sbe/atomic"
 	"github.com/Hittlert/TGX/pkg/sbe/gate"
 )
@@ -36,6 +37,7 @@ type WebServer struct {
 	logger       *zap.Logger
 	password     string
 	gate         *gate.FloodGate
+	mover        *mover.Mover
 
 	sessionsMu sync.RWMutex
 	sessions   map[string]time.Time
@@ -44,6 +46,10 @@ type WebServer struct {
 
 func (s *WebServer) SetAuthWizard(w *AuthWizard) {
 	s.authWizard = w
+}
+
+func (s *WebServer) SetMover(m *mover.Mover) {
+	s.mover = m
 }
 
 func NewWebServer(
@@ -125,7 +131,7 @@ func (s *WebServer) Handler() http.Handler {
 		if totalBytes > 0 {
 			percent = float64(usedBytes) / float64(totalBytes) * 100
 		}
-		writeJSON(w, http.StatusOK, map[string]any{
+		resp := map[string]any{
 			"ok":           true,
 			"path":         path,
 			"free_bytes":   freeBytes,
@@ -135,7 +141,17 @@ func (s *WebServer) Handler() http.Handler {
 			"total_human":  formatBytes(int64(totalBytes)),
 			"used_human":   formatBytes(int64(usedBytes)),
 			"percent_used": fmt.Sprintf("%.1f%%", percent),
-		})
+		}
+		if s.mover != nil {
+			resp["buffer"] = map[string]any{
+				"used_bytes":    s.mover.UsedBytes(),
+				"max_bytes":     s.mover.MaxCapacity(),
+				"active_moving": s.mover.ActiveMoving(),
+				"used_human":    formatBytes(s.mover.UsedBytes()),
+				"max_human":     formatBytes(s.mover.MaxCapacity()),
+			}
+		}
+		writeJSON(w, http.StatusOK, resp)
 	}).Methods(http.MethodGet)
 
 	r.HandleFunc("/api/tasks", func(w http.ResponseWriter, r *http.Request) {

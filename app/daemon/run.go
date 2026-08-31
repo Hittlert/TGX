@@ -18,6 +18,7 @@ import (
 	"github.com/Hittlert/TGX/core/dcpool"
 	"github.com/Hittlert/TGX/core/downloader"
 	"github.com/Hittlert/TGX/core/logctx"
+	"github.com/Hittlert/TGX/core/mover"
 	"github.com/Hittlert/TGX/core/storage"
 	"github.com/Hittlert/TGX/core/tclient"
 	"github.com/Hittlert/TGX/pkg/sbe/gate"
@@ -27,6 +28,9 @@ type Options struct {
 	Listen           string
 	OutputDir        string
 	TempDir          string
+	BufferType       string // "memory" (default), "ssd", "none"
+	BufferDir        string
+	BufferSize       int64  // capacity in bytes
 	DBPath           string
 	Password         string
 	SingboxURL       string
@@ -58,6 +62,22 @@ func (o Options) withDefaults() Options {
 	if o.TempDir == "" {
 		o.TempDir = "/app/temp/tdl"
 	}
+	if o.BufferType == "" {
+		o.BufferType = "memory"
+	}
+	if o.BufferDir == "" {
+		o.BufferDir = o.TempDir
+	}
+	if o.BufferSize == 0 {
+		switch o.BufferType {
+		case "ssd":
+			o.BufferSize = 5 * 1024 * 1024 * 1024 // 5 GiB
+		case "none":
+			o.BufferSize = 0
+		default:
+			o.BufferSize = 512 * 1024 * 1024 // 512 MiB
+		}
+	}
 	if o.DBPath == "" {
 		o.DBPath = "/app/state/download_records.sqlite3"
 	}
@@ -84,6 +104,7 @@ func (o Options) withDefaults() Options {
 	}
 	if o == (Options{
 		Namespace: "default", Listen: "0.0.0.0:18080", OutputDir: "/app/downloads", TempDir: "/app/temp/tdl",
+		BufferType: "memory", BufferDir: "/app/temp/tdl", BufferSize: 512 * 1024 * 1024,
 		DBPath: "/app/state/download_records.sqlite3", SingboxURL: "http://127.0.0.1:9090",
 		QueueCapacity: 1000, TerminalLimit: 2000, FileConcurrency: 5, Threads: 48, PoolSize: 48,
 		PeerSyncTimeout: 3 * time.Minute,
@@ -122,11 +143,15 @@ func (o Options) validate() error {
 }
 
 func Run(ctx context.Context, client *telegram.Client, kvd storage.Storage, opts Options) (resultErr error) {
+	opts = opts.withDefaults()
 	if err := opts.validate(); err != nil {
 		return err
 	}
 	if err := os.MkdirAll(opts.TempDir, 0o755); err != nil {
 		return fmt.Errorf("create daemon temp directory: %w", err)
+	}
+	if err := os.MkdirAll(opts.BufferDir, 0o755); err != nil {
+		return fmt.Errorf("create daemon buffer directory: %w", err)
 	}
 	if err := os.MkdirAll(opts.OutputDir, 0o755); err != nil {
 		return fmt.Errorf("create daemon output directory: %w", err)
@@ -143,14 +168,28 @@ func Run(ctx context.Context, client *telegram.Client, kvd storage.Storage, opts
 	manager := peers.Options{Storage: storage.NewPeers(kvd)}.Build(pool.Default(ctx))
 	access := newTelegramMediaAccess(ctx, pool, manager, opts.PeerSyncTimeout, sharedGate)
 
+	// Automatic disk writer concurrency: SSD buffer/direct is 32, direct HDD is 8
+	diskWorkers := 8
+	if opts.BufferType == "ssd" || opts.BufferType == "memory" {
+		diskWorkers = 32
+	}
+
+	// Initialize background sequential mover if staging buffer is separate from target
+	var seqMover *mover.Mover
+	if opts.BufferType != "none" && opts.BufferDir != opts.OutputDir {
+		seqMover = mover.New(1, opts.BufferSize)
+		seqMover.Start(ctx)
+		defer func() { _ = seqMover.Close() }()
+	}
+
 	registry := NewRegistryWithContext(ctx, opts.QueueCapacity, opts.TerminalLimit, time.Now)
 	registry.SetPaused(opts.StartPaused)
 	registry.SetPool(PoolSnapshot{Size: effectivePoolSize})
-	iter := newTaskIter(registry, newTaskResolver(access, opts.TempDir, opts.OutputDir))
+	iter := newTaskIter(registry, newTaskResolver(access, opts.BufferDir, opts.OutputDir))
 	dl := downloader.New(downloader.Options{
 		Pool:            pool,
 		Threads:         opts.Threads,
-		DiskWorkers:     6,
+		DiskWorkers:     diskWorkers,
 		FileConcurrency: opts.FileConcurrency,
 		Iter:            iter,
 		Progress:        newTaskProgress(),
@@ -163,8 +202,8 @@ func Run(ctx context.Context, client *telegram.Client, kvd storage.Storage, opts
 	}
 	if db != nil {
 		defer db.Close()
-		// Execute SBE Startup Crash Recovery Matrix
-		reconciler := NewReconciler(db.DB(), opts.OutputDir, opts.TempDir, logctx.From(ctx))
+		// Execute SBE Startup Crash Recovery Matrix with buffer awareness
+		reconciler := NewReconcilerWithBuffer(db.DB(), opts.OutputDir, opts.BufferDir, opts.BufferType, logctx.From(ctx))
 		if recResults, err := reconciler.ReconcileAll(ctx); err != nil {
 			logctx.From(ctx).Error("startup crash recovery failed", zap.Error(err))
 		} else if len(recResults) > 0 {
@@ -200,6 +239,10 @@ func Run(ctx context.Context, client *telegram.Client, kvd storage.Storage, opts
 	authWizard := NewAuthWizard(db, client, kvd, logctx.From(ctx), opts.Namespace)
 	webServer := NewWebServer(db, slotPool, proxyManager, orchestrator, access, registry, logctx.From(ctx), opts.Password, sharedGate)
 	webServer.SetAuthWizard(authWizard)
+	if seqMover != nil {
+		webServer.SetMover(seqMover)
+	}
+
 	server := &http.Server{
 		Addr: opts.Listen, Handler: webServer.Handler(),
 		ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 30 * time.Second,
@@ -249,8 +292,11 @@ func Run(ctx context.Context, client *telegram.Client, kvd storage.Storage, opts
 
 	logctx.From(ctx).Info("TGX download daemon started",
 		zap.String("listen", opts.Listen),
+		zap.String("buffer_type", opts.BufferType),
+		zap.Int64("buffer_size", opts.BufferSize),
 		zap.Int("file_concurrency", opts.FileConcurrency),
 		zap.Int("threads", opts.Threads),
+		zap.Int("disk_workers", diskWorkers),
 		zap.Int("pool_size", opts.PoolSize),
 		zap.Duration("peer_sync_timeout", opts.PeerSyncTimeout),
 		zap.Bool("paused", opts.StartPaused),

@@ -53,8 +53,16 @@ func newFileElement(task *Task, file downloader.File, tempRoot, outputRoot strin
 		return nil, fmt.Errorf("create destination directory: %w", err)
 	}
 
+	tempDir := dir
+	if tempRoot != "" {
+		tempDir = tempRoot
+		if err := os.MkdirAll(tempDir, 0o755); err != nil {
+			return nil, fmt.Errorf("create temp directory: %w", err)
+		}
+	}
+
 	hash := sha256.Sum256([]byte(task.Request().ID))
-	tempPath := filepath.Join(dir, fmt.Sprintf(".tdl-part-%s.part", hex.EncodeToString(hash[:8])))
+	tempPath := filepath.Join(tempDir, fmt.Sprintf(".tdl-part-%s.part", hex.EncodeToString(hash[:8])))
 	writer, err := os.OpenFile(tempPath, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return nil, fmt.Errorf("create part file: %w", err)

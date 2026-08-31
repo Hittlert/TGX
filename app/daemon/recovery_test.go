@@ -2,7 +2,10 @@ package daemon
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -41,22 +44,17 @@ func TestReconciler_PromotesExistingFileToSuccess(t *testing.T) {
 	db := setupTestDB(t)
 	defer db.Close()
 
-	outDir, err := os.MkdirTemp("", "sbe_rec_out_*")
-	require.NoError(t, err)
-	defer os.RemoveAll(outDir)
-
-	tempDir, err := os.MkdirTemp("", "sbe_rec_tmp_*")
-	require.NoError(t, err)
-	defer os.RemoveAll(tempDir)
+	outDir := t.TempDir()
+	tempDir := t.TempDir()
 
 	// Final file exists with exact size
 	finalPath := filepath.Join(outDir, "test.mp4")
 	require.NoError(t, os.WriteFile(finalPath, []byte("data"), 0644))
 
-	_, err = db.Exec(`INSERT INTO download_records (chat_id, message_id, status, file_name, save_path, file_size) VALUES ('123', 1, 'downloading', 'test.mp4', 'test.mp4', 4)`)
+	_, err := db.Exec(`INSERT INTO download_records (chat_id, message_id, status, file_name, save_path, file_size) VALUES ('123', 1, 'downloading', 'test.mp4', 'test.mp4', 4)`)
 	require.NoError(t, err)
 
-	r := NewReconciler(db, outDir, tempDir, zap.NewNop())
+	r := NewReconcilerWithBuffer(db, outDir, tempDir, "memory", zap.NewNop())
 	results, err := r.ReconcileAll(context.Background())
 	require.NoError(t, err)
 	require.Equal(t, 1, len(results))
@@ -70,32 +68,55 @@ func TestReconciler_PromotesExistingFileToSuccess(t *testing.T) {
 	assert.Equal(t, "success", newStatus)
 }
 
-func TestReconciler_ResetsIncompleteFileToPending(t *testing.T) {
+func TestReconciler_MemoryBufferVolatileReset(t *testing.T) {
 	db := setupTestDB(t)
 	defer db.Close()
 
-	outDir, err := os.MkdirTemp("", "sbe_rec_out2_*")
-	require.NoError(t, err)
-	defer os.RemoveAll(outDir)
+	outDir := t.TempDir()
+	tempDir := t.TempDir()
 
-	tempDir, err := os.MkdirTemp("", "sbe_rec_tmp2_*")
-	require.NoError(t, err)
-	defer os.RemoveAll(tempDir)
-
-	// Incomplete file missing on disk
-	_, err = db.Exec(`INSERT INTO download_records (chat_id, message_id, status, file_name, save_path, file_size) VALUES ('123', 2, 'downloading', 'missing.mp4', 'missing.mp4', 100)`)
+	_, err := db.Exec(`INSERT INTO download_records (chat_id, message_id, status, file_name, save_path, file_size) VALUES ('123', 2, 'downloading', 'missing.mp4', 'missing.mp4', 100)`)
 	require.NoError(t, err)
 
-	r := NewReconciler(db, outDir, tempDir, zap.NewNop())
+	r := NewReconcilerWithBuffer(db, outDir, tempDir, "memory", zap.NewNop())
 	results, err := r.ReconcileAll(context.Background())
 	require.NoError(t, err)
 	require.Equal(t, 1, len(results))
 
 	assert.Equal(t, "pending", results[0].NextState)
-	assert.Equal(t, "INCOMPLETE_RESET_TO_PENDING", results[0].ActionTaken)
+	assert.Equal(t, "MEMORY_BUFFER_VOLATILE_RESET_TO_PENDING", results[0].ActionTaken)
 
 	var newStatus string
 	err = db.QueryRow(`SELECT status FROM download_records WHERE chat_id = '123' AND message_id = 2`).Scan(&newStatus)
 	require.NoError(t, err)
 	assert.Equal(t, "pending", newStatus)
+}
+
+func TestReconciler_SSDBufferPartialRetainedForResume(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+
+	outDir := t.TempDir()
+	tempDir := t.TempDir()
+
+	// Write partial .part file in SSD tempDir
+	hash := sha256.Sum256([]byte("123_3"))
+	partFileName := fmt.Sprintf(".tdl-part-%s.part", hex.EncodeToString(hash[:8]))
+	partPath := filepath.Join(tempDir, partFileName)
+	require.NoError(t, os.WriteFile(partPath, make([]byte, 50), 0644))
+
+	_, err := db.Exec(`INSERT INTO download_records (chat_id, message_id, status, file_name, save_path, file_size) VALUES ('123', 3, 'downloading', 'resume.mp4', 'resume.mp4', 100)`)
+	require.NoError(t, err)
+
+	r := NewReconcilerWithBuffer(db, outDir, tempDir, "ssd", zap.NewNop())
+	results, err := r.ReconcileAll(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 1, len(results))
+
+	assert.Equal(t, "pending", results[0].NextState)
+	assert.Equal(t, "SSD_BUFFER_PARTIAL_RETAINED_FOR_RESUME", results[0].ActionTaken)
+
+	// Verify partial file was NOT deleted
+	_, err = os.Stat(partPath)
+	assert.NoError(t, err)
 }
