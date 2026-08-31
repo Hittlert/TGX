@@ -209,9 +209,8 @@ func TestTargetWriter_RegisterTaskRejectsOlderGenerationRollback(t *testing.T) {
 	tw.RegisterTask(manifestNew)
 
 	// Verify bitmap has range [0, 512)
-	bmVal, ok := tw.bitmaps.Load("task-tw-rollback")
+	bm, ok := tw.TaskBitmap("task-tw-rollback")
 	require.True(t, ok)
-	bm := bmVal.(*MovedBitmap)
 	assert.Equal(t, int64(512), bm.DurableBytes())
 
 	// Stale resolver attempts to register older generation "1" or "retry_1000" with empty range
@@ -224,9 +223,8 @@ func TestTargetWriter_RegisterTaskRejectsOlderGenerationRollback(t *testing.T) {
 	tw.RegisterTask(manifestOld)
 
 	// Verify bitmap was NOT wiped or replaced
-	bmVal, ok = tw.bitmaps.Load("task-tw-rollback")
+	bm, ok = tw.TaskBitmap("task-tw-rollback")
 	require.True(t, ok)
-	bm = bmVal.(*MovedBitmap)
 	assert.Equal(t, int64(512), bm.DurableBytes())
 }
 
@@ -251,10 +249,10 @@ func TestTargetWriter_CompletedTaskRejectsLateResolver(t *testing.T) {
 	tw.RegisterTask(manifestStale)
 
 	// Verify completed tombstone was NOT deleted and task was NOT registered
-	compVal, ok := tw.completedTasks.Load("task-comp")
+	compGen, ok := tw.TaskCompleted("task-comp")
 	require.True(t, ok)
-	assert.Equal(t, "retry_2000", compVal.(string))
+	assert.Equal(t, "retry_2000", compGen)
 
-	_, manifestExists := tw.manifests.Load("task-comp")
-	assert.False(t, manifestExists)
+	_, bmExists := tw.TaskBitmap("task-comp")
+	assert.False(t, bmExists)
 }
