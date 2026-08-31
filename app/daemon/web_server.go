@@ -330,7 +330,7 @@ func (s *WebServer) handleIndex(w http.ResponseWriter, r *http.Request) {
 
 	ver := consts.Version
 	if ver == "" || ver == "dev" {
-		ver = "v4.4.9"
+		ver = "v4.4.12"
 	}
 
 	content := strings.ReplaceAll(string(data), "{{ download_state }}", state)
@@ -437,7 +437,7 @@ func (s *WebServer) handleGetAppVersion(w http.ResponseWriter, r *http.Request) 
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	ver := consts.Version
 	if ver == "" || ver == "dev" {
-		ver = "v4.4.9"
+		ver = "v4.4.12"
 	}
 	_, _ = w.Write([]byte(ver))
 }
@@ -512,7 +512,7 @@ func (s *WebServer) handleGetDownloadStatus(w http.ResponseWriter, r *http.Reque
 			"files":        filesMap,
 		},
 		"sbe_stats": map[string]any{
-			"engine_version":  "v4.4.0-UnifiedStorageBuffer",
+			"engine_version":  consts.Version,
 			"buffer_used_mb":  bufferUsedMB,
 			"buffer_limit_mb": bufferLimitMB,
 			"dirty_used_mb":   bufferUsedMB,

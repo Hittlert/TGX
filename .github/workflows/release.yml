@@ -48,7 +48,7 @@ jobs:
           CGO_ENABLED: 0
         run: |
           mkdir -p dist
-          go build -ldflags="-s -w -X 'github.com/Hittlert/TGX/cmd.Version=${{ github.ref_name }}' -X 'github.com/Hittlert/TGX/cmd.Commit=${{ github.sha }}'" -o dist/${{ matrix.output }} ./main.go
+          go build -ldflags="-s -w -X 'github.com/Hittlert/TGX/pkg/consts.Version=${{ github.ref_name }}' -X 'github.com/Hittlert/TGX/pkg/consts.Commit=${{ github.sha }}' -X 'github.com/Hittlert/TGX/pkg/consts.CommitDate=$(date -u +%Y-%m-%dT%H:%M:%SZ)'" -o dist/${{ matrix.output }} ./main.go
 
       - name: Upload Release Asset
         uses: softprops/action-gh-release@v2

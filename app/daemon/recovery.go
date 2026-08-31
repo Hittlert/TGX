@@ -13,6 +13,7 @@ import (
 
 	"github.com/Hittlert/TGX/core/mover"
 	"github.com/Hittlert/TGX/core/targetwriter"
+	atomicCommit "github.com/Hittlert/TGX/pkg/sbe/atomic"
 )
 
 // TaskRecoveryResult encapsulates differential actions performed per task.
@@ -192,10 +193,12 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) ([]TaskRecoveryResult, er
 					if bm.IsComplete() {
 						// Complete bitmap: TargetWriter will finalize via pendingFinalize queue
 						if r.tw != nil {
-							r.tw.RegisterTask(manifest)
-						}
-						if r.registry != nil {
-							r.registry.RegisterRecoveredTask(manifest.TaskID, manifest.Gen, rec.SavePath, manifest.ExpectedSize)
+							res := r.tw.RegisterTask(manifest)
+							if res == targetwriter.RegisterAccepted || res == targetwriter.RegisterAlreadyFinalized {
+								if r.registry != nil {
+									r.registry.RegisterRecoveredTask(manifest.TaskID, manifest.Gen, rec.SavePath, manifest.ExpectedSize)
+								}
+							}
 						}
 						results = append(results, TaskRecoveryResult{
 							FileKey:     fileKey,
@@ -254,7 +257,7 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) ([]TaskRecoveryResult, er
 					ActionTaken: "SSD_BUFFER_COMPLETED_REQUEUED_IN_MOVER",
 				})
 			} else {
-				if err := os.Rename(tempPartPath, finalPath); err == nil {
+				if err := atomicCommit.CommitFile(tempPartPath, finalPath); err == nil {
 					_, _ = r.db.ExecContext(ctx, `UPDATE download_records SET status = 'success', error = '' WHERE chat_id = ? AND message_id = ?`, rec.ChatID, rec.MessageID)
 					results = append(results, TaskRecoveryResult{
 						FileKey:     fileKey,
@@ -263,6 +266,19 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) ([]TaskRecoveryResult, er
 						ActionTaken: "LEGACY_PART_COMMITTED_TO_SUCCESS",
 					})
 				} else {
+					if errors.Is(err, atomicCommit.ErrTargetExists) {
+						if stat, statErr := os.Stat(finalPath); statErr == nil && stat.Size() == rec.FileSize {
+							_ = os.Remove(tempPartPath)
+							_, _ = r.db.ExecContext(ctx, `UPDATE download_records SET status = 'success', error = '' WHERE chat_id = ? AND message_id = ?`, rec.ChatID, rec.MessageID)
+							results = append(results, TaskRecoveryResult{
+								FileKey:     fileKey,
+								PrevState:   rec.Status,
+								NextState:   "success",
+								ActionTaken: "LEGACY_PART_TARGET_ALREADY_EXISTS_PROMOTED",
+							})
+							continue
+						}
+					}
 					_, _ = r.db.ExecContext(ctx, `UPDATE download_records SET status = 'pending', attempts = 0, next_retry_at = 0, error = '' WHERE chat_id = ? AND message_id = ?`, rec.ChatID, rec.MessageID)
 					results = append(results, TaskRecoveryResult{
 						FileKey:     fileKey,

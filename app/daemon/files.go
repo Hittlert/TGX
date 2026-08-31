@@ -94,7 +94,10 @@ func newBucketFileElement(
 		bkt.SetTaskGeneration(task.Request().ID, gen)
 	}
 	if tw != nil {
-		tw.RegisterTask(manifest)
+		res := tw.RegisterTask(manifest)
+		if res == targetwriter.RegisterStale || res == targetwriter.RegisterConflict {
+			return nil, fmt.Errorf("target writer rejected attempt: %s", res)
+		}
 	}
 
 	elem := &bucketFileElement{
@@ -365,7 +368,10 @@ func newLazySmallFileElement(
 			Date:         date,
 			Gen:          gen,
 		}
-		tw.RegisterTask(manifest)
+		res := tw.RegisterTask(manifest)
+		if res == targetwriter.RegisterStale || res == targetwriter.RegisterConflict {
+			return nil, fmt.Errorf("target writer rejected small file attempt: %s", res)
+		}
 	}
 	return &lazySmallFileElement{
 		task:       task,

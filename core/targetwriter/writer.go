@@ -19,25 +19,24 @@ import (
 	atomicCommit "github.com/Hittlert/TGX/pkg/sbe/atomic"
 )
 
-const SidecarVersion = 1
-
-// Permanent finalize errors — these will never succeed on retry.
 var (
-	// ErrContentConflict indicates target exists with different SHA256.
-	ErrContentConflict = errors.New("target content conflict")
-	// ErrSizeMismatch indicates .moving file size does not match expected.
-	ErrSizeMismatch = errors.New("moving file size mismatch")
+	ErrTaskNotRegistered = errors.New("task manifest not registered yet")
+	ErrStaleObject       = errors.New("stale object from previous attempt")
+	ErrSizeMismatch      = errors.New("final size mismatch")
+	ErrContentConflict   = errors.New("target exists with different content")
 )
 
 type TaskManifest struct {
-	Version      int     `json:"version,omitempty"`
 	TaskID       string  `json:"task_id"`
 	FinalPath    string  `json:"final_path"`
 	ExpectedSize int64   `json:"expected_size"`
 	Date         int64   `json:"date"`
 	Gen          string  `json:"gen"`
 	Ranges       []Range `json:"ranges"`
+	Version      int     `json:"version"`
 }
+
+const SidecarVersion = 1
 
 type Metrics struct {
 	Active               bool    `json:"active"`
@@ -45,18 +44,13 @@ type Metrics struct {
 	ContiguousWriteRatio float64 `json:"contiguous_write_ratio"`
 	ActiveFilesCount     int     `json:"active_files_count"`
 	TotalBytesWritten    int64   `json:"total_bytes_written"`
-	LastError            string  `json:"last_error"`
+	LastError            string  `json:"last_error,omitempty"`
 }
 
-// processPhase represents the outcome of processObject, determined by which
-// durability boundary the operation crossed before encountering an error.
-//
-// The critical invariant: once AckDurable succeeds, the source buffer object
-// no longer exists and must NEVER be Requeued.
 type processPhase int
 
 const (
-	phaseDurableOK         processPhase = iota // Object durable, source deleted, all good
+	phaseDurableOK         processPhase = iota // Write + sidecar + AckDurable succeeded
 	phaseObjectRetryable                       // Error before AckDurable: source exists, safe to Requeue
 	phaseFinalizeRetryable                     // Error after AckDurable (in finalize): must not Requeue source
 	phaseStaleDiscarded                        // Object from old generation or completed task: silently consumed
@@ -67,8 +61,18 @@ type processResult struct {
 	err   error
 }
 
+type AttemptPhase int
+
+const (
+	PhaseActive AttemptPhase = iota
+	PhaseClosing
+	PhaseFinalizing
+	PhaseFinalized
+)
+
 // AttemptWriteState tracks all state for a single active or completed task attempt in TargetWriter.
 type AttemptWriteState struct {
+	mu              sync.Mutex
 	manifest        TaskManifest
 	bitmap          *MovedBitmap
 	file            *os.File
@@ -76,6 +80,32 @@ type AttemptWriteState struct {
 	pendingNext     time.Time
 	finalized       bool
 	finalGen        string
+	activeOps       int
+	phase           AttemptPhase
+}
+
+type RegisterResult int
+
+const (
+	RegisterAccepted RegisterResult = iota
+	RegisterStale
+	RegisterAlreadyFinalized
+	RegisterConflict
+)
+
+func (r RegisterResult) String() string {
+	switch r {
+	case RegisterAccepted:
+		return "ACCEPTED"
+	case RegisterStale:
+		return "STALE"
+	case RegisterAlreadyFinalized:
+		return "ALREADY_FINALIZED"
+	case RegisterConflict:
+		return "CONFLICT"
+	default:
+		return "UNKNOWN"
+	}
 }
 
 type TargetWriter struct {
@@ -92,6 +122,7 @@ type TargetWriter struct {
 	writtenBytes     int64
 	contiguousWrites int64
 	totalWrites      int64
+	openFilesCount   int64
 	lastBPSBits      uint64 // atomic float64
 	lastError        string
 	errMu            sync.RWMutex
@@ -123,15 +154,20 @@ func (w *TargetWriter) SetCallbacks(
 	w.onError = onError
 }
 
-// TaskBitmap returns a snapshot of the bitmap for a task, if registered.
+// TaskBitmap returns a snapshot copy of the bitmap for a task, if registered.
 func (w *TargetWriter) TaskBitmap(taskID string) (*MovedBitmap, bool) {
 	w.stateMu.RLock()
-	defer w.stateMu.RUnlock()
 	state, ok := w.tasks[taskID]
-	if !ok || state.bitmap == nil {
+	w.stateMu.RUnlock()
+	if !ok {
 		return nil, false
 	}
-	return state.bitmap, true
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.bitmap == nil {
+		return nil, false
+	}
+	return state.bitmap.Clone(), true
 }
 
 // TaskCompleted returns the finalized generation if completed.
@@ -152,29 +188,30 @@ func (w *TargetWriter) MarkTaskCompleted(taskID, gen string) {
 	defer w.stateMu.Unlock()
 
 	if state, ok := w.tasks[taskID]; ok {
+		state.mu.Lock()
 		state.finalized = true
 		state.finalGen = gen
 		state.pendingFinalize = false
+		state.phase = PhaseFinalized
+		state.bitmap = nil
+		state.manifest.Ranges = nil
 		if state.file != nil {
 			_ = state.file.Sync()
 			_ = state.file.Close()
 			state.file = nil
+			atomic.AddInt64(&w.openFilesCount, -1)
 		}
+		state.mu.Unlock()
 	} else {
 		w.tasks[taskID] = &AttemptWriteState{
 			manifest:  TaskManifest{TaskID: taskID, Gen: gen},
 			finalized: true,
 			finalGen:  gen,
+			phase:     PhaseFinalized,
 		}
 	}
 }
 
-// RegisterTask registers or re-registers a task manifest for target writing.
-//
-// Generation isolation: if a manifest already exists with a different generation,
-// all prior state (bitmap, FD, pending finalize) is cleared. A new generation
-// must not inherit durable ranges or file handles from a previous attempt.
-//
 // isOlderGeneration checks if newGen is strictly older than currentGen.
 func isOlderGeneration(newGen, currentGen string) bool {
 	if currentGen == "" || newGen == currentGen {
@@ -195,46 +232,41 @@ func isOlderGeneration(newGen, currentGen string) bool {
 }
 
 // RegisterTask registers or re-registers a task manifest for target writing.
-//
-// Generation isolation: if a manifest already exists with a different generation,
-// all prior state (bitmap, FD, pending finalize) is cleared. A new generation
-// must not inherit durable ranges or file handles from a previous attempt.
-// If an older generation is passed (e.g. from a slow resolver), it is safely rejected.
-//
-// Complete bitmap recovery: if the registered bitmap is already complete (all
-// ranges cover [0, expectedSize)), the task is queued for immediate finalize.
-// This handles the crash-after-last-Ack-before-finalize recovery case where
-// no more Ready objects will arrive to trigger finalize.
-func (w *TargetWriter) RegisterTask(manifest TaskManifest) {
+func (w *TargetWriter) RegisterTask(manifest TaskManifest) RegisterResult {
 	w.stateMu.Lock()
 	defer w.stateMu.Unlock()
 
-	// 1. If task was already completed and finalized:
+	// 1. If task was already registered:
 	if existing, ok := w.tasks[manifest.TaskID]; ok {
+		existing.mu.Lock()
 		if existing.finalized {
 			if isOlderGeneration(manifest.Gen, existing.finalGen) || manifest.Gen == existing.finalGen {
-				// Stale or duplicate attempt trying to re-register an already finalized task: reject!
-				return
+				existing.mu.Unlock()
+				return RegisterAlreadyFinalized
 			}
 		} else if existing.manifest.Gen != manifest.Gen {
 			if isOlderGeneration(manifest.Gen, existing.manifest.Gen) {
-				// Reject rollback to older generation by slow/stale resolver
-				return
+				existing.mu.Unlock()
+				return RegisterStale
 			}
-			// New generation: clean up old file handle
+			// Cutover to newer generation: mark old attempt closing and close FD
+			existing.phase = PhaseClosing
 			if existing.file != nil {
+				_ = existing.file.Sync()
 				_ = existing.file.Close()
+				existing.file = nil
+				atomic.AddInt64(&w.openFilesCount, -1)
 			}
+			existing.mu.Unlock()
 		} else {
 			// Same generation re-register:
-			// If FinalPath or ExpectedSize changed, reject inconsistent identity for same generation
 			if existing.manifest.FinalPath != manifest.FinalPath || existing.manifest.ExpectedSize != manifest.ExpectedSize {
-				return
+				existing.mu.Unlock()
+				return RegisterConflict
 			}
-			// Same identity: update manifest but do NOT rebuild bitmap.
-			// This preserves durable ranges recovered from sidecar or written since first register.
 			existing.manifest = manifest
-			return
+			existing.mu.Unlock()
+			return RegisterAccepted
 		}
 	}
 
@@ -243,11 +275,12 @@ func (w *TargetWriter) RegisterTask(manifest TaskManifest) {
 		manifest:        manifest,
 		bitmap:          bm,
 		pendingFinalize: bm.IsComplete(),
+		phase:           PhaseActive,
 	}
+	return RegisterAccepted
 }
 
 // Start initializes context and launches background goroutines.
-// The writerLoop blocks on consumeGate until BeginConsuming is called.
 func (w *TargetWriter) Start(ctx context.Context) {
 	w.ctx, w.cancel = context.WithCancel(ctx)
 	w.wg.Add(1)
@@ -257,7 +290,6 @@ func (w *TargetWriter) Start(ctx context.Context) {
 
 // BeginConsuming unblocks the writerLoop. Must be called after SetCallbacks
 // to guarantee callbacks are installed before any object is processed.
-// Concurrent-safe and idempotent (uses sync.Once internally).
 func (w *TargetWriter) BeginConsuming() {
 	w.consumeOnce.Do(func() { close(w.consumeGate) })
 }
@@ -292,20 +324,11 @@ func (w *TargetWriter) Metrics() Metrics {
 		ratio = float64(cw) / float64(tw) * 100.0
 	}
 
-	activeFiles := 0
-	w.stateMu.RLock()
-	for _, state := range w.tasks {
-		if !state.finalized && state.file != nil {
-			activeFiles++
-		}
-	}
-	w.stateMu.RUnlock()
-
 	return Metrics{
 		Active:               atomic.LoadInt32(&w.closed) == 0,
 		BytesPerSecond:       float64(atomic.LoadUint64(&w.lastBPSBits)),
 		ContiguousWriteRatio: ratio,
-		ActiveFilesCount:     activeFiles,
+		ActiveFilesCount:     int(atomic.LoadInt64(&w.openFilesCount)),
 		TotalBytesWritten:    atomic.LoadInt64(&w.writtenBytes),
 		LastError:            lastErr,
 	}
@@ -408,11 +431,15 @@ func (w *TargetWriter) writerLoop() {
 			// Error after AckDurable (during finalize): source is deleted.
 			// Enqueue task for finalize retry. NEVER Requeue the source object.
 			taskID := obj.Key.TaskID
-			w.stateMu.Lock()
-			if state, ok := w.tasks[taskID]; ok && state.manifest.Gen == obj.Key.Gen {
-				state.pendingFinalize = true
+			w.stateMu.RLock()
+			if state, ok := w.tasks[taskID]; ok {
+				state.mu.Lock()
+				if state.manifest.Gen == obj.Key.Gen {
+					state.pendingFinalize = true
+				}
+				state.mu.Unlock()
 			}
-			w.stateMu.Unlock()
+			w.stateMu.RUnlock()
 			w.setLastError(result.err)
 			currentTaskID = ""
 			nextOffset = 0
@@ -423,16 +450,16 @@ func (w *TargetWriter) writerLoop() {
 
 // drainPendingFinalizes attempts to finalize all tasks that have complete
 // bitmaps but haven't been finalized yet.
-// Permanent errors (content conflict, size mismatch) trigger onError and removal.
-// Transient errors use per-task backoff to avoid tight-loop SHA recomputation.
 func (w *TargetWriter) drainPendingFinalizes() {
 	w.stateMu.RLock()
 	var toFinalize []TaskManifest
 	now := time.Now()
 	for _, state := range w.tasks {
+		state.mu.Lock()
 		if !state.finalized && state.pendingFinalize && now.After(state.pendingNext) {
 			toFinalize = append(toFinalize, state.manifest)
 		}
+		state.mu.Unlock()
 	}
 	w.stateMu.RUnlock()
 
@@ -440,30 +467,36 @@ func (w *TargetWriter) drainPendingFinalizes() {
 		taskID := manifest.TaskID
 		if err := w.finalizeTask(manifest); err != nil {
 			w.setLastError(err)
-			if isFinalizePermError(err) {
-				// Permanent: content conflict or irrecoverable. Enter terminal state.
-				w.stateMu.Lock()
-				if curState, curOk := w.tasks[taskID]; curOk && curState.manifest.Gen == manifest.Gen {
-					delete(w.tasks, taskID)
+			w.stateMu.RLock()
+			state, ok := w.tasks[taskID]
+			w.stateMu.RUnlock()
+
+			if ok {
+				state.mu.Lock()
+				if state.manifest.Gen == manifest.Gen {
+					if isFinalizePermError(err) {
+						state.phase = PhaseClosing
+						state.pendingFinalize = false
+						if state.file != nil {
+							_ = state.file.Close()
+							state.file = nil
+							atomic.AddInt64(&w.openFilesCount, -1)
+						}
+					} else {
+						state.pendingNext = now.Add(5 * time.Second)
+					}
 				}
-				w.stateMu.Unlock()
-				if w.onError != nil {
-					w.onError(taskID, manifest.Gen, fmt.Errorf("permanent finalize error: %w", err))
-				}
-			} else {
-				// Transient: backoff 5s before next retry to avoid tight-loop SHA
-				w.stateMu.Lock()
-				if curState, curOk := w.tasks[taskID]; curOk && curState.manifest.Gen == manifest.Gen {
-					curState.pendingNext = now.Add(5 * time.Second)
-				}
-				w.stateMu.Unlock()
+				state.mu.Unlock()
+			}
+
+			if isFinalizePermError(err) && w.onError != nil {
+				w.onError(taskID, manifest.Gen, fmt.Errorf("permanent finalize error: %w", err))
 			}
 		}
 	}
 }
 
 // isFinalizePermError returns true for errors that will never succeed on retry.
-// Uses typed sentinel errors instead of string matching for reliable classification.
 func isFinalizePermError(err error) bool {
 	if errors.Is(err, ErrContentConflict) {
 		return true
@@ -478,44 +511,51 @@ func isFinalizePermError(err error) bool {
 }
 
 // processObject writes a single buffer object to the target .moving file.
-//
-// The function is organized around the AckDurable boundary:
-//   - BEFORE AckDurable: errors are ObjectRetryable (source can be Requeued)
-//   - AFTER AckDurable: errors are FinalizeRetryable (source is gone, must not Requeue)
 func (w *TargetWriter) processObject(obj *bucket.BufferObject, isContiguous bool) processResult {
 	taskID := obj.Key.TaskID
 
 	// Phase 1: Look up task attempt state
-	w.stateMu.Lock()
+	w.stateMu.RLock()
 	state, ok := w.tasks[taskID]
+	w.stateMu.RUnlock()
+
 	if !ok {
-		w.stateMu.Unlock()
 		return processResult{phaseObjectRetryable, errors.New("task manifest not registered yet")}
 	}
 
+	state.mu.Lock()
 	if state.finalized {
-		w.stateMu.Unlock()
-		// If task was already completed and finalized, safely consume and delete leftover object
-		if err := w.bkt.AckDurable([]bucket.ObjectKey{obj.Key}); err != nil {
-			return processResult{phaseObjectRetryable, fmt.Errorf("ack completed task leftover object: %w", err)}
+		isMatchingGen := (state.finalGen == obj.Key.Gen)
+		state.mu.Unlock()
+		if isMatchingGen {
+			if err := w.bkt.AckDurable([]bucket.ObjectKey{obj.Key}); err != nil {
+				return processResult{phaseObjectRetryable, fmt.Errorf("ack completed task leftover object: %w", err)}
+			}
 		}
 		return processResult{phase: phaseStaleDiscarded}
 	}
 
-	// Generation guard: reject objects from stale attempts.
-	if obj.Key.Gen != state.manifest.Gen {
-		w.stateMu.Unlock()
+	if state.manifest.Gen != obj.Key.Gen || state.phase != PhaseActive {
+		state.mu.Unlock()
 		if err := w.bkt.AckDurable([]bucket.ObjectKey{obj.Key}); err != nil {
 			return processResult{phaseObjectRetryable, fmt.Errorf("ack stale object: %w", err)}
 		}
 		return processResult{phase: phaseStaleDiscarded}
 	}
 
+	// Grant operation lease
+	state.activeOps++
 	manifest := state.manifest
 	bm := state.bitmap
-	f, err := w.getOrOpenFileLocked(state)
-	w.stateMu.Unlock()
+	state.mu.Unlock()
 
+	defer func() {
+		state.mu.Lock()
+		state.activeOps--
+		state.mu.Unlock()
+	}()
+
+	f, err := w.getOrOpenFile(state)
 	if err != nil {
 		return processResult{phaseObjectRetryable, fmt.Errorf("open target moving file: %w", err)}
 	}
@@ -552,17 +592,12 @@ func (w *TargetWriter) processObject(obj *bucket.BufferObject, isContiguous bool
 	manifest.Ranges = bm.Ranges()
 	manifest.Version = SidecarVersion
 	if err := w.persistMeta(manifest); err != nil {
-		// Sidecar not durable: restore bitmap to match the persisted state
 		bm.Restore(snapshot)
 		return processResult{phaseObjectRetryable, fmt.Errorf("persist sidecar metadata: %w", err)}
 	}
 
 	// ──── DURABILITY BOUNDARY ────
-	// After this point, the source buffer object is deleted.
-	// Errors below must NEVER result in Requeue of the source object.
-
 	if err := w.bkt.AckDurable([]bucket.ObjectKey{obj.Key}); err != nil {
-		// AckDurable failed: source might still exist. Safe to retry via Requeue.
 		return processResult{phaseObjectRetryable, fmt.Errorf("ack durable object: %w", err)}
 	}
 
@@ -587,11 +622,6 @@ func (w *TargetWriter) processObject(obj *bucket.BufferObject, isContiguous bool
 	return processResult{phase: phaseDurableOK}
 }
 
-// persistMeta writes the sidecar metadata file with full durability guarantee:
-// write tmp → fsync tmp → close → rename → fsync directory.
-//
-// The contract: if this function returns nil, the sidecar content survives
-// power loss. All errors (including directory fsync) are returned.
 func (w *TargetWriter) persistMeta(manifest TaskManifest) error {
 	finalPath := filepath.Join(w.outputDir, manifest.FinalPath)
 	metaPath := finalPath + ".moving.meta"
@@ -629,8 +659,6 @@ func (w *TargetWriter) persistMeta(manifest TaskManifest) error {
 		return fmt.Errorf("rename sidecar: %w", err)
 	}
 
-	// Directory fsync: ensures the rename is durable across power loss.
-	// This is required — returning nil without dir fsync violates the durability contract.
 	d, err := os.Open(dir)
 	if err != nil {
 		return fmt.Errorf("open directory for fsync: %w", err)
@@ -644,9 +672,15 @@ func (w *TargetWriter) persistMeta(manifest TaskManifest) error {
 	return nil
 }
 
-func (w *TargetWriter) getOrOpenFileLocked(state *AttemptWriteState) (*os.File, error) {
+func (w *TargetWriter) getOrOpenFile(state *AttemptWriteState) (*os.File, error) {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+
 	if state.file != nil {
 		return state.file, nil
+	}
+	if state.phase != PhaseActive {
+		return nil, errors.New("attempt is no longer active")
 	}
 
 	finalPath := filepath.Join(w.outputDir, state.manifest.FinalPath)
@@ -662,24 +696,55 @@ func (w *TargetWriter) getOrOpenFileLocked(state *AttemptWriteState) (*os.File, 
 	}
 
 	state.file = f
+	atomic.AddInt64(&w.openFilesCount, 1)
 	return f, nil
 }
 
 func (w *TargetWriter) finalizeTask(manifest TaskManifest) error {
 	taskID := manifest.TaskID
+
+	w.stateMu.RLock()
+	state, ok := w.tasks[taskID]
+	w.stateMu.RUnlock()
+
+	if !ok {
+		return errors.New("task not found for finalize")
+	}
+
+	state.mu.Lock()
+	if state.finalized {
+		state.mu.Unlock()
+		return nil
+	}
+	if state.manifest.Gen != manifest.Gen {
+		state.mu.Unlock()
+		return nil // superseded by newer generation
+	}
+
+	// Close open FD and enforce Sync & Close error propagation (P0-1 fix)
+	var fToClose *os.File
+	if state.file != nil {
+		fToClose = state.file
+		state.file = nil
+		atomic.AddInt64(&w.openFilesCount, -1)
+	}
+	state.phase = PhaseFinalizing
+	state.mu.Unlock()
+
+	if fToClose != nil {
+		syncErr := fToClose.Sync()
+		closeErr := fToClose.Close()
+		if syncErr != nil {
+			return fmt.Errorf("final sync moving file: %w", syncErr)
+		}
+		if closeErr != nil {
+			return fmt.Errorf("close moving file: %w", closeErr)
+		}
+	}
+
 	finalPath := filepath.Join(w.outputDir, manifest.FinalPath)
 	movingPath := finalPath + ".moving"
 	metaPath := finalPath + ".moving.meta"
-
-	// Close open FD under lock — must Close even if Sync fails to avoid FD leak
-	w.stateMu.Lock()
-	if state, ok := w.tasks[taskID]; ok && state.file != nil {
-		f := state.file
-		state.file = nil
-		_ = f.Sync()
-		_ = f.Close()
-	}
-	w.stateMu.Unlock()
 
 	// Verify size
 	stat, err := os.Stat(movingPath)
@@ -705,14 +770,11 @@ func (w *TargetWriter) finalizeTask(manifest TaskManifest) error {
 	// Atomic non-replacing commit to final destination
 	if err := atomicCommit.CommitFile(movingPath, finalPath); err != nil {
 		if errors.Is(err, atomicCommit.ErrTargetExists) {
-			// Content identity check: accept only if SHA256 matches exactly.
-			// No size-only fallback — different content must not be silently accepted.
 			existingSHA, existErr := computeFileSHA256(finalPath)
 			if existErr == nil && existingSHA == shaHash {
 				_ = os.Remove(movingPath)
 				_ = os.Remove(metaPath)
 			} else if existErr != nil {
-				// Transient IO error reading existing target file
 				return fmt.Errorf("read existing target file for sha verification: %w", existErr)
 			} else {
 				return fmt.Errorf("existing_sha=%s, new_sha=%s: %w",
@@ -725,18 +787,17 @@ func (w *TargetWriter) finalizeTask(manifest TaskManifest) error {
 
 	_ = os.Remove(metaPath)
 
-	// Clean tracking state — atomically mark finalized if generation still matches
-	w.stateMu.Lock()
-	if state, ok := w.tasks[taskID]; ok && state.manifest.Gen == manifest.Gen {
+	// Clean tracking state — atomically mark finalized, release heavy objects (P1-5 fix)
+	state.mu.Lock()
+	if state.manifest.Gen == manifest.Gen {
 		state.finalized = true
 		state.finalGen = manifest.Gen
 		state.pendingFinalize = false
-		if state.file != nil {
-			_ = state.file.Close()
-			state.file = nil
-		}
+		state.phase = PhaseFinalized
+		state.bitmap = nil
+		state.manifest.Ranges = nil
 	}
-	w.stateMu.Unlock()
+	state.mu.Unlock()
 
 	if w.onComplete != nil {
 		w.onComplete(taskID, manifest.Gen, manifest.FinalPath, shaHash)
@@ -768,11 +829,14 @@ func (w *TargetWriter) Close() error {
 
 	w.stateMu.Lock()
 	for _, state := range w.tasks {
+		state.mu.Lock()
 		if state.file != nil {
 			_ = state.file.Sync()
 			_ = state.file.Close()
 			state.file = nil
+			atomic.AddInt64(&w.openFilesCount, -1)
 		}
+		state.mu.Unlock()
 	}
 	w.stateMu.Unlock()
 	return nil

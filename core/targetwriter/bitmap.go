@@ -144,3 +144,10 @@ func (b *MovedBitmap) Restore(snapshot []Range) {
 	defer b.mu.Unlock()
 	b.ranges = snapshot
 }
+
+// Clone returns a deep copy of MovedBitmap.
+func (b *MovedBitmap) Clone() *MovedBitmap {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return NewMovedBitmapWithRanges(b.expectedSize, b.ranges)
+}

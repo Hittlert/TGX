@@ -256,3 +256,154 @@ func TestTargetWriter_CompletedTaskRejectsLateResolver(t *testing.T) {
 	_, bmExists := tw.TaskBitmap("task-comp")
 	assert.False(t, bmExists)
 }
+
+func TestTargetWriter_RegisterResultEnum(t *testing.T) {
+	bkt, err := bucket.New(bucket.Config{Mode: bucket.ModeMemory, MaxCapacity: 10 * 1024 * 1024})
+	require.NoError(t, err)
+	defer bkt.Close()
+
+	outDir := t.TempDir()
+	tw := New(bkt, outDir)
+
+	manifest1 := TaskManifest{
+		TaskID:       "task-enum",
+		FinalPath:    "file.bin",
+		ExpectedSize: 1024,
+		Gen:          "retry_100",
+	}
+	res1 := tw.RegisterTask(manifest1)
+	assert.Equal(t, RegisterAccepted, res1)
+
+	// Stale registration with older generation "1"
+	manifestStale := TaskManifest{
+		TaskID:       "task-enum",
+		FinalPath:    "file.bin",
+		ExpectedSize: 1024,
+		Gen:          "1",
+	}
+	resStale := tw.RegisterTask(manifestStale)
+	assert.Equal(t, RegisterStale, resStale)
+
+	// Conflict registration: same gen but different path
+	manifestConflict := TaskManifest{
+		TaskID:       "task-enum",
+		FinalPath:    "different.bin",
+		ExpectedSize: 1024,
+		Gen:          "retry_100",
+	}
+	resConflict := tw.RegisterTask(manifestConflict)
+	assert.Equal(t, RegisterConflict, resConflict)
+
+	// Mark completed
+	tw.MarkTaskCompleted("task-enum", "retry_100")
+	resAfterComp := tw.RegisterTask(manifest1)
+	assert.Equal(t, RegisterAlreadyFinalized, resAfterComp)
+}
+
+func TestTargetWriter_CompletedLeftoverOnlyAcksMatchingGen(t *testing.T) {
+	tempDir := t.TempDir()
+	outDir := filepath.Join(tempDir, "output")
+	require.NoError(t, os.MkdirAll(outDir, 0755))
+
+	bkt, err := bucket.New(bucket.Config{Mode: bucket.ModeMemory, MaxCapacity: 10 * 1024 * 1024})
+	require.NoError(t, err)
+	defer bkt.Close()
+
+	tw := New(bkt, outDir)
+
+	completeChan := make(chan string, 1)
+	tw.SetCallbacks(func(taskID, gen, finalPath, shaHash string) {
+		completeChan <- finalPath
+	}, nil, nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	tw.Start(ctx)
+	tw.BeginConsuming()
+	defer tw.Close()
+
+	totalSize := int64(1024)
+	data := make([]byte, totalSize)
+	_, _ = rand.Read(data)
+
+	manifest := TaskManifest{
+		TaskID:       "task-match-gen",
+		FinalPath:    "doc.bin",
+		ExpectedSize: totalSize,
+		Gen:          "retry_200",
+	}
+	require.Equal(t, RegisterAccepted, tw.RegisterTask(manifest))
+
+	key0 := bucket.ObjectKey{TaskID: manifest.TaskID, Gen: "retry_200", Offset: 0, Length: totalSize}
+	require.NoError(t, bkt.Reserve(ctx, totalSize))
+	require.NoError(t, bkt.PutObject(key0, data))
+
+	select {
+	case <-completeChan:
+	case <-time.After(3 * time.Second):
+		t.Fatal("task did not complete in time")
+	}
+
+	// Put leftover with matching generation -> should be Acked and cleaned up
+	keyMatching := bucket.ObjectKey{TaskID: manifest.TaskID, Gen: "retry_200", Offset: 0, Length: 512}
+	require.NoError(t, bkt.Reserve(ctx, 512))
+	require.NoError(t, bkt.PutObject(keyMatching, data[:512]))
+
+	require.Eventually(t, func() bool {
+		m := bkt.Metrics()
+		return m.ReadyBytes == 0 && m.PendingDeleteBytes == 0
+	}, 2*time.Second, 20*time.Millisecond)
+}
+
+func TestTargetWriter_TombstoneReleasesHeavyMemory(t *testing.T) {
+	tempDir := t.TempDir()
+	outDir := filepath.Join(tempDir, "output")
+	require.NoError(t, os.MkdirAll(outDir, 0755))
+
+	bkt, err := bucket.New(bucket.Config{Mode: bucket.ModeMemory, MaxCapacity: 10 * 1024 * 1024})
+	require.NoError(t, err)
+	defer bkt.Close()
+
+	tw := New(bkt, outDir)
+
+	completeChan := make(chan string, 1)
+	tw.SetCallbacks(func(taskID, gen, finalPath, shaHash string) {
+		completeChan <- finalPath
+	}, nil, nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	tw.Start(ctx)
+	tw.BeginConsuming()
+	defer tw.Close()
+
+	totalSize := int64(1024)
+	data := make([]byte, totalSize)
+	_, _ = rand.Read(data)
+
+	manifest := TaskManifest{
+		TaskID:       "task-tombstone-gc",
+		FinalPath:    "tombstone.bin",
+		ExpectedSize: totalSize,
+		Gen:          "1",
+	}
+	tw.RegisterTask(manifest)
+
+	key0 := bucket.ObjectKey{TaskID: manifest.TaskID, Gen: "1", Offset: 0, Length: totalSize}
+	require.NoError(t, bkt.Reserve(ctx, totalSize))
+	require.NoError(t, bkt.PutObject(key0, data))
+
+	select {
+	case <-completeChan:
+	case <-time.After(3 * time.Second):
+		t.Fatal("task did not complete in time")
+	}
+
+	// Verify bitmap and ranges are nil in tombstone state
+	_, bmExists := tw.TaskBitmap("task-tombstone-gc")
+	assert.False(t, bmExists)
+
+	compGen, ok := tw.TaskCompleted("task-tombstone-gc")
+	require.True(t, ok)
+	assert.Equal(t, "1", compGen)
+}
