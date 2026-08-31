@@ -22,6 +22,7 @@ import (
 	"github.com/Hittlert/TGX/core/bucket"
 	"github.com/Hittlert/TGX/core/mover"
 	"github.com/Hittlert/TGX/core/targetwriter"
+	"github.com/Hittlert/TGX/pkg/consts"
 	atomic "github.com/Hittlert/TGX/pkg/sbe/atomic"
 	"github.com/Hittlert/TGX/pkg/sbe/gate"
 )
@@ -327,7 +328,13 @@ func (s *WebServer) handleIndex(w http.ResponseWriter, r *http.Request) {
 		state = "paused"
 	}
 
+	ver := consts.Version
+	if ver == "" || ver == "dev" {
+		ver = "v4.4.9"
+	}
+
 	content := strings.ReplaceAll(string(data), "{{ download_state }}", state)
+	content = strings.ReplaceAll(content, "{{ app_version }}", ver)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = w.Write([]byte(content))
 }
@@ -428,7 +435,11 @@ func (s *WebServer) decryptFrontendPassword(encryptedB64 string) string {
 
 func (s *WebServer) handleGetAppVersion(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	_, _ = w.Write([]byte("v2.0.0-pure-go"))
+	ver := consts.Version
+	if ver == "" || ver == "dev" {
+		ver = "v4.4.9"
+	}
+	_, _ = w.Write([]byte(ver))
 }
 
 func (s *WebServer) handleDownloadStateChange(w http.ResponseWriter, r *http.Request) {

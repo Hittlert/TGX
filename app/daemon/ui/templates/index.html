@@ -4,7 +4,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <title>TGX - Next-Gen Media Downloader & SBE Engine</title>
+  <title>TGX - Streaming Download Engine</title>
   <link href="static/layui/css/layui.css" rel="stylesheet">
   <link href="static/css/index.css" rel="stylesheet">
 </head>
@@ -16,7 +16,7 @@
       <div class="apple-nav-top">
         <div class="apple-brand">
           <span class="apple-brand-icon">⚡</span>
-          <span class="apple-brand-title">TGX <span style="font-size: 11px; opacity: 0.6; font-weight: normal; margin-left: 4px;">SBE v4.1</span></span>
+          <span class="apple-brand-title">TGX <span style="font-size: 11px; opacity: 0.6; font-weight: normal; margin-left: 4px;" id="brand_version">{{ app_version }}</span></span>
           <canvas id="speed_sparkline" width="80" height="20" style="margin-left: 8px; border-radius: 4px; vertical-align: middle; display: inline-block;" title="实时网络吞吐波动"></canvas>
         </div>
         <div class="apple-nav-actions">
@@ -182,7 +182,7 @@
     <!-- Frosted Glass Bottom Status Bar -->
     <footer class="apple-footer">
       <div class="footer-left">
-        <span>Telegram Media Downloader <b id="app_version">v2.2.8</b></span>
+        <span>TGX Downloader <b id="app_version">{{ app_version }}</b></span>
       </div>
       <div class="footer-right">
         <span class="footer-speed-badge">
