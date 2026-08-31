@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,6 +16,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/Hittlert/TGX/core/mover"
+	"github.com/Hittlert/TGX/core/targetwriter"
 )
 
 func setupTestDB(t *testing.T) *sql.DB {
@@ -295,4 +297,66 @@ func TestOrchestrator_RejectsConflictingAndStaleCallbacks(t *testing.T) {
 	// 5. Unknown task: not found
 	res = r.FinishTask("unknown:999", "1", StateSuccess, "", "", "file.bin", false, "sha")
 	assert.Equal(t, FinishNotFound, res)
+}
+
+func TestRecovery_PartialSidecarDoesNotRegisterPublishingTask(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+
+	outDir := t.TempDir()
+	tempDir := t.TempDir()
+
+	fileKey := CanonicalTaskID("123", 55)
+	finalPath := filepath.Join(outDir, "partial.bin")
+	movingPath := finalPath + ".moving"
+	metaPath := finalPath + ".moving.meta"
+
+	// Create incomplete .moving (size 500) and sidecar with ExpectedSize 1000 and range [0, 500)
+	testContent := make([]byte, 500)
+	require.NoError(t, os.WriteFile(movingPath, testContent, 0644))
+
+	manifest := targetwriter.TaskManifest{
+		Version:      targetwriter.SidecarVersion,
+		TaskID:       fileKey,
+		FinalPath:    "partial.bin",
+		ExpectedSize: 1000,
+		Gen:          "1",
+		Ranges: []targetwriter.Range{
+			{Start: 0, End: 500},
+		},
+	}
+	metaBytes, err := json.Marshal(manifest)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(metaPath, metaBytes, 0644))
+
+	_, err = db.Exec(`INSERT INTO download_records (chat_id, message_id, status, file_name, save_path, file_size) VALUES ('123', 55, 'downloading', 'partial.bin', 'partial.bin', 1000)`)
+	require.NoError(t, err)
+
+	reg := NewRegistry(10, 100, time.Now)
+	reconciler := NewReconcilerWithBuffer(db, outDir, tempDir, "ssd", nil, zap.NewNop())
+	reconciler.SetRegistry(reg)
+
+	results, err := reconciler.ReconcileAll(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 1, len(results))
+	assert.Equal(t, "pending", results[0].NextState)
+	assert.Equal(t, "SSD_BUFFER_PARTIAL_RESET_TO_PENDING", results[0].ActionTaken)
+
+	// Verify Registry has NO synthetic Publishing task left behind
+	_, exists := reg.Task(fileKey)
+	assert.False(t, exists)
+	assert.Equal(t, 0, len(reg.Tasks()))
+
+	// Verify pending scanner can cleanly submit real TaskRequest with 0 ID conflict
+	realReq := TaskRequest{
+		ID:           fileKey,
+		Peer:         "123",
+		MessageID:    55,
+		FinalPath:    "partial.bin",
+		ExpectedSize: 1000,
+	}
+	snap, ok, err := reg.Submit(realReq)
+	require.NoError(t, err)
+	require.True(t, ok)
+	assert.Equal(t, StateQueued, snap.State)
 }

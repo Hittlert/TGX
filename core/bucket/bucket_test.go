@@ -309,3 +309,39 @@ func TestBucket_RequeueStaleGenerationDropped(t *testing.T) {
 	_, ok = b.TakeReady()
 	assert.False(t, ok)
 }
+
+func TestBucket_SetTaskGenerationRejectsOlderGenerationRollback(t *testing.T) {
+	b, err := New(Config{Mode: ModeMemory, MaxCapacity: 10 * 1024 * 1024})
+	require.NoError(t, err)
+	defer b.Close()
+
+	ctx := context.Background()
+	data := []byte("retry-gen-data")
+	key := ObjectKey{
+		TaskID:   "task-rollback",
+		Gen:      "retry_2000",
+		Offset:   0,
+		Length:   int64(len(data)),
+		Checksum: crc32.ChecksumIEEE(data),
+	}
+
+	// 1. Set authoritative generation to retry_2000 and write object
+	b.SetTaskGeneration("task-rollback", "retry_2000")
+	require.NoError(t, b.Reserve(ctx, key.Length))
+	require.NoError(t, b.PutObject(key, data))
+
+	assert.Equal(t, int64(1), b.Metrics().ObjectCount)
+	assert.Equal(t, key.Length, b.Metrics().ReadyBytes)
+
+	// 2. Slow resolver attempts to roll back to generation "1" or "retry_1000"
+	b.SetTaskGeneration("task-rollback", "1")
+	b.SetTaskGeneration("task-rollback", "retry_1000")
+
+	// 3. Verify retry_2000 object was NOT purged
+	assert.Equal(t, int64(1), b.Metrics().ObjectCount)
+	assert.Equal(t, key.Length, b.Metrics().ReadyBytes)
+
+	obj, ok := b.TakeReady()
+	require.True(t, ok)
+	assert.Equal(t, "retry_2000", obj.Key.Gen)
+}

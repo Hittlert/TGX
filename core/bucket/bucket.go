@@ -204,11 +204,37 @@ func (b *bucketImpl) ReleaseReservation(bytes int64) {
 	b.mu.Unlock()
 }
 
+// isOlderGeneration checks if newGen is strictly older than currentGen.
+func isOlderGeneration(newGen, currentGen string) bool {
+	if currentGen == "" || newGen == currentGen {
+		return false
+	}
+	if currentGen != "1" && newGen == "1" {
+		return true // "1" is older than any retry generation
+	}
+	if strings.HasPrefix(currentGen, "retry_") && strings.HasPrefix(newGen, "retry_") {
+		var curNano, newNano int64
+		if _, err := fmt.Sscanf(currentGen, "retry_%d", &curNano); err == nil {
+			if _, err2 := fmt.Sscanf(newGen, "retry_%d", &newNano); err2 == nil {
+				return newNano < curNano
+			}
+		}
+	}
+	return false
+}
+
 // SetTaskGeneration establishes the authoritative active generation for a task.
 // Any buffered objects from prior generations for this task are purged to release capacity.
+// If an older generation is passed (e.g. from a slow resolver), it is safely rejected.
 func (b *bucketImpl) SetTaskGeneration(taskID, gen string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+
+	if currentGen, exists := b.currentTaskGen[taskID]; exists && currentGen != "" {
+		if isOlderGeneration(gen, currentGen) {
+			return
+		}
+	}
 
 	b.currentTaskGen[taskID] = gen
 

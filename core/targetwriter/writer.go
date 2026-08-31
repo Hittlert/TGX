@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -126,6 +127,32 @@ func (w *TargetWriter) MarkTaskCompleted(taskID, gen string) {
 // all prior state (bitmap, FD, pending finalize) is cleared. A new generation
 // must not inherit durable ranges or file handles from a previous attempt.
 //
+// isOlderGeneration checks if newGen is strictly older than currentGen.
+func isOlderGeneration(newGen, currentGen string) bool {
+	if currentGen == "" || newGen == currentGen {
+		return false
+	}
+	if currentGen != "1" && newGen == "1" {
+		return true // "1" is older than any retry generation
+	}
+	if strings.HasPrefix(currentGen, "retry_") && strings.HasPrefix(newGen, "retry_") {
+		var curNano, newNano int64
+		if _, err := fmt.Sscanf(currentGen, "retry_%d", &curNano); err == nil {
+			if _, err2 := fmt.Sscanf(newGen, "retry_%d", &newNano); err2 == nil {
+				return newNano < curNano
+			}
+		}
+	}
+	return false
+}
+
+// RegisterTask registers or re-registers a task manifest for target writing.
+//
+// Generation isolation: if a manifest already exists with a different generation,
+// all prior state (bitmap, FD, pending finalize) is cleared. A new generation
+// must not inherit durable ranges or file handles from a previous attempt.
+// If an older generation is passed (e.g. from a slow resolver), it is safely rejected.
+//
 // Complete bitmap recovery: if the registered bitmap is already complete (all
 // ranges cover [0, expectedSize)), the task is queued for immediate finalize.
 // This handles the crash-after-last-Ack-before-finalize recovery case where
@@ -137,6 +164,10 @@ func (w *TargetWriter) RegisterTask(manifest TaskManifest) {
 	if val, ok := w.manifests.Load(manifest.TaskID); ok {
 		old := val.(TaskManifest)
 		if old.Gen != manifest.Gen {
+			if isOlderGeneration(manifest.Gen, old.Gen) {
+				// Reject rollback to older generation by slow/stale resolver
+				return
+			}
 			// New generation: clean up old state entirely
 			w.bitmaps.Delete(manifest.TaskID)
 			if fVal, fOk := w.openFiles.LoadAndDelete(manifest.TaskID); fOk {

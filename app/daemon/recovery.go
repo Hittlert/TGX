@@ -133,7 +133,7 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) ([]TaskRecoveryResult, er
 			metaData, metaErr := os.ReadFile(metaPath)
 			if metaErr == nil {
 				var manifest targetwriter.TaskManifest
-				if json.Unmarshal(metaData, &manifest) == nil && r.tw != nil {
+				if json.Unmarshal(metaData, &manifest) == nil {
 					// Validate manifest identity and physical consistency
 					valid := true
 					reason := ""
@@ -199,16 +199,16 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) ([]TaskRecoveryResult, er
 					}
 
 					if valid {
-						// RegisterTask handles generation isolation and complete-bitmap finalize internally
-						r.tw.RegisterTask(manifest)
-						if r.registry != nil {
-							r.registry.RegisterRecoveredTask(manifest.TaskID, manifest.Gen, rec.SavePath, manifest.ExpectedSize)
-						}
-
 						// Determine if bitmap is complete to choose recovery action
 						bm := targetwriter.NewMovedBitmapWithRanges(manifest.ExpectedSize, manifest.Ranges)
 						if bm.IsComplete() {
 							// Complete bitmap: TargetWriter will finalize via pendingFinalize queue
+							if r.tw != nil {
+								r.tw.RegisterTask(manifest)
+							}
+							if r.registry != nil {
+								r.registry.RegisterRecoveredTask(manifest.TaskID, manifest.Gen, rec.SavePath, manifest.ExpectedSize)
+							}
 							results = append(results, TaskRecoveryResult{
 								FileKey:     fileKey,
 								PrevState:   rec.Status,
@@ -217,7 +217,8 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) ([]TaskRecoveryResult, er
 							})
 						} else {
 							// Incomplete bitmap: reset DB to pending so pending scanner
-							// re-dispatches the task to fill missing ranges via network
+							// re-dispatches the task to fill missing ranges via network.
+							// Do NOT register a publishing task in Registry or TargetWriter.
 							_, _ = r.db.ExecContext(ctx, `UPDATE download_records SET status = 'pending' WHERE chat_id = ? AND message_id = ?`, rec.ChatID, rec.MessageID)
 							results = append(results, TaskRecoveryResult{
 								FileKey:     fileKey,

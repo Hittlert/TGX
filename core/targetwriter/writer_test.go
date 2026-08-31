@@ -188,3 +188,44 @@ func TestTargetWriter_ContentConflict(t *testing.T) {
 		t.Fatal("expected content conflict error callback")
 	}
 }
+
+func TestTargetWriter_RegisterTaskRejectsOlderGenerationRollback(t *testing.T) {
+	bkt, err := bucket.New(bucket.Config{Mode: bucket.ModeMemory, MaxCapacity: 10 * 1024 * 1024})
+	require.NoError(t, err)
+	defer bkt.Close()
+
+	outDir := t.TempDir()
+	tw := New(bkt, outDir)
+
+	manifestNew := TaskManifest{
+		TaskID:       "task-tw-rollback",
+		FinalPath:    "file.bin",
+		ExpectedSize: 1024,
+		Gen:          "retry_2000",
+		Ranges: []Range{
+			{Start: 0, End: 512},
+		},
+	}
+	tw.RegisterTask(manifestNew)
+
+	// Verify bitmap has range [0, 512)
+	bmVal, ok := tw.bitmaps.Load("task-tw-rollback")
+	require.True(t, ok)
+	bm := bmVal.(*MovedBitmap)
+	assert.Equal(t, int64(512), bm.DurableBytes())
+
+	// Stale resolver attempts to register older generation "1" or "retry_1000" with empty range
+	manifestOld := TaskManifest{
+		TaskID:       "task-tw-rollback",
+		FinalPath:    "file.bin",
+		ExpectedSize: 1024,
+		Gen:          "1",
+	}
+	tw.RegisterTask(manifestOld)
+
+	// Verify bitmap was NOT wiped or replaced
+	bmVal, ok = tw.bitmaps.Load("task-tw-rollback")
+	require.True(t, ok)
+	bm = bmVal.(*MovedBitmap)
+	assert.Equal(t, int64(512), bm.DurableBytes())
+}

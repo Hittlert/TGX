@@ -77,7 +77,12 @@ func (o *Orchestrator) Start(ctx context.Context) {
 				if len(parts) == 2 {
 					var msgID int
 					_, _ = fmt.Sscanf(parts[1], "%d", &msgID)
-					_ = o.db.UpdateDownloadStatus(parts[0], msgID, "success", "", finalPath, "", 0, "")
+					for attempt := 0; attempt < 3; attempt++ {
+						if err := o.db.UpdateDownloadStatus(parts[0], msgID, "success", "", finalPath, "", 0, ""); err == nil {
+							break
+						}
+						time.Sleep(50 * time.Millisecond)
+					}
 				}
 			},
 			func(taskID string, movedBytes, totalBytes int64) {
@@ -93,7 +98,12 @@ func (o *Orchestrator) Start(ctx context.Context) {
 				if len(parts) == 2 {
 					var msgID int
 					_, _ = fmt.Sscanf(parts[1], "%d", &msgID)
-					_ = o.db.UpdateDownloadStatus(parts[0], msgID, "failed", "", "", "", 0, err.Error())
+					for attempt := 0; attempt < 3; attempt++ {
+						if err := o.db.UpdateDownloadStatus(parts[0], msgID, "failed", "", "", "", 0, err.Error()); err == nil {
+							break
+						}
+						time.Sleep(50 * time.Millisecond)
+					}
 				}
 			},
 		)
