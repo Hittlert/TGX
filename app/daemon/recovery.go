@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -30,6 +31,7 @@ type Reconciler struct {
 	bufferType string
 	mover      *mover.Mover
 	tw         *targetwriter.TargetWriter
+	registry   *Registry
 	logger     *zap.Logger
 }
 
@@ -50,6 +52,10 @@ func NewReconcilerWithBuffer(db *sql.DB, outputDir, tempDir, bufferType string, 
 
 func (r *Reconciler) SetTargetWriter(tw *targetwriter.TargetWriter) {
 	r.tw = tw
+}
+
+func (r *Reconciler) SetRegistry(reg *Registry) {
+	r.registry = reg
 }
 
 // ReconcileAll runs the differential crash recovery matrix on all non-terminal tasks.
@@ -93,11 +99,10 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) ([]TaskRecoveryResult, er
 		metaPath := finalPath + ".moving.meta"
 
 		// 1. Check if final file was already committed via our SHA-verified CommitFile.
-		// Accept only if: final exists with exact size AND .moving does NOT exist
-		// (presence of .moving indicates CommitFile did not complete successfully).
+		// Accept only if: final exists with exact size AND .moving explicitly does NOT exist.
 		stat, err := os.Stat(finalPath)
-		_, movingExists := os.Stat(movingPath)
-		if err == nil && stat.Size() == rec.FileSize && rec.FileSize > 0 && movingExists != nil {
+		_, movingErr := os.Stat(movingPath)
+		if err == nil && stat.Size() == rec.FileSize && rec.FileSize > 0 && errors.Is(movingErr, os.ErrNotExist) {
 			_ = os.Remove(metaPath)
 			_, _ = r.db.ExecContext(ctx, `UPDATE download_records SET status = 'success', error = '' WHERE chat_id = ? AND message_id = ?`, rec.ChatID, rec.MessageID)
 			results = append(results, TaskRecoveryResult{
@@ -196,6 +201,9 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) ([]TaskRecoveryResult, er
 					if valid {
 						// RegisterTask handles generation isolation and complete-bitmap finalize internally
 						r.tw.RegisterTask(manifest)
+						if r.registry != nil {
+							r.registry.RegisterRecoveredTask(manifest.TaskID, manifest.Gen, rec.SavePath, manifest.ExpectedSize)
+						}
 
 						// Determine if bitmap is complete to choose recovery action
 						bm := targetwriter.NewMovedBitmapWithRanges(manifest.ExpectedSize, manifest.Ranges)

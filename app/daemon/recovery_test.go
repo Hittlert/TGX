@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -202,6 +203,41 @@ func TestTask_StaleAttemptCannotTerminateNewAttempt(t *testing.T) {
 	assert.False(t, task2.IsTerminal())
 }
 
+func TestTask_ImmutableAttemptPointers(t *testing.T) {
+	r := NewRegistry(10, 100, time.Now)
+	req1 := TaskRequest{ID: "chat1:100", Peer: "chat1", MessageID: 100, FinalPath: "chat1/file1.bin", ExpectedSize: 1024}
+
+	// 1. Submit first attempt
+	_, ok, err := r.Submit(req1)
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	task1, err := r.Next(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, "1", task1.AttemptGen())
+
+	// Fail attempt 1
+	task1.Fail("error", "net drop", false)
+	require.True(t, task1.IsTerminal())
+	require.Error(t, task1.Context().Err())
+
+	// 2. Submit retry
+	req1.Retry = true
+	_, ok, err = r.Submit(req1)
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	task2, err := r.Next(context.Background())
+	require.NoError(t, err)
+	require.NotEqual(t, "1", task2.AttemptGen())
+	require.NoError(t, task2.Context().Err())
+
+	// 3. Verify task1 still holds old canceled context and old request
+	require.Error(t, task1.Context().Err())
+	require.Equal(t, StateFailed, task1.Snapshot().State)
+	require.Equal(t, StateResolving, task2.Snapshot().State)
+}
+
 func TestOrchestrator_StartupRecoveryCallbackUpdatesDB(t *testing.T) {
 	db := setupTestDB(t)
 	defer db.Close()
@@ -212,14 +248,17 @@ func TestOrchestrator_StartupRecoveryCallbackUpdatesDB(t *testing.T) {
 	require.NoError(t, err)
 
 	r := NewRegistry(10, 100, time.Now)
+	// Register recovered task into Registry
+	r.RegisterRecoveredTask("123:99", "1", "rec.bin", 1024)
 
-	// Task 123:99 is NOT in registry (startup recovery task)
-	// Orchestrator callbacks are invoked by TargetWriter on completion:
+	// Orchestrator callback logic
 	completeCallback := func(taskID, gen, finalPath, shaHash string) {
 		res := r.FinishTask(taskID, gen, StateSuccess, "", "", finalPath, false, shaHash)
-		if res == FinishAccepted || res == FinishNotFound {
-			parts := []string{"123", "99"}
-			_, _ = db.Exec(`UPDATE download_records SET status = 'success' WHERE chat_id = ? AND message_id = ?`, parts[0], 99)
+		if res == FinishAcceptedNewTerminal {
+			parts := strings.Split(taskID, ":")
+			if len(parts) == 2 {
+				_, _ = db.Exec(`UPDATE download_records SET status = 'success' WHERE chat_id = ? AND message_id = ?`, parts[0], 99)
+			}
 		}
 	}
 
@@ -229,4 +268,31 @@ func TestOrchestrator_StartupRecoveryCallbackUpdatesDB(t *testing.T) {
 	err = db.QueryRow(`SELECT status FROM download_records WHERE chat_id = '123' AND message_id = 99`).Scan(&status)
 	require.NoError(t, err)
 	assert.Equal(t, "success", status)
+}
+
+func TestOrchestrator_RejectsConflictingAndStaleCallbacks(t *testing.T) {
+	r := NewRegistry(10, 100, time.Now)
+	req := TaskRequest{ID: "chat1:50", Peer: "chat1", MessageID: 50, FinalPath: "file.bin", ExpectedSize: 100}
+	_, _, _ = r.Submit(req)
+	_, _ = r.Next(context.Background())
+
+	// 1. Stale generation callback: rejected
+	res := r.FinishTask("chat1:50", "stale_gen", StateSuccess, "", "", "file.bin", false, "sha")
+	assert.Equal(t, FinishRejectedStale, res)
+
+	// 2. Valid first terminal callback: accepted
+	res = r.FinishTask("chat1:50", "1", StateSuccess, "", "", "file.bin", false, "sha")
+	assert.Equal(t, FinishAcceptedNewTerminal, res)
+
+	// 3. Duplicate same terminal callback: already same terminal
+	res = r.FinishTask("chat1:50", "1", StateSuccess, "", "", "file.bin", false, "sha")
+	assert.Equal(t, FinishAlreadySameTerminal, res)
+
+	// 4. Conflicting callback: conflicting terminal
+	res = r.FinishTask("chat1:50", "1", StateFailed, "err", "msg", "", false, "")
+	assert.Equal(t, FinishConflictingTerminal, res)
+
+	// 5. Unknown task: not found
+	res = r.FinishTask("unknown:999", "1", StateSuccess, "", "", "file.bin", false, "sha")
+	assert.Equal(t, FinishNotFound, res)
 }

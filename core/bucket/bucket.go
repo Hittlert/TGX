@@ -227,7 +227,16 @@ func (b *bucketImpl) SetTaskGeneration(taskID, gen string) {
 				b.objectCount--
 			}
 			if b.cfg.Mode == ModeSSD && entry.obj.DiskPath != "" {
-				_ = os.Remove(entry.obj.DiskPath)
+				if err := os.Remove(entry.obj.DiskPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+					go func(p string) {
+						for i := 0; i < 3; i++ {
+							time.Sleep(200 * time.Millisecond)
+							if err := os.Remove(p); err == nil || errors.Is(err, os.ErrNotExist) {
+								return
+							}
+						}
+					}(entry.obj.DiskPath)
+				}
 			} else if b.cfg.Mode == ModeMemory {
 				delete(b.memData, entry.obj.Key.String())
 			}
@@ -317,6 +326,12 @@ func (b *bucketImpl) PutObject(key ObjectKey, data []byte) error {
 			_ = os.Remove(obj.DiskPath)
 		} else if b.cfg.Mode == ModeMemory {
 			delete(b.memData, key.String())
+		}
+		// Release reservation on rejected stale generation to prevent capacity leak
+		if b.reservedBytes >= key.Length {
+			b.reservedBytes -= key.Length
+		} else {
+			b.reservedBytes = 0
 		}
 		b.notifyWaitersLocked()
 		return nil
@@ -490,6 +505,24 @@ func (b *bucketImpl) Requeue(obj *BufferObject) {
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
+
+	// Authoritative generation guard: if task has switched generation,
+	// discard the stale object and release pending-delete capacity!
+	if currentGen, ok := b.currentTaskGen[obj.Key.TaskID]; ok && currentGen != "" && obj.Key.Gen != currentGen {
+		if b.pendingDeleteBytes >= obj.Key.Length {
+			b.pendingDeleteBytes -= obj.Key.Length
+		}
+		if b.objectCount > 0 {
+			b.objectCount--
+		}
+		if b.cfg.Mode == ModeSSD && obj.DiskPath != "" {
+			_ = os.Remove(obj.DiskPath)
+		} else if b.cfg.Mode == ModeMemory {
+			delete(b.memData, obj.Key.String())
+		}
+		b.notifyWaitersLocked()
+		return
+	}
 
 	if b.pendingDeleteBytes >= obj.Key.Length {
 		b.pendingDeleteBytes -= obj.Key.Length

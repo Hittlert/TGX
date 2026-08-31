@@ -76,6 +76,11 @@ func newBucketFileElement(
 	bkt bucket.Bucket,
 	tw *targetwriter.TargetWriter,
 ) (*bucketFileElement, error) {
+	// Guard against stale/canceled Task attempt after slow resolve
+	if task.IsTerminal() || (task.Context() != nil && task.Context().Err() != nil) {
+		return nil, errors.New("task attempt is no longer active")
+	}
+
 	// Generation determined once at task submission, not derived at download time
 	gen := task.AttemptGen()
 	manifest := targetwriter.TaskManifest{
@@ -342,6 +347,11 @@ func newLazySmallFileElement(
 	bkt bucket.Bucket,
 	tw *targetwriter.TargetWriter,
 ) (*lazySmallFileElement, error) {
+	// Guard against stale/canceled Task attempt after slow resolve
+	if task.IsTerminal() || (task.Context() != nil && task.Context().Err() != nil) {
+		return nil, errors.New("task attempt is no longer active")
+	}
+
 	// Generation determined once at task submission, not derived at download time
 	gen := task.AttemptGen()
 	if bkt != nil {

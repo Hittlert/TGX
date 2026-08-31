@@ -191,16 +191,18 @@ func (r *Registry) Submit(request TaskRequest) (TaskSnapshot, bool, error) {
 			}
 			now := r.now()
 			taskCtx, taskCancel := context.WithCancel(pCtx)
-			// Unique generation for this retry attempt, determined at submission
-			*existing = taskState{
+			// Immutable Attempt: create a brand new taskState pointer for this retry attempt.
+			// Old Task instances continue to hold their original, canceled taskState pointer.
+			newState := &taskState{
 				request: request, state: StateQueued, totalSize: request.ExpectedSize, createdAt: now,
 				attemptGen: fmt.Sprintf("retry_%d", now.UnixNano()),
 				ctx: taskCtx, cancel: taskCancel,
 			}
+			r.tasks[request.ID] = newState
 			r.removeTerminalLocked(request.ID)
-			r.queue = append(r.queue, existing)
+			r.queue = append(r.queue, newState)
 			r.signalLocked()
-			return r.snapshotTaskLocked(existing, now), true, nil
+			return r.snapshotTaskLocked(newState, now), true, nil
 		}
 		return r.snapshotTaskLocked(existing, r.now()), false, nil
 	}
@@ -331,9 +333,11 @@ func (t *Task) Request() TaskRequest {
 type FinishResult int
 
 const (
-	FinishAccepted FinishResult = iota + 1
-	FinishRejectedStale
-	FinishNotFound
+	FinishAcceptedNewTerminal FinishResult = iota + 1 // Accepted and transitioned to terminal state (DB update authorized)
+	FinishAlreadySameTerminal                         // Already in the exact same terminal state (Idempotent OK, no DB update needed)
+	FinishConflictingTerminal                         // Conflict: already terminal in different state (Reject DB update)
+	FinishRejectedStale                               // Stale generation callback (Reject DB update)
+	FinishNotFound                                    // Task not found in active registry (Reject DB update)
 )
 
 // AttemptGen returns the generation ID for this task attempt.
@@ -532,9 +536,11 @@ func (r *Registry) finishWithGen(state *taskState, gen string, status TaskState,
 }
 
 // FinishTask attempts to transition a task to terminal state.
-// Returns FinishAccepted if generation matches current attempt.
+// Returns FinishAcceptedNewTerminal if generation matches and transitions from active to terminal.
+// Returns FinishAlreadySameTerminal if already in the exact same terminal state.
+// Returns FinishConflictingTerminal if already in a different terminal state.
 // Returns FinishRejectedStale if generation does not match (stale callback).
-// Returns FinishNotFound if task is not in active registry (e.g. startup recovery task).
+// Returns FinishNotFound if task is not in active registry.
 func (r *Registry) FinishTask(id, gen string, status TaskState, class, message, finalPath string, already bool, sha256 string) FinishResult {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -548,7 +554,10 @@ func (r *Registry) FinishTask(id, gen string, status TaskState, class, message, 
 		return FinishRejectedStale
 	}
 	if isTerminal(state.state) {
-		return FinishAccepted
+		if state.state == status {
+			return FinishAlreadySameTerminal
+		}
+		return FinishConflictingTerminal
 	}
 	state.state = status
 	state.errorClass = class
@@ -571,7 +580,31 @@ func (r *Registry) FinishTask(id, gen string, status TaskState, class, message, 
 		r.terminalOrder = r.terminalOrder[1:]
 		delete(r.tasks, oldest)
 	}
-	return FinishAccepted
+	return FinishAcceptedNewTerminal
+}
+
+// RegisterRecoveredTask registers a task recovered from startup crash recovery into the
+// active Registry so its finalization callback can be authoritatively validated and accepted.
+func (r *Registry) RegisterRecoveredTask(id, gen, finalPath string, expectedSize int64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	taskCtx, taskCancel := context.WithCancel(r.parentCtx)
+	state := &taskState{
+		request: TaskRequest{
+			ID:           id,
+			FinalPath:    finalPath,
+			ExpectedSize: expectedSize,
+		},
+		state:      StatePublishing,
+		attemptGen: gen,
+		totalSize:  expectedSize,
+		createdAt:  r.now(),
+		startedAt:  r.now(),
+		ctx:        taskCtx,
+		cancel:     taskCancel,
+	}
+	r.tasks[id] = state
 }
 
 func (r *Registry) Cancel(id string, reason string) {

@@ -236,3 +236,76 @@ func TestBucket_CapacityBackpressure(t *testing.T) {
 		t.Fatal("backpressure reserve did not unblock")
 	}
 }
+
+func TestBucket_PutObjectSecondGuardReleasesReservation(t *testing.T) {
+	b, err := New(Config{Mode: ModeMemory, MaxCapacity: 10 * 1024 * 1024})
+	require.NoError(t, err)
+	defer b.Close()
+
+	ctx := context.Background()
+	data := []byte("hello-data")
+	key := ObjectKey{
+		TaskID:   "task-guard",
+		Gen:      "1",
+		Offset:   0,
+		Length:   int64(len(data)),
+		Checksum: crc32.ChecksumIEEE(data),
+	}
+
+	// 1. Initially active gen is "1"
+	b.SetTaskGeneration("task-guard", "1")
+	require.NoError(t, b.Reserve(ctx, key.Length))
+	assert.Equal(t, key.Length, b.Metrics().ReservedBytes)
+
+	// 2. Cutover active gen to "2" before PutObject completes Phase 2
+	b.SetTaskGeneration("task-guard", "2")
+
+	// 3. PutObject with Gen "1" arrives
+	require.NoError(t, b.PutObject(key, data))
+
+	// Verify reservation was released (no leak) and no object added
+	m := b.Metrics()
+	assert.Equal(t, int64(0), m.ReservedBytes)
+	assert.Equal(t, int64(0), m.ReadyBytes)
+	assert.Equal(t, int64(0), m.ObjectCount)
+}
+
+func TestBucket_RequeueStaleGenerationDropped(t *testing.T) {
+	b, err := New(Config{Mode: ModeMemory, MaxCapacity: 10 * 1024 * 1024})
+	require.NoError(t, err)
+	defer b.Close()
+
+	ctx := context.Background()
+	data1 := []byte("old-attempt-chunk")
+	key1 := ObjectKey{
+		TaskID:   "task-requeue",
+		Gen:      "1",
+		Offset:   0,
+		Length:   int64(len(data1)),
+		Checksum: crc32.ChecksumIEEE(data1),
+	}
+
+	b.SetTaskGeneration("task-requeue", "1")
+	require.NoError(t, b.Reserve(ctx, key1.Length))
+	require.NoError(t, b.PutObject(key1, data1))
+
+	// TakeReady moves key1 to pending-delete
+	obj, ok := b.TakeReady()
+	require.True(t, ok)
+	assert.Equal(t, key1.Length, b.Metrics().PendingDeleteBytes)
+
+	// Cutover to generation "retry_1"
+	b.SetTaskGeneration("task-requeue", "retry_1")
+
+	// Writer fails and calls Requeue on the old generation object
+	b.Requeue(obj)
+
+	// Verify old object was dropped, PendingDeleteBytes released, and not in ready queue
+	m := b.Metrics()
+	assert.Equal(t, int64(0), m.PendingDeleteBytes)
+	assert.Equal(t, int64(0), m.ReadyBytes)
+	assert.Equal(t, int64(0), m.ObjectCount)
+
+	_, ok = b.TakeReady()
+	assert.False(t, ok)
+}

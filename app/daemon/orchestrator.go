@@ -65,45 +65,35 @@ func (o *Orchestrator) Start(ctx context.Context) {
 		o.tw.SetCallbacks(
 			func(taskID, gen, finalPath, shaHash string) {
 				// Registry validates generation atomically before any persistent side effects.
-				// If rejected (stale gen), DB is NOT updated — prevents false terminal state.
-				// If accepted or not found (e.g. startup recovery task), DB is updated.
-				updateDB := false
+				// Only accept valid new terminal transitions.
+				// Stale, conflicting, duplicate, or unknown callbacks are rejected without DB side effects.
 				if o.registry != nil {
 					res := o.registry.FinishTask(taskID, gen, StateSuccess, "", "", finalPath, false, shaHash)
-					if res == FinishAccepted || res == FinishNotFound {
-						updateDB = true
+					if res != FinishAcceptedNewTerminal {
+						return
 					}
-				} else {
-					updateDB = true
 				}
-				if updateDB {
-					parts := strings.Split(taskID, ":")
-					if len(parts) == 2 {
-						var msgID int
-						_, _ = fmt.Sscanf(parts[1], "%d", &msgID)
-						_ = o.db.UpdateDownloadStatus(parts[0], msgID, "success", "", finalPath, "", 0, "")
-					}
+				parts := strings.Split(taskID, ":")
+				if len(parts) == 2 {
+					var msgID int
+					_, _ = fmt.Sscanf(parts[1], "%d", &msgID)
+					_ = o.db.UpdateDownloadStatus(parts[0], msgID, "success", "", finalPath, "", 0, "")
 				}
 			},
 			func(taskID string, movedBytes, totalBytes int64) {
 			},
 			func(taskID, gen string, err error) {
-				updateDB := false
 				if o.registry != nil {
 					res := o.registry.FinishTask(taskID, gen, StateFailed, "write_error", err.Error(), "", false, "")
-					if res == FinishAccepted || res == FinishNotFound {
-						updateDB = true
+					if res != FinishAcceptedNewTerminal {
+						return
 					}
-				} else {
-					updateDB = true
 				}
-				if updateDB {
-					parts := strings.Split(taskID, ":")
-					if len(parts) == 2 {
-						var msgID int
-						_, _ = fmt.Sscanf(parts[1], "%d", &msgID)
-						_ = o.db.UpdateDownloadStatus(parts[0], msgID, "failed", "", "", "", 0, err.Error())
-					}
+				parts := strings.Split(taskID, ":")
+				if len(parts) == 2 {
+					var msgID int
+					_, _ = fmt.Sscanf(parts[1], "%d", &msgID)
+					_ = o.db.UpdateDownloadStatus(parts[0], msgID, "failed", "", "", "", 0, err.Error())
 				}
 			},
 		)

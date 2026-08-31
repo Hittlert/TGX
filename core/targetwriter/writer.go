@@ -360,8 +360,11 @@ func (w *TargetWriter) drainPendingFinalizes() {
 				// Permanent: content conflict or irrecoverable. Enter terminal state.
 				w.pendingFinalize.Delete(taskID)
 				w.pendingFinalizeNext.Delete(taskID)
-				w.manifests.Delete(taskID)
-				w.bitmaps.Delete(taskID)
+				// Generation-aware cleanup: only delete manifest/bitmap if current gen matches
+				if curVal, ok := w.manifests.Load(taskID); ok && curVal.(TaskManifest).Gen == manifest.Gen {
+					w.manifests.Delete(taskID)
+					w.bitmaps.Delete(taskID)
+				}
 				if w.onError != nil {
 					w.onError(taskID, manifest.Gen, fmt.Errorf("permanent finalize error: %w", err))
 				}
