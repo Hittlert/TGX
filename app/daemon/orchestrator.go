@@ -270,8 +270,7 @@ func (o *Orchestrator) dispatchOneRecord(ctx context.Context, record DownloadRec
 			if err != nil {
 				return
 			}
-			// Fix P1-3: Use sync.Once to release slot exactly once.
-			// Slot is released when task enters moving (AsyncMoving) OR on return.
+			// Slot released via sync.Once: either when task enters moving or on return.
 			releaseSlot = func() { slotOnce.Do(func() { o.slotPool.Release(taskID) }) }
 			defer releaseSlot()
 		}
@@ -352,8 +351,7 @@ func (o *Orchestrator) dispatchOneRecord(ctx context.Context, record DownloadRec
 			if snapshot.State == StatePublishing && !recordedMoving {
 				recordedMoving = true
 				_ = o.db.UpdateDownloadStatus(record.ChatID, record.MessageID, "moving", record.FileName, finalRelPath, record.MediaType, record.FileSize, "")
-				// Fix P1-3: Release network/file slot immediately when entering moving.
-				// TargetWriter will handle the rest; network can serve other files now.
+				// Release network slot: TargetWriter handles the rest, network is free for other files.
 				if isLargeFile {
 					releaseSlot()
 				}

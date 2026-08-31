@@ -127,24 +127,36 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) ([]TaskRecoveryResult, er
 			if metaErr == nil {
 				var manifest targetwriter.TaskManifest
 				if json.Unmarshal(metaData, &manifest) == nil && r.tw != nil {
-					// Fix P0-3: Validate .moving file and sidecar ranges consistency
+					// Validate manifest identity and physical consistency
 					valid := true
 					reason := ""
 
-					// 1. TaskID must match
+					// Identity: taskID, finalPath and expectedSize must match DB record
 					if manifest.TaskID != fileKey {
 						valid = false
 						reason = "taskID mismatch"
 					}
-
-					// 2. .moving file must exist
-					movingStat, movingStatErr := os.Stat(movingPath)
-					if movingStatErr != nil {
+					if valid && manifest.FinalPath != rec.SavePath {
 						valid = false
-						reason = ".moving file missing"
+						reason = fmt.Sprintf("finalPath mismatch: manifest=%q db=%q", manifest.FinalPath, rec.SavePath)
+					}
+					if valid && rec.FileSize > 0 && manifest.ExpectedSize != rec.FileSize {
+						valid = false
+						reason = fmt.Sprintf("expectedSize mismatch: manifest=%d db=%d", manifest.ExpectedSize, rec.FileSize)
 					}
 
-					// 3. Validate ranges
+					// Physical: .moving file must exist and cover all durable ranges
+					var movingStat os.FileInfo
+					if valid {
+						var movingStatErr error
+						movingStat, movingStatErr = os.Stat(movingPath)
+						if movingStatErr != nil {
+							valid = false
+							reason = ".moving file missing"
+						}
+					}
+
+					// Ranges: bounds valid, within expected size, covered by .moving
 					if valid {
 						var maxEnd int64
 						for _, rng := range manifest.Ranges {
@@ -162,7 +174,6 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) ([]TaskRecoveryResult, er
 								maxEnd = rng.End
 							}
 						}
-						// .moving must be at least as large as the highest durable range
 						if valid && movingStat.Size() < maxEnd {
 							valid = false
 							reason = fmt.Sprintf(".moving size %d < max range end %d", movingStat.Size(), maxEnd)
@@ -170,13 +181,30 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) ([]TaskRecoveryResult, er
 					}
 
 					if valid {
+						// RegisterTask handles generation isolation and complete-bitmap finalize internally
 						r.tw.RegisterTask(manifest)
-						results = append(results, TaskRecoveryResult{
-							FileKey:     fileKey,
-							PrevState:   rec.Status,
-							NextState:   "moving",
-							ActionTaken: "SSD_BUFFER_RESUMED_IN_TARGET_WRITER",
-						})
+
+						// Determine if bitmap is complete to choose recovery action
+						bm := targetwriter.NewMovedBitmapWithRanges(manifest.ExpectedSize, manifest.Ranges)
+						if bm.IsComplete() {
+							// Complete bitmap: TargetWriter will finalize via pendingFinalize queue
+							results = append(results, TaskRecoveryResult{
+								FileKey:     fileKey,
+								PrevState:   rec.Status,
+								NextState:   "moving",
+								ActionTaken: "SSD_BUFFER_COMPLETE_FINALIZE_PENDING",
+							})
+						} else {
+							// Incomplete bitmap: reset DB to pending so pending scanner
+							// re-dispatches the task to fill missing ranges via network
+							_, _ = r.db.ExecContext(ctx, `UPDATE download_records SET status = 'pending' WHERE chat_id = ? AND message_id = ?`, rec.ChatID, rec.MessageID)
+							results = append(results, TaskRecoveryResult{
+								FileKey:     fileKey,
+								PrevState:   rec.Status,
+								NextState:   "pending",
+								ActionTaken: "SSD_BUFFER_PARTIAL_RESET_TO_PENDING",
+							})
+						}
 						continue
 					}
 

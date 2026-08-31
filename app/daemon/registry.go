@@ -190,7 +190,7 @@ func (r *Registry) Submit(request TaskRequest) (TaskSnapshot, bool, error) {
 			}
 			now := r.now()
 			taskCtx, taskCancel := context.WithCancel(pCtx)
-			// Fix P1-1: Generate a unique attemptGen for this retry attempt
+			// Unique generation for this retry attempt, determined at submission
 			*existing = taskState{
 				request: request, state: StateQueued, totalSize: request.ExpectedSize, createdAt: now,
 				attemptGen: fmt.Sprintf("retry_%d", now.UnixNano()),

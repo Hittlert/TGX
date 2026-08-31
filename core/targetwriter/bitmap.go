@@ -127,33 +127,20 @@ func (b *MovedBitmap) Contains(offset, length int64) bool {
 	return false
 }
 
-// RemoveMark rolls back a previously added [offset, offset+length) mark.
-// Used when sidecar persist fails after AddMark — the bitmap must reflect
-// only what has been durably committed to the sidecar.
-func (b *MovedBitmap) RemoveMark(offset, length int64) {
-	if length <= 0 || offset < 0 {
-		return
-	}
+// Snapshot returns a deep copy of the current durable ranges for transactional rollback.
+// Use with Restore to implement atomic AddMark + persist: if persist fails,
+// Restore the snapshot instead of attempting a partial inverse operation.
+func (b *MovedBitmap) Snapshot() []Range {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	snap := make([]Range, len(b.ranges))
+	copy(snap, b.ranges)
+	return snap
+}
+
+// Restore atomically replaces the current ranges with a previously taken snapshot.
+func (b *MovedBitmap) Restore(snapshot []Range) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-
-	cutStart := offset
-	cutEnd := offset + length
-
-	var newRanges []Range
-	for _, r := range b.ranges {
-		if r.End <= cutStart || r.Start >= cutEnd {
-			// No overlap
-			newRanges = append(newRanges, r)
-		} else {
-			// Overlap: split around the cut region
-			if r.Start < cutStart {
-				newRanges = append(newRanges, Range{Start: r.Start, End: cutStart})
-			}
-			if r.End > cutEnd {
-				newRanges = append(newRanges, Range{Start: cutEnd, End: r.End})
-			}
-		}
-	}
-	b.ranges = newRanges
+	b.ranges = snapshot
 }

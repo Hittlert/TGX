@@ -215,7 +215,7 @@ func (b *bucketImpl) PutObject(key ObjectKey, data []byte) error {
 	// caller's reservation (since it won't become a new ready object) and return nil.
 	if taskMap, ok := b.readyByTask[key.TaskID]; ok {
 		if entry, exists := taskMap[key.Offset]; exists && entry.obj.Key.Gen == key.Gen && entry.obj.Key.Checksum == key.Checksum {
-			// Fix P0-5: Release the reservation that the caller already made
+			// Duplicate object: release the caller's reservation to prevent capacity leak
 			if b.reservedBytes >= key.Length {
 				b.reservedBytes -= key.Length
 			}
@@ -271,6 +271,21 @@ func (b *bucketImpl) PutObject(key ObjectKey, data []byte) error {
 		b.readyByTask[key.TaskID] = taskMap
 		b.taskOrder = append(b.taskOrder, key.TaskID)
 	}
+
+	// If overwriting an existing entry (different gen/checksum at same offset),
+	// reclaim the old entry's capacity and remove orphaned SSD file.
+	if oldEntry, exists := taskMap[key.Offset]; exists {
+		if b.readyBytes >= oldEntry.obj.Key.Length {
+			b.readyBytes -= oldEntry.obj.Key.Length
+		}
+		if b.objectCount > 0 {
+			b.objectCount--
+		}
+		if b.cfg.Mode == ModeSSD && oldEntry.obj.DiskPath != "" {
+			_ = os.Remove(oldEntry.obj.DiskPath)
+		}
+	}
+
 	taskMap[key.Offset] = &readyEntry{
 		obj:     obj,
 		addedAt: time.Now(),
@@ -460,7 +475,7 @@ func (b *bucketImpl) DeleteObjects(keys []ObjectKey) error {
 				freedBytes += key.Length
 				freedCount++
 			} else {
-				// Fix P1-5: Collect SSD delete failures instead of silently ignoring
+				// Collect SSD delete failures to prevent permanent pendingDeleteBytes leak
 				deleteErrs = append(deleteErrs, fmt.Errorf("remove %s: %w", absPath, err1))
 			}
 		}

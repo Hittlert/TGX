@@ -255,10 +255,10 @@ func Run(ctx context.Context, client *telegram.Client, kvd storage.Storage, opts
 		orchestrator.SetBufferDir(opts.BufferDir)
 		orchestrator.SetBucket(bkt)
 		orchestrator.SetTargetWriter(tw)
-		orchestrator.Start(groupCtx) // This installs TargetWriter callbacks
+		orchestrator.Start(groupCtx) // Installs TargetWriter callbacks
 
-		// Fix P0-4: Only now allow TargetWriter to start consuming objects,
-		// after callbacks are installed by orchestrator.Start().
+		// Allow TargetWriter to consume only after callbacks are installed,
+		// guaranteeing that no completed task is lost during recovery.
 		if tw != nil {
 			tw.BeginConsuming()
 		}

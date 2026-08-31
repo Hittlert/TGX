@@ -76,7 +76,7 @@ func newBucketFileElement(
 	bkt bucket.Bucket,
 	tw *targetwriter.TargetWriter,
 ) (*bucketFileElement, error) {
-	// Fix P1-1: Use generation from task state, not the cleared Retry bool
+	// Generation determined once at task submission, not derived at download time
 	gen := task.AttemptGen()
 	manifest := targetwriter.TaskManifest{
 		TaskID:       task.Request().ID,
@@ -339,7 +339,7 @@ func newLazySmallFileElement(
 	bkt bucket.Bucket,
 	tw *targetwriter.TargetWriter,
 ) (*lazySmallFileElement, error) {
-	// Fix P1-1: Use generation from task state, not the cleared Retry bool
+	// Generation determined once at task submission, not derived at download time
 	gen := task.AttemptGen()
 	if tw != nil {
 		manifest := targetwriter.TaskManifest{
@@ -395,7 +395,7 @@ func (e *lazySmallFileElement) Publish() (result PublishResult, resultErr error)
 	shaHash := hex.EncodeToString(hashBytes[:])
 
 	if e.bkt != nil && e.tw != nil {
-		// Fix P1-1: Use generation from task state
+		// Generation from task state, consistent with element construction
 		gen := e.task.AttemptGen()
 		key := bucket.ObjectKey{
 			TaskID:           e.task.Request().ID,

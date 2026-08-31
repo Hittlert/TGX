@@ -46,6 +46,7 @@ func TestTargetWriter_OutOfOrderAndContiguous(t *testing.T) {
 		TaskID:       "task-oo",
 		FinalPath:    "Videos/movie.mp4",
 		ExpectedSize: totalSize,
+		Gen:          "g1",
 	}
 	tw.RegisterTask(manifest)
 

@@ -31,35 +31,55 @@ type TaskManifest struct {
 }
 
 type Metrics struct {
-	Active                bool    `json:"active"`
-	BytesPerSecond        float64 `json:"bytes_per_second"`
-	ContiguousWriteRatio  float64 `json:"contiguous_write_ratio"`
-	ActiveFilesCount      int     `json:"active_files_count"`
-	TotalBytesWritten     int64   `json:"total_bytes_written"`
-	LastError             string  `json:"last_error"`
+	Active               bool    `json:"active"`
+	BytesPerSecond       float64 `json:"bytes_per_second"`
+	ContiguousWriteRatio float64 `json:"contiguous_write_ratio"`
+	ActiveFilesCount     int     `json:"active_files_count"`
+	TotalBytesWritten    int64   `json:"total_bytes_written"`
+	LastError            string  `json:"last_error"`
 }
 
-const maxTaskRetries = 5 // After this many consecutive errors on a task, declare permanent failure
+// processPhase represents the outcome of processObject, determined by which
+// durability boundary the operation crossed before encountering an error.
+//
+// The critical invariant: once AckDurable succeeds, the source buffer object
+// no longer exists and must NEVER be Requeued.
+type processPhase int
+
+const (
+	phaseDurableOK         processPhase = iota // Object durable, source deleted, all good
+	phaseObjectRetryable                       // Error before AckDurable: source exists, safe to Requeue
+	phaseFinalizeRetryable                     // Error after AckDurable (in finalize): must not Requeue source
+	phaseStaleDiscarded                        // Object from old generation: silently consumed
+)
+
+type processResult struct {
+	phase processPhase
+	err   error
+}
 
 type TargetWriter struct {
-	bkt         bucket.Bucket
-	outputDir   string
-	manifests   sync.Map // taskID -> TaskManifest
-	bitmaps     sync.Map // taskID -> *MovedBitmap
-	openFiles   sync.Map // taskID -> *os.File
-	hashers     sync.Map // taskID -> hash.Hash
-	onComplete  func(taskID, finalPath string, shaHash string)
-	onProgress  func(taskID string, movedBytes, totalBytes int64)
-	onError     func(taskID string, err error)
+	bkt       bucket.Bucket
+	outputDir string
 
-	writtenBytes      int64
-	contiguousWrites  int64
-	totalWrites       int64
-	lastBPSBits       uint64 // atomic float64
-	lastError         string
-	errMu             sync.RWMutex
+	manifests       sync.Map // taskID → TaskManifest (exactly one generation per taskID)
+	bitmaps         sync.Map // taskID → *MovedBitmap
+	openFiles       sync.Map // taskID → *os.File
+	pendingFinalize sync.Map // taskID → TaskManifest (complete bitmap awaiting finalize)
 
-	consumeGate chan struct{} // closed when writerLoop should start consuming (after callbacks are set)
+	onComplete func(taskID, finalPath string, shaHash string)
+	onProgress func(taskID string, movedBytes, totalBytes int64)
+	onError    func(taskID string, err error)
+
+	writtenBytes     int64
+	contiguousWrites int64
+	totalWrites      int64
+	lastBPSBits      uint64 // atomic float64
+	lastError        string
+	errMu            sync.RWMutex
+
+	consumeOnce sync.Once
+	consumeGate chan struct{}
 	ctx         context.Context
 	cancel      context.CancelFunc
 	wg          sync.WaitGroup
@@ -84,17 +104,41 @@ func (w *TargetWriter) SetCallbacks(
 	w.onError = onError
 }
 
+// RegisterTask registers or re-registers a task manifest for target writing.
+//
+// Generation isolation: if a manifest already exists with a different generation,
+// all prior state (bitmap, FD, pending finalize) is cleared. A new generation
+// must not inherit durable ranges or file handles from a previous attempt.
+//
+// Complete bitmap recovery: if the registered bitmap is already complete (all
+// ranges cover [0, expectedSize)), the task is queued for immediate finalize.
+// This handles the crash-after-last-Ack-before-finalize recovery case where
+// no more Ready objects will arrive to trigger finalize.
 func (w *TargetWriter) RegisterTask(manifest TaskManifest) {
-	w.manifests.Store(manifest.TaskID, manifest)
-	if _, ok := w.bitmaps.Load(manifest.TaskID); !ok {
-		bm := NewMovedBitmapWithRanges(manifest.ExpectedSize, manifest.Ranges)
-		w.bitmaps.Store(manifest.TaskID, bm)
+	// Generation isolation: clear stale state from previous attempt
+	if val, ok := w.manifests.Load(manifest.TaskID); ok {
+		old := val.(TaskManifest)
+		if old.Gen != manifest.Gen {
+			w.bitmaps.Delete(manifest.TaskID)
+			if fVal, fOk := w.openFiles.LoadAndDelete(manifest.TaskID); fOk {
+				_ = fVal.(*os.File).Close()
+			}
+			w.pendingFinalize.Delete(manifest.TaskID)
+		}
 	}
-	w.hashers.Store(manifest.TaskID, sha256.New())
+
+	w.manifests.Store(manifest.TaskID, manifest)
+	bm := NewMovedBitmapWithRanges(manifest.ExpectedSize, manifest.Ranges)
+	w.bitmaps.Store(manifest.TaskID, bm)
+
+	// Complete bitmap: enqueue finalize (no Ready objects will arrive for this task)
+	if bm.IsComplete() {
+		w.pendingFinalize.Store(manifest.TaskID, manifest)
+	}
 }
 
-// Start initializes the writer context and launches background goroutines.
-// The writerLoop will NOT consume objects until BeginConsuming() is called.
+// Start initializes context and launches background goroutines.
+// The writerLoop blocks on consumeGate until BeginConsuming is called.
 func (w *TargetWriter) Start(ctx context.Context) {
 	w.ctx, w.cancel = context.WithCancel(ctx)
 	w.wg.Add(1)
@@ -102,15 +146,11 @@ func (w *TargetWriter) Start(ctx context.Context) {
 	go w.metricsLoop()
 }
 
-// BeginConsuming signals the writerLoop to start consuming Ready objects.
-// Must be called AFTER SetCallbacks so that onComplete/onError are installed.
+// BeginConsuming unblocks the writerLoop. Must be called after SetCallbacks
+// to guarantee callbacks are installed before any object is processed.
+// Concurrent-safe and idempotent (uses sync.Once internally).
 func (w *TargetWriter) BeginConsuming() {
-	select {
-	case <-w.consumeGate:
-		// Already closed (idempotent)
-	default:
-		close(w.consumeGate)
-	}
+	w.consumeOnce.Do(func() { close(w.consumeGate) })
 }
 
 func (w *TargetWriter) metricsLoop() {
@@ -126,8 +166,7 @@ func (w *TargetWriter) metricsLoop() {
 			current := atomic.LoadInt64(&w.writtenBytes)
 			diff := current - prevBytes
 			prevBytes = current
-			bps := float64(diff)
-			atomic.StoreUint64(&w.lastBPSBits, uint64(bps))
+			atomic.StoreUint64(&w.lastBPSBits, uint64(float64(diff)))
 		}
 	}
 }
@@ -150,11 +189,9 @@ func (w *TargetWriter) Metrics() Metrics {
 		return true
 	})
 
-	bps := float64(atomic.LoadUint64(&w.lastBPSBits))
-
 	return Metrics{
 		Active:               atomic.LoadInt32(&w.closed) == 0,
-		BytesPerSecond:       bps,
+		BytesPerSecond:       float64(atomic.LoadUint64(&w.lastBPSBits)),
 		ContiguousWriteRatio: ratio,
 		ActiveFilesCount:     activeFiles,
 		TotalBytesWritten:    atomic.LoadInt64(&w.writtenBytes),
@@ -162,12 +199,21 @@ func (w *TargetWriter) Metrics() Metrics {
 	}
 }
 
-const maxSequentialQuantum = 16 // Max consecutive 1MB chunks on same task before fair yield
+func (w *TargetWriter) setLastError(err error) {
+	if err == nil {
+		return
+	}
+	w.errMu.Lock()
+	w.lastError = err.Error()
+	w.errMu.Unlock()
+}
+
+const maxSequentialQuantum = 16
 
 func (w *TargetWriter) writerLoop() {
 	defer w.wg.Done()
 
-	// Fix P0-4: Wait for callbacks to be installed before consuming any objects.
+	// Block until callbacks are installed
 	select {
 	case <-w.consumeGate:
 	case <-w.ctx.Done():
@@ -175,9 +221,8 @@ func (w *TargetWriter) writerLoop() {
 	}
 
 	var currentTaskID string
-	var nextOffset int64 = 0
-	var sequentialCount int = 0
-	taskRetries := make(map[string]int) // Fix P1-2: per-task retry counter
+	var nextOffset int64
+	var sequentialCount int
 
 	for {
 		if atomic.LoadInt32(&w.closed) == 1 {
@@ -188,6 +233,9 @@ func (w *TargetWriter) writerLoop() {
 			return
 		default:
 		}
+
+		// Drain any tasks with complete bitmaps awaiting finalize (recovery case)
+		w.drainPendingFinalizes()
 
 		var obj *bucket.BufferObject
 		var isContiguous bool
@@ -201,7 +249,7 @@ func (w *TargetWriter) writerLoop() {
 			}
 		}
 
-		// 2. If quantum exhausted or no contiguous object, take highest-priority ready object
+		// 2. Take highest-priority ready object
 		if obj == nil {
 			if readyObj, ok := w.bkt.TakeReady(); ok {
 				obj = readyObj
@@ -226,121 +274,133 @@ func (w *TargetWriter) writerLoop() {
 			continue
 		}
 
-		// Process and write object to target
-		err := w.processObject(obj, isContiguous)
-		if err != nil {
-			taskID := obj.Key.TaskID
-
-			w.errMu.Lock()
-			w.lastError = err.Error()
-			w.errMu.Unlock()
-
-			// Fix P1-2: Distinguish retryable vs permanent errors.
-			// Only call onError after retries are exhausted; otherwise just Requeue.
-			taskRetries[taskID]++
-			if taskRetries[taskID] >= maxTaskRetries {
-				// Permanent failure: don't requeue, call onError to enter terminal state
-				delete(taskRetries, taskID)
-				// Clean up open FD and tracking for this task
-				if val, ok := w.openFiles.LoadAndDelete(taskID); ok {
-					f := val.(*os.File)
-					_ = f.Close()
-				}
-				if w.onError != nil {
-					w.onError(taskID, fmt.Errorf("target write failed after %d retries: %w", maxTaskRetries, err))
-				}
-			} else {
-				// Transient: requeue object for retry, do NOT call onError
-				w.bkt.Requeue(obj)
+		// Phase state machine: action depends on which durability boundary was crossed
+		result := w.processObject(obj, isContiguous)
+		switch result.phase {
+		case phaseDurableOK, phaseStaleDiscarded:
+			if result.phase == phaseDurableOK {
+				currentTaskID = obj.Key.TaskID
+				nextOffset = obj.Key.Offset + obj.Key.Length
 			}
 
-			// Reset current task tracker
+		case phaseObjectRetryable:
+			// Error before AckDurable: source object still exists → safe to Requeue
+			w.bkt.Requeue(obj)
+			w.setLastError(result.err)
 			currentTaskID = ""
 			nextOffset = 0
 			sequentialCount = 0
+			time.Sleep(100 * time.Millisecond)
 
-			// Back off: exponential based on retry count, capped at 2s
-			backoff := time.Duration(50<<taskRetries[taskID]) * time.Millisecond
-			if backoff > 2*time.Second {
-				backoff = 2 * time.Second
+		case phaseFinalizeRetryable:
+			// Error after AckDurable (during finalize): source is deleted.
+			// Enqueue task for finalize retry. NEVER Requeue the source object.
+			taskID := obj.Key.TaskID
+			if m, ok := w.manifests.Load(taskID); ok {
+				w.pendingFinalize.Store(taskID, m.(TaskManifest))
 			}
-			if backoff < 50*time.Millisecond {
-				backoff = 50 * time.Millisecond
-			}
-			time.Sleep(backoff)
-		} else {
-			// Success: clear retry counter for this task
-			delete(taskRetries, obj.Key.TaskID)
-			currentTaskID = obj.Key.TaskID
-			nextOffset = obj.Key.Offset + obj.Key.Length
+			w.setLastError(result.err)
+			currentTaskID = ""
+			nextOffset = 0
+			sequentialCount = 0
 		}
 	}
 }
 
-func (w *TargetWriter) processObject(obj *bucket.BufferObject, isContiguous bool) error {
+// drainPendingFinalizes attempts to finalize all tasks that have complete
+// bitmaps but haven't been finalized yet. On failure, the task remains in
+// the queue for the next iteration.
+func (w *TargetWriter) drainPendingFinalizes() {
+	w.pendingFinalize.Range(func(key, value any) bool {
+		taskID := key.(string)
+		manifest := value.(TaskManifest)
+		if err := w.finalizeTask(manifest); err != nil {
+			w.setLastError(err)
+			// Leave in pendingFinalize for retry on next loop iteration
+		} else {
+			w.pendingFinalize.Delete(taskID)
+		}
+		return true
+	})
+}
+
+// processObject writes a single buffer object to the target .moving file.
+//
+// The function is organized around the AckDurable boundary:
+//   - BEFORE AckDurable: errors are ObjectRetryable (source can be Requeued)
+//   - AFTER AckDurable: errors are FinalizeRetryable (source is gone, must not Requeue)
+func (w *TargetWriter) processObject(obj *bucket.BufferObject, isContiguous bool) processResult {
 	taskID := obj.Key.TaskID
 
-	// 1. Look up task manifest
+	// Phase 1: Look up task manifest
 	val, ok := w.manifests.Load(taskID)
 	if !ok {
-		// Task manifest not registered yet (e.g. during startup before task resolve). Requeue!
-		return errors.New("task manifest not registered yet")
+		return processResult{phaseObjectRetryable, errors.New("task manifest not registered yet")}
 	}
 	manifest := val.(TaskManifest)
 
-	// 2. Fetch data from Buffer
+	// Generation guard: reject objects from stale attempts.
+	// Release buffer capacity for the stale object without writing.
+	if obj.Key.Gen != manifest.Gen {
+		_ = w.bkt.AckDurable([]bucket.ObjectKey{obj.Key})
+		return processResult{phase: phaseStaleDiscarded}
+	}
+
+	// Phase 2: Fetch data from buffer
 	var data []byte
 	if len(obj.Data) > 0 {
 		data = obj.Data
 	} else {
 		readData, err := w.bkt.ReadObject(obj.Key)
 		if err != nil {
-			return fmt.Errorf("read buffer object %s: %w", obj.Key, err)
+			return processResult{phaseObjectRetryable, fmt.Errorf("read buffer object %s: %w", obj.Key, err)}
 		}
 		data = readData
 	}
 
-	// 3. Get or open target.moving file descriptor
+	// Phase 3: Write data to target .moving file
 	f, err := w.getOrOpenFile(manifest)
 	if err != nil {
-		return fmt.Errorf("open target moving file: %w", err)
+		return processResult{phaseObjectRetryable, fmt.Errorf("open target moving file: %w", err)}
 	}
 
-	// 4. Write data at exact offset
 	nw, err := f.WriteAt(data, obj.Key.Offset)
 	if err != nil {
-		return fmt.Errorf("writeAt target moving file: %w", err)
+		return processResult{phaseObjectRetryable, fmt.Errorf("writeAt target moving file: %w", err)}
 	}
 	if int64(nw) != obj.Key.Length {
-		return fmt.Errorf("short write to target: %d of %d bytes", nw, obj.Key.Length)
+		return processResult{phaseObjectRetryable, fmt.Errorf("short write to target: %d of %d bytes", nw, obj.Key.Length)}
 	}
 
-	// 5. fdatasync target file
 	if err := f.Sync(); err != nil {
-		return fmt.Errorf("sync target file: %w", err)
+		return processResult{phaseObjectRetryable, fmt.Errorf("sync target file: %w", err)}
 	}
 
-	// 6. Update durable moved bitmap
+	// Phase 4: Bitmap + sidecar durable commit (transactional via snapshot/restore)
 	bmVal, _ := w.bitmaps.Load(taskID)
 	bm := bmVal.(*MovedBitmap)
+
+	snapshot := bm.Snapshot()
 	bm.AddMark(obj.Key.Offset, obj.Key.Length)
 
-	// Fix P0-1 + P0-2: Persist sidecar metadata with full fsync.
-	// If persist fails, return error to trigger Requeue — do NOT AckDurable.
 	manifest.Ranges = bm.Ranges()
 	manifest.Version = sidecarVersion
 	if err := w.persistMeta(manifest); err != nil {
-		// Rollback the in-memory bitmap mark since sidecar is not durable
-		bm.RemoveMark(obj.Key.Offset, obj.Key.Length)
-		return fmt.Errorf("persist sidecar metadata: %w", err)
+		// Sidecar not durable: restore bitmap to match the persisted state
+		bm.Restore(snapshot)
+		return processResult{phaseObjectRetryable, fmt.Errorf("persist sidecar metadata: %w", err)}
 	}
 
-	// 7. Ack durable in bucket (deletes source object and frees capacity!)
+	// ──── DURABILITY BOUNDARY ────
+	// After this point, the source buffer object is deleted.
+	// Errors below must NEVER result in Requeue of the source object.
+
 	if err := w.bkt.AckDurable([]bucket.ObjectKey{obj.Key}); err != nil {
-		return fmt.Errorf("ack durable object: %w", err)
+		// AckDurable failed: source might still exist. Safe to retry via Requeue.
+		return processResult{phaseObjectRetryable, fmt.Errorf("ack durable object: %w", err)}
 	}
 
-	// Track metrics
+	// Track write metrics
 	atomic.AddInt64(&w.writtenBytes, obj.Key.Length)
 	atomic.AddInt64(&w.totalWrites, 1)
 	if isContiguous {
@@ -351,16 +411,21 @@ func (w *TargetWriter) processObject(obj *bucket.BufferObject, isContiguous bool
 		w.onProgress(taskID, bm.DurableBytes(), manifest.ExpectedSize)
 	}
 
-	// 8. Check if file is 100% complete
+	// Phase 5: Finalize if all ranges are complete
 	if bm.IsComplete() {
-		return w.finalizeTask(manifest)
+		if err := w.finalizeTask(manifest); err != nil {
+			return processResult{phaseFinalizeRetryable, err}
+		}
 	}
 
-	return nil
+	return processResult{phase: phaseDurableOK}
 }
 
-// persistMeta writes the sidecar metadata file with full durability guarantees:
-// write tmp → fsync tmp → rename → fsync directory.
+// persistMeta writes the sidecar metadata file with full durability guarantee:
+// write tmp → fsync tmp → close → rename → fsync directory.
+//
+// The contract: if this function returns nil, the sidecar content survives
+// power loss. All errors (including directory fsync) are returned.
 func (w *TargetWriter) persistMeta(manifest TaskManifest) error {
 	finalPath := filepath.Join(w.outputDir, manifest.FinalPath)
 	metaPath := finalPath + ".moving.meta"
@@ -372,7 +437,6 @@ func (w *TargetWriter) persistMeta(manifest TaskManifest) error {
 		return fmt.Errorf("marshal sidecar: %w", err)
 	}
 
-	// Open tmp file explicitly so we can fsync before rename
 	f, err := os.OpenFile(tmpMetaPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
 		return fmt.Errorf("create sidecar tmp: %w", err)
@@ -384,7 +448,6 @@ func (w *TargetWriter) persistMeta(manifest TaskManifest) error {
 		return fmt.Errorf("write sidecar tmp: %w", err)
 	}
 
-	// Fsync tmp file to guarantee content is on disk before rename
 	if err := f.Sync(); err != nil {
 		_ = f.Close()
 		_ = os.Remove(tmpMetaPath)
@@ -395,20 +458,21 @@ func (w *TargetWriter) persistMeta(manifest TaskManifest) error {
 		return fmt.Errorf("close sidecar tmp: %w", err)
 	}
 
-	// Atomic rename
 	if err := os.Rename(tmpMetaPath, metaPath); err != nil {
 		_ = os.Remove(tmpMetaPath)
 		return fmt.Errorf("rename sidecar: %w", err)
 	}
 
-	// Fsync the directory to make the rename durable across power loss
+	// Directory fsync: ensures the rename is durable across power loss.
+	// This is required — returning nil without dir fsync violates the durability contract.
 	d, err := os.Open(dir)
 	if err != nil {
-		// Rename succeeded but dir sync failed: data is likely durable on most
-		// filesystems (ext4/btrfs) but not guaranteed. Log and continue.
-		return nil
+		return fmt.Errorf("open directory for fsync: %w", err)
 	}
-	_ = d.Sync()
+	if err := d.Sync(); err != nil {
+		_ = d.Close()
+		return fmt.Errorf("fsync directory: %w", err)
+	}
 	_ = d.Close()
 
 	return nil
@@ -461,7 +525,7 @@ func (w *TargetWriter) finalizeTask(manifest TaskManifest) error {
 		return fmt.Errorf("final size %d does not match expected %d", stat.Size(), manifest.ExpectedSize)
 	}
 
-	// Set modification time if present
+	// Set modification time
 	if manifest.Date > 0 {
 		when := time.Unix(manifest.Date, 0)
 		_ = os.Chtimes(movingPath, when, when)
@@ -476,16 +540,15 @@ func (w *TargetWriter) finalizeTask(manifest TaskManifest) error {
 	// Atomic non-replacing commit to final destination
 	if err := atomicCommit.CommitFile(movingPath, finalPath); err != nil {
 		if errors.Is(err, atomicCommit.ErrTargetExists) {
-			// Fix P1-7: Compare SHA256 with existing file, not just size
-			if existingSHA, existErr := computeFileSHA256(finalPath); existErr == nil && existingSHA == shaHash {
-				_ = os.Remove(movingPath)
-				_ = os.Remove(metaPath)
-			} else if existingStat, checkErr := os.Stat(finalPath); checkErr == nil && existingStat.Size() == manifest.ExpectedSize {
-				// Fallback: size matches but SHA differs or couldn't be computed — accept with warning
+			// Content identity check: accept only if SHA256 matches exactly.
+			// No size-only fallback — different content must not be silently accepted.
+			existingSHA, existErr := computeFileSHA256(finalPath)
+			if existErr == nil && existingSHA == shaHash {
 				_ = os.Remove(movingPath)
 				_ = os.Remove(metaPath)
 			} else {
-				return fmt.Errorf("target exists with conflicting content: %w", err)
+				return fmt.Errorf("target exists with different content (existing_sha=%s, new_sha=%s): %w",
+					existingSHA, shaHash, err)
 			}
 		} else {
 			return fmt.Errorf("commit target file: %w", err)
@@ -497,7 +560,7 @@ func (w *TargetWriter) finalizeTask(manifest TaskManifest) error {
 	// Clean tracking state
 	w.manifests.Delete(taskID)
 	w.bitmaps.Delete(taskID)
-	w.hashers.Delete(taskID)
+	w.pendingFinalize.Delete(taskID)
 
 	if w.onComplete != nil {
 		w.onComplete(taskID, manifest.FinalPath, shaHash)
