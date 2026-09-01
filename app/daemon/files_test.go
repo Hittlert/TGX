@@ -2,7 +2,6 @@ package daemon
 
 import (
 	"bytes"
-	"context"
 	"crypto/sha256"
 	"fmt"
 	"os"
@@ -13,8 +12,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/Hittlert/TGX/core/bucket"
-	"github.com/Hittlert/TGX/core/targetwriter"
 	"github.com/Hittlert/TGX/pkg/spool"
 	"github.com/Hittlert/TGX/pkg/writeback"
 )
@@ -135,88 +132,6 @@ func TestExistingFileRequiresExactSize(t *testing.T) {
 	}
 }
 
-func TestLazySmallFileElement_DirectPublish(t *testing.T) {
-	root := t.TempDir()
-	outputRoot := filepath.Join(root, "hdd")
-	content := []byte("small-image-binary-payload-data")
-
-	registry := NewRegistry(1, 100, nil)
-	request := validRequest("small", 1)
-	request.ExpectedSize = int64(len(content))
-	request.FinalPath = "Photos/2026_08/image.jpg"
-	_, _, _ = registry.Submit(request)
-	task, _ := registry.Next(t.Context())
-
-	element, err := newLazySmallFileElement(task, fakeDownloadFile{size: int64(len(content)), dc: 4}, outputRoot, 0, nil, nil)
-	require.NoError(t, err)
-
-	_, err = element.To().WriteAt(content, 0)
-	require.NoError(t, err)
-
-	result, err := element.Publish()
-	require.NoError(t, err)
-
-	wantHash := fmt.Sprintf("%x", sha256.Sum256(content))
-	assert.Equal(t, wantHash, result.SHA256)
-
-	final, err := os.ReadFile(filepath.Join(outputRoot, filepath.FromSlash(request.FinalPath)))
-	require.NoError(t, err)
-	assert.Equal(t, content, final)
-}
-
-func TestBucketFileElement_BucketAndTargetWriterIntegration(t *testing.T) {
-	root := t.TempDir()
-	outputRoot := filepath.Join(root, "hdd")
-	content := []byte("large-file-chunk-data-stream-content")
-
-	bkt, err := bucket.New(bucket.Config{Mode: bucket.ModeMemory, MaxCapacity: 50 * 1024 * 1024})
-	require.NoError(t, err)
-	defer bkt.Close()
-
-	tw := targetwriter.New(bkt, outputRoot)
-	completeChan := make(chan string, 1)
-	tw.SetCallbacks(func(taskID, gen, finalPath, shaHash string) {
-		completeChan <- finalPath
-	}, nil, nil)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	tw.Start(ctx)
-	tw.BeginConsuming()
-	defer tw.Close()
-
-	registry := NewRegistry(1, 100, nil)
-	request := validRequest("mover-test", 1)
-	request.ExpectedSize = int64(len(content))
-	request.FinalPath = "Movies/2026_08/video.mp4"
-	_, _, _ = registry.Submit(request)
-	task, _ := registry.Next(t.Context())
-
-	element, err := newBucketFileElement(task, fakeDownloadFile{size: int64(len(content)), dc: 4}, outputRoot, 0, bkt, tw)
-	require.NoError(t, err)
-
-	// Network downloads chunks to bucket
-	require.NoError(t, bkt.Reserve(ctx, int64(len(content))))
-	_, err = element.To().WriteAt(content, 0)
-	require.NoError(t, err)
-
-	// Publish completes network phase immediately
-	result, err := element.Publish()
-	require.NoError(t, err)
-	assert.Equal(t, request.FinalPath, result.Path)
-
-	// Wait for TargetWriter to finish writing and atomic commit
-	select {
-	case finalRel := <-completeChan:
-		assert.Equal(t, request.FinalPath, finalRel)
-	case <-time.After(3 * time.Second):
-		t.Fatal("target writer timed out")
-	}
-
-	final, err := os.ReadFile(filepath.Join(outputRoot, filepath.FromSlash(request.FinalPath)))
-	require.NoError(t, err)
-	assert.True(t, bytes.Equal(content, final))
-}
 
 func TestSpoolFileElement_EndToEndStreamingAndPublish(t *testing.T) {
 	root := t.TempDir()

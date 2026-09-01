@@ -11,9 +11,7 @@ import (
 	"github.com/flytam/filenamify"
 	"go.uber.org/zap"
 
-	"github.com/Hittlert/TGX/core/bucket"
 	"github.com/Hittlert/TGX/core/downloader"
-	"github.com/Hittlert/TGX/core/targetwriter"
 	atomic "github.com/Hittlert/TGX/pkg/sbe/atomic"
 	"github.com/Hittlert/TGX/pkg/spool"
 	"github.com/Hittlert/TGX/pkg/writeback"
@@ -28,8 +26,6 @@ type Orchestrator struct {
 	logger       *zap.Logger
 	saveDir      string
 	bufferDir    string
-	bkt          bucket.Bucket
-	tw           *targetwriter.TargetWriter
 	spool        spool.Store
 	wbSink       *writeback.TargetSink
 
@@ -52,14 +48,6 @@ func NewOrchestrator(db *Database, slotPool *GlobalSlotPool, proxyManager *Proxy
 	}
 }
 
-func (o *Orchestrator) SetBucket(bkt bucket.Bucket) {
-	o.bkt = bkt
-}
-
-func (o *Orchestrator) SetTargetWriter(tw *targetwriter.TargetWriter) {
-	o.tw = tw
-}
-
 func (o *Orchestrator) SetSpool(s spool.Store) {
 	o.spool = s
 }
@@ -73,54 +61,6 @@ func (o *Orchestrator) SetBufferDir(dir string) {
 }
 
 func (o *Orchestrator) Start(ctx context.Context) {
-	if o.tw != nil {
-		o.tw.SetCallbacks(
-			func(taskID, gen, finalPath, shaHash string) {
-				// Registry validates generation atomically before any persistent side effects.
-				// Only accept valid new terminal transitions.
-				// Stale, conflicting, duplicate, or unknown callbacks are rejected without DB side effects.
-				if o.registry != nil {
-					res := o.registry.FinishTask(taskID, gen, StateSuccess, "", "", finalPath, false, shaHash)
-					if res != FinishAcceptedNewTerminal {
-						return
-					}
-				}
-				parts := strings.Split(taskID, ":")
-				if len(parts) == 2 {
-					var msgID int
-					_, _ = fmt.Sscanf(parts[1], "%d", &msgID)
-					for attempt := 0; attempt < 3; attempt++ {
-						if err := o.db.UpdateDownloadStatus(parts[0], msgID, "success", "", finalPath, "", 0, ""); err == nil {
-							break
-						}
-						time.Sleep(50 * time.Millisecond)
-					}
-				}
-			},
-			func(taskID string, movedBytes, totalBytes int64) {
-			},
-			func(taskID, gen string, err error) {
-				if o.registry != nil {
-					res := o.registry.FinishTask(taskID, gen, StateFailed, "write_error", err.Error(), "", false, "")
-					if res != FinishAcceptedNewTerminal {
-						return
-					}
-				}
-				parts := strings.Split(taskID, ":")
-				if len(parts) == 2 {
-					var msgID int
-					_, _ = fmt.Sscanf(parts[1], "%d", &msgID)
-					for attempt := 0; attempt < 3; attempt++ {
-						if err := o.db.UpdateDownloadStatus(parts[0], msgID, "failed", "", "", "", 0, err.Error()); err == nil {
-							break
-						}
-						time.Sleep(50 * time.Millisecond)
-					}
-				}
-			},
-		)
-	}
-
 	go o.scanLoop(ctx)
 	go o.dispatchLoop(ctx)
 	go o.metricsLoop(ctx)

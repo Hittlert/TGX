@@ -19,9 +19,6 @@ import (
 	"github.com/gorilla/mux"
 	"go.uber.org/zap"
 
-	"github.com/Hittlert/TGX/core/bucket"
-	"github.com/Hittlert/TGX/core/mover"
-	"github.com/Hittlert/TGX/core/targetwriter"
 	"github.com/Hittlert/TGX/pkg/consts"
 	atomic "github.com/Hittlert/TGX/pkg/sbe/atomic"
 	"github.com/Hittlert/TGX/pkg/sbe/gate"
@@ -41,9 +38,6 @@ type WebServer struct {
 	logger       *zap.Logger
 	password     string
 	gate         *gate.FloodGate
-	mover        *mover.Mover
-	bkt          bucket.Bucket
-	tw           *targetwriter.TargetWriter
 	spool        spool.Store
 
 	sessionsMu sync.RWMutex
@@ -53,18 +47,6 @@ type WebServer struct {
 
 func (s *WebServer) SetAuthWizard(w *AuthWizard) {
 	s.authWizard = w
-}
-
-func (s *WebServer) SetMover(m *mover.Mover) {
-	s.mover = m
-}
-
-func (s *WebServer) SetBucket(b bucket.Bucket) {
-	s.bkt = b
-}
-
-func (s *WebServer) SetTargetWriter(tw *targetwriter.TargetWriter) {
-	s.tw = tw
 }
 
 func (s *WebServer) SetSpool(store spool.Store) {
@@ -176,42 +158,6 @@ func (s *WebServer) Handler() http.Handler {
 				"max_human":       formatBytes(m.MaxBytes),
 				"used_human":      formatBytes(m.UsedBytes),
 				"ready_human":     formatBytes(m.ReadyBytes),
-			}
-		} else if s.bkt != nil {
-			m := s.bkt.Metrics()
-			resp["buffer"] = map[string]any{
-				"mode":                 m.Mode,
-				"max_bytes":            m.MaxCapacity,
-				"reserved_bytes":       m.ReservedBytes,
-				"ready_bytes":          m.ReadyBytes,
-				"pending_delete_bytes": m.PendingDeleteBytes,
-				"used_bytes":           m.UsedBytes,
-				"object_count":         m.ObjectCount,
-				"backpressured":        m.Backpressured,
-				"max_human":            formatBytes(m.MaxCapacity),
-				"used_human":           formatBytes(m.UsedBytes),
-				"ready_human":          formatBytes(m.ReadyBytes),
-			}
-		} else if s.mover != nil {
-			resp["buffer"] = map[string]any{
-				"used_bytes":    s.mover.UsedBytes(),
-				"max_bytes":     s.mover.MaxCapacity(),
-				"active_moving": s.mover.ActiveMoving(),
-				"used_human":    formatBytes(s.mover.UsedBytes()),
-				"max_human":     formatBytes(s.mover.MaxCapacity()),
-			}
-		}
-
-		if s.tw != nil {
-			m := s.tw.Metrics()
-			resp["target_writer"] = map[string]any{
-				"active":                 m.Active,
-				"bytes_per_second":       m.BytesPerSecond,
-				"bytes_per_second_human": formatBytes(int64(m.BytesPerSecond)) + "/s",
-				"contiguous_write_ratio": fmt.Sprintf("%.1f%%", m.ContiguousWriteRatio),
-				"active_files_count":     m.ActiveFilesCount,
-				"total_bytes_written":    m.TotalBytesWritten,
-				"last_error":             m.LastError,
 			}
 		}
 		writeJSON(w, http.StatusOK, resp)
@@ -501,10 +447,10 @@ func (s *WebServer) handleGetDownloadStatus(w http.ResponseWriter, r *http.Reque
 
 	bufferUsedMB := float64(0)
 	bufferLimitMB := float64(512)
-	if s.bkt != nil {
-		m := s.bkt.Metrics()
+	if s.spool != nil {
+		m := s.spool.Metrics()
 		bufferUsedMB = float64(m.UsedBytes) / (1024 * 1024)
-		bufferLimitMB = float64(m.MaxCapacity) / (1024 * 1024)
+		bufferLimitMB = float64(m.MaxBytes) / (1024 * 1024)
 	}
 
 	resp := map[string]any{
@@ -532,7 +478,7 @@ func (s *WebServer) handleGetDownloadStatus(w http.ResponseWriter, r *http.Reque
 			"buffer_used_mb":  bufferUsedMB,
 			"buffer_limit_mb": bufferLimitMB,
 			"dirty_used_mb":   bufferUsedMB,
-			"target_writer":   s.tw != nil && s.tw.Metrics().Active,
+			"target_writer":   true,
 		},
 		"total_download_task": 0,
 		"total_download_byte": formatBytes(0),

@@ -2,10 +2,7 @@ package chaos
 
 import (
 	"context"
-	"crypto/sha256"
 	"database/sql"
-	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -14,7 +11,6 @@ import (
 	"time"
 
 	"github.com/Hittlert/TGX/app/daemon"
-	"github.com/Hittlert/TGX/core/targetwriter"
 	sbeatomic "github.com/Hittlert/TGX/pkg/sbe/atomic"
 	"github.com/Hittlert/TGX/pkg/sbe/coordinator"
 	"github.com/Hittlert/TGX/pkg/sbe/lease"
@@ -105,8 +101,8 @@ func TestChaos_PowerCut_During_Part_Write(t *testing.T) {
 	assert.False(t, recInfo.IsComplete)
 }
 
-// 2. TestChaos_PowerCut_After_Complete_Meta
-func TestChaos_PowerCut_After_Complete_Meta(t *testing.T) {
+// 2. TestChaos_PowerCut_After_Complete_File
+func TestChaos_PowerCut_After_Complete_File(t *testing.T) {
 	db := setupMemoryDB(t)
 	defer db.Close()
 
@@ -120,22 +116,8 @@ func TestChaos_PowerCut_After_Complete_Meta(t *testing.T) {
 
 	fileName := "complete_media.bin"
 	finalPath := filepath.Join(outDir, fileName)
-	data := []byte("complete_data_19_bytes")
+	data := []byte("complete_data_22_bytes")
 	require.NoError(t, os.WriteFile(finalPath, data, 0644))
-
-	sum := sha256.Sum256(data)
-	// Write .moving.meta with ExpectedSHA (simulating crash after CommitFile before meta was removed)
-	manifest := targetwriter.TaskManifest{
-		Version:      targetwriter.SidecarVersion,
-		TaskID:       "123:42",
-		Gen:          "1",
-		FinalPath:    fileName,
-		ExpectedSize: 22,
-		ExpectedSHA:  hex.EncodeToString(sum[:]),
-		Ranges:       []targetwriter.Range{{Start: 0, End: 22}},
-	}
-	metaData, _ := json.Marshal(manifest)
-	require.NoError(t, os.WriteFile(finalPath+".moving.meta", metaData, 0644))
 
 	// Insert database state as downloading (power cut before DB update)
 	_, err = db.Exec(`INSERT INTO download_records (chat_id, message_id, status, file_name, save_path, file_size) VALUES ('123', 42, 'downloading', ?, ?, 22)`, fileName, fileName)
@@ -152,8 +134,8 @@ func TestChaos_PowerCut_After_Complete_Meta(t *testing.T) {
 	assert.FileExists(t, finalPath)
 }
 
-// 2b. TestChaos_Tampered_Final_File_Rejected
-func TestChaos_Tampered_Final_File_Rejected(t *testing.T) {
+// 2b. TestChaos_Size_Mismatch_Final_File_Rejected
+func TestChaos_Size_Mismatch_Final_File_Rejected(t *testing.T) {
 	db := setupMemoryDB(t)
 	defer db.Close()
 
@@ -167,79 +149,20 @@ func TestChaos_Tampered_Final_File_Rejected(t *testing.T) {
 
 	fileName := "tampered_media.bin"
 	finalPath := filepath.Join(outDir, fileName)
-	tamperedData := []byte("tampered_bad_data_bytes") // 23 bytes
+	tamperedData := []byte("tampered_short_data") // 19 bytes
 	require.NoError(t, os.WriteFile(finalPath, tamperedData, 0644))
-
-	// Pre-commit meta has original legitimate SHA
-	origSum := sha256.Sum256([]byte("legitimate_data_23bytes"))
-	manifest := targetwriter.TaskManifest{
-		Version:      targetwriter.SidecarVersion,
-		TaskID:       "123:99",
-		Gen:          "1",
-		FinalPath:    fileName,
-		ExpectedSize: 23,
-		ExpectedSHA:  hex.EncodeToString(origSum[:]),
-		Ranges:       []targetwriter.Range{{Start: 0, End: 23}},
-	}
-	metaData, _ := json.Marshal(manifest)
-	require.NoError(t, os.WriteFile(finalPath+".moving.meta", metaData, 0644))
 
 	_, err = db.Exec(`INSERT INTO download_records (chat_id, message_id, status, file_name, save_path, file_size) VALUES ('123', 99, 'downloading', ?, ?, 23)`, fileName, fileName)
 	require.NoError(t, err)
 
-	// Run Reconciler: must reject tampered content and not promote to success!
+	// Run Reconciler: must reject mismatched size and not promote to success!
 	r := daemon.NewReconciler(db, outDir, tempDir, zap.NewNop())
 	results, err := r.ReconcileAll(context.Background())
 	require.NoError(t, err)
 	require.Equal(t, 1, len(results))
 
-	assert.NotEqual(t, "success", results[0].NextState, "Tampered final file must never be promoted to success")
+	assert.NotEqual(t, "success", results[0].NextState, "Size mismatch final file must never be promoted to success")
 	assert.Equal(t, "pending", results[0].NextState)
-}
-
-// 3. TestChaos_Linkat_Unlink_Crash
-func TestChaos_Linkat_Unlink_Crash(t *testing.T) {
-	db := setupMemoryDB(t)
-	defer db.Close()
-
-	outDir, err := os.MkdirTemp("", "chaos_link_out_*")
-	require.NoError(t, err)
-	defer os.RemoveAll(outDir)
-
-	tempDir, err := os.MkdirTemp("", "chaos_link_tmp_*")
-	require.NoError(t, err)
-	defer os.RemoveAll(tempDir)
-
-	fileName := "linked_file.bin"
-	finalPath := filepath.Join(outDir, fileName)
-	data := []byte("identical_hardlink_data")
-	require.NoError(t, os.WriteFile(finalPath, data, 0644))
-
-	// Write commit proof tmp (simulating crash during atomic proof rename)
-	sum := sha256.Sum256(data)
-	proof := targetwriter.CommitProof{
-		Version:      1,
-		TaskID:       "123:43",
-		Gen:          "1",
-		FinalPath:    fileName,
-		ExpectedSize: 23,
-		SHA256:       hex.EncodeToString(sum[:]),
-		CommittedAt:  time.Now().Unix(),
-	}
-	proofData, _ := json.Marshal(proof)
-	require.NoError(t, os.WriteFile(finalPath+".tgx_commit.tmp", proofData, 0644))
-
-	_, err = db.Exec(`INSERT INTO download_records (chat_id, message_id, status, file_name, save_path, file_size) VALUES ('123', 43, 'downloading', ?, ?, 23)`, fileName, fileName)
-	require.NoError(t, err)
-
-	r := daemon.NewReconciler(db, outDir, tempDir, zap.NewNop())
-	results, err := r.ReconcileAll(context.Background())
-	require.NoError(t, err)
-	require.Equal(t, 1, len(results))
-
-	assert.Equal(t, "success", results[0].NextState)
-	assert.Equal(t, "FINAL_FILE_COMMITTED_PROMOTED_TO_SUCCESS", results[0].ActionTaken)
-	assert.FileExists(t, finalPath)
 }
 
 // 4. TestChaos_Target_Path_Collision

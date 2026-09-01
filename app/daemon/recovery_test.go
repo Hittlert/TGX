@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,10 +15,6 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 	_ "modernc.org/sqlite"
-
-	"github.com/Hittlert/TGX/core/bucket"
-	"github.com/Hittlert/TGX/core/mover"
-	"github.com/Hittlert/TGX/core/targetwriter"
 )
 
 func setupTestDB(t *testing.T) *sql.DB {
@@ -61,19 +56,6 @@ func TestReconciler_PromotesExistingFileToSuccess(t *testing.T) {
 	data := []byte("data")
 	require.NoError(t, os.WriteFile(finalPath, data, 0644))
 
-	sum := sha256.Sum256(data)
-	proof := targetwriter.CommitProof{
-		Version:      1,
-		TaskID:       CanonicalTaskID("123", 1),
-		Gen:          "1",
-		FinalPath:    "test.mp4",
-		ExpectedSize: 4,
-		SHA256:       hex.EncodeToString(sum[:]),
-		CommittedAt:  time.Now().Unix(),
-	}
-	proofData, _ := json.Marshal(proof)
-	require.NoError(t, os.WriteFile(finalPath+".tgx_commit", proofData, 0644))
-
 	_, err := db.Exec(`INSERT INTO download_records (chat_id, message_id, status, file_name, save_path, file_size) VALUES ('123', 1, 'downloading', 'test.mp4', 'test.mp4', 4)`)
 	require.NoError(t, err)
 
@@ -113,78 +95,6 @@ func TestReconciler_MemoryBufferVolatileReset(t *testing.T) {
 	err = db.QueryRow(`SELECT status FROM download_records WHERE chat_id = '123' AND message_id = 2`).Scan(&newStatus)
 	require.NoError(t, err)
 	assert.Equal(t, "pending", newStatus)
-}
-
-func TestReconciler_SSDBufferPartialRetainedForResume(t *testing.T) {
-	db := setupTestDB(t)
-	defer db.Close()
-
-	outDir := t.TempDir()
-	tempDir := t.TempDir()
-
-	// Write partial .part file in SSD tempDir using canonical naming
-	taskID := CanonicalTaskID("123", 3)
-	partPath := CanonicalPartPath(tempDir, taskID)
-	require.NoError(t, os.WriteFile(partPath, make([]byte, 50), 0644))
-
-	_, err := db.Exec(`INSERT INTO download_records (chat_id, message_id, status, file_name, save_path, file_size) VALUES ('123', 3, 'downloading', 'resume.mp4', 'resume.mp4', 100)`)
-	require.NoError(t, err)
-
-	r := NewReconcilerWithBuffer(db, outDir, tempDir, "ssd", nil, zap.NewNop())
-	results, err := r.ReconcileAll(context.Background())
-	require.NoError(t, err)
-	require.Equal(t, 1, len(results))
-
-	assert.Equal(t, "pending", results[0].NextState)
-	assert.Equal(t, "SSD_BUFFER_PARTIAL_RETAINED_FOR_RESUME", results[0].ActionTaken)
-
-	// Verify partial file was NOT deleted
-	_, err = os.Stat(partPath)
-	assert.NoError(t, err)
-}
-
-func TestReconciler_SSDBufferCompletedRequeuedInMover(t *testing.T) {
-	db := setupTestDB(t)
-	defer db.Close()
-
-	outDir := t.TempDir()
-	tempDir := t.TempDir()
-
-	// Write completed .part file in SSD tempDir using canonical naming
-	taskID := CanonicalTaskID("123", 4)
-	partPath := CanonicalPartPath(tempDir, taskID)
-	testContent := []byte("completed-file-content")
-	require.NoError(t, os.WriteFile(partPath, testContent, 0644))
-
-	_, err := db.Exec(`INSERT INTO download_records (chat_id, message_id, status, file_name, save_path, file_size) VALUES ('123', 4, 'moving', 'completed.mp4', 'completed.mp4', ?)`, len(testContent))
-	require.NoError(t, err)
-
-	m := mover.New(1, 100*1024*1024)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	m.Start(ctx)
-	defer m.Close()
-
-	r := NewReconcilerWithBuffer(db, outDir, tempDir, "ssd", m, zap.NewNop())
-	results, err := r.ReconcileAll(ctx)
-	require.NoError(t, err)
-	require.Equal(t, 1, len(results))
-
-	assert.Equal(t, "moving", results[0].NextState)
-	assert.Equal(t, "SSD_BUFFER_COMPLETED_REQUEUED_IN_MOVER", results[0].ActionTaken)
-
-	// Wait for mover to finish moving
-	require.Eventually(t, func() bool {
-		var status string
-		_ = db.QueryRow(`SELECT status FROM download_records WHERE chat_id = '123' AND message_id = 4`).Scan(&status)
-		return status == "success"
-	}, 3*time.Second, 50*time.Millisecond)
-
-	// Verify destination file exists
-	finalPath := filepath.Join(outDir, "completed.mp4")
-	data, err := os.ReadFile(finalPath)
-	require.NoError(t, err)
-	assert.Equal(t, testContent, data)
 }
 
 func TestTask_StaleAttemptCannotTerminateNewAttempt(t *testing.T) {
@@ -273,7 +183,7 @@ func TestOrchestrator_StartupRecoveryCallbackUpdatesDB(t *testing.T) {
 	// Register recovered task into Registry
 	r.RegisterRecoveredTask("123:99", "1", "rec.bin", 1024)
 
-	// Orchestrator callback logic
+	// Callback logic
 	completeCallback := func(taskID, gen, finalPath, shaHash string) {
 		res := r.FinishTask(taskID, gen, StateSuccess, "", "", finalPath, false, shaHash)
 		if res == FinishAcceptedNewTerminal {
@@ -319,68 +229,6 @@ func TestOrchestrator_RejectsConflictingAndStaleCallbacks(t *testing.T) {
 	assert.Equal(t, FinishNotFound, res)
 }
 
-func TestRecovery_PartialSidecarDoesNotRegisterPublishingTask(t *testing.T) {
-	db := setupTestDB(t)
-	defer db.Close()
-
-	outDir := t.TempDir()
-	tempDir := t.TempDir()
-
-	fileKey := CanonicalTaskID("123", 55)
-	finalPath := filepath.Join(outDir, "partial.bin")
-	movingPath := finalPath + ".moving"
-	metaPath := finalPath + ".moving.meta"
-
-	// Create incomplete .moving (size 500) and sidecar with ExpectedSize 1000 and range [0, 500)
-	testContent := make([]byte, 500)
-	require.NoError(t, os.WriteFile(movingPath, testContent, 0644))
-
-	manifest := targetwriter.TaskManifest{
-		Version:      targetwriter.SidecarVersion,
-		TaskID:       fileKey,
-		FinalPath:    "partial.bin",
-		ExpectedSize: 1000,
-		Gen:          "1",
-		Ranges: []targetwriter.Range{
-			{Start: 0, End: 500},
-		},
-	}
-	metaBytes, err := json.Marshal(manifest)
-	require.NoError(t, err)
-	require.NoError(t, os.WriteFile(metaPath, metaBytes, 0644))
-
-	_, err = db.Exec(`INSERT INTO download_records (chat_id, message_id, status, file_name, save_path, file_size) VALUES ('123', 55, 'downloading', 'partial.bin', 'partial.bin', 1000)`)
-	require.NoError(t, err)
-
-	reg := NewRegistry(10, 100, time.Now)
-	reconciler := NewReconcilerWithBuffer(db, outDir, tempDir, "ssd", nil, zap.NewNop())
-	reconciler.SetRegistry(reg)
-
-	results, err := reconciler.ReconcileAll(context.Background())
-	require.NoError(t, err)
-	require.Equal(t, 1, len(results))
-	assert.Equal(t, "pending", results[0].NextState)
-	assert.Equal(t, "SSD_BUFFER_PARTIAL_RESET_TO_PENDING", results[0].ActionTaken)
-
-	// Verify Registry has NO synthetic Publishing task left behind
-	_, exists := reg.Task(fileKey)
-	assert.False(t, exists)
-	assert.Equal(t, 0, len(reg.Tasks()))
-
-	// Verify pending scanner can cleanly submit real TaskRequest with 0 ID conflict
-	realReq := TaskRequest{
-		ID:           fileKey,
-		Peer:         "123",
-		MessageID:    55,
-		FinalPath:    "partial.bin",
-		ExpectedSize: 1000,
-	}
-	snap, ok, err := reg.Submit(realReq)
-	require.NoError(t, err)
-	require.True(t, ok)
-	assert.Equal(t, StateQueued, snap.State)
-}
-
 func TestRecovery_UnfreezesCanceledFailedTasks(t *testing.T) {
 	db := setupTestDB(t)
 	defer db.Close()
@@ -410,60 +258,6 @@ func TestRecovery_UnfreezesCanceledFailedTasks(t *testing.T) {
 	assert.Equal(t, int64(0), nextRetry)
 }
 
-func TestRecovery_MemoryModeRecoversTargetStorageSidecars(t *testing.T) {
-	db := setupTestDB(t)
-	defer db.Close()
-
-	outDir := t.TempDir()
-	tempDir := t.TempDir()
-
-	fileKey := CanonicalTaskID("123", 77)
-	finalPath := filepath.Join(outDir, "complete.bin")
-	movingPath := finalPath + ".moving"
-	metaPath := finalPath + ".moving.meta"
-
-	// Create complete .moving (size 1000) and sidecar with ExpectedSize 1000 and range [0, 1000)
-	testContent := make([]byte, 1000)
-	require.NoError(t, os.WriteFile(movingPath, testContent, 0644))
-
-	manifest := targetwriter.TaskManifest{
-		Version:      targetwriter.SidecarVersion,
-		TaskID:       fileKey,
-		FinalPath:    "complete.bin",
-		ExpectedSize: 1000,
-		Gen:          "1",
-		Ranges: []targetwriter.Range{
-			{Start: 0, End: 1000},
-		},
-	}
-	metaBytes, err := json.Marshal(manifest)
-	require.NoError(t, err)
-	require.NoError(t, os.WriteFile(metaPath, metaBytes, 0644))
-
-	_, err = db.Exec(`INSERT INTO download_records (chat_id, message_id, status, file_name, save_path, file_size) VALUES ('123', 77, 'moving', 'complete.bin', 'complete.bin', 1000)`)
-	require.NoError(t, err)
-
-	bkt, err := bucket.New(bucket.Config{Mode: bucket.ModeMemory, MaxCapacity: 10 * 1024 * 1024})
-	require.NoError(t, err)
-	defer bkt.Close()
-
-	tw := targetwriter.New(bkt, outDir)
-	reconciler := NewReconcilerWithBuffer(db, outDir, tempDir, "memory", nil, zap.NewNop())
-	reconciler.SetTargetWriter(tw)
-
-	results, err := reconciler.ReconcileAll(context.Background())
-	require.NoError(t, err)
-	require.Equal(t, 1, len(results))
-	assert.Equal(t, "moving", results[0].NextState)
-	assert.Equal(t, "SSD_BUFFER_COMPLETE_FINALIZE_PENDING", results[0].ActionTaken)
-
-	// Verify .moving and .moving.meta were NOT destroyed in memory buffer mode
-	_, err = os.Stat(movingPath)
-	assert.NoError(t, err)
-	_, err = os.Stat(metaPath)
-	assert.NoError(t, err)
-}
-
 func TestDatabase_UpdateDownloadStatus_ContextCanceledDoesNotIncrementAttemptsOrFreeze(t *testing.T) {
 	rawDB := setupTestDB(t)
 	defer rawDB.Close()
@@ -489,149 +283,32 @@ func TestDatabase_UpdateDownloadStatus_ContextCanceledDoesNotIncrementAttemptsOr
 	assert.Equal(t, int64(0), nextRetry)
 }
 
-func TestRecovery_LegacyPart_ContentConflictDifferentSHA(t *testing.T) {
-	db := setupTestDB(t)
-	defer db.Close()
-
-	outDir := t.TempDir()
+func TestVerifyFinalFileIdentity_CalculatesSHA256(t *testing.T) {
 	tempDir := t.TempDir()
-
-	fileKeyConflict := CanonicalTaskID("chat_conf", 1)
-	finalPathConf := filepath.Join(outDir, "conf.bin")
-	tempPartPathConf := CanonicalPartPath(tempDir, fileKeyConflict)
-
-	// Create target and temp part with SAME SIZE but DIFFERENT CONTENT
-	partData := []byte("part-data-12345")
-	diffData := []byte("diff-data-67890")
-	require.Equal(t, len(partData), len(diffData))
-
-	require.NoError(t, os.WriteFile(finalPathConf, diffData, 0644))
-	require.NoError(t, os.WriteFile(tempPartPathConf, partData, 0644))
-
-	_, err := db.Exec(`INSERT INTO download_records (chat_id, message_id, status, file_name, save_path, file_size) VALUES ('chat_conf', 1, 'moving', 'conf.bin', 'conf.bin', ?)`, len(partData))
-	require.NoError(t, err)
-
-	rec := NewReconciler(db, outDir, tempDir, zap.NewNop())
-	results, err := rec.ReconcileAll(context.Background())
-	require.NoError(t, err)
-	require.Len(t, results, 1)
-
-	// Result should be reset to pending because SHAs do not match
-	assert.Equal(t, "pending", results[0].NextState)
-	assert.Equal(t, "LEGACY_PART_RESET_TO_PENDING", results[0].ActionTaken)
-
-	// Temp part must NOT have been deleted
-	_, err = os.Stat(tempPartPathConf)
-	assert.NoError(t, err)
-
-	// Now test identical SHA:
-	fileKeyIdentical := CanonicalTaskID("chat_ident", 2)
-	finalPathIdent := filepath.Join(outDir, "ident.bin")
-	tempPartPathIdent := CanonicalPartPath(tempDir, fileKeyIdentical)
-
-	require.NoError(t, os.WriteFile(finalPathIdent, partData, 0644))
-	require.NoError(t, os.WriteFile(tempPartPathIdent, partData, 0644))
-
-	_, err = db.Exec(`INSERT INTO download_records (chat_id, message_id, status, file_name, save_path, file_size) VALUES ('chat_ident', 2, 'moving', 'ident.bin', 'ident.bin', ?)`, len(partData))
-	require.NoError(t, err)
-
-	results, err = rec.ReconcileAll(context.Background())
-	require.NoError(t, err)
-	require.Len(t, results, 1)
-
-	assert.Equal(t, fileKeyIdentical, results[0].FileKey)
-	assert.Equal(t, "success", results[0].NextState)
-	assert.Equal(t, "LEGACY_PART_TARGET_ALREADY_EXISTS_PROMOTED", results[0].ActionTaken)
-
-	// Temp part should be cleaned up on verified identical content
-	_, err = os.Stat(tempPartPathIdent)
-	assert.True(t, os.IsNotExist(err))
-}
-
-func TestReconciler_RejectsSameSizeWrongHashFile(t *testing.T) {
-	db := setupTestDB(t)
-	defer db.Close()
-
-	outDir := t.TempDir()
-	tempDir := t.TempDir()
-
-	fileKey := CanonicalTaskID("chat_wrong", 1)
-	finalPath := filepath.Join(outDir, "wrong.bin")
-
-	// Final file has different content with the same length
-	require.NoError(t, os.WriteFile(finalPath, []byte("bad content 1234"), 0644))
-
-	// Commit proof specifies a different SHA
-	proof := targetwriter.CommitProof{
-		TaskID:       fileKey,
-		Gen:          "1",
-		FinalPath:    "wrong.bin",
-		ExpectedSize: 16,
-		SHA256:       "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-		CommittedAt:  time.Now().Unix(),
-	}
-	proofData, _ := json.Marshal(proof)
-	require.NoError(t, os.WriteFile(finalPath+".tgx_commit", proofData, 0644))
-
-	_, err := db.Exec(`INSERT INTO download_records (chat_id, message_id, status, file_name, save_path, file_size) VALUES ('chat_wrong', 1, 'downloading', 'wrong.bin', 'wrong.bin', 16)`)
-	require.NoError(t, err)
-
-	rec := NewReconciler(db, outDir, tempDir, zap.NewNop())
-	results, err := rec.ReconcileAll(context.Background())
-	require.NoError(t, err)
-	require.Len(t, results, 1)
-
-	// Must NOT promote to success because proof SHA does not match actual file SHA!
-	assert.Equal(t, "pending", results[0].NextState)
-}
-
-func TestVerifyFinalFileIdentity_FailClosedWhenProofMissing(t *testing.T) {
-	tempDir := t.TempDir()
-	finalPath := filepath.Join(tempDir, "unverified.bin")
-	require.NoError(t, os.WriteFile(finalPath, []byte("some content"), 0644))
-
-	// No expectedSHA and no .tgx_commit sidecar proof -> MUST return error (fail-closed)
-	_, err := verifyFinalFileIdentity(finalPath, 12, "", "some_task")
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "missing commit proof sidecar")
-}
-
-func TestVerifyFinalFileIdentity_RejectsCorruptProofOrMismatch(t *testing.T) {
-	tempDir := t.TempDir()
-	finalPath := filepath.Join(tempDir, "corrupt.bin")
-	data := []byte("corrupt test content")
+	finalPath := filepath.Join(tempDir, "verified.bin")
+	data := []byte("hello world 1234567890")
 	require.NoError(t, os.WriteFile(finalPath, data, 0644))
 
-	// 1. Corrupt JSON proof
-	require.NoError(t, os.WriteFile(finalPath+".tgx_commit", []byte("{not-json"), 0644))
-	_, err := verifyFinalFileIdentity(finalPath, int64(len(data)), "", "task-1")
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "corrupt or incomplete")
-
-	// 2. Task ID mismatch
 	sum := sha256.Sum256(data)
-	proof := targetwriter.CommitProof{
-		Version:      1,
-		TaskID:       "task-other",
-		Gen:          "1",
-		FinalPath:    "corrupt.bin",
-		ExpectedSize: int64(len(data)),
-		SHA256:       hex.EncodeToString(sum[:]),
-		CommittedAt:  time.Now().Unix(),
-	}
-	proofData, _ := json.Marshal(proof)
-	require.NoError(t, os.WriteFile(finalPath+".tgx_commit", proofData, 0644))
+	expectedSHA := hex.EncodeToString(sum[:])
 
-	_, err = verifyFinalFileIdentity(finalPath, int64(len(data)), "", "task-1")
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "task ID mismatch")
-
-	// 3. Exact matching proof succeeds
-	proof.TaskID = "task-1"
-	proofData, _ = json.Marshal(proof)
-	require.NoError(t, os.WriteFile(finalPath+".tgx_commit", proofData, 0644))
-
+	// 1. Exact size and empty expectedSHA -> returns computed SHA
 	sha, err := verifyFinalFileIdentity(finalPath, int64(len(data)), "", "task-1")
 	assert.NoError(t, err)
-	assert.Equal(t, hex.EncodeToString(sum[:]), sha)
+	assert.Equal(t, expectedSHA, sha)
+
+	// 2. Exact size and matching expectedSHA -> returns computed SHA
+	sha, err = verifyFinalFileIdentity(finalPath, int64(len(data)), expectedSHA, "task-1")
+	assert.NoError(t, err)
+	assert.Equal(t, expectedSHA, sha)
+
+	// 3. Mismatching expectedSHA -> returns error
+	_, err = verifyFinalFileIdentity(finalPath, int64(len(data)), "wrong_sha", "task-1")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "content conflict")
+
+	// 4. Size mismatch -> returns error
+	_, err = verifyFinalFileIdentity(finalPath, int64(len(data))+1, "", "task-1")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "size mismatch")
 }

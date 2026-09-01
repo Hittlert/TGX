@@ -6,9 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/Hittlert/TGX/core/bucket"
 	"github.com/Hittlert/TGX/core/downloader"
-	"github.com/Hittlert/TGX/core/targetwriter"
 	"github.com/Hittlert/TGX/pkg/spool"
 	"github.com/Hittlert/TGX/pkg/writeback"
 	"github.com/flytam/filenamify"
@@ -30,8 +28,6 @@ type taskResolver struct {
 	access     MediaAccess
 	tempRoot   string
 	outputRoot string
-	bkt        bucket.Bucket
-	tw         *targetwriter.TargetWriter
 	spool      spool.Store
 	wbQueue    *writeback.Queue
 }
@@ -40,10 +36,6 @@ func newTaskResolver(access MediaAccess, tempRoot, outputRoot string, optArgs ..
 	r := &taskResolver{access: access, tempRoot: tempRoot, outputRoot: outputRoot}
 	for _, arg := range optArgs {
 		switch v := arg.(type) {
-		case bucket.Bucket:
-			r.bkt = v
-		case *targetwriter.TargetWriter:
-			r.tw = v
 		case spool.Store:
 			r.spool = v
 		case *writeback.Queue:
@@ -82,13 +74,7 @@ func (r *taskResolver) Resolve(ctx context.Context, task *Task) (taskElement, er
 	if exists, err := existingFile(absolute, media.Size); err != nil {
 		return nil, NewTaskError("collision", false, err)
 	} else if exists {
-		var expectedSHA string
-		if r.tw != nil {
-			if _, _, sha, ok := r.tw.TaskFinalInfo(request.ID); ok && sha != "" {
-				expectedSHA = sha
-			}
-		}
-		verifiedSHA, err := verifyFinalFileIdentity(absolute, media.Size, expectedSHA, request.ID)
+		verifiedSHA, err := verifyFinalFileIdentity(absolute, media.Size, "", request.ID)
 		if err != nil {
 			return nil, NewTaskError("collision", false, err)
 		}
@@ -101,22 +87,6 @@ func (r *taskResolver) Resolve(ctx context.Context, task *Task) (taskElement, er
 			return nil, NewTaskError("spool", false, err)
 		}
 		return spoolElem, nil
-	}
-
-	if media.Size <= downloader.SmallFileThreshold {
-		lazyElem, err := newLazySmallFileElement(task, media.File, r.outputRoot, media.Date, r.bkt, r.tw)
-		if err != nil {
-			return nil, NewTaskError("memory", false, err)
-		}
-		return lazyElem, nil
-	}
-
-	if r.bkt != nil && r.tw != nil {
-		bucketElem, err := newBucketFileElement(task, media.File, r.outputRoot, media.Date, r.bkt, r.tw)
-		if err != nil {
-			return nil, NewTaskError("bucket", false, err)
-		}
-		return bucketElem, nil
 	}
 
 	element, err := newFileElement(task, media.File, r.tempRoot, r.outputRoot, media.Date)

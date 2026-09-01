@@ -847,3 +847,59 @@ func (d *Database) DeleteAccount(namespace string) error {
 	_, err := d.db.Exec(`DELETE FROM telegram_accounts WHERE namespace = ?`, namespace)
 	return err
 }
+
+type TargetCommitRecord struct {
+	TaskID          string `json:"task_id"`
+	Generation      string `json:"generation"`
+	FinalPath       string `json:"final_path"`
+	ExpectedSize    int64  `json:"expected_size"`
+	ExpectedSHA256  string `json:"expected_sha256"`
+	CommittedSHA256 string `json:"committed_sha256"`
+	State           string `json:"state"`
+	Version         int    `json:"version"`
+	UpdatedAt       int64  `json:"updated_at"`
+}
+
+func (d *Database) RecordTargetCommit(rec TargetCommitRecord) error {
+	d.lock.Lock()
+	defer d.lock.Unlock()
+
+	now := time.Now().Unix()
+	if rec.UpdatedAt == 0 {
+		rec.UpdatedAt = now
+	}
+	if rec.Version == 0 {
+		rec.Version = 1
+	}
+
+	_, err := d.db.Exec(`
+		INSERT INTO target_commits (task_id, generation, final_path, expected_size, expected_sha256, committed_sha256, state, version, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(task_id, generation) DO UPDATE SET
+			final_path = excluded.final_path,
+			expected_size = excluded.expected_size,
+			expected_sha256 = excluded.expected_sha256,
+			committed_sha256 = excluded.committed_sha256,
+			state = excluded.state,
+			version = excluded.version,
+			updated_at = excluded.updated_at
+	`, rec.TaskID, rec.Generation, rec.FinalPath, rec.ExpectedSize, rec.ExpectedSHA256, rec.CommittedSHA256, rec.State, rec.Version, rec.UpdatedAt)
+	return err
+}
+
+func (d *Database) GetTargetCommit(taskID, generation string) (*TargetCommitRecord, error) {
+	d.lock.RLock()
+	defer d.lock.RUnlock()
+
+	var rec TargetCommitRecord
+	err := d.db.QueryRow(`
+		SELECT task_id, generation, final_path, expected_size, expected_sha256, committed_sha256, state, version, updated_at
+		FROM target_commits
+		WHERE task_id = ? AND generation = ?
+		LIMIT 1
+	`, taskID, generation).Scan(&rec.TaskID, &rec.Generation, &rec.FinalPath, &rec.ExpectedSize, &rec.ExpectedSHA256, &rec.CommittedSHA256, &rec.State, &rec.Version, &rec.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &rec, nil
+}

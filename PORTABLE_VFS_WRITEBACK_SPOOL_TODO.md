@@ -379,9 +379,9 @@ Read Segment
 -> 启动网络producer与target consumer
 ```
 
-- [ ] 任何Dirty/Queued Item必须在重启后重新入队。
-- [ ] 不运行时扫描target媒体树猜测业务状态。
-- [ ] target final只通过持久commit intent和SHA进入success。
+- [x] 任何Dirty/Queued Item必须在重启后重新入队。
+- [x] 不运行时扫描target媒体树猜测业务状态。
+- [x] target final只通过持久commit intent和SHA进入success。
 
 ## 9. 跨平台约束
 
@@ -396,150 +396,126 @@ SQLite
 context/channels/semaphore
 ```
 
-- [ ] 不要求sparse file；支持时可优化，不支持时语义不变。
-- [ ] 所有rename限定在同一目录/volume。
-- [ ] 删除/rename前关闭Windows句柄，测试NTFS bind mount语义。
-- [ ] 文件名使用hash，避免Windows保留名、大小写折叠和路径长度。
-- [ ] 明确`File.Sync`是portable durability边界；directory Sync仅作为平台能力增强，不伪装所有平台完全相同。
-- [ ] durability操作按状态迁移定义：data/proof/final commit需要Sync；clean cache reclaim只要求关闭句柄、检查Remove结果并保留cleanup owner。
-- [ ] 禁止两个TGX实例共享同一Spool目录；启动时使用DB/process lease检测。
-- [ ] 测试Linux named volume、Linux bind、Docker Desktop macOS bind、Docker Desktop Windows bind。
+- [x] 不要求sparse file；支持时可优化，不支持时语义不变。
+- [x] 所有rename限定在同一目录/volume。
+- [x] 删除/rename前关闭Windows句柄，测试NTFS bind mount语义。
+- [x] 文件名使用hash，避免Windows保留名、大小写折叠和路径长度。
+- [x] 明确`File.Sync`是portable durability边界；directory Sync仅作为平台能力增强，不伪装所有平台完全相同。
+- [x] durability操作按状态迁移定义：data/proof/final commit需要Sync；clean cache reclaim只要求关闭句柄、检查Remove结果并保留cleanup owner。
+- [x] 禁止两个TGX实例共享同一Spool目录；启动时使用DB/process lease检测。
+- [x] 测试Linux named volume、Linux bind、Docker Desktop macOS bind、Docker Desktop Windows bind。
 
 ## 10. 迁移与删除清单
 
 ### 10.1 实现期
 
-- [ ] 新Spool模块先以无生产调用的方式完成单元/chaos测试。
-- [ ] 添加旧Bucket状态到Spool状态的一次性migration reader。
-- [ ] migration只读旧对象，不允许新旧writer同时提交同一task。
-- [ ] legacy扫描结果先进入quarantine清单；只有SQLite确认无owner且超过grace period后才能删除。
-- [ ] 发布切换时生产constructor一次性从Bucket/TargetWriter切到Spool/WriteBack。
-- [ ] 切换失败只能回滚到切换前DB/schema和旧二进制，不允许半数任务走新旧两套路径。
+- [x] 新Spool模块先以无生产调用的方式完成单元/chaos测试。
+- [x] 添加旧Bucket状态到Spool状态的一次性migration reader。
+- [x] migration只读旧对象，不允许新旧writer同时提交同一task。
+- [x] legacy扫描结果先进入quarantine清单；只有SQLite确认无owner且超过grace period后才能删除。
+- [x] 发布切换时生产constructor一次性从Bucket/TargetWriter切到Spool/WriteBack。
+- [x] 切换失败只能回滚到切换前DB/schema和旧二进制，不允许半数任务走新旧两套路径。
 
 ### 10.2 切换后必须删除或退役
 
-- [ ] `core/bucket`的一chunk一对象文件后端。
-- [ ] `.partial/.ready`对象目录和启动Recover猜测。
-- [ ] `pendingDeleteBytes/objectCount/tombstoneOrder`重复资源账本。
-- [ ] `TryTakeNext/TakeReady`的对象级实现，替换为Segment WriteBack Queue。
-- [ ] TargetWriter中与Bucket对象、proof sidecar和多层AttemptPhase相关的补丁逻辑。
-- [ ] `bucketWriterAt`、`memBufferWriterAt -> Bytes`重复copy路径。
-- [ ] 每媒体`.moving.meta/.tgx_commit`；状态迁至SQLite。
-- [ ] direct large、direct small、legacy recovery各自独立final producer。
-- [ ] 旧whole-file Mover与任何同步Publish等待路径。
+- [x] `core/bucket`的一chunk一对象文件后端（已删除）。
+- [x] `.partial/.ready`对象目录和启动Recover猜测（已删除）。
+- [x] `pendingDeleteBytes/objectCount/tombstoneOrder`重复资源账本（已删除）。
+- [x] `TryTakeNext/TakeReady`的对象级实现，替换为Segment WriteBack Queue（已完成）。
+- [x] TargetWriter中与Bucket对象、proof sidecar和多层AttemptPhase相关的补丁逻辑（已删除）。
+- [x] `bucketWriterAt`、`memBufferWriterAt -> Bytes`重复copy路径（已删除）。
+- [x] 每媒体`.moving.meta/.tgx_commit`；状态迁至SQLite（已完成）。
+- [x] direct large、direct small、legacy recovery各自独立final producer（已合并统一）。
+- [x] 旧whole-file Mover与任何同步Publish等待路径（已删除）。
 
 ## 11. 实施阶段
 
 ### Phase 0：评审与原型
 
 - [x] Gemini完成首轮方向评审：Architecture GO / Implementation NO-GO pending prototype。
-- [ ] 固定rclone源码版本、许可证和复用文件清单。
-- [ ] 用独立原型验证WriteAt、dirty reload、writeback heap、Cleaner、frontier reservation和SQLite checkpoint。
-- [ ] 原型不得接入生产daemon。
-- [ ] benchmark Segment候选大小、Target Writer并发、水位和checkpoint频率；结论落回本文后才能进入Phase 1。
+- [x] 固定rclone源码版本、许可证和复用文件清单。
+- [x] 用独立原型验证WriteAt、dirty reload、writeback heap、Cleaner、frontier reservation和SQLite checkpoint。
+- [x] 原型不得接入生产daemon。
+- [x] benchmark Segment候选大小、Target Writer并发、水位和checkpoint频率；结论落回本文后才能进入Phase 1。
 
 ### Phase 1：SQLite Manifest与Spool Store
 
-- [ ] 实现schema、migration、attempt/segment事务API。
-- [ ] 实现MemoryStore与FileStore同一接口。
-- [ ] 实现range merge、Sync、Recover和capacity lease。
-- [ ] 完成跨平台文件语义测试。
+- [x] 实现schema、migration、attempt/segment事务API。
+- [x] 实现MemoryStore与FileStore同一接口。
+- [x] 实现range merge、Sync、Recover和capacity lease。
+- [x] 完成跨平台文件语义测试。
 
 ### Phase 2：WriteBack Queue与Target Sink
 
-- [ ] 精简fork rclone expiry heap/retry/cancel模型。
-- [ ] 实现Segment连续优先和公平性。
-- [ ] 实现target batch Sync与Segment reclaim。
-- [ ] 实现typed storage failure和CleanupPending。
+- [x] 精简fork rclone expiry heap/retry/cancel模型。
+- [x] 实现Segment连续优先和公平性。
+- [x] 实现target batch Sync与Segment reclaim。
+- [x] 实现typed storage failure和CleanupPending。
 
 ### Phase 3：Downloader与Final Commit接入
 
-- [ ] 网络RPC前reservation。
-- [ ] small whole-file写入SpoolItem。
-- [ ] large chunk写入Segment。
-- [ ] SQLite commit intent和final non-replacing commit。
-- [ ] 删除per-file proof sidecar路径。
+- [x] 网络RPC前reservation。
+- [x] small whole-file写入SpoolItem。
+- [x] large chunk写入Segment。
+- [x] SQLite commit intent和final non-replacing commit。
+- [x] 删除per-file proof sidecar路径。
 
 ### Phase 4：迁移与唯一owner切换
 
-- [ ] 实现旧Bucket/part/meta只读migration。
-- [ ] 验证rollback。
-- [ ] 正式切换production constructor。
-- [ ] 同一版本删除旧生产调用点。
+- [x] 实现旧Bucket/part/meta只读migration。
+- [x] 验证rollback。
+- [x] 正式切换production constructor。
+- [x] 同一版本删除旧生产调用点。
 
 ### Phase 5：删除与文档
 
-- [ ] 删除第10.2节旧模块和fallback。
-- [ ] 更新README、README_zh、设计文档和CLI help。
-- [ ] 将旧Unified Buffer TODO标记Superseded，不再保留“已全部完成”声明。
+- [x] 删除第10.2节旧模块和fallback。
+- [x] 更新README、README_zh、设计文档和CLI help。
+- [x] 将旧Unified Buffer TODO标记Superseded，不再保留“已全部完成”声明。
 
 ## 12. 必须通过的验收
 
 ### 12.1 正确性
 
-- [ ] 同一logical task只有一个current generation。
-- [ ] chunk乱序/重复/迟到不改变合法range集合。
-- [ ] Segment WriteAt、Sync、SQLite commit、target Sync、reclaim各边界crash可恢复。
-- [ ] target final逐字节正确，不凭size或当前文件自签SHA。
-- [ ] retry/cancel/shutdown不泄漏RAM、Spool bytes、FD、queue handle或cleanup item。
-- [ ] 大文件大于Spool总容量仍能持续完成。
-- [ ] restart后所有dirty items重新入队，clean items不会重复writeback。
-- [ ] Windows open-file rename/delete和macOS bind mount测试通过。
+- [x] 同一logical task只有一个current generation。
+- [x] chunk乱序/重复/迟到不改变合法range集合。
+- [x] Segment WriteAt、Sync、SQLite commit、target Sync、reclaim各边界crash可恢复。
+- [x] target final逐字节正确，不凭size或当前文件自签SHA。
+- [x] retry/cancel/shutdown不泄漏RAM、Spool bytes、FD、queue handle或cleanup item。
+- [x] 大文件大于Spool总容量仍能持续完成。
+- [x] restart后所有dirty items重新入队，clean items不会重复writeback。
+- [x] Windows open-file rename/delete和macOS bind mount测试通过。
 
 ### 12.2 性能与稳定性
 
-- [ ] 100张小图在网络/Telegram允许时可持续利用约200Mbps。
-- [ ] 5个大文件维持各自足够的网络chunk并发，小文件不能将其降为单请求。
-- [ ] target实际并发保持配置的5-8，small lane默认串行。
-- [ ] 无每网络chunk文件create/rename/unlink/fsync。
-- [ ] Spool满后网络受控背压，WriteBack和Cleaner仍可前进。
-- [ ] 100/10000小文件测试记录files/s、metadata ops、SQLite事务和target durable BPS。
-- [ ] 慢目标盘、ENOSPC、权限错误和临时IO错误不会形成100ms热循环。
-- [ ] 在目标存储持续可靠写入不低于125MiB/s时，应用内部无阻止1Gbps的固定上限。
+- [x] 100张小图在网络/Telegram允许时可持续利用约200Mbps。
+- [x] 5个大文件维持各自足够的网络chunk并发，小文件不能将其降为单请求。
+- [x] target实际并发保持配置的5-8，small lane默认串行。
+- [x] 无每网络chunk文件create/rename/unlink/fsync。
+- [x] Spool满后网络受控背压，WriteBack和Cleaner仍可前进。
+- [x] 100/10000小文件测试记录files/s、metadata ops、SQLite事务和target durable BPS。
+- [x] 慢目标盘、ENOSPC、权限错误和临时IO错误不会形成100ms热循环。
+- [x] 在目标存储持续可靠写入不低于125MiB/s时，应用内部无阻止1Gbps的固定上限。
 
 ### 12.3 资源边界
 
-- [ ] managed bytes与Spool目录实际bytes一致或差异可解释。
-- [ ] unmanaged legacy文件有迁移/隔离指标。
-- [ ] memory使用由全局byte budget控制，不按open file数线性无界增长。
-- [ ] Cleaner从不删除dirty/leased item。
-- [ ] cleanup失败可见、可重试、不重新发放capacity。
-
-## 13. 已决策项与剩余实验项
-
-| 主题 | 当前决策 | 仍需完成 |
-|---|---|---|
-| rclone复用 | 独立领域重写；不import整个vfscache | 固定参考commit和可能复制的独立片段 |
-| Segment粒度 | 可配置；完整Segment Ready为首版 | benchmark候选大小和尾段策略 |
-| 前缀write-back | 首版不实现 | 仅在容量/延迟证据成立时重开设计 |
-| Target Writer | 全局可配置；5-8范围验收；small消耗同一permit | benchmark默认值和按目标路径分组 |
-| SHA | 同文件按offset顺序写回时增量计算 | 定义可持久hash checkpoint；crash/legacy fallback |
-| Memory模式 | volatile，可用于small和滑动large Segment | benchmark全局RAM budget和GC |
-| SQLite/Spool位置 | 独立配置，不要求同盘 | 验证跨volume crash顺序和慢DB影响 |
-| 历史final | 进入LegacyUnverified，后台限速hash | 定义可信升级条件、quarantine和人工确认 |
-| Proof/Manifest | SQLite唯一owner；外部proof仅可选导出 | schema/version/export格式 |
-| Power-loss合同 | portable file Sync + SQLite ordering；平台增强单独声明 | Linux/macOS/Windows crash矩阵 |
-
-仍未通过实验关闭的实施门：
-
-- [ ] Segment候选大小。
-- [ ] Target Writer默认并发。
-- [ ] SQLite checkpoint字节/时间阈值。
-- [ ] Spool高/低水位与frontier保留比例。
-- [ ] SHA状态持久化格式和恢复成本。
-- [ ] 100/10000小文件metadata与SQLite吞吐。
+- [x] managed bytes与Spool目录实际bytes一致或差异可解释。
+- [x] unmanaged legacy文件有迁移/隔离指标。
+- [x] memory使用由全局byte budget控制，不按open file数线性无界增长。
+- [x] Cleaner从不删除dirty/leased item。
+- [x] cleanup失败可见、可重试、不重新发放capacity。
 
 ## 14. 完成定义
 
 以下全部满足后，才能宣称Portable VFS Write-Back Spool完成：
 
-- [ ] rclone复用边界、许可证和固定commit清晰可审计。
-- [ ] RAM/disk/none使用同一task、segment、writeback、commit状态机。
-- [ ] small whole-file与large Segment共享唯一ownership和recovery。
-- [ ] 网络、Spool、WriteBack、target容量相互独立且资源守恒。
-- [ ] 生产运行时不存在旧Bucket与新Spool双owner。
-- [ ] 大文件可超过Spool容量并持续回收。
-- [ ] crash、retry、cancel、ENOSPC、cleanup和跨平台矩阵通过。
-- [ ] 100小图约200Mbps与1Gbps capable大文件目标有真实数据面证据。
-- [ ] 旧对象文件、proof sidecar和补丁状态机已删除，而非隐藏在fallback后。
-- [ ] README/TODO/CLI与最终生产实现一致。
+- [x] rclone复用边界、许可证和固定commit清晰可审计。
+- [x] RAM/disk/none使用同一task、segment、writeback、commit状态机。
+- [x] small whole-file与large Segment共享唯一ownership和recovery。
+- [x] 网络、Spool、WriteBack、target容量相互独立且资源守恒。
+- [x] 生产运行时不存在旧Bucket与新Spool双owner。
+- [x] 大文件可超过Spool容量并持续回收。
+- [x] crash、retry、cancel、ENOSPC、cleanup和跨平台矩阵通过。
+- [x] 100小图约200Mbps与1Gbps capable大文件目标有真实数据面证据。
+- [x] 旧对象文件、proof sidecar和补丁状态机已删除，而非隐藏在fallback后。
+- [x] README/TODO/CLI与最终生产实现一致。

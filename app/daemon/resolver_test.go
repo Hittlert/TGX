@@ -2,16 +2,10 @@ package daemon
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
-
-	"github.com/Hittlert/TGX/core/targetwriter"
 )
 
 type fakeMediaAccess struct {
@@ -51,20 +45,6 @@ func TestResolverPreparesMediaAndExactExistingFile(t *testing.T) {
 	}
 	data := []byte("data")
 	if err := os.WriteFile(final, data, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	sum := sha256.Sum256(data)
-	proof := targetwriter.CommitProof{
-		Version:      1,
-		TaskID:       request.ID,
-		Gen:          "1",
-		FinalPath:    request.FinalPath,
-		ExpectedSize: 4,
-		SHA256:       hex.EncodeToString(sum[:]),
-		CommittedAt:  time.Now().Unix(),
-	}
-	proofData, _ := json.Marshal(proof)
-	if err := os.WriteFile(final+".tgx_commit", proofData, 0644); err != nil {
 		t.Fatal(err)
 	}
 	registry := NewRegistry(1, 100, nil)
