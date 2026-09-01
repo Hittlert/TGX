@@ -88,6 +88,7 @@ type AttemptWriteState struct {
 	finalPath       string
 	activeOps       int
 	phase           AttemptPhase
+	failedOnce      bool
 }
 
 func newAttemptWriteState(manifest TaskManifest, bm *MovedBitmap) *AttemptWriteState {
@@ -113,6 +114,25 @@ func (s *AttemptWriteState) AcquireOp() bool {
 	}
 	s.activeOps++
 	return true
+}
+
+func (s *AttemptWriteState) AcquireFinalizeOp(expectedGen string) (fToClose *os.File, dataSynced bool, ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.finalized || s.manifest.Gen != expectedGen || s.phase != PhaseActive {
+		return nil, false, false
+	}
+	s.phase = PhaseFinalizing
+	if s.activeOps == 0 {
+		s.drainedCh = make(chan struct{})
+	}
+	s.activeOps++
+	if s.file != nil {
+		fToClose = s.file
+		s.file = nil
+	}
+	dataSynced = s.dataSynced
+	return fToClose, dataSynced, true
 }
 
 func (s *AttemptWriteState) ReleaseOp() {
@@ -701,16 +721,27 @@ func (w *TargetWriter) processObject(obj *bucket.BufferObject, isContiguous bool
 		}
 	}
 
+	if state.phase == PhaseFailed {
+		state.mu.Unlock()
+		if ackErr := w.bkt.AckDurable([]bucket.ObjectKey{obj.Key}); ackErr != nil {
+			_ = w.bkt.DeleteObjects([]bucket.ObjectKey{obj.Key})
+		}
+		return processResult{phase: phaseStaleDiscarded, err: fmt.Errorf("attempt %s gen %s already in PhaseFailed", taskID, obj.Key.Gen)}
+	}
+
 	if state.phase != PhaseActive {
 		state.mu.Unlock()
 		return processResult{phase: phaseObjectRetryable, err: errors.New("attempt is closing or finalizing")}
 	}
 
-	// Grant operation lease
-	state.activeOps++
 	manifest := state.manifest
 	bm := state.bitmap
 	state.mu.Unlock()
+
+	// Grant operation lease using unified AcquireOp
+	if !state.AcquireOp() {
+		return processResult{phase: phaseObjectRetryable, err: errors.New("attempt lease acquire failed")}
+	}
 
 	f, err := w.getOrOpenFile(state)
 	if err != nil {
@@ -858,6 +889,8 @@ func (w *TargetWriter) persistMeta(manifest TaskManifest) error {
 
 func (w *TargetWriter) failAttemptPermanent(state *AttemptWriteState, key bucket.ObjectKey, manifest TaskManifest, err error) processResult {
 	state.mu.Lock()
+	shouldNotify := !state.failedOnce
+	state.failedOnce = true
 	state.phase = PhaseFailed
 	if state.file != nil {
 		_ = state.file.Sync()
@@ -872,7 +905,7 @@ func (w *TargetWriter) failAttemptPermanent(state *AttemptWriteState, key bucket
 	if ackErr := w.bkt.AckDurable([]bucket.ObjectKey{key}); ackErr != nil {
 		_ = w.bkt.DeleteObjects([]bucket.ObjectKey{key})
 	}
-	if w.onError != nil {
+	if shouldNotify && w.onError != nil {
 		w.onError(manifest.TaskID, manifest.Gen, err)
 	}
 	return processResult{phase: phaseStaleDiscarded, err: fmt.Errorf("permanent attempt failure: %w", err)}
@@ -962,33 +995,13 @@ func (w *TargetWriter) finalizeTask(manifest TaskManifest) (finalErr error) {
 		return errors.New("task not found for finalize")
 	}
 
-	state.mu.Lock()
-	if state.finalized {
-		state.mu.Unlock()
-		return nil
+	fToClose, dataSynced, ok := state.AcquireFinalizeOp(manifest.Gen)
+	if !ok {
+		return nil // already finalized or superseded by newer generation
 	}
-	if state.manifest.Gen != manifest.Gen {
-		state.mu.Unlock()
-		return nil // superseded by newer generation
-	}
-	if state.phase == PhaseClosing {
-		state.mu.Unlock()
-		return errors.New("attempt is closing")
-	}
-
-	// Transition to PhaseFinalizing (exclusive finalize lease)
-	state.phase = PhaseFinalizing
-	state.activeOps++
-
-	// Close open FD if attached
-	var fToClose *os.File
-	if state.file != nil {
-		fToClose = state.file
-		state.file = nil
+	if fToClose != nil {
 		atomic.AddInt64(&w.openFilesCount, -1)
 	}
-	dataSynced := state.dataSynced
-	state.mu.Unlock()
 
 	finalPath := filepath.Join(w.outputDir, manifest.FinalPath)
 	movingPath := finalPath + ".moving"

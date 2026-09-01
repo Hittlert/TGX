@@ -105,7 +105,7 @@ func newBucketFileElement(
 			if _, _, sha, ok := tw.TaskFinalInfo(manifest.TaskID); ok && sha != "" {
 				expectedSHA = sha
 			}
-			verifiedSHA, err := verifyFinalFileIdentity(finalFile, file.Size(), expectedSHA)
+			verifiedSHA, err := verifyFinalFileIdentity(finalFile, file.Size(), expectedSHA, manifest.TaskID)
 			if err != nil {
 				return nil, fmt.Errorf("already finalized verification failed: %w", err)
 			}
@@ -395,7 +395,7 @@ func newLazySmallFileElement(
 			if _, _, sha, ok := tw.TaskFinalInfo(manifest.TaskID); ok && sha != "" {
 				expectedSHA = sha
 			}
-			verifiedSHA, err := verifyFinalFileIdentity(finalFile, file.Size(), expectedSHA)
+			verifiedSHA, err := verifyFinalFileIdentity(finalFile, file.Size(), expectedSHA, manifest.TaskID)
 			if err != nil {
 				return nil, fmt.Errorf("already finalized verification failed: %w", err)
 			}
@@ -630,7 +630,7 @@ func syncDirectory(dir string) error {
 	return f.Sync()
 }
 
-func verifyFinalFileIdentity(finalPath string, expectedSize int64, expectedSHA string) (string, error) {
+func verifyFinalFileIdentity(finalPath string, expectedSize int64, expectedSHA string, expectedTaskID string) (string, error) {
 	stat, err := os.Stat(finalPath)
 	if err != nil {
 		return "", fmt.Errorf("target file missing: %w", err)
@@ -653,11 +653,18 @@ func verifyFinalFileIdentity(finalPath string, expectedSize int64, expectedSHA s
 	if data, err := os.ReadFile(proofPath); err == nil {
 		var proof targetwriter.CommitProof
 		if json.Unmarshal(data, &proof) == nil && proof.SHA256 != "" {
+			if expectedTaskID != "" && proof.TaskID != "" && proof.TaskID != expectedTaskID {
+				return "", fmt.Errorf("task ID mismatch in commit proof: expected %s, got %s", expectedTaskID, proof.TaskID)
+			}
+			if expectedSize > 0 && proof.ExpectedSize > 0 && proof.ExpectedSize != expectedSize {
+				return "", fmt.Errorf("size mismatch in commit proof: expected %d, got %d", expectedSize, proof.ExpectedSize)
+			}
 			if actualSHA != proof.SHA256 {
 				return "", fmt.Errorf("content conflict with commit proof: expected %s, got %s", proof.SHA256, actualSHA)
 			}
 			return actualSHA, nil
 		}
+		return "", fmt.Errorf("corrupt or incomplete commit proof at %s", proofPath)
 	}
-	return actualSHA, nil
+	return "", fmt.Errorf("no verifiable commit proof or expected sha for %s", finalPath)
 }

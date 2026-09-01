@@ -56,7 +56,20 @@ func TestReconciler_PromotesExistingFileToSuccess(t *testing.T) {
 
 	// Final file exists with exact size
 	finalPath := filepath.Join(outDir, "test.mp4")
-	require.NoError(t, os.WriteFile(finalPath, []byte("data"), 0644))
+	data := []byte("data")
+	require.NoError(t, os.WriteFile(finalPath, data, 0644))
+
+	sum := sha256.Sum256(data)
+	proof := targetwriter.CommitProof{
+		TaskID:       CanonicalTaskID("123", 1),
+		Gen:          "1",
+		FinalPath:    "test.mp4",
+		ExpectedSize: 4,
+		SHA256:       hex.EncodeToString(sum[:]),
+		CommittedAt:  time.Now().Unix(),
+	}
+	proofData, _ := json.Marshal(proof)
+	require.NoError(t, os.WriteFile(finalPath+".tgx_commit", proofData, 0644))
 
 	_, err := db.Exec(`INSERT INTO download_records (chat_id, message_id, status, file_name, save_path, file_size) VALUES ('123', 1, 'downloading', 'test.mp4', 'test.mp4', 4)`)
 	require.NoError(t, err)

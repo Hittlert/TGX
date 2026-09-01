@@ -115,25 +115,16 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) ([]TaskRecoveryResult, er
 
 		if err == nil && stat.Size() == rec.FileSize && rec.FileSize > 0 && errors.Is(movingErr, os.ErrNotExist) && !hasTempPart {
 			var expectedSHA string
-			// Check immutable .tgx_commit sidecar proof
-			proofData, proofErr := os.ReadFile(finalPath + ".tgx_commit")
-			if proofErr == nil {
-				var proof targetwriter.CommitProof
-				if json.Unmarshal(proofData, &proof) == nil && proof.SHA256 != "" {
-					expectedSHA = proof.SHA256
-				}
-			}
-			// Check in-memory tombstone
-			if expectedSHA == "" && r.tw != nil {
+			if r.tw != nil {
 				if _, _, finalSHA, ok := r.tw.TaskFinalInfo(fileKey); ok && finalSHA != "" {
 					expectedSHA = finalSHA
 				}
 			}
 
-			actualSHA, shaErr := computeRecoverySHA256(finalPath)
-			if shaErr == nil && (expectedSHA == "" || actualSHA == expectedSHA) {
+			verifiedSHA, verifyErr := verifyFinalFileIdentity(finalPath, rec.FileSize, expectedSHA, fileKey)
+			if verifyErr == nil && verifiedSHA != "" {
 				_ = os.Remove(metaPath)
-				if execErr := r.updateRecordSuccess(ctx, rec.ChatID, rec.MessageID, actualSHA); execErr != nil {
+				if execErr := r.updateRecordSuccess(ctx, rec.ChatID, rec.MessageID, verifiedSHA); execErr != nil {
 					r.logger.Warn("failed to update record to success in recovery", zap.Error(execErr))
 				} else {
 					results = append(results, TaskRecoveryResult{
@@ -145,7 +136,7 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) ([]TaskRecoveryResult, er
 					continue
 				}
 			} else {
-				r.logger.Warn("file content mismatch during recovery", zap.String("expected", expectedSHA), zap.String("actual", actualSHA))
+				r.logger.Warn("target file content unverified or mismatch during recovery", zap.Error(verifyErr))
 			}
 		}
 
@@ -243,7 +234,7 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) ([]TaskRecoveryResult, er
 										expectedSHA = finalSHA
 									}
 								}
-								verifiedSHA, verifyErr := verifyFinalFileIdentity(finalPath, manifest.ExpectedSize, expectedSHA)
+								verifiedSHA, verifyErr := verifyFinalFileIdentity(finalPath, manifest.ExpectedSize, expectedSHA, manifest.TaskID)
 								if verifyErr == nil && verifiedSHA != "" {
 									_ = os.Remove(metaPath)
 									_ = os.Remove(movingPath)

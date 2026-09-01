@@ -71,10 +71,16 @@ func (r *taskResolver) Resolve(ctx context.Context, task *Task) (taskElement, er
 	if err != nil {
 		return nil, NewTaskError("path", false, err)
 	}
-	if exists, err := existingFile(absolute, media.Size); err != nil {
-		return nil, NewTaskError("collision", false, err)
-	} else if exists {
-		return &existingElement{task: task, file: media.File, path: finalPath}, nil
+	var expectedSHA string
+	if r.tw != nil {
+		if _, _, sha, ok := r.tw.TaskFinalInfo(request.ID); ok && sha != "" {
+			expectedSHA = sha
+		}
+	}
+	if stat, statErr := os.Stat(absolute); statErr == nil && stat.Size() == media.Size {
+		if verifiedSHA, verifyErr := verifyFinalFileIdentity(absolute, media.Size, expectedSHA, request.ID); verifyErr == nil && verifiedSHA != "" {
+			return &existingElement{task: task, file: media.File, path: finalPath, sha: verifiedSHA}, nil
+		}
 	}
 
 	if media.Size <= downloader.SmallFileThreshold {

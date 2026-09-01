@@ -725,3 +725,71 @@ func TestTargetWriter_WaitForDrainingCancel(t *testing.T) {
 	state.ReleaseOp()
 	assert.NoError(t, state.WaitForDraining(context.Background()))
 }
+
+func TestTargetWriter_PhaseFailedDiscardsSubsequentObjects(t *testing.T) {
+	tempDir := t.TempDir()
+	outDir := filepath.Join(tempDir, "output")
+	require.NoError(t, os.MkdirAll(outDir, 0755))
+
+	bkt, err := bucket.New(bucket.Config{Mode: bucket.ModeMemory, MaxCapacity: 10 * 1024 * 1024})
+	require.NoError(t, err)
+	defer bkt.Close()
+
+	tw := New(bkt, outDir)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	tw.Start(ctx)
+	tw.BeginConsuming()
+	defer tw.Close()
+
+	manifest := TaskManifest{
+		TaskID:       "task-fail-isolation",
+		FinalPath:    "failed.bin",
+		ExpectedSize: 2048,
+		Gen:          "1",
+	}
+	require.Equal(t, RegisterAccepted, tw.RegisterTask(manifest))
+
+	// Manually set PhaseFailed to simulate permanent error
+	tw.stateMu.RLock()
+	st := tw.tasks["task-fail-isolation"]
+	tw.stateMu.RUnlock()
+	st.mu.Lock()
+	st.phase = PhaseFailed
+	st.mu.Unlock()
+
+	// Put an object for this failed attempt
+	key := bucket.ObjectKey{TaskID: "task-fail-isolation", Gen: "1", Offset: 0, Length: 1024}
+	require.NoError(t, bkt.Reserve(ctx, 1024))
+	require.NoError(t, bkt.PutObject(key, make([]byte, 1024)))
+
+	// It must be discarded without blocking the writer loop!
+	time.Sleep(150 * time.Millisecond)
+
+	tw.stateMu.RLock()
+	st = tw.tasks["task-fail-isolation"]
+	tw.stateMu.RUnlock()
+	assert.NotNil(t, st)
+}
+
+func TestTargetWriter_AcquireFinalizeOpProductionDraining(t *testing.T) {
+	state := newAttemptWriteState(TaskManifest{TaskID: "t-finalize", Gen: "1"}, nil)
+
+	// Acquire finalize op through the production method
+	fToClose, _, ok := state.AcquireFinalizeOp("1")
+	require.True(t, ok)
+	assert.Nil(t, fToClose)
+	assert.Equal(t, PhaseFinalizing, state.phase)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	// While finalizing is active, WaitForDraining must block and respect context
+	err := state.WaitForDraining(ctx)
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
+
+	// After release, draining must unblock immediately
+	state.ReleaseOp()
+	assert.NoError(t, state.WaitForDraining(context.Background()))
+}
