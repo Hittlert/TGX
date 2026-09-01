@@ -830,6 +830,12 @@ func (w *TargetWriter) processObject(obj *bucket.BufferObject, isContiguous bool
 	// Phase 5: Finalize if all ranges are complete
 	if isComplete {
 		if err := w.finalizeTask(manifest); err != nil {
+			if isFinalizePermError(err) {
+				if w.onError != nil {
+					w.onError(manifest.TaskID, manifest.Gen, err)
+				}
+				return processResult{phase: phaseStaleDiscarded, err: err}
+			}
 			return processResult{phaseFinalizeRetryable, err}
 		}
 	}
