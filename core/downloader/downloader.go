@@ -1224,6 +1224,8 @@ func (d *Downloader) fetchLargeChunk(ctx context.Context, workerID int, job *lar
 			d.floodGate.TriggerTransportError(fetchErr)
 		}
 
+		retryDelay := time.Duration(1<<attempt) * 100 * time.Millisecond
+
 		select {
 		case <-ctx.Done():
 			job.fileState.fail(ctx.Err())
@@ -1239,7 +1241,7 @@ func (d *Downloader) fetchLargeChunk(ctx context.Context, workerID int, job *lar
 			case writeChan <- &largeWriteJob{fileState: job.fileState, leaseGen: job.leaseGen, offset: job.offset, isFailed: true, err: context.Canceled}:
 			}
 			return
-		case <-time.After(time.Duration(attempt+1) * 200 * time.Millisecond):
+		case <-time.After(retryDelay):
 		}
 	}
 
@@ -1431,6 +1433,8 @@ func (d *Downloader) fetchSmallFile(ctx context.Context, workerID int, job *smal
 				d.floodGate.TriggerTransportError(fetchErr)
 			}
 
+			retryDelay := time.Duration(1<<attempt) * 100 * time.Millisecond
+
 			select {
 			case <-ctx.Done():
 				d.opts.Progress.OnDone(job.elem, ctx.Err())
@@ -1440,7 +1444,7 @@ func (d *Downloader) fetchSmallFile(ctx context.Context, workerID int, job *smal
 				d.opts.Progress.OnDone(job.elem, context.Canceled)
 				budget.release(job.totalSize)
 				return
-			case <-time.After(time.Duration(attempt+1) * 200 * time.Millisecond):
+			case <-time.After(retryDelay):
 			}
 		}
 
