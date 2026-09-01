@@ -653,7 +653,7 @@ func verifyFinalFileIdentity(finalPath string, expectedSize int64, expectedSHA s
 	proofPath := finalPath + ".tgx_commit"
 	if data, err := os.ReadFile(proofPath); err == nil {
 		var proof targetwriter.CommitProof
-		if json.Unmarshal(data, &proof) == nil && proof.SHA256 != "" && proof.Version >= 1 {
+		if json.Unmarshal(data, &proof) == nil && proof.SHA256 != "" && proof.Version >= 0 {
 			if expectedTaskID != "" && proof.TaskID != "" && proof.TaskID != expectedTaskID {
 				return "", fmt.Errorf("task ID mismatch in commit proof: expected %s, got %s", expectedTaskID, proof.TaskID)
 			}
@@ -672,7 +672,7 @@ func verifyFinalFileIdentity(finalPath string, expectedSize int64, expectedSHA s
 	tmpProofPath := proofPath + ".tmp"
 	if data, err := os.ReadFile(tmpProofPath); err == nil {
 		var proof targetwriter.CommitProof
-		if json.Unmarshal(data, &proof) == nil && proof.SHA256 != "" && proof.Version >= 1 {
+		if json.Unmarshal(data, &proof) == nil && proof.SHA256 != "" && proof.Version >= 0 {
 			if expectedTaskID != "" && proof.TaskID != "" && proof.TaskID != expectedTaskID {
 				return "", fmt.Errorf("task ID mismatch in tmp commit proof: expected %s, got %s", expectedTaskID, proof.TaskID)
 			}

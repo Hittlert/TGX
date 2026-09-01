@@ -63,6 +63,7 @@ func TestReconciler_PromotesExistingFileToSuccess(t *testing.T) {
 
 	sum := sha256.Sum256(data)
 	proof := targetwriter.CommitProof{
+		Version:      1,
 		TaskID:       CanonicalTaskID("123", 1),
 		Gen:          "1",
 		FinalPath:    "test.mp4",
