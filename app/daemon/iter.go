@@ -77,7 +77,11 @@ func (i *taskIter) startWorkers(ctx context.Context) {
 					continue
 				}
 				if path, ok := element.AlreadyComplete(); ok {
-					task.Succeed(path, true)
+					if ee, isExisting := element.(*existingElement); isExisting {
+						task.SucceedResult(PublishResult{Path: path, SHA256: ee.sha, AlreadyExists: true})
+					} else {
+						task.Succeed(path, true)
+					}
 					continue
 				}
 

@@ -659,3 +659,69 @@ func TestTargetWriter_TaskFinalInfo(t *testing.T) {
 	assert.Equal(t, cbSHA, sha)
 	assert.NotEmpty(t, sha)
 }
+
+func TestTargetWriter_OnCompleteReentryNoDeadlock(t *testing.T) {
+	tempDir := t.TempDir()
+	outDir := filepath.Join(tempDir, "output")
+	require.NoError(t, os.MkdirAll(outDir, 0755))
+
+	bkt, err := bucket.New(bucket.Config{Mode: bucket.ModeMemory, MaxCapacity: 10 * 1024 * 1024})
+	require.NoError(t, err)
+	defer bkt.Close()
+
+	tw := New(bkt, outDir)
+
+	// Callback that re-registers the next gen inside onComplete
+	reentryDone := make(chan struct{})
+	tw.SetCallbacks(func(taskID, gen, finalPath, shaHash string) {
+		res := tw.RegisterTask(TaskManifest{
+			TaskID:       taskID,
+			FinalPath:    finalPath,
+			ExpectedSize: 1024,
+			Gen:          "retry_from_complete",
+		})
+		assert.Equal(t, RegisterAccepted, res)
+		close(reentryDone)
+	}, nil, nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	tw.Start(ctx)
+	tw.BeginConsuming()
+	defer tw.Close()
+
+	data := []byte("complete reentry test data")
+	manifest := TaskManifest{
+		TaskID:       "task-complete-reentry",
+		FinalPath:    "reentry_complete.bin",
+		ExpectedSize: int64(len(data)),
+		Gen:          "1",
+	}
+	require.Equal(t, RegisterAccepted, tw.RegisterTask(manifest))
+
+	key := bucket.ObjectKey{TaskID: "task-complete-reentry", Gen: "1", Offset: 0, Length: int64(len(data))}
+	require.NoError(t, bkt.Reserve(ctx, int64(len(data))))
+	require.NoError(t, bkt.PutObject(key, data))
+
+	select {
+	case <-reentryDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("onComplete reentry deadlocked or timed out")
+	}
+}
+
+func TestTargetWriter_WaitForDrainingCancel(t *testing.T) {
+	state := newAttemptWriteState(TaskManifest{TaskID: "t1", Gen: "1"}, nil)
+	state.AcquireOp()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	// Should unblock promptly with ctx.Err() without hanging
+	err := state.WaitForDraining(ctx)
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
+
+	// Now release and verify draining succeeds
+	state.ReleaseOp()
+	assert.NoError(t, state.WaitForDraining(context.Background()))
+}

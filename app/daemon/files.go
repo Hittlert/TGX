@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -100,14 +101,15 @@ func newBucketFileElement(
 			// Normal download path
 		case targetwriter.RegisterAlreadyFinalized:
 			finalFile := filepath.Join(outputRoot, manifest.FinalPath)
-			if stat, statErr := os.Stat(finalFile); statErr == nil && stat.Size() == file.Size() {
-				var finalSHA string
-				if _, _, sha, ok := tw.TaskFinalInfo(manifest.TaskID); ok && sha != "" {
-					finalSHA = sha
-				}
-				return &existingElement{task: task, file: file, path: manifest.FinalPath, sha: finalSHA}, nil
+			var expectedSHA string
+			if _, _, sha, ok := tw.TaskFinalInfo(manifest.TaskID); ok && sha != "" {
+				expectedSHA = sha
 			}
-			return nil, fmt.Errorf("task already finalized in writer but target file missing: %s", manifest.FinalPath)
+			verifiedSHA, err := verifyFinalFileIdentity(finalFile, file.Size(), expectedSHA)
+			if err != nil {
+				return nil, fmt.Errorf("already finalized verification failed: %w", err)
+			}
+			return &existingElement{task: task, file: file, path: manifest.FinalPath, sha: verifiedSHA}, nil
 		case targetwriter.RegisterStale:
 			return nil, fmt.Errorf("target writer rejected attempt: STALE")
 		case targetwriter.RegisterConflict:
@@ -389,14 +391,15 @@ func newLazySmallFileElement(
 			// Normal download path
 		case targetwriter.RegisterAlreadyFinalized:
 			finalFile := filepath.Join(outputRoot, manifest.FinalPath)
-			if stat, statErr := os.Stat(finalFile); statErr == nil && stat.Size() == file.Size() {
-				var finalSHA string
-				if _, _, sha, ok := tw.TaskFinalInfo(manifest.TaskID); ok && sha != "" {
-					finalSHA = sha
-				}
-				return &existingElement{task: task, file: file, path: manifest.FinalPath, sha: finalSHA}, nil
+			var expectedSHA string
+			if _, _, sha, ok := tw.TaskFinalInfo(manifest.TaskID); ok && sha != "" {
+				expectedSHA = sha
 			}
-			return nil, fmt.Errorf("small file already finalized in writer but target file missing: %s", manifest.FinalPath)
+			verifiedSHA, err := verifyFinalFileIdentity(finalFile, file.Size(), expectedSHA)
+			if err != nil {
+				return nil, fmt.Errorf("already finalized verification failed: %w", err)
+			}
+			return &existingElement{task: task, file: file, path: manifest.FinalPath, sha: verifiedSHA}, nil
 		case targetwriter.RegisterStale:
 			return nil, fmt.Errorf("target writer rejected small file attempt: STALE")
 		case targetwriter.RegisterConflict:
@@ -625,4 +628,36 @@ func syncDirectory(dir string) error {
 	}
 	defer f.Close()
 	return f.Sync()
+}
+
+func verifyFinalFileIdentity(finalPath string, expectedSize int64, expectedSHA string) (string, error) {
+	stat, err := os.Stat(finalPath)
+	if err != nil {
+		return "", fmt.Errorf("target file missing: %w", err)
+	}
+	if expectedSize > 0 && stat.Size() != expectedSize {
+		return "", fmt.Errorf("size mismatch: expected %d, got %d", expectedSize, stat.Size())
+	}
+	actualSHA, err := computeSHA256(finalPath)
+	if err != nil {
+		return "", fmt.Errorf("compute target sha256: %w", err)
+	}
+	if expectedSHA != "" {
+		if actualSHA != expectedSHA {
+			return "", fmt.Errorf("content conflict: expected sha %s, got %s", expectedSHA, actualSHA)
+		}
+		return actualSHA, nil
+	}
+	// Check .tgx_commit sidecar proof if expectedSHA was not provided in memory
+	proofPath := finalPath + ".tgx_commit"
+	if data, err := os.ReadFile(proofPath); err == nil {
+		var proof targetwriter.CommitProof
+		if json.Unmarshal(data, &proof) == nil && proof.SHA256 != "" {
+			if actualSHA != proof.SHA256 {
+				return "", fmt.Errorf("content conflict with commit proof: expected %s, got %s", proof.SHA256, actualSHA)
+			}
+			return actualSHA, nil
+		}
+	}
+	return actualSHA, nil
 }

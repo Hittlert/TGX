@@ -24,6 +24,9 @@ func main() {
 	}
 
 	if err := cmd.New().ExecuteContext(ctx); err != nil {
+		if errors.Is(err, context.Canceled) {
+			os.Exit(0)
+		}
 		for e, m := range humanizeErrors {
 			if errors.Is(err, e) {
 				color.Red("%s", m)

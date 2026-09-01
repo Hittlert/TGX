@@ -531,3 +531,40 @@ func TestRecovery_LegacyPart_ContentConflictDifferentSHA(t *testing.T) {
 	_, err = os.Stat(tempPartPathIdent)
 	assert.True(t, os.IsNotExist(err))
 }
+
+func TestReconciler_RejectsSameSizeWrongHashFile(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+
+	outDir := t.TempDir()
+	tempDir := t.TempDir()
+
+	fileKey := CanonicalTaskID("chat_wrong", 1)
+	finalPath := filepath.Join(outDir, "wrong.bin")
+
+	// Final file has different content with the same length
+	require.NoError(t, os.WriteFile(finalPath, []byte("bad content 1234"), 0644))
+
+	// Commit proof specifies a different SHA
+	proof := targetwriter.CommitProof{
+		TaskID:       fileKey,
+		Gen:          "1",
+		FinalPath:    "wrong.bin",
+		ExpectedSize: 16,
+		SHA256:       "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+		CommittedAt:  time.Now().Unix(),
+	}
+	proofData, _ := json.Marshal(proof)
+	require.NoError(t, os.WriteFile(finalPath+".tgx_commit", proofData, 0644))
+
+	_, err := db.Exec(`INSERT INTO download_records (chat_id, message_id, status, file_name, save_path, file_size) VALUES ('chat_wrong', 1, 'downloading', 'wrong.bin', 'wrong.bin', 16)`)
+	require.NoError(t, err)
+
+	rec := NewReconciler(db, outDir, tempDir, zap.NewNop())
+	results, err := rec.ReconcileAll(context.Background())
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+
+	// Must NOT promote to success because proof SHA does not match actual file SHA!
+	assert.Equal(t, "pending", results[0].NextState)
+}

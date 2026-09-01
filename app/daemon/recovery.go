@@ -114,26 +114,39 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) ([]TaskRecoveryResult, er
 		hasTempPart := (partErr == nil)
 
 		if err == nil && stat.Size() == rec.FileSize && rec.FileSize > 0 && errors.Is(movingErr, os.ErrNotExist) && !hasTempPart {
-			var sha string
-			if r.tw != nil {
-				if _, _, finalSHA, ok := r.tw.TaskFinalInfo(fileKey); ok && finalSHA != "" {
-					sha = finalSHA
+			var expectedSHA string
+			// Check immutable .tgx_commit sidecar proof
+			proofData, proofErr := os.ReadFile(finalPath + ".tgx_commit")
+			if proofErr == nil {
+				var proof targetwriter.CommitProof
+				if json.Unmarshal(proofData, &proof) == nil && proof.SHA256 != "" {
+					expectedSHA = proof.SHA256
 				}
 			}
-			if sha == "" {
-				sha, _ = computeRecoverySHA256(finalPath)
+			// Check in-memory tombstone
+			if expectedSHA == "" && r.tw != nil {
+				if _, _, finalSHA, ok := r.tw.TaskFinalInfo(fileKey); ok && finalSHA != "" {
+					expectedSHA = finalSHA
+				}
 			}
-			_ = os.Remove(metaPath)
-			if execErr := r.updateRecordSuccess(ctx, rec.ChatID, rec.MessageID, sha); execErr != nil {
-				r.logger.Warn("failed to update record to success in recovery", zap.Error(execErr))
+
+			actualSHA, shaErr := computeRecoverySHA256(finalPath)
+			if shaErr == nil && (expectedSHA == "" || actualSHA == expectedSHA) {
+				_ = os.Remove(metaPath)
+				if execErr := r.updateRecordSuccess(ctx, rec.ChatID, rec.MessageID, actualSHA); execErr != nil {
+					r.logger.Warn("failed to update record to success in recovery", zap.Error(execErr))
+				} else {
+					results = append(results, TaskRecoveryResult{
+						FileKey:     fileKey,
+						PrevState:   rec.Status,
+						NextState:   "success",
+						ActionTaken: "FINAL_FILE_COMMITTED_PROMOTED_TO_SUCCESS",
+					})
+					continue
+				}
+			} else {
+				r.logger.Warn("file content mismatch during recovery", zap.String("expected", expectedSHA), zap.String("actual", actualSHA))
 			}
-			results = append(results, TaskRecoveryResult{
-				FileKey:     fileKey,
-				PrevState:   rec.Status,
-				NextState:   "success",
-				ActionTaken: "FINAL_FILE_COMMITTED_PROMOTED_TO_SUCCESS",
-			})
-			continue
 		}
 
 		// 2. Check if durable target storage sidecar .moving.meta exists (valid across ALL buffer modes)
@@ -224,37 +237,37 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) ([]TaskRecoveryResult, er
 									ActionTaken: "SSD_BUFFER_COMPLETE_FINALIZE_PENDING",
 								})
 							case targetwriter.RegisterAlreadyFinalized:
-								if stat, err := os.Stat(finalPath); err == nil && stat.Size() == manifest.ExpectedSize {
-									var sha string
-									if r.tw != nil {
-										if _, _, finalSHA, ok := r.tw.TaskFinalInfo(manifest.TaskID); ok && finalSHA != "" {
-											sha = finalSHA
-										}
+								var expectedSHA string
+								if r.tw != nil {
+									if _, _, finalSHA, ok := r.tw.TaskFinalInfo(manifest.TaskID); ok && finalSHA != "" {
+										expectedSHA = finalSHA
 									}
-									if sha == "" {
-										sha, _ = computeRecoverySHA256(finalPath)
-									}
+								}
+								verifiedSHA, verifyErr := verifyFinalFileIdentity(finalPath, manifest.ExpectedSize, expectedSHA)
+								if verifyErr == nil && verifiedSHA != "" {
 									_ = os.Remove(metaPath)
 									_ = os.Remove(movingPath)
-									if execErr := r.updateRecordSuccess(ctx, rec.ChatID, rec.MessageID, sha); execErr != nil {
+									if execErr := r.updateRecordSuccess(ctx, rec.ChatID, rec.MessageID, verifiedSHA); execErr != nil {
 										r.logger.Warn("failed to update record to success in recovery", zap.Error(execErr))
+									} else {
+										results = append(results, TaskRecoveryResult{
+											FileKey:     fileKey,
+											PrevState:   rec.Status,
+											NextState:   "success",
+											ActionTaken: "ALREADY_FINALIZED_PROMOTED_TO_SUCCESS",
+										})
 									}
-									results = append(results, TaskRecoveryResult{
-										FileKey:     fileKey,
-										PrevState:   rec.Status,
-										NextState:   "success",
-										ActionTaken: "ALREADY_FINALIZED_PROMOTED_TO_SUCCESS",
-									})
 								} else {
 									if execErr := r.updateRecordPending(ctx, rec.ChatID, rec.MessageID); execErr != nil {
 										r.logger.Warn("failed to reset record to pending in recovery", zap.Error(execErr))
+									} else {
+										results = append(results, TaskRecoveryResult{
+											FileKey:     fileKey,
+											PrevState:   rec.Status,
+											NextState:   "pending",
+											ActionTaken: "ALREADY_FINALIZED_TARGET_MISSING_RESET",
+										})
 									}
-									results = append(results, TaskRecoveryResult{
-										FileKey:     fileKey,
-										PrevState:   rec.Status,
-										NextState:   "pending",
-										ActionTaken: "ALREADY_FINALIZED_TARGET_MISSING_RESET",
-									})
 								}
 							case targetwriter.RegisterStale, targetwriter.RegisterConflict:
 								_ = os.Remove(metaPath)
@@ -396,13 +409,33 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) ([]TaskRecoveryResult, er
 }
 
 func (r *Reconciler) updateRecordSuccess(ctx context.Context, chatID string, msgID int, sha string) error {
-	_, err := r.db.ExecContext(ctx, `UPDATE download_records SET status = 'success', error = '' WHERE chat_id = ? AND message_id = ?`, chatID, msgID)
-	return err
+	res, err := r.db.ExecContext(ctx, `UPDATE download_records SET status = 'success', error = '' WHERE chat_id = ? AND message_id = ?`, chatID, msgID)
+	if err != nil {
+		return err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return fmt.Errorf("no record updated for %s:%d", chatID, msgID)
+	}
+	return nil
 }
 
 func (r *Reconciler) updateRecordPending(ctx context.Context, chatID string, msgID int) error {
-	_, err := r.db.ExecContext(ctx, `UPDATE download_records SET status = 'pending', attempts = 0, next_retry_at = 0, error = '' WHERE chat_id = ? AND message_id = ?`, chatID, msgID)
-	return err
+	res, err := r.db.ExecContext(ctx, `UPDATE download_records SET status = 'pending', attempts = 0, next_retry_at = 0, error = '' WHERE chat_id = ? AND message_id = ?`, chatID, msgID)
+	if err != nil {
+		return err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return fmt.Errorf("no record updated for %s:%d", chatID, msgID)
+	}
+	return nil
 }
 
 func computeRecoverySHA256(path string) (string, error) {

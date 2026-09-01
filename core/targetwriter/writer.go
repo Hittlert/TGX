@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/Hittlert/TGX/core/bucket"
@@ -68,12 +69,13 @@ const (
 	PhaseClosing
 	PhaseFinalizing
 	PhaseFinalized
+	PhaseFailed
 )
 
 // AttemptWriteState tracks all state for a single active or completed task attempt in TargetWriter.
 type AttemptWriteState struct {
 	mu              sync.Mutex
-	cond            *sync.Cond
+	drainedCh       chan struct{}
 	manifest        TaskManifest
 	bitmap          *MovedBitmap
 	file            *os.File
@@ -94,8 +96,9 @@ func newAttemptWriteState(manifest TaskManifest, bm *MovedBitmap) *AttemptWriteS
 		bitmap:          bm,
 		pendingFinalize: bm != nil && bm.IsComplete(),
 		phase:           PhaseActive,
+		drainedCh:       make(chan struct{}),
 	}
-	s.cond = sync.NewCond(&s.mu)
+	close(s.drainedCh) // 0 active ops, initially drained
 	return s
 }
 
@@ -105,6 +108,9 @@ func (s *AttemptWriteState) AcquireOp() bool {
 	if s.phase != PhaseActive {
 		return false
 	}
+	if s.activeOps == 0 {
+		s.drainedCh = make(chan struct{})
+	}
 	s.activeOps++
 	return true
 }
@@ -113,21 +119,35 @@ func (s *AttemptWriteState) ReleaseOp() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.activeOps--
-	if s.activeOps <= 0 && s.cond != nil {
-		s.cond.Broadcast()
+	if s.activeOps <= 0 {
+		s.activeOps = 0
+		select {
+		case <-s.drainedCh:
+		default:
+			close(s.drainedCh)
+		}
 	}
 }
 
 func (s *AttemptWriteState) WaitForDraining(ctx context.Context) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	for s.activeOps > 0 {
-		if ctx != nil && ctx.Err() != nil {
-			return ctx.Err()
-		}
-		s.cond.Wait()
+	if s.activeOps <= 0 {
+		s.mu.Unlock()
+		return nil
 	}
-	return nil
+	ch := s.drainedCh
+	s.mu.Unlock()
+
+	if ctx == nil {
+		<-ch
+		return nil
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-ch:
+		return nil
+	}
 }
 
 type RegisterResult int
@@ -350,7 +370,9 @@ func (w *TargetWriter) RegisterTask(manifest TaskManifest) RegisterResult {
 			w.stateMu.Unlock()
 
 			// 3. Wait for in-flight operations of the old attempt to drain
-			_ = existing.WaitForDraining(w.ctx)
+			if err := existing.WaitForDraining(w.ctx); err != nil {
+				return RegisterConflict
+			}
 
 			// 4. Safely sync and close old file handle
 			existing.mu.Lock()
@@ -692,14 +714,10 @@ func (w *TargetWriter) processObject(obj *bucket.BufferObject, isContiguous bool
 
 	f, err := w.getOrOpenFile(state)
 	if err != nil {
-		state.ReleaseOp()
 		if isPermanentObjectError(err) {
-			_ = w.bkt.AckDurable([]bucket.ObjectKey{obj.Key})
-			if w.onError != nil {
-				w.onError(taskID, manifest.Gen, err)
-			}
-			return processResult{phaseStaleDiscarded, fmt.Errorf("permanent error open target: %w", err)}
+			return w.failAttemptPermanent(state, obj.Key, manifest, fmt.Errorf("open target moving file: %w", err))
 		}
+		state.ReleaseOp()
 		return processResult{phaseObjectRetryable, fmt.Errorf("open target moving file: %w", err)}
 	}
 
@@ -710,14 +728,10 @@ func (w *TargetWriter) processObject(obj *bucket.BufferObject, isContiguous bool
 	} else {
 		readData, err := w.bkt.ReadObject(obj.Key)
 		if err != nil {
-			state.ReleaseOp()
 			if isPermanentObjectError(err) {
-				_ = w.bkt.AckDurable([]bucket.ObjectKey{obj.Key})
-				if w.onError != nil {
-					w.onError(taskID, manifest.Gen, err)
-				}
-				return processResult{phaseStaleDiscarded, fmt.Errorf("permanent error read buffer: %w", err)}
+				return w.failAttemptPermanent(state, obj.Key, manifest, fmt.Errorf("read buffer object %s: %w", obj.Key, err))
 			}
+			state.ReleaseOp()
 			return processResult{phaseObjectRetryable, fmt.Errorf("read buffer object %s: %w", obj.Key, err)}
 		}
 		data = readData
@@ -726,14 +740,10 @@ func (w *TargetWriter) processObject(obj *bucket.BufferObject, isContiguous bool
 	// Phase 3: Write data to target .moving file
 	nw, err := f.WriteAt(data, obj.Key.Offset)
 	if err != nil {
-		state.ReleaseOp()
 		if isPermanentObjectError(err) {
-			_ = w.bkt.AckDurable([]bucket.ObjectKey{obj.Key})
-			if w.onError != nil {
-				w.onError(taskID, manifest.Gen, err)
-			}
-			return processResult{phaseStaleDiscarded, fmt.Errorf("permanent error writeAt target: %w", err)}
+			return w.failAttemptPermanent(state, obj.Key, manifest, fmt.Errorf("writeAt target moving file: %w", err))
 		}
+		state.ReleaseOp()
 		return processResult{phaseObjectRetryable, fmt.Errorf("writeAt target moving file: %w", err)}
 	}
 	if int64(nw) != obj.Key.Length {
@@ -846,6 +856,28 @@ func (w *TargetWriter) persistMeta(manifest TaskManifest) error {
 	return nil
 }
 
+func (w *TargetWriter) failAttemptPermanent(state *AttemptWriteState, key bucket.ObjectKey, manifest TaskManifest, err error) processResult {
+	state.mu.Lock()
+	state.phase = PhaseFailed
+	if state.file != nil {
+		_ = state.file.Sync()
+		_ = state.file.Close()
+		state.file = nil
+		atomic.AddInt64(&w.openFilesCount, -1)
+	}
+	state.mu.Unlock()
+
+	state.ReleaseOp()
+
+	if ackErr := w.bkt.AckDurable([]bucket.ObjectKey{key}); ackErr != nil {
+		_ = w.bkt.DeleteObjects([]bucket.ObjectKey{key})
+	}
+	if w.onError != nil {
+		w.onError(manifest.TaskID, manifest.Gen, err)
+	}
+	return processResult{phase: phaseStaleDiscarded, err: fmt.Errorf("permanent attempt failure: %w", err)}
+}
+
 func (w *TargetWriter) getOrOpenFile(state *AttemptWriteState) (*os.File, error) {
 	state.mu.Lock()
 	defer state.mu.Unlock()
@@ -874,21 +906,52 @@ func (w *TargetWriter) getOrOpenFile(state *AttemptWriteState) (*os.File, error)
 	return f, nil
 }
 
+type StorageErrorKind int
+
+const (
+	StorageErrTransient StorageErrorKind = iota
+	StorageErrPermanent
+	StorageErrENOSPC
+)
+
 func isPermanentObjectError(err error) bool {
-	if err == nil {
-		return false
-	}
-	if errors.Is(err, os.ErrPermission) || errors.Is(err, os.ErrNotExist) {
-		return true
-	}
-	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "permission denied") ||
-		strings.Contains(msg, "read-only file system") ||
-		strings.Contains(msg, "is a directory") ||
-		strings.Contains(msg, "invalid argument")
+	return classifyStorageError(err) == StorageErrPermanent
 }
 
-func (w *TargetWriter) finalizeTask(manifest TaskManifest) error {
+func classifyStorageError(err error) StorageErrorKind {
+	if err == nil {
+		return StorageErrTransient
+	}
+	if errors.Is(err, os.ErrPermission) || errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.EROFS) || errors.Is(err, syscall.EACCES) || errors.Is(err, syscall.EINVAL) {
+		return StorageErrPermanent
+	}
+	if errors.Is(err, syscall.ENOSPC) {
+		return StorageErrENOSPC
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "no space left on device") || strings.Contains(msg, "disk full") || strings.Contains(msg, "quota exceeded") {
+		return StorageErrENOSPC
+	}
+	if strings.Contains(msg, "permission denied") ||
+		strings.Contains(msg, "read-only file system") ||
+		strings.Contains(msg, "is a directory") ||
+		strings.Contains(msg, "invalid argument") ||
+		strings.Contains(msg, "bad file descriptor") {
+		return StorageErrPermanent
+	}
+	return StorageErrTransient
+}
+
+type CommitProof struct {
+	TaskID       string `json:"task_id"`
+	Gen          string `json:"gen"`
+	FinalPath    string `json:"final_path"`
+	ExpectedSize int64  `json:"expected_size"`
+	SHA256       string `json:"sha256"`
+	CommittedAt  int64  `json:"committed_at"`
+}
+
+func (w *TargetWriter) finalizeTask(manifest TaskManifest) (finalErr error) {
 	taskID := manifest.TaskID
 
 	w.stateMu.RLock()
@@ -927,11 +990,10 @@ func (w *TargetWriter) finalizeTask(manifest TaskManifest) error {
 	dataSynced := state.dataSynced
 	state.mu.Unlock()
 
-	defer state.ReleaseOp()
-
 	finalPath := filepath.Join(w.outputDir, manifest.FinalPath)
 	movingPath := finalPath + ".moving"
 	metaPath := finalPath + ".moving.meta"
+	proofPath := finalPath + ".tgx_commit"
 
 	// Step 1: Ensure data is 100% durable synced to disk (P0-2 fix)
 	if !dataSynced {
@@ -939,23 +1001,28 @@ func (w *TargetWriter) finalizeTask(manifest TaskManifest) error {
 			syncErr := fToClose.Sync()
 			closeErr := fToClose.Close()
 			if syncErr != nil {
+				state.ReleaseOp()
 				return fmt.Errorf("final sync moving file: %w", syncErr)
 			}
 			if closeErr != nil {
+				state.ReleaseOp()
 				return fmt.Errorf("close moving file: %w", closeErr)
 			}
 		} else {
 			// Re-open staging file on retry to guarantee a clean sync/close cycle
 			f, openErr := os.OpenFile(movingPath, os.O_RDWR, 0644)
 			if openErr != nil {
+				state.ReleaseOp()
 				return fmt.Errorf("reopen moving file for final sync: %w", openErr)
 			}
 			syncErr := f.Sync()
 			closeErr := f.Close()
 			if syncErr != nil {
+				state.ReleaseOp()
 				return fmt.Errorf("retry sync moving file: %w", syncErr)
 			}
 			if closeErr != nil {
+				state.ReleaseOp()
 				return fmt.Errorf("retry close moving file: %w", closeErr)
 			}
 		}
@@ -967,9 +1034,11 @@ func (w *TargetWriter) finalizeTask(manifest TaskManifest) error {
 	// Step 2: Verify size
 	stat, err := os.Stat(movingPath)
 	if err != nil {
+		state.ReleaseOp()
 		return fmt.Errorf("stat completed moving file: %w", err)
 	}
 	if manifest.ExpectedSize > 0 && stat.Size() != manifest.ExpectedSize {
+		state.ReleaseOp()
 		return fmt.Errorf("final size %d does not match expected %d: %w", stat.Size(), manifest.ExpectedSize, ErrSizeMismatch)
 	}
 
@@ -982,6 +1051,7 @@ func (w *TargetWriter) finalizeTask(manifest TaskManifest) error {
 	// Step 4: Compute SHA256
 	shaHash, shaErr := computeFileSHA256(movingPath)
 	if shaErr != nil {
+		state.ReleaseOp()
 		return fmt.Errorf("compute SHA256 of completed file: %w", shaErr)
 	}
 
@@ -993,6 +1063,7 @@ func (w *TargetWriter) finalizeTask(manifest TaskManifest) error {
 	state.mu.Lock()
 	if !stillCurrent || currentAttempt != state || state.manifest.Gen != manifest.Gen || state.phase != PhaseFinalizing {
 		state.mu.Unlock()
+		state.ReleaseOp()
 		return fmt.Errorf("attempt superseded before commit: task %s gen %s", taskID, manifest.Gen)
 	}
 	state.mu.Unlock()
@@ -1005,19 +1076,35 @@ func (w *TargetWriter) finalizeTask(manifest TaskManifest) error {
 				_ = os.Remove(movingPath)
 				_ = os.Remove(metaPath)
 			} else if existErr != nil {
+				state.ReleaseOp()
 				return fmt.Errorf("read existing target file for sha verification: %w", existErr)
 			} else {
+				state.ReleaseOp()
 				return fmt.Errorf("existing_sha=%s, new_sha=%s: %w",
 					existingSHA, shaHash, ErrContentConflict)
 			}
 		} else {
+			state.ReleaseOp()
 			return fmt.Errorf("commit target file: %w", err)
 		}
 	}
 
 	_ = os.Remove(metaPath)
 
-	// Step 7: Clean tracking state — atomically mark finalized, release heavy objects, record tombstone (P1-5 / P1-8 fix)
+	// Persist immutable commit proof sidecar for 100% verifiable recovery
+	proof := CommitProof{
+		TaskID:       manifest.TaskID,
+		Gen:          manifest.Gen,
+		FinalPath:    manifest.FinalPath,
+		ExpectedSize: manifest.ExpectedSize,
+		SHA256:       shaHash,
+		CommittedAt:  time.Now().Unix(),
+	}
+	if proofData, err := json.Marshal(proof); err == nil {
+		_ = os.WriteFile(proofPath, proofData, 0644)
+	}
+
+	// Step 7: Clean tracking state — atomically mark finalized, release heavy objects, record tombstone
 	w.stateMu.Lock()
 	state.mu.Lock()
 	if state.manifest.Gen == manifest.Gen {
@@ -1033,6 +1120,9 @@ func (w *TargetWriter) finalizeTask(manifest TaskManifest) error {
 	}
 	state.mu.Unlock()
 	w.stateMu.Unlock()
+
+	// RELEASE LEASE BEFORE CALLING onComplete TO PREVENT RE-ENTRY DEADLOCKS (P1-7 fix)
+	state.ReleaseOp()
 
 	if w.onComplete != nil {
 		w.onComplete(taskID, manifest.Gen, manifest.FinalPath, shaHash)
