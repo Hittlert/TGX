@@ -69,6 +69,7 @@ const (
 	PhaseClosing
 	PhaseFinalizing
 	PhaseFinalizePending
+	PhaseCommitProofPending
 	PhaseFinalized
 	PhaseFailed
 )
@@ -123,7 +124,10 @@ func (s *AttemptWriteState) AcquireFinalizeOp(expectedGen string) (fToClose *os.
 	if s.finalized || s.manifest.Gen != expectedGen {
 		return nil, false, false
 	}
-	if s.phase != PhaseActive && s.phase != PhaseFinalizePending && s.phase != PhaseFinalizing {
+	if s.phase != PhaseActive && s.phase != PhaseFinalizePending && s.phase != PhaseCommitProofPending {
+		return nil, false, false
+	}
+	if s.activeOps > 0 {
 		return nil, false, false
 	}
 	s.phase = PhaseFinalizing
@@ -626,7 +630,7 @@ func (w *TargetWriter) drainPendingFinalizes() {
 	now := time.Now()
 	for _, state := range w.tasks {
 		state.mu.Lock()
-		if !state.finalized && state.pendingFinalize && (state.phase == PhaseActive || state.phase == PhaseFinalizePending) && now.After(state.pendingNext) {
+		if !state.finalized && state.pendingFinalize && (state.phase == PhaseActive || state.phase == PhaseFinalizePending || state.phase == PhaseCommitProofPending) && now.After(state.pendingNext) {
 			toFinalize = append(toFinalize, state.manifest)
 		}
 		state.mu.Unlock()
@@ -808,10 +812,7 @@ func (w *TargetWriter) processObject(obj *bucket.BufferObject, isContiguous bool
 	// Phase 5: Finalize if all ranges are complete
 	if isComplete {
 		if err := w.finalizeTask(manifest); err != nil {
-			if isFinalizePermError(err) {
-				if w.onError != nil {
-					w.onError(manifest.TaskID, manifest.Gen, err)
-				}
+			if isFinalizePermError(err) || classifyStorageError(err) == StorageErrPermanent {
 				return processResult{phase: phaseStaleDiscarded, err: err}
 			}
 			return processResult{phaseFinalizeRetryable, err}
@@ -1007,19 +1008,28 @@ func (w *TargetWriter) persistCommitProof(proof CommitProof) error {
 	}
 
 	d, err := os.Open(dir)
-	if err == nil {
-		_ = d.Sync()
-		_ = d.Close()
+	if err != nil {
+		return fmt.Errorf("open directory for proof sync: %w", err)
+	}
+	defer d.Close()
+	if err := d.Sync(); err != nil {
+		return fmt.Errorf("sync directory for proof: %w", err)
 	}
 	return nil
 }
 
-func (w *TargetWriter) finishFinalizeError(state *AttemptWriteState, manifest TaskManifest, err error) error {
+func (w *TargetWriter) finishFinalizeError(state *AttemptWriteState, manifest TaskManifest, isPostCommit bool, err error) error {
 	isPerm := isFinalizePermError(err) || classifyStorageError(err) == StorageErrPermanent
 
 	state.mu.Lock()
 	var shouldNotify bool
-	if isPerm {
+	if isPostCommit {
+		// Irreversible final commit has already occurred: never mark PhaseFailed!
+		// Keep in PhaseCommitProofPending so retry only retries proof persistence on finalPath.
+		state.phase = PhaseCommitProofPending
+		state.pendingFinalize = true
+		state.pendingNext = time.Now().Add(5 * time.Second)
+	} else if isPerm {
 		state.phase = PhaseFailed
 		state.pendingFinalize = false
 		shouldNotify = !state.failedOnce
@@ -1050,6 +1060,11 @@ func (w *TargetWriter) finalizeTask(manifest TaskManifest) (finalErr error) {
 		return errors.New("task not found for finalize")
 	}
 
+	state.mu.Lock()
+	isPostCommit := (state.phase == PhaseCommitProofPending)
+	savedFinalSHA := state.finalSHA
+	state.mu.Unlock()
+
 	fToClose, dataSynced, ok := state.AcquireFinalizeOp(manifest.Gen)
 	if !ok {
 		return nil // already finalized or superseded by newer generation
@@ -1062,90 +1077,110 @@ func (w *TargetWriter) finalizeTask(manifest TaskManifest) (finalErr error) {
 	movingPath := finalPath + ".moving"
 	metaPath := finalPath + ".moving.meta"
 
-	// Step 1: Ensure data is 100% durable synced to disk (P0-2 fix)
-	if !dataSynced {
-		if fToClose != nil {
-			syncErr := fToClose.Sync()
-			closeErr := fToClose.Close()
-			if syncErr != nil {
-				return w.finishFinalizeError(state, manifest, fmt.Errorf("final sync moving file: %w", syncErr))
-			}
-			if closeErr != nil {
-				return w.finishFinalizeError(state, manifest, fmt.Errorf("close moving file: %w", closeErr))
-			}
+	var shaHash string
+
+	if isPostCommit {
+		// Post-commit continuation: final file already exists, only finish proof & cleanup
+		if savedFinalSHA != "" {
+			shaHash = savedFinalSHA
 		} else {
-			// Re-open staging file on retry to guarantee a clean sync/close cycle
-			f, openErr := os.OpenFile(movingPath, os.O_RDWR, 0644)
-			if openErr != nil {
-				return w.finishFinalizeError(state, manifest, fmt.Errorf("reopen moving file for final sync: %w", openErr))
-			}
-			syncErr := f.Sync()
-			closeErr := f.Close()
-			if syncErr != nil {
-				return w.finishFinalizeError(state, manifest, fmt.Errorf("retry sync moving file: %w", syncErr))
-			}
-			if closeErr != nil {
-				return w.finishFinalizeError(state, manifest, fmt.Errorf("retry close moving file: %w", closeErr))
+			var shaErr error
+			shaHash, shaErr = computeFileSHA256(finalPath)
+			if shaErr != nil {
+				return w.finishFinalizeError(state, manifest, true, fmt.Errorf("compute SHA256 of committed final file: %w", shaErr))
 			}
 		}
-		state.mu.Lock()
-		state.dataSynced = true
-		state.mu.Unlock()
-	}
-
-	// Step 2: Verify size
-	stat, err := os.Stat(movingPath)
-	if err != nil {
-		return w.finishFinalizeError(state, manifest, fmt.Errorf("stat completed moving file: %w", err))
-	}
-	if manifest.ExpectedSize > 0 && stat.Size() != manifest.ExpectedSize {
-		return w.finishFinalizeError(state, manifest, fmt.Errorf("final size %d does not match expected %d: %w", stat.Size(), manifest.ExpectedSize, ErrSizeMismatch))
-	}
-
-	// Step 3: Set modification time
-	if manifest.Date > 0 {
-		when := time.Unix(manifest.Date, 0)
-		_ = os.Chtimes(movingPath, when, when)
-	}
-
-	// Step 4: Compute SHA256
-	shaHash, shaErr := computeFileSHA256(movingPath)
-	if shaErr != nil {
-		return w.finishFinalizeError(state, manifest, fmt.Errorf("compute SHA256 of completed file: %w", shaErr))
-	}
-
-	// Step 5: Pre-Commit CAS check under stateMu + state.mu (P0-3 fix)
-	w.stateMu.RLock()
-	currentAttempt, stillCurrent := w.tasks[taskID]
-	w.stateMu.RUnlock()
-
-	state.mu.Lock()
-	if !stillCurrent || currentAttempt != state || state.manifest.Gen != manifest.Gen || state.phase != PhaseFinalizing {
-		state.mu.Unlock()
-		state.ReleaseOp()
-		return fmt.Errorf("attempt superseded before commit: task %s gen %s", taskID, manifest.Gen)
-	}
-	state.mu.Unlock()
-
-	// Step 6: Atomic non-replacing commit to final destination
-	if err := atomicCommit.CommitFile(movingPath, finalPath); err != nil {
-		if errors.Is(err, atomicCommit.ErrTargetExists) {
-			existingSHA, existErr := computeFileSHA256(finalPath)
-			if existErr == nil && existingSHA == shaHash {
-				_ = os.Remove(movingPath)
-				_ = os.Remove(metaPath)
-			} else if existErr != nil {
-				return w.finishFinalizeError(state, manifest, fmt.Errorf("read existing target file for sha verification: %w", existErr))
+	} else {
+		// Pre-commit steps:
+		// Step 1: Ensure data is 100% durable synced to disk (P0-2 fix)
+		if !dataSynced {
+			if fToClose != nil {
+				syncErr := fToClose.Sync()
+				closeErr := fToClose.Close()
+				if syncErr != nil {
+					return w.finishFinalizeError(state, manifest, false, fmt.Errorf("final sync moving file: %w", syncErr))
+				}
+				if closeErr != nil {
+					return w.finishFinalizeError(state, manifest, false, fmt.Errorf("close moving file: %w", closeErr))
+				}
 			} else {
-				return w.finishFinalizeError(state, manifest, fmt.Errorf("existing_sha=%s, new_sha=%s: %w",
-					existingSHA, shaHash, ErrContentConflict))
+				// Re-open staging file on retry to guarantee a clean sync/close cycle
+				f, openErr := os.OpenFile(movingPath, os.O_RDWR, 0644)
+				if openErr != nil {
+					return w.finishFinalizeError(state, manifest, false, fmt.Errorf("reopen moving file for final sync: %w", openErr))
+				}
+				syncErr := f.Sync()
+				closeErr := f.Close()
+				if syncErr != nil {
+					return w.finishFinalizeError(state, manifest, false, fmt.Errorf("retry sync moving file: %w", syncErr))
+				}
+				if closeErr != nil {
+					return w.finishFinalizeError(state, manifest, false, fmt.Errorf("retry close moving file: %w", closeErr))
+				}
 			}
-		} else {
-			return w.finishFinalizeError(state, manifest, fmt.Errorf("commit target file: %w", err))
+			state.mu.Lock()
+			state.dataSynced = true
+			state.mu.Unlock()
 		}
-	}
 
-	_ = os.Remove(metaPath)
+		// Step 2: Verify size
+		stat, err := os.Stat(movingPath)
+		if err != nil {
+			return w.finishFinalizeError(state, manifest, false, fmt.Errorf("stat completed moving file: %w", err))
+		}
+		if manifest.ExpectedSize > 0 && stat.Size() != manifest.ExpectedSize {
+			return w.finishFinalizeError(state, manifest, false, fmt.Errorf("final size %d does not match expected %d: %w", stat.Size(), manifest.ExpectedSize, ErrSizeMismatch))
+		}
+
+		// Step 3: Set modification time
+		if manifest.Date > 0 {
+			when := time.Unix(manifest.Date, 0)
+			_ = os.Chtimes(movingPath, when, when)
+		}
+
+		// Step 4: Compute SHA256
+		var shaErr error
+		shaHash, shaErr = computeFileSHA256(movingPath)
+		if shaErr != nil {
+			return w.finishFinalizeError(state, manifest, false, fmt.Errorf("compute SHA256 of completed file: %w", shaErr))
+		}
+
+		// Step 5: Pre-Commit CAS check under stateMu + state.mu (P0-3 fix)
+		w.stateMu.RLock()
+		currentAttempt, stillCurrent := w.tasks[taskID]
+		w.stateMu.RUnlock()
+
+		state.mu.Lock()
+		if !stillCurrent || currentAttempt != state || state.manifest.Gen != manifest.Gen || state.phase != PhaseFinalizing {
+			state.mu.Unlock()
+			state.ReleaseOp()
+			return fmt.Errorf("attempt superseded before commit: task %s gen %s", taskID, manifest.Gen)
+		}
+		state.mu.Unlock()
+
+		// Step 6: Atomic non-replacing commit to final destination
+		if err := atomicCommit.CommitFile(movingPath, finalPath); err != nil {
+			if errors.Is(err, atomicCommit.ErrTargetExists) {
+				existingSHA, existErr := computeFileSHA256(finalPath)
+				if existErr == nil && existingSHA == shaHash {
+					_ = os.Remove(movingPath)
+				} else if existErr != nil {
+					return w.finishFinalizeError(state, manifest, false, fmt.Errorf("read existing target file for sha verification: %w", existErr))
+				} else {
+					return w.finishFinalizeError(state, manifest, false, fmt.Errorf("existing_sha=%s, new_sha=%s: %w",
+						existingSHA, shaHash, ErrContentConflict))
+				}
+			} else {
+				return w.finishFinalizeError(state, manifest, false, fmt.Errorf("commit target file: %w", err))
+			}
+		}
+
+		// Mark post-commit state immediately
+		state.mu.Lock()
+		state.phase = PhaseCommitProofPending
+		state.finalSHA = shaHash
+		state.mu.Unlock()
+	}
 
 	// Persist durable commit proof sidecar for 100% verifiable recovery
 	proof := CommitProof{
@@ -1158,8 +1193,11 @@ func (w *TargetWriter) finalizeTask(manifest TaskManifest) (finalErr error) {
 		CommittedAt:  time.Now().Unix(),
 	}
 	if err := w.persistCommitProof(proof); err != nil {
-		return w.finishFinalizeError(state, manifest, fmt.Errorf("persist durable commit proof: %w", err))
+		return w.finishFinalizeError(state, manifest, true, fmt.Errorf("persist durable commit proof: %w", err))
 	}
+
+	// Remove moving.meta only AFTER proof is durable on disk
+	_ = os.Remove(metaPath)
 
 	// Step 7: Clean tracking state — atomically mark finalized, release heavy objects, record tombstone
 	w.stateMu.Lock()

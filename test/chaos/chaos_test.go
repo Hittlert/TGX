@@ -2,7 +2,10 @@ package chaos
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -11,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Hittlert/TGX/app/daemon"
+	"github.com/Hittlert/TGX/core/targetwriter"
 	sbeatomic "github.com/Hittlert/TGX/pkg/sbe/atomic"
 	"github.com/Hittlert/TGX/pkg/sbe/coordinator"
 	"github.com/Hittlert/TGX/pkg/sbe/lease"
@@ -116,7 +120,20 @@ func TestChaos_PowerCut_After_Complete_Meta(t *testing.T) {
 
 	fileName := "complete_media.bin"
 	finalPath := filepath.Join(outDir, fileName)
-	require.NoError(t, os.WriteFile(finalPath, []byte("complete_data_19_bytes"), 0644))
+	data := []byte("complete_data_19_bytes")
+	require.NoError(t, os.WriteFile(finalPath, data, 0644))
+
+	// Write .moving.meta (simulating crash after CommitFile before meta was removed)
+	manifest := targetwriter.TaskManifest{
+		Version:      targetwriter.SidecarVersion,
+		TaskID:       "123:42",
+		Gen:          "1",
+		FinalPath:    fileName,
+		ExpectedSize: 22,
+		Ranges:       []targetwriter.Range{{Start: 0, End: 22}},
+	}
+	metaData, _ := json.Marshal(manifest)
+	require.NoError(t, os.WriteFile(finalPath+".moving.meta", metaData, 0644))
 
 	// Insert database state as downloading (power cut before DB update)
 	_, err = db.Exec(`INSERT INTO download_records (chat_id, message_id, status, file_name, save_path, file_size) VALUES ('123', 42, 'downloading', ?, ?, 22)`, fileName, fileName)
@@ -148,7 +165,22 @@ func TestChaos_Linkat_Unlink_Crash(t *testing.T) {
 
 	fileName := "linked_file.bin"
 	finalPath := filepath.Join(outDir, fileName)
-	require.NoError(t, os.WriteFile(finalPath, []byte("identical_hardlink_data"), 0644))
+	data := []byte("identical_hardlink_data")
+	require.NoError(t, os.WriteFile(finalPath, data, 0644))
+
+	// Write commit proof tmp (simulating crash during atomic proof rename)
+	sum := sha256.Sum256(data)
+	proof := targetwriter.CommitProof{
+		Version:      1,
+		TaskID:       "123:43",
+		Gen:          "1",
+		FinalPath:    fileName,
+		ExpectedSize: 23,
+		SHA256:       hex.EncodeToString(sum[:]),
+		CommittedAt:  time.Now().Unix(),
+	}
+	proofData, _ := json.Marshal(proof)
+	require.NoError(t, os.WriteFile(finalPath+".tgx_commit.tmp", proofData, 0644))
 
 	_, err = db.Exec(`INSERT INTO download_records (chat_id, message_id, status, file_name, save_path, file_size) VALUES ('123', 43, 'downloading', ?, ?, 23)`, fileName, fileName)
 	require.NoError(t, err)

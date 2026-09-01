@@ -648,11 +648,12 @@ func verifyFinalFileIdentity(finalPath string, expectedSize int64, expectedSHA s
 		}
 		return actualSHA, nil
 	}
-	// Check .tgx_commit sidecar proof if expectedSHA was not provided in memory
+
+	// Step 1: Check .tgx_commit sidecar proof
 	proofPath := finalPath + ".tgx_commit"
 	if data, err := os.ReadFile(proofPath); err == nil {
 		var proof targetwriter.CommitProof
-		if json.Unmarshal(data, &proof) == nil && proof.SHA256 != "" {
+		if json.Unmarshal(data, &proof) == nil && proof.SHA256 != "" && proof.Version >= 1 {
 			if expectedTaskID != "" && proof.TaskID != "" && proof.TaskID != expectedTaskID {
 				return "", fmt.Errorf("task ID mismatch in commit proof: expected %s, got %s", expectedTaskID, proof.TaskID)
 			}
@@ -666,5 +667,52 @@ func verifyFinalFileIdentity(finalPath string, expectedSize int64, expectedSHA s
 		}
 		return "", fmt.Errorf("corrupt or incomplete commit proof at %s", proofPath)
 	}
+
+	// Step 2: Check .tgx_commit.tmp (crash during atomic proof rename)
+	tmpProofPath := proofPath + ".tmp"
+	if data, err := os.ReadFile(tmpProofPath); err == nil {
+		var proof targetwriter.CommitProof
+		if json.Unmarshal(data, &proof) == nil && proof.SHA256 != "" && proof.Version >= 1 {
+			if expectedTaskID != "" && proof.TaskID != "" && proof.TaskID != expectedTaskID {
+				return "", fmt.Errorf("task ID mismatch in tmp commit proof: expected %s, got %s", expectedTaskID, proof.TaskID)
+			}
+			if expectedSize > 0 && proof.ExpectedSize > 0 && proof.ExpectedSize != expectedSize {
+				return "", fmt.Errorf("size mismatch in tmp commit proof: expected %d, got %d", expectedSize, proof.ExpectedSize)
+			}
+			if actualSHA == proof.SHA256 {
+				_ = os.Rename(tmpProofPath, proofPath)
+				_ = os.Remove(finalPath + ".moving.meta")
+				return actualSHA, nil
+			}
+		}
+	}
+
+	// Step 3: Check .moving.meta (crash after CommitFile before meta deletion)
+	metaPath := finalPath + ".moving.meta"
+	if data, err := os.ReadFile(metaPath); err == nil {
+		var manifest targetwriter.TaskManifest
+		if json.Unmarshal(data, &manifest) == nil && manifest.Version == targetwriter.SidecarVersion {
+			if (expectedTaskID == "" || manifest.TaskID == expectedTaskID) && (expectedSize == 0 || manifest.ExpectedSize == expectedSize) {
+				bm := targetwriter.NewMovedBitmapWithRanges(manifest.ExpectedSize, manifest.Ranges)
+				if bm.IsComplete() {
+					proof := targetwriter.CommitProof{
+						Version:      1,
+						TaskID:       manifest.TaskID,
+						Gen:          manifest.Gen,
+						FinalPath:    manifest.FinalPath,
+						ExpectedSize: stat.Size(),
+						SHA256:       actualSHA,
+						CommittedAt:  time.Now().Unix(),
+					}
+					if pData, pErr := json.Marshal(proof); pErr == nil {
+						_ = os.WriteFile(proofPath, pData, 0644)
+						_ = os.Remove(metaPath)
+						return actualSHA, nil
+					}
+				}
+			}
+		}
+	}
+
 	return "", fmt.Errorf("missing commit proof sidecar for %s: cannot verify content identity", finalPath)
 }

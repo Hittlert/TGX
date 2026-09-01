@@ -815,7 +815,7 @@ func TestTargetWriter_TransientFinalizeRetrySucceeds(t *testing.T) {
 	state.pendingFinalize = true
 
 	// Simulate transient error during finalize
-	tw.finishFinalizeError(state, state.manifest, errors.New("temporary sync error"))
+	tw.finishFinalizeError(state, state.manifest, false, errors.New("temporary sync error"))
 
 	// State must be in PhaseFinalizePending with pendingNext set
 	state.mu.Lock()
@@ -865,7 +865,7 @@ func TestTargetWriter_PermanentFinalizeSetsPhaseFailed(t *testing.T) {
 	}, nil)
 
 	// Trigger permanent finalize error
-	tw.finishFinalizeError(state, state.manifest, ErrContentConflict)
+	tw.finishFinalizeError(state, state.manifest, false, ErrContentConflict)
 
 	state.mu.Lock()
 	assert.Equal(t, PhaseFailed, state.phase)
@@ -878,4 +878,51 @@ func TestTargetWriter_PermanentFinalizeSetsPhaseFailed(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("onError was not called for permanent finalize error")
 	}
+}
+
+func TestTargetWriter_PostCommitProofPendingRetry(t *testing.T) {
+	tempDir := t.TempDir()
+	outDir := filepath.Join(tempDir, "output")
+	require.NoError(t, os.MkdirAll(outDir, 0755))
+
+	bkt, err := bucket.New(bucket.Config{Mode: bucket.ModeMemory, MaxCapacity: 10 * 1024 * 1024})
+	require.NoError(t, err)
+	defer bkt.Close()
+
+	tw := New(bkt, outDir)
+
+	state := newAttemptWriteState(TaskManifest{
+		TaskID:       "task-post-commit",
+		FinalPath:    "post.bin",
+		ExpectedSize: 10,
+		Gen:          "1",
+	}, nil)
+
+	// Simulate post-commit proof error
+	tw.finishFinalizeError(state, state.manifest, true, errors.New("temporary proof error"))
+
+	state.mu.Lock()
+	assert.Equal(t, PhaseCommitProofPending, state.phase)
+	assert.True(t, state.pendingFinalize)
+	state.pendingNext = time.Now().Add(-1 * time.Second)
+	state.mu.Unlock()
+
+	// Final file already committed (moving file does not exist!)
+	finalPath := filepath.Join(outDir, "post.bin")
+	require.NoError(t, os.WriteFile(finalPath, []byte("0123456789"), 0644))
+
+	tw.stateMu.Lock()
+	tw.tasks["task-post-commit"] = state
+	tw.stateMu.Unlock()
+
+	tw.drainPendingFinalizes()
+
+	state.mu.Lock()
+	assert.True(t, state.finalized)
+	assert.Equal(t, PhaseFinalized, state.phase)
+	assert.False(t, state.pendingFinalize)
+	state.mu.Unlock()
+
+	// Commit proof must be durable!
+	assert.FileExists(t, finalPath+".tgx_commit")
 }
