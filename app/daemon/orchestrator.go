@@ -377,6 +377,11 @@ func (o *Orchestrator) dispatchOneRecord(ctx context.Context, record DownloadRec
 			}
 
 			if snapshot.State == StateSuccess {
+				realFileName := snapshot.FileName
+				if realFileName == "" {
+					realFileName = record.FileName
+				}
+				_ = o.db.UpdateDownloadStatus(record.ChatID, record.MessageID, "success", realFileName, finalRelPath, record.MediaType, record.FileSize, "")
 				return
 			}
 			if snapshot.State == StateFailed || snapshot.State == StateUnavailable {

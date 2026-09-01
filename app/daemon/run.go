@@ -80,7 +80,7 @@ func (o Options) withDefaults() Options {
 			case "ssd":
 				o.BufferSize = 5 * 1024 * 1024 * 1024 // 5 GiB
 			default:
-				o.BufferSize = 512 * 1024 * 1024 // 512 MiB
+				o.BufferSize = 128 * 1024 * 1024 // 128 MiB (memory safe default)
 			}
 		}
 	}
@@ -110,7 +110,7 @@ func (o Options) withDefaults() Options {
 	}
 	if o == (Options{
 		Namespace: "default", Listen: "0.0.0.0:18080", OutputDir: "/app/downloads", TempDir: "/app/temp/tdl",
-		BufferType: "memory", BufferDir: "/app/temp/tdl", BufferSize: 512 * 1024 * 1024,
+		BufferType: "memory", BufferDir: "/app/temp/tdl", BufferSize: 128 * 1024 * 1024,
 		DBPath: "/app/state/download_records.sqlite3", SingboxURL: "http://127.0.0.1:9090",
 		QueueCapacity: 1000, TerminalLimit: 2000, FileConcurrency: 5, Threads: 48, PoolSize: 48,
 		PeerSyncTimeout: 3 * time.Minute,

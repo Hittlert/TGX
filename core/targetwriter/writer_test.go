@@ -566,3 +566,96 @@ func TestTargetWriter_TaskCompletedConcurrentRead(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, "1", gen)
 }
+
+func TestTargetWriter_CallbackReentryNoDeadlock(t *testing.T) {
+	tempDir := t.TempDir()
+	outDir := filepath.Join(tempDir, "output")
+	require.NoError(t, os.MkdirAll(outDir, 0755))
+
+	bkt, err := bucket.New(bucket.Config{Mode: bucket.ModeMemory, MaxCapacity: 10 * 1024 * 1024})
+	require.NoError(t, err)
+	defer bkt.Close()
+
+	tw := New(bkt, outDir)
+
+	// Callback that re-enters RegisterTask during onProgress
+	tw.SetCallbacks(nil, func(taskID string, movedBytes, totalBytes int64) {
+		_ = tw.RegisterTask(TaskManifest{
+			TaskID:       taskID,
+			FinalPath:    "reentry.bin",
+			ExpectedSize: totalBytes,
+			Gen:          "retry_new",
+		})
+	}, nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	tw.Start(ctx)
+	tw.BeginConsuming()
+	defer tw.Close()
+
+	manifest := TaskManifest{
+		TaskID:       "task-reentry",
+		FinalPath:    "reentry.bin",
+		ExpectedSize: 1024,
+		Gen:          "1",
+	}
+	require.Equal(t, RegisterAccepted, tw.RegisterTask(manifest))
+
+	key := bucket.ObjectKey{TaskID: "task-reentry", Gen: "1", Offset: 0, Length: 512}
+	require.NoError(t, bkt.Reserve(ctx, 512))
+	require.NoError(t, bkt.PutObject(key, make([]byte, 512)))
+
+	// Should not deadlock and consume cleanly
+	time.Sleep(100 * time.Millisecond)
+}
+
+func TestTargetWriter_TaskFinalInfo(t *testing.T) {
+	tempDir := t.TempDir()
+	outDir := filepath.Join(tempDir, "output")
+	require.NoError(t, os.MkdirAll(outDir, 0755))
+
+	bkt, err := bucket.New(bucket.Config{Mode: bucket.ModeMemory, MaxCapacity: 10 * 1024 * 1024})
+	require.NoError(t, err)
+	defer bkt.Close()
+
+	tw := New(bkt, outDir)
+
+	completeChan := make(chan string, 1)
+	tw.SetCallbacks(func(taskID, gen, finalPath, shaHash string) {
+		completeChan <- shaHash
+	}, nil, nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	tw.Start(ctx)
+	tw.BeginConsuming()
+	defer tw.Close()
+
+	data := []byte("hello final info verification")
+	manifest := TaskManifest{
+		TaskID:       "task-final-info",
+		FinalPath:    "info.txt",
+		ExpectedSize: int64(len(data)),
+		Gen:          "1",
+	}
+	require.Equal(t, RegisterAccepted, tw.RegisterTask(manifest))
+
+	key := bucket.ObjectKey{TaskID: "task-final-info", Gen: "1", Offset: 0, Length: int64(len(data))}
+	require.NoError(t, bkt.Reserve(ctx, int64(len(data))))
+	require.NoError(t, bkt.PutObject(key, data))
+
+	var cbSHA string
+	select {
+	case cbSHA = <-completeChan:
+	case <-time.After(3 * time.Second):
+		t.Fatal("finalize did not complete in time")
+	}
+
+	gen, finalPath, sha, ok := tw.TaskFinalInfo("task-final-info")
+	require.True(t, ok)
+	assert.Equal(t, "1", gen)
+	assert.Equal(t, "info.txt", finalPath)
+	assert.Equal(t, cbSHA, sha)
+	assert.NotEmpty(t, sha)
+}

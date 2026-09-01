@@ -101,7 +101,11 @@ func newBucketFileElement(
 		case targetwriter.RegisterAlreadyFinalized:
 			finalFile := filepath.Join(outputRoot, manifest.FinalPath)
 			if stat, statErr := os.Stat(finalFile); statErr == nil && stat.Size() == file.Size() {
-				return &existingElement{task: task, file: file, path: manifest.FinalPath}, nil
+				var finalSHA string
+				if _, _, sha, ok := tw.TaskFinalInfo(manifest.TaskID); ok && sha != "" {
+					finalSHA = sha
+				}
+				return &existingElement{task: task, file: file, path: manifest.FinalPath, sha: finalSHA}, nil
 			}
 			return nil, fmt.Errorf("task already finalized in writer but target file missing: %s", manifest.FinalPath)
 		case targetwriter.RegisterStale:
@@ -386,7 +390,11 @@ func newLazySmallFileElement(
 		case targetwriter.RegisterAlreadyFinalized:
 			finalFile := filepath.Join(outputRoot, manifest.FinalPath)
 			if stat, statErr := os.Stat(finalFile); statErr == nil && stat.Size() == file.Size() {
-				return &existingElement{task: task, file: file, path: manifest.FinalPath}, nil
+				var finalSHA string
+				if _, _, sha, ok := tw.TaskFinalInfo(manifest.TaskID); ok && sha != "" {
+					finalSHA = sha
+				}
+				return &existingElement{task: task, file: file, path: manifest.FinalPath, sha: finalSHA}, nil
 			}
 			return nil, fmt.Errorf("small file already finalized in writer but target file missing: %s", manifest.FinalPath)
 		case targetwriter.RegisterStale:
@@ -539,6 +547,7 @@ type existingElement struct {
 	task *Task
 	file downloader.File
 	path string
+	sha  string
 }
 
 func (e *existingElement) File() downloader.File { return e.file }
@@ -559,7 +568,7 @@ func (e *existingElement) AlreadyComplete() (string, bool) {
 }
 func (e *existingElement) Abort() error { return nil }
 func (e *existingElement) Publish() (PublishResult, error) {
-	return PublishResult{Path: e.path, AlreadyExists: true}, nil
+	return PublishResult{Path: e.path, SHA256: e.sha, AlreadyExists: true}, nil
 }
 
 type discardWriterAt struct{}

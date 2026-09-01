@@ -82,6 +82,8 @@ type AttemptWriteState struct {
 	pendingNext     time.Time
 	finalized       bool
 	finalGen        string
+	finalSHA        string
+	finalPath       string
 	activeOps       int
 	phase           AttemptPhase
 }
@@ -116,12 +118,16 @@ func (s *AttemptWriteState) ReleaseOp() {
 	}
 }
 
-func (s *AttemptWriteState) WaitForDraining() {
+func (s *AttemptWriteState) WaitForDraining(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for s.activeOps > 0 {
+		if ctx != nil && ctx.Err() != nil {
+			return ctx.Err()
+		}
 		s.cond.Wait()
 	}
+	return nil
 }
 
 type RegisterResult int
@@ -229,8 +235,31 @@ func (w *TargetWriter) TaskCompleted(taskID string) (string, bool) {
 	return state.finalGen, true
 }
 
+// TaskFinalInfo returns the finalized generation, final relative path, and SHA256 if completed.
+func (w *TargetWriter) TaskFinalInfo(taskID string) (gen, finalPath, sha string, ok bool) {
+	w.stateMu.RLock()
+	state, exists := w.tasks[taskID]
+	w.stateMu.RUnlock()
+	if !exists {
+		return "", "", "", false
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if !state.finalized {
+		return "", "", "", false
+	}
+	return state.finalGen, state.finalPath, state.finalSHA, true
+}
+
 func (w *TargetWriter) recordTombstoneLocked(taskID string) {
-	w.tombstoneOrder = append(w.tombstoneOrder, taskID)
+	// Deduplicate taskID in tombstoneOrder so each taskID appears at most once
+	filtered := make([]string, 0, len(w.tombstoneOrder))
+	for _, id := range w.tombstoneOrder {
+		if id != taskID {
+			filtered = append(filtered, id)
+		}
+	}
+	w.tombstoneOrder = append(filtered, taskID)
 	for len(w.tombstoneOrder) > maxTombstoneEntries {
 		oldest := w.tombstoneOrder[0]
 		w.tombstoneOrder = w.tombstoneOrder[1:]
@@ -321,7 +350,7 @@ func (w *TargetWriter) RegisterTask(manifest TaskManifest) RegisterResult {
 			w.stateMu.Unlock()
 
 			// 3. Wait for in-flight operations of the old attempt to drain
-			existing.WaitForDraining()
+			_ = existing.WaitForDraining(w.ctx)
 
 			// 4. Safely sync and close old file handle
 			existing.mu.Lock()
@@ -661,10 +690,16 @@ func (w *TargetWriter) processObject(obj *bucket.BufferObject, isContiguous bool
 	bm := state.bitmap
 	state.mu.Unlock()
 
-	defer state.ReleaseOp()
-
 	f, err := w.getOrOpenFile(state)
 	if err != nil {
+		state.ReleaseOp()
+		if isPermanentObjectError(err) {
+			_ = w.bkt.AckDurable([]bucket.ObjectKey{obj.Key})
+			if w.onError != nil {
+				w.onError(taskID, manifest.Gen, err)
+			}
+			return processResult{phaseStaleDiscarded, fmt.Errorf("permanent error open target: %w", err)}
+		}
 		return processResult{phaseObjectRetryable, fmt.Errorf("open target moving file: %w", err)}
 	}
 
@@ -675,6 +710,14 @@ func (w *TargetWriter) processObject(obj *bucket.BufferObject, isContiguous bool
 	} else {
 		readData, err := w.bkt.ReadObject(obj.Key)
 		if err != nil {
+			state.ReleaseOp()
+			if isPermanentObjectError(err) {
+				_ = w.bkt.AckDurable([]bucket.ObjectKey{obj.Key})
+				if w.onError != nil {
+					w.onError(taskID, manifest.Gen, err)
+				}
+				return processResult{phaseStaleDiscarded, fmt.Errorf("permanent error read buffer: %w", err)}
+			}
 			return processResult{phaseObjectRetryable, fmt.Errorf("read buffer object %s: %w", obj.Key, err)}
 		}
 		data = readData
@@ -683,13 +726,28 @@ func (w *TargetWriter) processObject(obj *bucket.BufferObject, isContiguous bool
 	// Phase 3: Write data to target .moving file
 	nw, err := f.WriteAt(data, obj.Key.Offset)
 	if err != nil {
+		state.ReleaseOp()
+		if isPermanentObjectError(err) {
+			_ = w.bkt.AckDurable([]bucket.ObjectKey{obj.Key})
+			if w.onError != nil {
+				w.onError(taskID, manifest.Gen, err)
+			}
+			return processResult{phaseStaleDiscarded, fmt.Errorf("permanent error writeAt target: %w", err)}
+		}
 		return processResult{phaseObjectRetryable, fmt.Errorf("writeAt target moving file: %w", err)}
 	}
 	if int64(nw) != obj.Key.Length {
+		state.ReleaseOp()
 		return processResult{phaseObjectRetryable, fmt.Errorf("short write to target: %d of %d bytes", nw, obj.Key.Length)}
 	}
 
+	// Invalidate any prior dataSynced flag since new bytes were written (P1-9 fix)
+	state.mu.Lock()
+	state.dataSynced = false
+	state.mu.Unlock()
+
 	if err := f.Sync(); err != nil {
+		state.ReleaseOp()
 		return processResult{phaseObjectRetryable, fmt.Errorf("sync target file: %w", err)}
 	}
 
@@ -701,11 +759,13 @@ func (w *TargetWriter) processObject(obj *bucket.BufferObject, isContiguous bool
 	manifest.Version = SidecarVersion
 	if err := w.persistMeta(manifest); err != nil {
 		bm.Restore(snapshot)
+		state.ReleaseOp()
 		return processResult{phaseObjectRetryable, fmt.Errorf("persist sidecar metadata: %w", err)}
 	}
 
 	// ──── DURABILITY BOUNDARY ────
 	if err := w.bkt.AckDurable([]bucket.ObjectKey{obj.Key}); err != nil {
+		state.ReleaseOp()
 		return processResult{phaseObjectRetryable, fmt.Errorf("ack durable object: %w", err)}
 	}
 
@@ -716,12 +776,18 @@ func (w *TargetWriter) processObject(obj *bucket.BufferObject, isContiguous bool
 		atomic.AddInt64(&w.contiguousWrites, 1)
 	}
 
+	durableBytes := bm.DurableBytes()
+	isComplete := bm.IsComplete()
+
+	// RELEASE LEASE BEFORE CALLBACKS TO PREVENT RE-ENTRY DEADLOCKS (P1-7 fix)
+	state.ReleaseOp()
+
 	if w.onProgress != nil {
-		w.onProgress(taskID, bm.DurableBytes(), manifest.ExpectedSize)
+		w.onProgress(taskID, durableBytes, manifest.ExpectedSize)
 	}
 
 	// Phase 5: Finalize if all ranges are complete
-	if bm.IsComplete() {
+	if isComplete {
 		if err := w.finalizeTask(manifest); err != nil {
 			return processResult{phaseFinalizeRetryable, err}
 		}
@@ -808,6 +874,20 @@ func (w *TargetWriter) getOrOpenFile(state *AttemptWriteState) (*os.File, error)
 	return f, nil
 }
 
+func isPermanentObjectError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, os.ErrPermission) || errors.Is(err, os.ErrNotExist) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "permission denied") ||
+		strings.Contains(msg, "read-only file system") ||
+		strings.Contains(msg, "is a directory") ||
+		strings.Contains(msg, "invalid argument")
+}
+
 func (w *TargetWriter) finalizeTask(manifest TaskManifest) error {
 	taskID := manifest.TaskID
 
@@ -835,6 +915,7 @@ func (w *TargetWriter) finalizeTask(manifest TaskManifest) error {
 
 	// Transition to PhaseFinalizing (exclusive finalize lease)
 	state.phase = PhaseFinalizing
+	state.activeOps++
 
 	// Close open FD if attached
 	var fToClose *os.File
@@ -845,6 +926,8 @@ func (w *TargetWriter) finalizeTask(manifest TaskManifest) error {
 	}
 	dataSynced := state.dataSynced
 	state.mu.Unlock()
+
+	defer state.ReleaseOp()
 
 	finalPath := filepath.Join(w.outputDir, manifest.FinalPath)
 	movingPath := finalPath + ".moving"
@@ -940,6 +1023,8 @@ func (w *TargetWriter) finalizeTask(manifest TaskManifest) error {
 	if state.manifest.Gen == manifest.Gen {
 		state.finalized = true
 		state.finalGen = manifest.Gen
+		state.finalSHA = shaHash
+		state.finalPath = manifest.FinalPath
 		state.pendingFinalize = false
 		state.phase = PhaseFinalized
 		state.bitmap = nil

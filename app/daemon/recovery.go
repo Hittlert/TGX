@@ -114,8 +114,19 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) ([]TaskRecoveryResult, er
 		hasTempPart := (partErr == nil)
 
 		if err == nil && stat.Size() == rec.FileSize && rec.FileSize > 0 && errors.Is(movingErr, os.ErrNotExist) && !hasTempPart {
+			var sha string
+			if r.tw != nil {
+				if _, _, finalSHA, ok := r.tw.TaskFinalInfo(fileKey); ok && finalSHA != "" {
+					sha = finalSHA
+				}
+			}
+			if sha == "" {
+				sha, _ = computeRecoverySHA256(finalPath)
+			}
 			_ = os.Remove(metaPath)
-			_, _ = r.db.ExecContext(ctx, `UPDATE download_records SET status = 'success', error = '' WHERE chat_id = ? AND message_id = ?`, rec.ChatID, rec.MessageID)
+			if execErr := r.updateRecordSuccess(ctx, rec.ChatID, rec.MessageID, sha); execErr != nil {
+				r.logger.Warn("failed to update record to success in recovery", zap.Error(execErr))
+			}
 			results = append(results, TaskRecoveryResult{
 				FileKey:     fileKey,
 				PrevState:   rec.Status,
@@ -214,9 +225,20 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) ([]TaskRecoveryResult, er
 								})
 							case targetwriter.RegisterAlreadyFinalized:
 								if stat, err := os.Stat(finalPath); err == nil && stat.Size() == manifest.ExpectedSize {
+									var sha string
+									if r.tw != nil {
+										if _, _, finalSHA, ok := r.tw.TaskFinalInfo(manifest.TaskID); ok && finalSHA != "" {
+											sha = finalSHA
+										}
+									}
+									if sha == "" {
+										sha, _ = computeRecoverySHA256(finalPath)
+									}
 									_ = os.Remove(metaPath)
 									_ = os.Remove(movingPath)
-									_, _ = r.db.ExecContext(ctx, `UPDATE download_records SET status = 'success', error = '' WHERE chat_id = ? AND message_id = ?`, rec.ChatID, rec.MessageID)
+									if execErr := r.updateRecordSuccess(ctx, rec.ChatID, rec.MessageID, sha); execErr != nil {
+										r.logger.Warn("failed to update record to success in recovery", zap.Error(execErr))
+									}
 									results = append(results, TaskRecoveryResult{
 										FileKey:     fileKey,
 										PrevState:   rec.Status,
@@ -224,7 +246,9 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) ([]TaskRecoveryResult, er
 										ActionTaken: "ALREADY_FINALIZED_PROMOTED_TO_SUCCESS",
 									})
 								} else {
-									_, _ = r.db.ExecContext(ctx, `UPDATE download_records SET status = 'pending', attempts = 0, next_retry_at = 0, error = '' WHERE chat_id = ? AND message_id = ?`, rec.ChatID, rec.MessageID)
+									if execErr := r.updateRecordPending(ctx, rec.ChatID, rec.MessageID); execErr != nil {
+										r.logger.Warn("failed to reset record to pending in recovery", zap.Error(execErr))
+									}
 									results = append(results, TaskRecoveryResult{
 										FileKey:     fileKey,
 										PrevState:   rec.Status,
@@ -235,7 +259,9 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) ([]TaskRecoveryResult, er
 							case targetwriter.RegisterStale, targetwriter.RegisterConflict:
 								_ = os.Remove(metaPath)
 								_ = os.Remove(movingPath)
-								_, _ = r.db.ExecContext(ctx, `UPDATE download_records SET status = 'pending', attempts = 0, next_retry_at = 0, error = '' WHERE chat_id = ? AND message_id = ?`, rec.ChatID, rec.MessageID)
+								if execErr := r.updateRecordPending(ctx, rec.ChatID, rec.MessageID); execErr != nil {
+									r.logger.Warn("failed to reset record to pending in recovery", zap.Error(execErr))
+								}
 								results = append(results, TaskRecoveryResult{
 									FileKey:     fileKey,
 									PrevState:   rec.Status,
@@ -248,7 +274,9 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) ([]TaskRecoveryResult, er
 						// Incomplete bitmap: reset DB to pending with 0 attempts / next_retry_at
 						// so pending scanner re-dispatches the task cleanly.
 						// Do NOT register a publishing task in Registry or TargetWriter.
-						_, _ = r.db.ExecContext(ctx, `UPDATE download_records SET status = 'pending', attempts = 0, next_retry_at = 0, error = '' WHERE chat_id = ? AND message_id = ?`, rec.ChatID, rec.MessageID)
+						if execErr := r.updateRecordPending(ctx, rec.ChatID, rec.MessageID); execErr != nil {
+							r.logger.Warn("failed to reset record to pending in recovery", zap.Error(execErr))
+						}
 						results = append(results, TaskRecoveryResult{
 							FileKey:     fileKey,
 							PrevState:   rec.Status,
@@ -309,7 +337,9 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) ([]TaskRecoveryResult, er
 						finalSHA, err2 := computeRecoverySHA256(finalPath)
 						if err1 == nil && err2 == nil && partSHA == finalSHA {
 							_ = os.Remove(tempPartPath)
-							_, _ = r.db.ExecContext(ctx, `UPDATE download_records SET status = 'success', error = '' WHERE chat_id = ? AND message_id = ?`, rec.ChatID, rec.MessageID)
+							if execErr := r.updateRecordSuccess(ctx, rec.ChatID, rec.MessageID, finalSHA); execErr != nil {
+								r.logger.Warn("failed to update record to success in recovery", zap.Error(execErr))
+							}
 							results = append(results, TaskRecoveryResult{
 								FileKey:     fileKey,
 								PrevState:   rec.Status,
@@ -319,7 +349,9 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) ([]TaskRecoveryResult, er
 							continue
 						}
 					}
-					_, _ = r.db.ExecContext(ctx, `UPDATE download_records SET status = 'pending', attempts = 0, next_retry_at = 0, error = '' WHERE chat_id = ? AND message_id = ?`, rec.ChatID, rec.MessageID)
+					if execErr := r.updateRecordPending(ctx, rec.ChatID, rec.MessageID); execErr != nil {
+						r.logger.Warn("failed to reset record to pending in recovery", zap.Error(execErr))
+					}
 					results = append(results, TaskRecoveryResult{
 						FileKey:     fileKey,
 						PrevState:   rec.Status,
@@ -330,7 +362,9 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) ([]TaskRecoveryResult, er
 			}
 			continue
 		} else if partErr == nil && partStat.Size() > 0 {
-			_, _ = r.db.ExecContext(ctx, `UPDATE download_records SET status = 'pending', attempts = 0, next_retry_at = 0, error = '' WHERE chat_id = ? AND message_id = ?`, rec.ChatID, rec.MessageID)
+			if execErr := r.updateRecordPending(ctx, rec.ChatID, rec.MessageID); execErr != nil {
+				r.logger.Warn("failed to reset record to pending in recovery", zap.Error(execErr))
+			}
 			results = append(results, TaskRecoveryResult{
 				FileKey:     fileKey,
 				PrevState:   rec.Status,
@@ -347,7 +381,9 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) ([]TaskRecoveryResult, er
 		if r.bufferType == "memory" {
 			actionTaken = "MEMORY_BUFFER_VOLATILE_RESET_TO_PENDING"
 		}
-		_, _ = r.db.ExecContext(ctx, `UPDATE download_records SET status = 'pending', attempts = 0, next_retry_at = 0, error = '' WHERE chat_id = ? AND message_id = ?`, rec.ChatID, rec.MessageID)
+		if execErr := r.updateRecordPending(ctx, rec.ChatID, rec.MessageID); execErr != nil {
+			r.logger.Warn("failed to reset record to pending in recovery", zap.Error(execErr))
+		}
 		results = append(results, TaskRecoveryResult{
 			FileKey:     fileKey,
 			PrevState:   rec.Status,
@@ -357,6 +393,16 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) ([]TaskRecoveryResult, er
 	}
 
 	return results, nil
+}
+
+func (r *Reconciler) updateRecordSuccess(ctx context.Context, chatID string, msgID int, sha string) error {
+	_, err := r.db.ExecContext(ctx, `UPDATE download_records SET status = 'success', error = '' WHERE chat_id = ? AND message_id = ?`, chatID, msgID)
+	return err
+}
+
+func (r *Reconciler) updateRecordPending(ctx context.Context, chatID string, msgID int) error {
+	_, err := r.db.ExecContext(ctx, `UPDATE download_records SET status = 'pending', attempts = 0, next_retry_at = 0, error = '' WHERE chat_id = ? AND message_id = ?`, chatID, msgID)
+	return err
 }
 
 func computeRecoverySHA256(path string) (string, error) {
