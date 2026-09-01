@@ -68,6 +68,7 @@ const (
 	PhaseActive AttemptPhase = iota
 	PhaseClosing
 	PhaseFinalizing
+	PhaseFinalizePending
 	PhaseFinalized
 	PhaseFailed
 )
@@ -119,7 +120,10 @@ func (s *AttemptWriteState) AcquireOp() bool {
 func (s *AttemptWriteState) AcquireFinalizeOp(expectedGen string) (fToClose *os.File, dataSynced bool, ok bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.finalized || s.manifest.Gen != expectedGen || s.phase != PhaseActive {
+	if s.finalized || s.manifest.Gen != expectedGen {
+		return nil, false, false
+	}
+	if s.phase != PhaseActive && s.phase != PhaseFinalizePending && s.phase != PhaseFinalizing {
 		return nil, false, false
 	}
 	s.phase = PhaseFinalizing
@@ -622,7 +626,7 @@ func (w *TargetWriter) drainPendingFinalizes() {
 	now := time.Now()
 	for _, state := range w.tasks {
 		state.mu.Lock()
-		if !state.finalized && state.pendingFinalize && now.After(state.pendingNext) {
+		if !state.finalized && state.pendingFinalize && (state.phase == PhaseActive || state.phase == PhaseFinalizePending) && now.After(state.pendingNext) {
 			toFinalize = append(toFinalize, state.manifest)
 		}
 		state.mu.Unlock()
@@ -630,34 +634,8 @@ func (w *TargetWriter) drainPendingFinalizes() {
 	w.stateMu.RUnlock()
 
 	for _, manifest := range toFinalize {
-		taskID := manifest.TaskID
 		if err := w.finalizeTask(manifest); err != nil {
 			w.setLastError(err)
-			w.stateMu.RLock()
-			state, ok := w.tasks[taskID]
-			w.stateMu.RUnlock()
-
-			if ok {
-				state.mu.Lock()
-				if state.manifest.Gen == manifest.Gen {
-					if isFinalizePermError(err) {
-						state.phase = PhaseClosing
-						state.pendingFinalize = false
-						if state.file != nil {
-							_ = state.file.Close()
-							state.file = nil
-							atomic.AddInt64(&w.openFilesCount, -1)
-						}
-					} else {
-						state.pendingNext = now.Add(5 * time.Second)
-					}
-				}
-				state.mu.Unlock()
-			}
-
-			if isFinalizePermError(err) && w.onError != nil {
-				w.onError(taskID, manifest.Gen, fmt.Errorf("permanent finalize error: %w", err))
-			}
 		}
 	}
 }
@@ -982,12 +960,83 @@ func classifyStorageError(err error) StorageErrorKind {
 }
 
 type CommitProof struct {
+	Version      int    `json:"version"`
 	TaskID       string `json:"task_id"`
 	Gen          string `json:"gen"`
 	FinalPath    string `json:"final_path"`
 	ExpectedSize int64  `json:"expected_size"`
 	SHA256       string `json:"sha256"`
 	CommittedAt  int64  `json:"committed_at"`
+}
+
+func (w *TargetWriter) persistCommitProof(proof CommitProof) error {
+	proofPath := filepath.Join(w.outputDir, proof.FinalPath) + ".tgx_commit"
+	tmpProofPath := proofPath + ".tmp"
+	dir := filepath.Dir(proofPath)
+
+	data, err := json.Marshal(proof)
+	if err != nil {
+		return fmt.Errorf("marshal commit proof: %w", err)
+	}
+
+	f, err := os.OpenFile(tmpProofPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		return fmt.Errorf("create tmp commit proof: %w", err)
+	}
+
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmpProofPath)
+		return fmt.Errorf("write tmp commit proof: %w", err)
+	}
+
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmpProofPath)
+		return fmt.Errorf("fsync tmp commit proof: %w", err)
+	}
+
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmpProofPath)
+		return fmt.Errorf("close tmp commit proof: %w", err)
+	}
+
+	if err := os.Rename(tmpProofPath, proofPath); err != nil {
+		_ = os.Remove(tmpProofPath)
+		return fmt.Errorf("atomic rename commit proof: %w", err)
+	}
+
+	d, err := os.Open(dir)
+	if err == nil {
+		_ = d.Sync()
+		_ = d.Close()
+	}
+	return nil
+}
+
+func (w *TargetWriter) finishFinalizeError(state *AttemptWriteState, manifest TaskManifest, err error) error {
+	isPerm := isFinalizePermError(err) || classifyStorageError(err) == StorageErrPermanent
+
+	state.mu.Lock()
+	var shouldNotify bool
+	if isPerm {
+		state.phase = PhaseFailed
+		state.pendingFinalize = false
+		shouldNotify = !state.failedOnce
+		state.failedOnce = true
+	} else {
+		state.phase = PhaseFinalizePending
+		state.pendingFinalize = true
+		state.pendingNext = time.Now().Add(5 * time.Second)
+	}
+	state.mu.Unlock()
+
+	state.ReleaseOp()
+
+	if shouldNotify && w.onError != nil {
+		w.onError(manifest.TaskID, manifest.Gen, err)
+	}
+	return err
 }
 
 func (w *TargetWriter) finalizeTask(manifest TaskManifest) (finalErr error) {
@@ -1012,7 +1061,6 @@ func (w *TargetWriter) finalizeTask(manifest TaskManifest) (finalErr error) {
 	finalPath := filepath.Join(w.outputDir, manifest.FinalPath)
 	movingPath := finalPath + ".moving"
 	metaPath := finalPath + ".moving.meta"
-	proofPath := finalPath + ".tgx_commit"
 
 	// Step 1: Ensure data is 100% durable synced to disk (P0-2 fix)
 	if !dataSynced {
@@ -1020,29 +1068,24 @@ func (w *TargetWriter) finalizeTask(manifest TaskManifest) (finalErr error) {
 			syncErr := fToClose.Sync()
 			closeErr := fToClose.Close()
 			if syncErr != nil {
-				state.ReleaseOp()
-				return fmt.Errorf("final sync moving file: %w", syncErr)
+				return w.finishFinalizeError(state, manifest, fmt.Errorf("final sync moving file: %w", syncErr))
 			}
 			if closeErr != nil {
-				state.ReleaseOp()
-				return fmt.Errorf("close moving file: %w", closeErr)
+				return w.finishFinalizeError(state, manifest, fmt.Errorf("close moving file: %w", closeErr))
 			}
 		} else {
 			// Re-open staging file on retry to guarantee a clean sync/close cycle
 			f, openErr := os.OpenFile(movingPath, os.O_RDWR, 0644)
 			if openErr != nil {
-				state.ReleaseOp()
-				return fmt.Errorf("reopen moving file for final sync: %w", openErr)
+				return w.finishFinalizeError(state, manifest, fmt.Errorf("reopen moving file for final sync: %w", openErr))
 			}
 			syncErr := f.Sync()
 			closeErr := f.Close()
 			if syncErr != nil {
-				state.ReleaseOp()
-				return fmt.Errorf("retry sync moving file: %w", syncErr)
+				return w.finishFinalizeError(state, manifest, fmt.Errorf("retry sync moving file: %w", syncErr))
 			}
 			if closeErr != nil {
-				state.ReleaseOp()
-				return fmt.Errorf("retry close moving file: %w", closeErr)
+				return w.finishFinalizeError(state, manifest, fmt.Errorf("retry close moving file: %w", closeErr))
 			}
 		}
 		state.mu.Lock()
@@ -1053,12 +1096,10 @@ func (w *TargetWriter) finalizeTask(manifest TaskManifest) (finalErr error) {
 	// Step 2: Verify size
 	stat, err := os.Stat(movingPath)
 	if err != nil {
-		state.ReleaseOp()
-		return fmt.Errorf("stat completed moving file: %w", err)
+		return w.finishFinalizeError(state, manifest, fmt.Errorf("stat completed moving file: %w", err))
 	}
 	if manifest.ExpectedSize > 0 && stat.Size() != manifest.ExpectedSize {
-		state.ReleaseOp()
-		return fmt.Errorf("final size %d does not match expected %d: %w", stat.Size(), manifest.ExpectedSize, ErrSizeMismatch)
+		return w.finishFinalizeError(state, manifest, fmt.Errorf("final size %d does not match expected %d: %w", stat.Size(), manifest.ExpectedSize, ErrSizeMismatch))
 	}
 
 	// Step 3: Set modification time
@@ -1070,8 +1111,7 @@ func (w *TargetWriter) finalizeTask(manifest TaskManifest) (finalErr error) {
 	// Step 4: Compute SHA256
 	shaHash, shaErr := computeFileSHA256(movingPath)
 	if shaErr != nil {
-		state.ReleaseOp()
-		return fmt.Errorf("compute SHA256 of completed file: %w", shaErr)
+		return w.finishFinalizeError(state, manifest, fmt.Errorf("compute SHA256 of completed file: %w", shaErr))
 	}
 
 	// Step 5: Pre-Commit CAS check under stateMu + state.mu (P0-3 fix)
@@ -1095,23 +1135,21 @@ func (w *TargetWriter) finalizeTask(manifest TaskManifest) (finalErr error) {
 				_ = os.Remove(movingPath)
 				_ = os.Remove(metaPath)
 			} else if existErr != nil {
-				state.ReleaseOp()
-				return fmt.Errorf("read existing target file for sha verification: %w", existErr)
+				return w.finishFinalizeError(state, manifest, fmt.Errorf("read existing target file for sha verification: %w", existErr))
 			} else {
-				state.ReleaseOp()
-				return fmt.Errorf("existing_sha=%s, new_sha=%s: %w",
-					existingSHA, shaHash, ErrContentConflict)
+				return w.finishFinalizeError(state, manifest, fmt.Errorf("existing_sha=%s, new_sha=%s: %w",
+					existingSHA, shaHash, ErrContentConflict))
 			}
 		} else {
-			state.ReleaseOp()
-			return fmt.Errorf("commit target file: %w", err)
+			return w.finishFinalizeError(state, manifest, fmt.Errorf("commit target file: %w", err))
 		}
 	}
 
 	_ = os.Remove(metaPath)
 
-	// Persist immutable commit proof sidecar for 100% verifiable recovery
+	// Persist durable commit proof sidecar for 100% verifiable recovery
 	proof := CommitProof{
+		Version:      1,
 		TaskID:       manifest.TaskID,
 		Gen:          manifest.Gen,
 		FinalPath:    manifest.FinalPath,
@@ -1119,8 +1157,8 @@ func (w *TargetWriter) finalizeTask(manifest TaskManifest) (finalErr error) {
 		SHA256:       shaHash,
 		CommittedAt:  time.Now().Unix(),
 	}
-	if proofData, err := json.Marshal(proof); err == nil {
-		_ = os.WriteFile(proofPath, proofData, 0644)
+	if err := w.persistCommitProof(proof); err != nil {
+		return w.finishFinalizeError(state, manifest, fmt.Errorf("persist durable commit proof: %w", err))
 	}
 
 	// Step 7: Clean tracking state — atomically mark finalized, release heavy objects, record tombstone

@@ -583,3 +583,54 @@ func TestReconciler_RejectsSameSizeWrongHashFile(t *testing.T) {
 	// Must NOT promote to success because proof SHA does not match actual file SHA!
 	assert.Equal(t, "pending", results[0].NextState)
 }
+
+func TestVerifyFinalFileIdentity_FailClosedWhenProofMissing(t *testing.T) {
+	tempDir := t.TempDir()
+	finalPath := filepath.Join(tempDir, "unverified.bin")
+	require.NoError(t, os.WriteFile(finalPath, []byte("some content"), 0644))
+
+	// No expectedSHA and no .tgx_commit sidecar proof -> MUST return error (fail-closed)
+	_, err := verifyFinalFileIdentity(finalPath, 12, "", "some_task")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "missing commit proof sidecar")
+}
+
+func TestVerifyFinalFileIdentity_RejectsCorruptProofOrMismatch(t *testing.T) {
+	tempDir := t.TempDir()
+	finalPath := filepath.Join(tempDir, "corrupt.bin")
+	data := []byte("corrupt test content")
+	require.NoError(t, os.WriteFile(finalPath, data, 0644))
+
+	// 1. Corrupt JSON proof
+	require.NoError(t, os.WriteFile(finalPath+".tgx_commit", []byte("{not-json"), 0644))
+	_, err := verifyFinalFileIdentity(finalPath, int64(len(data)), "", "task-1")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "corrupt or incomplete")
+
+	// 2. Task ID mismatch
+	sum := sha256.Sum256(data)
+	proof := targetwriter.CommitProof{
+		Version:      1,
+		TaskID:       "task-other",
+		Gen:          "1",
+		FinalPath:    "corrupt.bin",
+		ExpectedSize: int64(len(data)),
+		SHA256:       hex.EncodeToString(sum[:]),
+		CommittedAt:  time.Now().Unix(),
+	}
+	proofData, _ := json.Marshal(proof)
+	require.NoError(t, os.WriteFile(finalPath+".tgx_commit", proofData, 0644))
+
+	_, err = verifyFinalFileIdentity(finalPath, int64(len(data)), "", "task-1")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "task ID mismatch")
+
+	// 3. Exact matching proof succeeds
+	proof.TaskID = "task-1"
+	proofData, _ = json.Marshal(proof)
+	require.NoError(t, os.WriteFile(finalPath+".tgx_commit", proofData, 0644))
+
+	sha, err := verifyFinalFileIdentity(finalPath, int64(len(data)), "", "task-1")
+	assert.NoError(t, err)
+	assert.Equal(t, hex.EncodeToString(sum[:]), sha)
+}

@@ -664,6 +664,7 @@ func verifyFinalFileIdentity(finalPath string, expectedSize int64, expectedSHA s
 			}
 			return actualSHA, nil
 		}
+		return "", fmt.Errorf("corrupt or incomplete commit proof at %s", proofPath)
 	}
-	return actualSHA, nil
+	return "", fmt.Errorf("missing commit proof sidecar for %s: cannot verify content identity", finalPath)
 }

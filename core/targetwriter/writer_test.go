@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -792,4 +793,89 @@ func TestTargetWriter_AcquireFinalizeOpProductionDraining(t *testing.T) {
 	// After release, draining must unblock immediately
 	state.ReleaseOp()
 	assert.NoError(t, state.WaitForDraining(context.Background()))
+}
+
+func TestTargetWriter_TransientFinalizeRetrySucceeds(t *testing.T) {
+	tempDir := t.TempDir()
+	outDir := filepath.Join(tempDir, "output")
+	require.NoError(t, os.MkdirAll(outDir, 0755))
+
+	bkt, err := bucket.New(bucket.Config{Mode: bucket.ModeMemory, MaxCapacity: 10 * 1024 * 1024})
+	require.NoError(t, err)
+	defer bkt.Close()
+
+	tw := New(bkt, outDir)
+
+	state := newAttemptWriteState(TaskManifest{
+		TaskID:       "task-retry-finalize",
+		FinalPath:    "retry.bin",
+		ExpectedSize: 10,
+		Gen:          "1",
+	}, nil)
+	state.pendingFinalize = true
+
+	// Simulate transient error during finalize
+	tw.finishFinalizeError(state, state.manifest, errors.New("temporary sync error"))
+
+	// State must be in PhaseFinalizePending with pendingNext set
+	state.mu.Lock()
+	assert.Equal(t, PhaseFinalizePending, state.phase)
+	assert.True(t, state.pendingFinalize)
+	state.pendingNext = time.Now().Add(-1 * time.Second) // allow immediate drain
+	state.mu.Unlock()
+
+	// Write the completed file so finalize can succeed on retry
+	finalPath := filepath.Join(outDir, "retry.bin.moving")
+	require.NoError(t, os.WriteFile(finalPath, []byte("0123456789"), 0644))
+
+	tw.stateMu.Lock()
+	tw.tasks["task-retry-finalize"] = state
+	tw.stateMu.Unlock()
+
+	tw.drainPendingFinalizes()
+
+	state.mu.Lock()
+	assert.True(t, state.finalized)
+	assert.Equal(t, PhaseFinalized, state.phase)
+	assert.False(t, state.pendingFinalize)
+	state.mu.Unlock()
+}
+
+func TestTargetWriter_PermanentFinalizeSetsPhaseFailed(t *testing.T) {
+	tempDir := t.TempDir()
+	outDir := filepath.Join(tempDir, "output")
+	require.NoError(t, os.MkdirAll(outDir, 0755))
+
+	bkt, err := bucket.New(bucket.Config{Mode: bucket.ModeMemory, MaxCapacity: 10 * 1024 * 1024})
+	require.NoError(t, err)
+	defer bkt.Close()
+
+	tw := New(bkt, outDir)
+
+	errNotified := make(chan error, 1)
+	tw.SetCallbacks(nil, nil, func(taskID, gen string, err error) {
+		errNotified <- err
+	})
+
+	state := newAttemptWriteState(TaskManifest{
+		TaskID:       "task-perm-finalize",
+		FinalPath:    "perm.bin",
+		ExpectedSize: 10,
+		Gen:          "1",
+	}, nil)
+
+	// Trigger permanent finalize error
+	tw.finishFinalizeError(state, state.manifest, ErrContentConflict)
+
+	state.mu.Lock()
+	assert.Equal(t, PhaseFailed, state.phase)
+	assert.False(t, state.pendingFinalize)
+	state.mu.Unlock()
+
+	select {
+	case err := <-errNotified:
+		assert.ErrorIs(t, err, ErrContentConflict)
+	case <-time.After(time.Second):
+		t.Fatal("onError was not called for permanent finalize error")
+	}
 }
