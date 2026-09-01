@@ -304,12 +304,69 @@ func (e *fileElement) Publish() (result PublishResult, resultErr error) {
 		return result, fmt.Errorf("publish destination atomic rename: %w", err)
 	}
 
+	taskID := ""
+	gen := "1"
+	if e.task != nil {
+		taskID = e.task.Request().ID
+	}
+	if err := persistDirectCommitProof(e.outputRoot, e.finalPath, taskID, gen, e.file.Size(), shaHash); err != nil {
+		return result, fmt.Errorf("persist direct commit proof: %w", err)
+	}
+
 	if err := syncDirectory(dir); err != nil {
 		return result, err
 	}
 	return PublishResult{
 		Path: e.finalPath, SHA256: shaHash, absolutePath: absolute,
 	}, nil
+}
+
+func persistDirectCommitProof(outputDir, finalRelPath, taskID, gen string, expectedSize int64, shaHash string) error {
+	proof := targetwriter.CommitProof{
+		Version:      1,
+		TaskID:       taskID,
+		Gen:          gen,
+		FinalPath:    finalRelPath,
+		ExpectedSize: expectedSize,
+		SHA256:       shaHash,
+		CommittedAt:  time.Now().Unix(),
+	}
+	proofPath := filepath.Join(outputDir, finalRelPath) + ".tgx_commit"
+	tmpProofPath := proofPath + ".tmp"
+	dir := filepath.Dir(proofPath)
+
+	data, err := json.Marshal(proof)
+	if err != nil {
+		return fmt.Errorf("marshal commit proof: %w", err)
+	}
+
+	f, err := os.OpenFile(tmpProofPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		return fmt.Errorf("create tmp commit proof: %w", err)
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmpProofPath)
+		return fmt.Errorf("write tmp commit proof: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmpProofPath)
+		return fmt.Errorf("fsync tmp commit proof: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmpProofPath)
+		return fmt.Errorf("close tmp commit proof: %w", err)
+	}
+	if err := os.Rename(tmpProofPath, proofPath); err != nil {
+		_ = os.Remove(tmpProofPath)
+		return fmt.Errorf("atomic rename commit proof: %w", err)
+	}
+	if d, err := os.Open(dir); err == nil {
+		_ = d.Sync()
+		_ = d.Close()
+	}
+	return nil
 }
 
 type memBufferWriterAt struct {
@@ -524,6 +581,15 @@ func (e *lazySmallFileElement) Publish() (result PublishResult, resultErr error)
 		return result, fmt.Errorf("publish destination atomic rename: %w", err)
 	}
 
+	taskID := ""
+	gen := "1"
+	if e.task != nil {
+		taskID = e.task.Request().ID
+	}
+	if err := persistDirectCommitProof(e.outputRoot, e.finalPath, taskID, gen, e.file.Size(), shaHash); err != nil {
+		return result, fmt.Errorf("persist direct commit proof: %w", err)
+	}
+
 	if err := syncDirectory(dir); err != nil {
 		return result, err
 	}
@@ -649,70 +715,32 @@ func verifyFinalFileIdentity(finalPath string, expectedSize int64, expectedSHA s
 		return actualSHA, nil
 	}
 
-	// Step 1: Check .tgx_commit sidecar proof
+	// Pure read-only verification of durable .tgx_commit sidecar proof
 	proofPath := finalPath + ".tgx_commit"
-	if data, err := os.ReadFile(proofPath); err == nil {
-		var proof targetwriter.CommitProof
-		if json.Unmarshal(data, &proof) == nil && proof.SHA256 != "" && proof.Version >= 0 {
-			if expectedTaskID != "" && proof.TaskID != "" && proof.TaskID != expectedTaskID {
-				return "", fmt.Errorf("task ID mismatch in commit proof: expected %s, got %s", expectedTaskID, proof.TaskID)
-			}
-			if expectedSize > 0 && proof.ExpectedSize > 0 && proof.ExpectedSize != expectedSize {
-				return "", fmt.Errorf("size mismatch in commit proof: expected %d, got %d", expectedSize, proof.ExpectedSize)
-			}
-			if actualSHA != proof.SHA256 {
-				return "", fmt.Errorf("content conflict with commit proof: expected %s, got %s", proof.SHA256, actualSHA)
-			}
-			return actualSHA, nil
-		}
-		return "", fmt.Errorf("corrupt or incomplete commit proof at %s", proofPath)
+	data, err := os.ReadFile(proofPath)
+	if err != nil {
+		return "", fmt.Errorf("missing commit proof sidecar for %s: cannot verify content identity", finalPath)
 	}
 
-	// Step 2: Check .tgx_commit.tmp (crash during atomic proof rename)
-	tmpProofPath := proofPath + ".tmp"
-	if data, err := os.ReadFile(tmpProofPath); err == nil {
-		var proof targetwriter.CommitProof
-		if json.Unmarshal(data, &proof) == nil && proof.SHA256 != "" && proof.Version >= 0 {
-			if expectedTaskID != "" && proof.TaskID != "" && proof.TaskID != expectedTaskID {
-				return "", fmt.Errorf("task ID mismatch in tmp commit proof: expected %s, got %s", expectedTaskID, proof.TaskID)
-			}
-			if expectedSize > 0 && proof.ExpectedSize > 0 && proof.ExpectedSize != expectedSize {
-				return "", fmt.Errorf("size mismatch in tmp commit proof: expected %d, got %d", expectedSize, proof.ExpectedSize)
-			}
-			if actualSHA == proof.SHA256 {
-				_ = os.Rename(tmpProofPath, proofPath)
-				_ = os.Remove(finalPath + ".moving.meta")
-				return actualSHA, nil
-			}
-		}
+	var proof targetwriter.CommitProof
+	if err := json.Unmarshal(data, &proof); err != nil {
+		return "", fmt.Errorf("corrupt or incomplete commit proof JSON at %s: %w", proofPath, err)
+	}
+	if proof.Version != 1 {
+		return "", fmt.Errorf("unsupported commit proof version %d at %s", proof.Version, proofPath)
+	}
+	if proof.SHA256 == "" {
+		return "", fmt.Errorf("empty sha in commit proof at %s", proofPath)
+	}
+	if expectedTaskID != "" && proof.TaskID != expectedTaskID {
+		return "", fmt.Errorf("task ID mismatch in commit proof: expected %s, got %s", expectedTaskID, proof.TaskID)
+	}
+	if expectedSize > 0 && proof.ExpectedSize != expectedSize {
+		return "", fmt.Errorf("size mismatch in commit proof: expected %d, got %d", expectedSize, proof.ExpectedSize)
+	}
+	if actualSHA != proof.SHA256 {
+		return "", fmt.Errorf("content conflict with commit proof: expected %s, got %s", proof.SHA256, actualSHA)
 	}
 
-	// Step 3: Check .moving.meta (crash after CommitFile before meta deletion)
-	metaPath := finalPath + ".moving.meta"
-	if data, err := os.ReadFile(metaPath); err == nil {
-		var manifest targetwriter.TaskManifest
-		if json.Unmarshal(data, &manifest) == nil && manifest.Version == targetwriter.SidecarVersion {
-			if (expectedTaskID == "" || manifest.TaskID == expectedTaskID) && (expectedSize == 0 || manifest.ExpectedSize == expectedSize) {
-				bm := targetwriter.NewMovedBitmapWithRanges(manifest.ExpectedSize, manifest.Ranges)
-				if bm.IsComplete() {
-					proof := targetwriter.CommitProof{
-						Version:      1,
-						TaskID:       manifest.TaskID,
-						Gen:          manifest.Gen,
-						FinalPath:    manifest.FinalPath,
-						ExpectedSize: stat.Size(),
-						SHA256:       actualSHA,
-						CommittedAt:  time.Now().Unix(),
-					}
-					if pData, pErr := json.Marshal(proof); pErr == nil {
-						_ = os.WriteFile(proofPath, pData, 0644)
-						_ = os.Remove(metaPath)
-						return actualSHA, nil
-					}
-				}
-			}
-		}
-	}
-
-	return "", fmt.Errorf("missing commit proof sidecar for %s: cannot verify content identity", finalPath)
+	return actualSHA, nil
 }

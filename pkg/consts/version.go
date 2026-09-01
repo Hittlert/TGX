@@ -7,7 +7,7 @@ var (
 	CommitDate = "unknown"
 )
 
-const FallbackVersion = "v4.4.19"
+const FallbackVersion = "v4.4.20"
 
 // EffectiveVersion returns the current runtime version string.
 func EffectiveVersion() string {

@@ -123,13 +123,15 @@ func TestChaos_PowerCut_After_Complete_Meta(t *testing.T) {
 	data := []byte("complete_data_19_bytes")
 	require.NoError(t, os.WriteFile(finalPath, data, 0644))
 
-	// Write .moving.meta (simulating crash after CommitFile before meta was removed)
+	sum := sha256.Sum256(data)
+	// Write .moving.meta with ExpectedSHA (simulating crash after CommitFile before meta was removed)
 	manifest := targetwriter.TaskManifest{
 		Version:      targetwriter.SidecarVersion,
 		TaskID:       "123:42",
 		Gen:          "1",
 		FinalPath:    fileName,
 		ExpectedSize: 22,
+		ExpectedSHA:  hex.EncodeToString(sum[:]),
 		Ranges:       []targetwriter.Range{{Start: 0, End: 22}},
 	}
 	metaData, _ := json.Marshal(manifest)
@@ -148,6 +150,51 @@ func TestChaos_PowerCut_After_Complete_Meta(t *testing.T) {
 	assert.Equal(t, "success", results[0].NextState)
 	assert.Equal(t, "FINAL_FILE_COMMITTED_PROMOTED_TO_SUCCESS", results[0].ActionTaken)
 	assert.FileExists(t, finalPath)
+}
+
+// 2b. TestChaos_Tampered_Final_File_Rejected
+func TestChaos_Tampered_Final_File_Rejected(t *testing.T) {
+	db := setupMemoryDB(t)
+	defer db.Close()
+
+	outDir, err := os.MkdirTemp("", "chaos_tamper_out_*")
+	require.NoError(t, err)
+	defer os.RemoveAll(outDir)
+
+	tempDir, err := os.MkdirTemp("", "chaos_tamper_tmp_*")
+	require.NoError(t, err)
+	defer os.RemoveAll(tempDir)
+
+	fileName := "tampered_media.bin"
+	finalPath := filepath.Join(outDir, fileName)
+	tamperedData := []byte("tampered_bad_data_bytes") // 23 bytes
+	require.NoError(t, os.WriteFile(finalPath, tamperedData, 0644))
+
+	// Pre-commit meta has original legitimate SHA
+	origSum := sha256.Sum256([]byte("legitimate_data_23bytes"))
+	manifest := targetwriter.TaskManifest{
+		Version:      targetwriter.SidecarVersion,
+		TaskID:       "123:99",
+		Gen:          "1",
+		FinalPath:    fileName,
+		ExpectedSize: 23,
+		ExpectedSHA:  hex.EncodeToString(origSum[:]),
+		Ranges:       []targetwriter.Range{{Start: 0, End: 23}},
+	}
+	metaData, _ := json.Marshal(manifest)
+	require.NoError(t, os.WriteFile(finalPath+".moving.meta", metaData, 0644))
+
+	_, err = db.Exec(`INSERT INTO download_records (chat_id, message_id, status, file_name, save_path, file_size) VALUES ('123', 99, 'downloading', ?, ?, 23)`, fileName, fileName)
+	require.NoError(t, err)
+
+	// Run Reconciler: must reject tampered content and not promote to success!
+	r := daemon.NewReconciler(db, outDir, tempDir, zap.NewNop())
+	results, err := r.ReconcileAll(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 1, len(results))
+
+	assert.NotEqual(t, "success", results[0].NextState, "Tampered final file must never be promoted to success")
+	assert.Equal(t, "pending", results[0].NextState)
 }
 
 // 3. TestChaos_Linkat_Unlink_Crash

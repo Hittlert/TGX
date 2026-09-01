@@ -135,8 +135,24 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) ([]TaskRecoveryResult, er
 					})
 					continue
 				}
+			}
+
+			// If read-only proof verification failed, check for valid crash recovery intent
+			repairedSHA, repairErr := r.repairCommittedProof(finalPath, metaPath, rec.FileSize, fileKey, rec.SavePath)
+			if repairErr == nil && repairedSHA != "" {
+				if execErr := r.updateRecordSuccess(ctx, rec.ChatID, rec.MessageID, repairedSHA); execErr != nil {
+					r.logger.Warn("failed to update record to success in recovery after proof repair", zap.Error(execErr))
+				} else {
+					results = append(results, TaskRecoveryResult{
+						FileKey:     fileKey,
+						PrevState:   rec.Status,
+						NextState:   "success",
+						ActionTaken: "FINAL_FILE_COMMITTED_PROMOTED_TO_SUCCESS",
+					})
+					continue
+				}
 			} else {
-				r.logger.Warn("target file content unverified or mismatch during recovery", zap.Error(verifyErr))
+				r.logger.Warn("target file content unverified or mismatch during recovery", zap.Error(verifyErr), zap.NamedError("repair_err", repairErr))
 			}
 		}
 
@@ -327,7 +343,11 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) ([]TaskRecoveryResult, er
 					ActionTaken: "SSD_BUFFER_COMPLETED_REQUEUED_IN_MOVER",
 				})
 			} else {
+				partSHA, shaErr := computeRecoverySHA256(tempPartPath)
 				if err := atomicCommit.CommitFile(tempPartPath, finalPath); err == nil {
+					if shaErr == nil {
+						_ = persistDirectCommitProof(r.outputDir, rec.SavePath, fileKey, "1", rec.FileSize, partSHA)
+					}
 					_, _ = r.db.ExecContext(ctx, `UPDATE download_records SET status = 'success', error = '' WHERE chat_id = ? AND message_id = ?`, rec.ChatID, rec.MessageID)
 					results = append(results, TaskRecoveryResult{
 						FileKey:     fileKey,
@@ -337,10 +357,10 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) ([]TaskRecoveryResult, er
 					})
 				} else {
 					if errors.Is(err, atomicCommit.ErrTargetExists) {
-						partSHA, err1 := computeRecoverySHA256(tempPartPath)
 						finalSHA, err2 := computeRecoverySHA256(finalPath)
-						if err1 == nil && err2 == nil && partSHA == finalSHA {
+						if shaErr == nil && err2 == nil && partSHA == finalSHA {
 							_ = os.Remove(tempPartPath)
+							_ = persistDirectCommitProof(r.outputDir, rec.SavePath, fileKey, "1", rec.FileSize, finalSHA)
 							if execErr := r.updateRecordSuccess(ctx, rec.ChatID, rec.MessageID, finalSHA); execErr != nil {
 								r.logger.Warn("failed to update record to success in recovery", zap.Error(execErr))
 							}
@@ -397,6 +417,56 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) ([]TaskRecoveryResult, er
 	}
 
 	return results, nil
+}
+
+func (r *Reconciler) repairCommittedProof(finalPath, metaPath string, expectedSize int64, fileKey, savePath string) (string, error) {
+	actualSHA, err := computeRecoverySHA256(finalPath)
+	if err != nil {
+		return "", fmt.Errorf("compute target sha256 for repair: %w", err)
+	}
+
+	proofPath := finalPath + ".tgx_commit"
+	tmpProofPath := proofPath + ".tmp"
+
+	// Source 1: Check .tgx_commit.tmp (crash during atomic proof rename)
+	if data, err := os.ReadFile(tmpProofPath); err == nil {
+		var proof targetwriter.CommitProof
+		if json.Unmarshal(data, &proof) == nil && proof.SHA256 != "" && proof.Version == 1 {
+			if proof.TaskID == fileKey && (expectedSize == 0 || proof.ExpectedSize == expectedSize) && proof.SHA256 == actualSHA {
+				if err := os.Rename(tmpProofPath, proofPath); err == nil {
+					if d, err := os.Open(filepath.Dir(proofPath)); err == nil {
+						_ = d.Sync()
+						_ = d.Close()
+					}
+					_ = os.Remove(metaPath)
+					return actualSHA, nil
+				}
+			}
+		}
+	}
+
+	// Source 2: Check .moving.meta (crash after CommitFile before proof write)
+	if data, err := os.ReadFile(metaPath); err == nil {
+		var manifest targetwriter.TaskManifest
+		if json.Unmarshal(data, &manifest) == nil && manifest.Version == targetwriter.SidecarVersion {
+			if manifest.TaskID == fileKey && (expectedSize == 0 || manifest.ExpectedSize == expectedSize) && manifest.ExpectedSHA != "" {
+				// Anti-tamper verification: the file on disk must match the SHA computed before commit!
+				if actualSHA != manifest.ExpectedSHA {
+					return "", fmt.Errorf("tamper detected: actual sha %s != pre-commit manifest expected sha %s", actualSHA, manifest.ExpectedSHA)
+				}
+
+				// Write durable proof using full transaction
+				if err := persistDirectCommitProof(r.outputDir, savePath, manifest.TaskID, manifest.Gen, expectedSize, actualSHA); err == nil {
+					_ = os.Remove(metaPath)
+					return actualSHA, nil
+				} else {
+					return "", fmt.Errorf("persist repaired commit proof: %w", err)
+				}
+			}
+		}
+	}
+
+	return "", fmt.Errorf("no verifiable commit proof or pre-commit intent found for %s", finalPath)
 }
 
 func (r *Reconciler) updateRecordSuccess(ctx context.Context, chatID string, msgID int, sha string) error {

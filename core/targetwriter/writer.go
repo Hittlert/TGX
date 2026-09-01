@@ -35,6 +35,7 @@ type TaskManifest struct {
 	Gen          string  `json:"gen"`
 	Ranges       []Range `json:"ranges"`
 	Version      int     `json:"version"`
+	ExpectedSHA  string  `json:"expected_sha,omitempty"`
 }
 
 const SidecarVersion = 1
@@ -374,8 +375,8 @@ func (w *TargetWriter) RegisterTask(manifest TaskManifest) RegisterResult {
 	existing, ok := w.tasks[manifest.TaskID]
 	if ok {
 		existing.mu.Lock()
-		if existing.finalized {
-			if isOlderGeneration(manifest.Gen, existing.finalGen) || manifest.Gen == existing.finalGen {
+		if existing.finalized || existing.phase == PhaseCommitProofPending {
+			if isOlderGeneration(manifest.Gen, existing.finalGen) || manifest.Gen == existing.finalGen || existing.phase == PhaseCommitProofPending {
 				existing.mu.Unlock()
 				w.stateMu.Unlock()
 				return RegisterAlreadyFinalized
@@ -1143,6 +1144,12 @@ func (w *TargetWriter) finalizeTask(manifest TaskManifest) (finalErr error) {
 		shaHash, shaErr = computeFileSHA256(movingPath)
 		if shaErr != nil {
 			return w.finishFinalizeError(state, manifest, false, fmt.Errorf("compute SHA256 of completed file: %w", shaErr))
+		}
+
+		// Persist commit intent with ExpectedSHA to .moving.meta before committing final file
+		manifest.ExpectedSHA = shaHash
+		if metaErr := w.persistMeta(manifest); metaErr != nil {
+			return w.finishFinalizeError(state, manifest, false, fmt.Errorf("persist commit intent in meta: %w", metaErr))
 		}
 
 		// Step 5: Pre-Commit CAS check under stateMu + state.mu (P0-3 fix)
