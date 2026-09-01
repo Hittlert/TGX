@@ -25,6 +25,7 @@ import (
 	"github.com/Hittlert/TGX/pkg/consts"
 	atomic "github.com/Hittlert/TGX/pkg/sbe/atomic"
 	"github.com/Hittlert/TGX/pkg/sbe/gate"
+	"github.com/Hittlert/TGX/pkg/spool"
 )
 
 //go:embed ui/*
@@ -43,6 +44,7 @@ type WebServer struct {
 	mover        *mover.Mover
 	bkt          bucket.Bucket
 	tw           *targetwriter.TargetWriter
+	spool        spool.Store
 
 	sessionsMu sync.RWMutex
 	sessions   map[string]time.Time
@@ -63,6 +65,10 @@ func (s *WebServer) SetBucket(b bucket.Bucket) {
 
 func (s *WebServer) SetTargetWriter(tw *targetwriter.TargetWriter) {
 	s.tw = tw
+}
+
+func (s *WebServer) SetSpool(store spool.Store) {
+	s.spool = store
 }
 
 func NewWebServer(
@@ -155,7 +161,23 @@ func (s *WebServer) Handler() http.Handler {
 			"used_human":   formatBytes(int64(usedBytes)),
 			"percent_used": fmt.Sprintf("%.1f%%", percent),
 		}
-		if s.bkt != nil {
+		if s.spool != nil {
+			m := s.spool.Metrics()
+			resp["buffer"] = map[string]any{
+				"mode":            m.Mode,
+				"max_bytes":       m.MaxBytes,
+				"reserved_bytes":  m.ReservedBytes,
+				"ready_bytes":     m.ReadyBytes,
+				"writing_bytes":   m.WritingBytes,
+				"reclaimed_bytes": m.ReclaimedBytes,
+				"used_bytes":      m.UsedBytes,
+				"active_segments": m.ActiveSegments,
+				"backpressured":   m.Backpressured,
+				"max_human":       formatBytes(m.MaxBytes),
+				"used_human":      formatBytes(m.UsedBytes),
+				"ready_human":     formatBytes(m.ReadyBytes),
+			}
+		} else if s.bkt != nil {
 			m := s.bkt.Metrics()
 			resp["buffer"] = map[string]any{
 				"mode":                 m.Mode,

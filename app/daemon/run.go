@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/gotd/td/telegram"
@@ -15,14 +16,14 @@ import (
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/Hittlert/TGX/core/bucket"
 	"github.com/Hittlert/TGX/core/dcpool"
 	"github.com/Hittlert/TGX/core/downloader"
 	"github.com/Hittlert/TGX/core/logctx"
 	"github.com/Hittlert/TGX/core/storage"
-	"github.com/Hittlert/TGX/core/targetwriter"
 	"github.com/Hittlert/TGX/core/tclient"
 	"github.com/Hittlert/TGX/pkg/sbe/gate"
+	"github.com/Hittlert/TGX/pkg/spool"
+	"github.com/Hittlert/TGX/pkg/writeback"
 )
 
 type Options struct {
@@ -180,34 +181,76 @@ func Run(ctx context.Context, client *telegram.Client, kvd storage.Storage, opts
 		diskWorkers = 32
 	}
 
-	// Initialize Object Bucket & Single TargetWriter
-	var bkt bucket.Bucket
-	var tw *targetwriter.TargetWriter
-	if opts.BufferType != "none" {
-		bktCfg := bucket.Config{
-			Mode:        bucket.Mode(opts.BufferType),
-			RootDir:     opts.BufferDir,
-			MaxCapacity: opts.BufferSize,
-		}
-		var err error
-		bkt, err = bucket.New(bktCfg)
-		if err != nil {
-			return fmt.Errorf("init bucket: %w", err)
-		}
-		if opts.BufferType == "ssd" {
-			_ = bkt.Recover(ctx)
-		}
-		defer func() { _ = bkt.Close() }()
+	// Initialize Portable VFS Write-Back Spool Store & Target Sink
+	var spoolStore spool.Store
+	var wbQueue *writeback.Queue
+	var targetSink *writeback.TargetSink
 
-		tw = targetwriter.New(bkt, opts.OutputDir)
-		tw.Start(ctx)
-		defer func() { _ = tw.Close() }()
+	if opts.BufferType == "memory" {
+		spoolStore = spool.NewMemoryStore(opts.BufferSize)
+	} else if opts.BufferType != "none" {
+		var err error
+		spoolStore, err = spool.NewFileStore(opts.BufferDir, opts.BufferSize)
+		if err != nil {
+			return fmt.Errorf("init spool store: %w", err)
+		}
+		_ = spoolStore.Recover(ctx)
 	}
 
 	registry := NewRegistryWithContext(ctx, opts.QueueCapacity, opts.TerminalLimit, time.Now)
 	registry.SetPaused(opts.StartPaused)
 	registry.SetPool(PoolSnapshot{Size: effectivePoolSize})
-	iter := newTaskIter(registry, newTaskResolver(access, opts.BufferDir, opts.OutputDir, bkt, tw))
+
+	var db *Database
+	var err error
+	if opts.DBPath != "" {
+		db, err = NewDatabase(opts.DBPath)
+		if err != nil {
+			logctx.From(ctx).Warn("could not initialize control database", zap.Error(err))
+		}
+	}
+
+	if spoolStore != nil {
+		defer func() { _ = spoolStore.Close() }()
+		wbQueue = writeback.NewQueue()
+		defer wbQueue.Close()
+
+		sinkCfg := writeback.DefaultConfig(opts.OutputDir)
+		sinkCfg.Concurrency = 5
+		cb := writeback.Callbacks{
+			OnTaskFinalized: func(taskID, gen, finalRelPath, shaHex string, size int64, finalErr error) {
+				if finalErr == nil {
+					if registry != nil {
+						registry.FinishTask(taskID, gen, StateSuccess, "", "", finalRelPath, false, shaHex)
+					}
+					if db != nil {
+						parts := strings.Split(taskID, ":")
+						if len(parts) == 2 {
+							var msgID int
+							_, _ = fmt.Sscanf(parts[1], "%d", &msgID)
+							_ = db.UpdateDownloadStatus(parts[0], msgID, "success", "", finalRelPath, "", 0, "")
+						}
+					}
+				} else {
+					if registry != nil {
+						registry.FinishTask(taskID, gen, StateFailed, "write_error", finalErr.Error(), "", false, "")
+					}
+					if db != nil {
+						parts := strings.Split(taskID, ":")
+						if len(parts) == 2 {
+							var msgID int
+							_, _ = fmt.Sscanf(parts[1], "%d", &msgID)
+							_ = db.UpdateDownloadStatus(parts[0], msgID, "failed", "", "", "", 0, finalErr.Error())
+						}
+					}
+				}
+			},
+		}
+		targetSink = writeback.NewTargetSink(sinkCfg, spoolStore, wbQueue, cb, logctx.From(ctx))
+		defer func() { _ = targetSink.Close() }()
+	}
+
+	iter := newTaskIter(registry, newTaskResolver(access, opts.BufferDir, opts.OutputDir, spoolStore, wbQueue))
 	dl := downloader.New(downloader.Options{
 		Pool:            pool,
 		Threads:         opts.Threads,
@@ -218,15 +261,10 @@ func Run(ctx context.Context, client *telegram.Client, kvd storage.Storage, opts
 		FloodGate:       sharedGate,
 	})
 
-	db, err := NewDatabase(opts.DBPath)
-	if err != nil {
-		logctx.From(ctx).Warn("could not initialize control database", zap.Error(err))
-	}
 	if db != nil {
 		defer db.Close()
 		// Execute SBE Startup Crash Recovery Matrix with buffer awareness
 		reconciler := NewReconcilerWithBuffer(db.DB(), opts.OutputDir, opts.BufferDir, opts.BufferType, nil, logctx.From(ctx))
-		reconciler.SetTargetWriter(tw)
 		reconciler.SetRegistry(registry)
 		if recResults, err := reconciler.ReconcileAll(ctx); err != nil {
 			logctx.From(ctx).Error("startup crash recovery failed", zap.Error(err))
@@ -254,15 +292,9 @@ func Run(ctx context.Context, client *telegram.Client, kvd storage.Storage, opts
 	if db != nil {
 		orchestrator = NewOrchestrator(db, slotPool, proxyManager, access, registry, logctx.From(ctx), opts.OutputDir)
 		orchestrator.SetBufferDir(opts.BufferDir)
-		orchestrator.SetBucket(bkt)
-		orchestrator.SetTargetWriter(tw)
-		orchestrator.Start(groupCtx) // Installs TargetWriter callbacks
-
-		// Allow TargetWriter to consume only after callbacks are installed,
-		// guaranteeing that no completed task is lost during recovery.
-		if tw != nil {
-			tw.BeginConsuming()
-		}
+		orchestrator.SetSpool(spoolStore)
+		orchestrator.SetTargetSink(targetSink)
+		orchestrator.Start(groupCtx)
 
 		// Start MTProto Real-Time Push Updates Streaming Engine
 		updatesStream := NewUpdatesStream(db, orchestrator, logctx.From(ctx))
@@ -272,8 +304,7 @@ func Run(ctx context.Context, client *telegram.Client, kvd storage.Storage, opts
 	authWizard := NewAuthWizard(db, client, kvd, logctx.From(ctx), opts.Namespace)
 	webServer := NewWebServer(db, slotPool, proxyManager, orchestrator, access, registry, logctx.From(ctx), opts.Password, sharedGate)
 	webServer.SetAuthWizard(authWizard)
-	webServer.SetBucket(bkt)
-	webServer.SetTargetWriter(tw)
+	webServer.SetSpool(spoolStore)
 
 	server := &http.Server{
 		Addr: opts.Listen, Handler: webServer.Handler(),

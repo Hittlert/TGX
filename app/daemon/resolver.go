@@ -9,6 +9,8 @@ import (
 	"github.com/Hittlert/TGX/core/bucket"
 	"github.com/Hittlert/TGX/core/downloader"
 	"github.com/Hittlert/TGX/core/targetwriter"
+	"github.com/Hittlert/TGX/pkg/spool"
+	"github.com/Hittlert/TGX/pkg/writeback"
 	"github.com/flytam/filenamify"
 )
 
@@ -30,6 +32,8 @@ type taskResolver struct {
 	outputRoot string
 	bkt        bucket.Bucket
 	tw         *targetwriter.TargetWriter
+	spool      spool.Store
+	wbQueue    *writeback.Queue
 }
 
 func newTaskResolver(access MediaAccess, tempRoot, outputRoot string, optArgs ...any) *taskResolver {
@@ -40,6 +44,10 @@ func newTaskResolver(access MediaAccess, tempRoot, outputRoot string, optArgs ..
 			r.bkt = v
 		case *targetwriter.TargetWriter:
 			r.tw = v
+		case spool.Store:
+			r.spool = v
+		case *writeback.Queue:
+			r.wbQueue = v
 		}
 	}
 	return r
@@ -85,6 +93,14 @@ func (r *taskResolver) Resolve(ctx context.Context, task *Task) (taskElement, er
 			return nil, NewTaskError("collision", false, err)
 		}
 		return &existingElement{task: task, file: media.File, path: finalPath, sha: verifiedSHA}, nil
+	}
+
+	if r.spool != nil && r.wbQueue != nil {
+		spoolElem, err := newSpoolFileElement(task, media.File, r.outputRoot, media.Date, r.spool, r.wbQueue)
+		if err != nil {
+			return nil, NewTaskError("spool", false, err)
+		}
+		return spoolElem, nil
 	}
 
 	if media.Size <= downloader.SmallFileThreshold {

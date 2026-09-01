@@ -115,6 +115,49 @@ func (d *Database) initSchema() error {
 			created_at INTEGER NOT NULL,
 			updated_at INTEGER NOT NULL
 		)`,
+		`CREATE TABLE IF NOT EXISTS spool_attempts (
+			task_id TEXT NOT NULL,
+			generation TEXT NOT NULL,
+			final_path TEXT NOT NULL,
+			expected_size INTEGER NOT NULL,
+			state TEXT NOT NULL,
+			created_at INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL,
+			PRIMARY KEY (task_id, generation)
+		)`,
+		`CREATE TABLE IF NOT EXISTS spool_segments (
+			task_id TEXT NOT NULL,
+			generation TEXT NOT NULL,
+			segment_index INTEGER NOT NULL,
+			start_offset INTEGER NOT NULL,
+			expected_length INTEGER NOT NULL,
+			state TEXT NOT NULL,
+			dirty INTEGER NOT NULL DEFAULT 1,
+			attempts INTEGER NOT NULL DEFAULT 0,
+			next_retry_at INTEGER NOT NULL DEFAULT 0,
+			path TEXT,
+			checksum TEXT,
+			PRIMARY KEY (task_id, generation, segment_index)
+		)`,
+		`CREATE TABLE IF NOT EXISTS target_commits (
+			task_id TEXT NOT NULL,
+			generation TEXT NOT NULL,
+			final_path TEXT NOT NULL,
+			expected_size INTEGER NOT NULL,
+			expected_sha256 TEXT NOT NULL,
+			committed_sha256 TEXT NOT NULL,
+			state TEXT NOT NULL,
+			version INTEGER NOT NULL DEFAULT 1,
+			updated_at INTEGER NOT NULL,
+			PRIMARY KEY (task_id, generation)
+		)`,
+		`CREATE TABLE IF NOT EXISTS spool_cleanup (
+			path TEXT PRIMARY KEY,
+			bytes INTEGER NOT NULL,
+			reason TEXT,
+			attempts INTEGER NOT NULL DEFAULT 0,
+			next_retry_at INTEGER NOT NULL DEFAULT 0
+		)`,
 	}
 
 	for _, q := range queries {

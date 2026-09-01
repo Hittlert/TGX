@@ -18,7 +18,161 @@ import (
 	"github.com/Hittlert/TGX/core/downloader"
 	"github.com/Hittlert/TGX/core/targetwriter"
 	atomic "github.com/Hittlert/TGX/pkg/sbe/atomic"
+	"github.com/Hittlert/TGX/pkg/spool"
+	"github.com/Hittlert/TGX/pkg/writeback"
 )
+
+// spoolWriterAt writes chunks directly to spool.Store segments with automatic Ready triggering.
+type spoolWriterAt struct {
+	store        spool.Store
+	queue        *writeback.Queue
+	task         *Task
+	taskID       string
+	gen          string
+	finalRelPath string
+	fileSize     int64
+	fileDate     int64
+}
+
+func (w *spoolWriterAt) WriteAt(p []byte, offset int64) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	ctx := context.Background()
+	if w.task != nil {
+		ctx = w.task.Context()
+	}
+
+	segIdx := int(offset / spool.DefaultSegmentSize)
+	segStart := int64(segIdx) * spool.DefaultSegmentSize
+	segLen := spool.DefaultSegmentSize
+	if segStart+segLen > w.fileSize {
+		segLen = w.fileSize - segStart
+	}
+	relOffset := offset - segStart
+
+	segKey := spool.SegmentKey{
+		TaskID:       w.taskID,
+		Gen:          w.gen,
+		SegmentIndex: segIdx,
+		StartOffset:  segStart,
+		Length:       segLen,
+	}
+
+	if w.store != nil {
+		if err := w.store.Reserve(ctx, int64(len(p))); err != nil {
+			return 0, err
+		}
+		item, err := w.store.CreateSegment(segKey)
+		if err != nil {
+			w.store.ReleaseReservation(int64(len(p)))
+			return 0, err
+		}
+		n, err := w.store.WriteAt(segKey, relOffset, p)
+		if err != nil {
+			return n, err
+		}
+		if item.Ranges.IsComplete(segLen) {
+			_ = w.store.MarkReady(segKey)
+			if w.queue != nil {
+				isLast := (segStart+segLen >= w.fileSize)
+				w.queue.Enqueue(&writeback.Item{
+					Key:              segKey,
+					FinalRelPath:     w.finalRelPath,
+					ExpectedFileSize: w.fileSize,
+					IsLastSegment:    isLast,
+					FileDate:         w.fileDate,
+					Item:             item,
+					AddedAt:          time.Now(),
+				})
+			}
+		}
+	}
+
+	if w.task != nil {
+		w.task.RecordWrite(offset, len(p))
+	}
+	return len(p), nil
+}
+
+type spoolFileElement struct {
+	task       *Task
+	file       downloader.File
+	store      spool.Store
+	queue      *writeback.Queue
+	writer     *spoolWriterAt
+	outputRoot string
+	finalPath  string
+	date       int64
+}
+
+func newSpoolFileElement(
+	task *Task,
+	file downloader.File,
+	outputRoot string,
+	date int64,
+	store spool.Store,
+	queue *writeback.Queue,
+) (taskElement, error) {
+	if task.IsTerminal() || (task.Context() != nil && task.Context().Err() != nil) {
+		return nil, errors.New("task attempt is no longer active")
+	}
+
+	gen := task.AttemptGen()
+	elem := &spoolFileElement{
+		task:       task,
+		file:       file,
+		store:      store,
+		queue:      queue,
+		outputRoot: outputRoot,
+		finalPath:  task.Request().FinalPath,
+		date:       date,
+	}
+	elem.writer = &spoolWriterAt{
+		store:        store,
+		queue:        queue,
+		task:         task,
+		taskID:       task.Request().ID,
+		gen:          gen,
+		finalRelPath: task.Request().FinalPath,
+		fileSize:     file.Size(),
+		fileDate:     date,
+	}
+	return elem, nil
+}
+
+func (e *spoolFileElement) File() downloader.File { return e.file }
+func (e *spoolFileElement) To() io.WriterAt       { return e.writer }
+func (e *spoolFileElement) AsTakeout() bool       { return false }
+func (e *spoolFileElement) Task() *Task           { return e.task }
+func (e *spoolFileElement) Context() context.Context {
+	if e.task != nil {
+		return e.task.Context()
+	}
+	return context.Background()
+}
+func (e *spoolFileElement) IsCanceled() bool {
+	return e.task != nil && e.task.IsTerminal()
+}
+func (e *spoolFileElement) AlreadyComplete() (string, bool) {
+	return "", false
+}
+func (e *spoolFileElement) Abort() error {
+	if e.queue != nil {
+		e.queue.Cancel(e.task.Request().ID, e.task.AttemptGen())
+	}
+	return nil
+}
+
+func (e *spoolFileElement) Publish() (PublishResult, error) {
+	if e.task != nil && e.task.IsTerminal() {
+		return PublishResult{}, errors.New("task is terminal, aborting publish")
+	}
+	return PublishResult{
+		Path:        e.finalPath,
+		AsyncMoving: true,
+	}, nil
+}
 
 // bucketWriterAt writes immutable chunk objects directly to bucket.Bucket with object-level reservation.
 type bucketWriterAt struct {

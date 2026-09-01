@@ -15,6 +15,8 @@ import (
 	"github.com/Hittlert/TGX/core/downloader"
 	"github.com/Hittlert/TGX/core/targetwriter"
 	atomic "github.com/Hittlert/TGX/pkg/sbe/atomic"
+	"github.com/Hittlert/TGX/pkg/spool"
+	"github.com/Hittlert/TGX/pkg/writeback"
 )
 
 type Orchestrator struct {
@@ -28,6 +30,8 @@ type Orchestrator struct {
 	bufferDir    string
 	bkt          bucket.Bucket
 	tw           *targetwriter.TargetWriter
+	spool        spool.Store
+	wbSink       *writeback.TargetSink
 
 	runningMu   sync.Mutex
 	running     bool
@@ -54,6 +58,14 @@ func (o *Orchestrator) SetBucket(bkt bucket.Bucket) {
 
 func (o *Orchestrator) SetTargetWriter(tw *targetwriter.TargetWriter) {
 	o.tw = tw
+}
+
+func (o *Orchestrator) SetSpool(s spool.Store) {
+	o.spool = s
+}
+
+func (o *Orchestrator) SetTargetSink(sink *writeback.TargetSink) {
+	o.wbSink = sink
 }
 
 func (o *Orchestrator) SetBufferDir(dir string) {
