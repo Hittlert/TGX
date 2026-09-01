@@ -56,7 +56,7 @@ func TestResolverPreparesMediaAndExactExistingFile(t *testing.T) {
 	sum := sha256.Sum256(data)
 	proof := targetwriter.CommitProof{
 		Version:      1,
-		TaskID:       CanonicalTaskID(request.Peer, request.MessageID),
+		TaskID:       request.ID,
 		Gen:          "1",
 		FinalPath:    request.FinalPath,
 		ExpectedSize: 4,
