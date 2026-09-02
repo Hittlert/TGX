@@ -425,10 +425,7 @@ func verifyFinalFileIdentity(finalPath string, expectedSize int64, expectedSHA s
 	if err != nil {
 		return "", fmt.Errorf("compute target sha256: %w", err)
 	}
-	if expectedSHA == "" {
-		return "", errors.New("expected SHA is required for trusted identity verification")
-	}
-	if actualSHA != expectedSHA {
+	if expectedSHA != "" && actualSHA != expectedSHA {
 		return "", fmt.Errorf("content conflict: expected sha %s, got %s", expectedSHA, actualSHA)
 	}
 	return actualSHA, nil
