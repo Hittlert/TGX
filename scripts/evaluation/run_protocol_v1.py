@@ -21,12 +21,8 @@ PROFILES = ["P-S", "P-SM", "P-LMS", "P-L"]
 FROZEN_SEED = 20260902
 
 def run_cmd(cmd):
-    print(f"[CMD] {cmd}")
-    res = subprocess.run(cmd, shell=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    print(res.stdout)
-    if res.returncode != 0:
-        raise RuntimeError(f"Command failed with exit code {res.returncode}: {cmd}")
-    return res.stdout
+    print(f"[CMD] {cmd}", flush=True)
+    subprocess.run(cmd, shell=True, check=True)
 
 def main():
     parser = argparse.ArgumentParser(description="TGX Evaluation Protocol v1.0 Master Controller")

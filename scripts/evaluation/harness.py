@@ -336,19 +336,19 @@ def execute_run(run_spec, engine_binary, eval_dir="/volume2/docker/telegram_down
         events_fp.flush()
 
     container_name = f"tgx-eval-runner-{run_id}"
-    subprocess.run(["sudo", "docker", "rm", "-f", container_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(f"sudo docker rm -f {container_name} tgx-eval-daemon $(sudo docker ps -q --filter name=tgx-eval-runner) 2>/dev/null || true", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(2)
 
-    # Launch Runner Container
-    print(f"[*] Spawning Runner Container: {container_name} on port {host_port}...")
+    # Launch Runner Container in isolated proxy network namespace
+    print(f"[*] Spawning Runner Container: {container_name} in tgx-eval-proxy network...")
     serve_args = [
         "sudo", "docker", "run", "-d",
         "--name", container_name,
-        "-p", f"{host_port}:5000",
+        "--net", "container:tgx-eval-proxy",
         "-v", f"{os.path.abspath(engine_binary)}:/app/telegram-downloader:ro",
         "-v", f"{output_dir}:/app/downloads",
         "-v", f"{session_dir}:/data",
         "-v", f"{log_dir}:/app/logs",
-        "--network", "tgx-eval-net",
     ]
     if engine == "tdl":
         serve_args.extend(["-v", f"{temp_dir}:/app/temp/tdl"])
@@ -360,7 +360,7 @@ def execute_run(run_spec, engine_binary, eval_dir="/volume2/docker/telegram_down
         "/app/telegram-downloader", "serve",
         "--dir", "/app/downloads",
         "--storage-path", "/data",
-        "--namespace", "default",
+        "--namespace", "production",
         "--listen", "0.0.0.0:5000",
         "--download-threads", str(net_concurrency),
         "--file-concurrency", str(file_concurrency),
@@ -375,7 +375,7 @@ def execute_run(run_spec, engine_binary, eval_dir="/volume2/docker/telegram_down
     if res.returncode != 0:
         raise RuntimeError(f"Failed to start container {container_name}: {res.stderr}")
 
-    api_base = f"http://127.0.0.1:{host_port}"
+    api_base = "http://127.0.0.1:5885"
 
     # Wait for daemon health
     print(f"[*] Waiting for {container_name} to be ready at {api_base}/healthz...")
@@ -495,6 +495,7 @@ def execute_run(run_spec, engine_binary, eval_dir="/volume2/docker/telegram_down
 
     # Teardown Container
     subprocess.run(["sudo", "docker", "rm", "-f", container_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(2)
 
     # 7. raw/task_results.jsonl and raw/hashes.jsonl
     print("[*] Generating task_results.jsonl, file_inventory.jsonl, and hashes.jsonl...")
