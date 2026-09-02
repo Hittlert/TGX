@@ -83,12 +83,11 @@ func (r *taskResolver) Resolve(ctx context.Context, task *Task) (taskElement, er
 				expectedSHA = commitRec.CommittedSHA256
 			}
 		}
-		if expectedSHA != "" {
-			verifiedSHA, err := verifyFinalFileIdentity(absolute, media.Size, expectedSHA, request.ID)
-			if err == nil && verifiedSHA != "" {
-				return &existingElement{task: task, file: media.File, path: finalPath, sha: verifiedSHA}, nil
-			}
+		verifiedSHA, err := verifyFinalFileIdentity(absolute, media.Size, expectedSHA, request.ID)
+		if err != nil {
+			return nil, NewTaskError("collision", false, err)
 		}
+		return &existingElement{task: task, file: media.File, path: finalPath, sha: verifiedSHA}, nil
 	}
 
 	if r.spool != nil && r.wbQueue != nil {
