@@ -168,6 +168,9 @@ class MetricsSampler(threading.Thread):
                 if rem > 0.05:
                     time.sleep(rem)
 
+    def stop(self):
+        self.running = False
+
 def extract_artifact_metadata(engine_binary, engine):
     binary_sha = compute_sha256(engine_binary) or "unknown"
     harness_sha = compute_sha256(__file__) if os.path.exists(__file__) else "unknown"
@@ -393,7 +396,7 @@ def execute_run(run_spec, engine_binary, eval_dir="/volume2/docker/telegram_down
     # Wait for daemon health
     print(f"[*] Waiting for {container_name} to be ready at {api_base}/healthz...")
     ready = False
-    for _ in range(30):
+    for _ in range(90):
         time.sleep(1)
         try:
             req = urllib.request.Request(f"{api_base}/healthz")
@@ -407,7 +410,7 @@ def execute_run(run_spec, engine_binary, eval_dir="/volume2/docker/telegram_down
     if not ready:
         p_logs = subprocess.run(["sudo", "docker", "logs", container_name], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         subprocess.run(["sudo", "docker", "rm", "-f", container_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        raise RuntimeError(f"Engine {engine} failed to start within 30s. Logs:\n{p_logs.stdout}")
+        raise RuntimeError(f"Engine {engine} failed to start within 90s. Logs:\n{p_logs.stdout}")
 
     print("[✓] Engine daemon is healthy and ready!")
     log_event("run.started", {"run_id": run_id, "cases_total": len(cases)})
@@ -754,7 +757,7 @@ def evaluate_policy(run_root, policy_version="baseline-v1"):
         f.write(f"- **Verdict**: `{verdict_status}`\n")
         f.write(f"- **Completed Ratio**: {completed_cases}/{total_cases} ({match_fraction * 100:.1f}%)\n")
         f.write(f"- **Orphan Residue**: {orphan_residue}\n")
-        f.write(f"- **Average Active Speed**: {avg_mbps} Mbps\n\n")
+        f.write(f"- **Average Active Speed**: {avg_active_mbps} Mbps (Total Avg: {avg_total_mbps} Mbps, Stalls: {zero_speed_fraction*100:.1f}%)\n\n")
         f.write("## Hashes & Verification Breakdown\n\n")
         f.write("| Case ID | Expected Path | Expected Size | Actual Size | SHA Match |\n")
         f.write("|---|---|---|---|---|\n")
