@@ -1,0 +1,78 @@
+{
+  "protocol_version": "1.0",
+  "size_buckets_bytes": {
+    "micro": [1, 65536],
+    "small_low": [65537, 262144],
+    "small_mid": [262145, 921600],
+    "small_high": [921601, 1048576],
+    "medium_low": [1048577, 16777216],
+    "medium_mid": [16777217, 33554432],
+    "medium_high": [33554433, 134217728],
+    "large_low": [268435456, 536870912],
+    "large_mid": [536870913, 1073741824],
+    "large_high": [1073741825, null]
+  },
+  "profiles": {
+    "P-S": {
+      "title": "pure-small",
+      "count_distribution": {
+        "micro": 0.20,
+        "small_low": 0.25,
+        "small_mid": 0.35,
+        "small_high": 0.20
+      },
+      "minimum_case_count": 100,
+      "required_sentinels": ["below_1MiB", "at_1MiB"]
+    },
+    "P-SM": {
+      "title": "small-medium",
+      "count_distribution": {
+        "small": 0.80,
+        "medium": 0.20
+      },
+      "medium_count_distribution": {
+        "medium_low": 0.50,
+        "medium_mid": 0.25,
+        "medium_high": 0.25
+      },
+      "minimum_small_byte_fraction": 0.10,
+      "minimum_case_count": 50,
+      "required_sentinels": ["around_1MiB", "around_16MiB", "around_32MiB"]
+    },
+    "P-LMS": {
+      "title": "large-medium-small",
+      "count_distribution": {
+        "small": 0.80,
+        "medium": 0.15,
+        "large": 0.05
+      },
+      "target_byte_distribution": {
+        "small": [0.10, 0.20],
+        "medium": [0.20, 0.30],
+        "large": [0.50, 0.70]
+      },
+      "minimum_case_count": 50,
+      "required_sentinels": ["around_1MiB", "around_16MiB", "around_32MiB"]
+    },
+    "P-L": {
+      "title": "pure-large",
+      "count_distribution": {
+        "large_low": 0.30,
+        "large_mid": 0.40,
+        "large_high": 0.30
+      },
+      "minimum_case_count_formula": "2 * file_concurrency",
+      "required_sentinels": []
+    }
+  },
+  "diversity": {
+    "minimum_groups": 5,
+    "maximum_group_count_fraction": 0.20,
+    "minimum_dcs": 2,
+    "insufficient_inventory_behavior": "record_coverage_gap"
+  },
+  "workload": {
+    "minimum_duration_multiplier": 1.5,
+    "formula": "manifest_total_bytes >= control_payload_bps * duration_seconds * minimum_duration_multiplier"
+  }
+}

@@ -1,0 +1,48 @@
+{
+  "policy_version": "baseline-v1",
+  "protocol_version": "1.0",
+  "missing_required_measurement": "BLOCKED",
+  "invalid_artifact_identity": "INVALID",
+  "correctness": {
+    "required_completed_file_match_fraction": 1.0,
+    "allow_unexpected_final_files": false,
+    "allow_unowned_residue": false,
+    "require_task_result_for_every_manifest_case": true
+  },
+  "stability": {
+    "allow_unexpected_process_restart": false,
+    "maximum_unexplained_zero_throughput_seconds": 10,
+    "require_buffer_drain": true,
+    "require_target_backlog_drain": true
+  },
+  "performance": {
+    "small_absolute_mbps_when_control_at_least_mbps": {
+      "control_minimum_mbps": 250,
+      "required_tgx_mbps": 200
+    },
+    "minimum_tgx_to_paired_tdl_payload_ratio": 0.75,
+    "minimum_tgx_to_network_control_ratio_when_control_below_threshold": 0.75
+  },
+  "diagnosability": {
+    "require_complete_trace_for_all_errors": true,
+    "required_error_fields": [
+      "case_id",
+      "attempt_id",
+      "stage",
+      "op",
+      "error_code",
+      "error_cause",
+      "retryable"
+    ]
+  },
+  "diagnostic_only_metrics": [
+    "throughput_cv",
+    "gc_pause",
+    "device_iops",
+    "device_await",
+    "device_util",
+    "fsync_latency",
+    "target_read_amplification",
+    "target_write_amplification"
+  ]
+}
