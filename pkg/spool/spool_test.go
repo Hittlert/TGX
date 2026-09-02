@@ -71,12 +71,16 @@ func TestFileStore_LifecycleAndWriteAt(t *testing.T) {
 	require.NoError(t, err)
 	defer store.Close()
 
+	chunk1Data := []byte("HELLO-DATA-CHUNK-1-")
+	chunk2Data := []byte("WORLD-DATA-CHUNK-2-")
+	totalLen := int64(len(chunk1Data) + len(chunk2Data))
+
 	key := SegmentKey{
 		TaskID:       "task-test-1",
 		Gen:          "1",
 		SegmentIndex: 0,
 		StartOffset:  0,
-		Length:       1024 * 1024, // 1 MiB
+		Length:       totalLen,
 	}
 
 	ctx := context.Background()
@@ -86,14 +90,16 @@ func TestFileStore_LifecycleAndWriteAt(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, StateReceiving, item.State)
 
-	// Write chunks out of order: Chunk 2 first, Chunk 1 second
-	chunk2Data := []byte("WORLD-DATA-CHUNK-2")
-	chunk1Data := []byte("HELLO-DATA-CHUNK-1")
-
-	n, err := store.WriteAt(key, 512, chunk2Data)
+	// Incomplete write: only write chunk 2
+	n, err := store.WriteAt(key, int64(len(chunk1Data)), chunk2Data)
 	require.NoError(t, err)
 	assert.Equal(t, len(chunk2Data), n)
 
+	// MarkReady MUST FAIL because chunk 1 is missing
+	err = store.MarkReady(key)
+	assert.ErrorIs(t, err, ErrInvalidRange)
+
+	// Write chunk 1 to complete the segment
 	n, err = store.WriteAt(key, 0, chunk1Data)
 	require.NoError(t, err)
 	assert.Equal(t, len(chunk1Data), n)
@@ -105,11 +111,11 @@ func TestFileStore_LifecycleAndWriteAt(t *testing.T) {
 	assert.Equal(t, chunk1Data, readBuf)
 
 	readBuf2 := make([]byte, len(chunk2Data))
-	n, err = store.ReadAt(key, 512, readBuf2)
+	n, err = store.ReadAt(key, int64(len(chunk1Data)), readBuf2)
 	require.NoError(t, err)
 	assert.Equal(t, chunk2Data, readBuf2)
 
-	// Mark ready
+	// Mark ready now succeeds!
 	require.NoError(t, store.MarkReady(key))
 	readyList := store.ListReadySegments()
 	require.Len(t, readyList, 1)
@@ -125,12 +131,13 @@ func TestMemoryStore_LifecycleAndWriteAt(t *testing.T) {
 	store := NewMemoryStore(10 * 1024 * 1024)
 	defer store.Close()
 
+	data := []byte("IN_MEMORY_PAYLOAD_TEST")
 	key := SegmentKey{
 		TaskID:       "task-mem-1",
 		Gen:          "1",
 		SegmentIndex: 0,
 		StartOffset:  0,
-		Length:       4096,
+		Length:       int64(len(data)),
 	}
 
 	ctx := context.Background()
@@ -139,13 +146,12 @@ func TestMemoryStore_LifecycleAndWriteAt(t *testing.T) {
 	_, err := store.CreateSegment(key)
 	require.NoError(t, err)
 
-	data := []byte("IN_MEMORY_PAYLOAD_TEST")
-	n, err := store.WriteAt(key, 100, data)
+	n, err := store.WriteAt(key, 0, data)
 	require.NoError(t, err)
 	assert.Equal(t, len(data), n)
 
 	readBuf := make([]byte, len(data))
-	n, err = store.ReadAt(key, 100, readBuf)
+	n, err = store.ReadAt(key, 0, readBuf)
 	require.NoError(t, err)
 	assert.Equal(t, data, readBuf)
 

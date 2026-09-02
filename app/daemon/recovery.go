@@ -95,8 +95,7 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) ([]TaskRecoveryResult, er
 		movingPath := finalPath + ".moving"
 		metaPath := finalPath + ".moving.meta"
 
-		// 1. Check if final file was already committed via our SHA-verified CommitFile.
-		// Accept only if: final exists with exact size, .moving does NOT exist.
+		// 1. Check if final file was already committed via SQLite target_commits record
 		stat, err := os.Stat(finalPath)
 		_, movingErr := os.Stat(movingPath)
 		tempPartPath := CanonicalPartPath(r.tempDir, fileKey)
@@ -104,19 +103,25 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) ([]TaskRecoveryResult, er
 		hasTempPart := (partErr == nil)
 
 		if err == nil && stat.Size() == rec.FileSize && rec.FileSize > 0 && errors.Is(movingErr, os.ErrNotExist) && !hasTempPart {
-			verifiedSHA, verifyErr := verifyFinalFileIdentity(finalPath, rec.FileSize, "", fileKey)
-			if verifyErr == nil && verifiedSHA != "" {
-				_ = os.Remove(metaPath)
-				if execErr := r.updateRecordSuccess(ctx, rec.ChatID, rec.MessageID, verifiedSHA); execErr != nil {
-					r.logger.Warn("failed to update record to success in recovery", zap.Error(execErr))
-				} else {
-					results = append(results, TaskRecoveryResult{
-						FileKey:     fileKey,
-						PrevState:   rec.Status,
-						NextState:   "success",
-						ActionTaken: "FINAL_FILE_COMMITTED_PROMOTED_TO_SUCCESS",
-					})
-					continue
+			// Query target_commits table for authoritative committed SHA
+			var committedSHA string
+			_ = r.db.QueryRowContext(ctx, `SELECT committed_sha256 FROM target_commits WHERE task_id = ? ORDER BY updated_at DESC LIMIT 1`, fileKey).Scan(&committedSHA)
+
+			if committedSHA != "" {
+				verifiedSHA, verifyErr := verifyFinalFileIdentity(finalPath, rec.FileSize, committedSHA, fileKey)
+				if verifyErr == nil && verifiedSHA != "" {
+					_ = os.Remove(metaPath)
+					if execErr := r.updateRecordSuccess(ctx, rec.ChatID, rec.MessageID, verifiedSHA); execErr != nil {
+						r.logger.Warn("failed to update record to success in recovery", zap.Error(execErr))
+					} else {
+						results = append(results, TaskRecoveryResult{
+							FileKey:     fileKey,
+							PrevState:   rec.Status,
+							NextState:   "success",
+							ActionTaken: "FINAL_FILE_COMMITTED_PROMOTED_TO_SUCCESS",
+						})
+						continue
+					}
 				}
 			}
 		}

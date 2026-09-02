@@ -181,6 +181,30 @@ func Run(ctx context.Context, client *telegram.Client, kvd storage.Storage, opts
 		diskWorkers = 32
 	}
 
+	var db *Database
+	var err error
+	if opts.DBPath != "" {
+		db, err = NewDatabase(opts.DBPath)
+		if err != nil {
+			logctx.From(ctx).Warn("could not initialize control database", zap.Error(err))
+		}
+	}
+
+	registry := NewRegistryWithContext(ctx, opts.QueueCapacity, opts.TerminalLimit, time.Now)
+	registry.SetPaused(opts.StartPaused)
+	registry.SetPool(PoolSnapshot{Size: effectivePoolSize})
+
+	if db != nil {
+		// Execute Startup Crash Recovery Matrix with buffer awareness
+		reconciler := NewReconcilerWithBuffer(db.DB(), opts.OutputDir, opts.BufferDir, opts.BufferType, nil, logctx.From(ctx))
+		reconciler.SetRegistry(registry)
+		if recResults, err := reconciler.ReconcileAll(ctx); err != nil {
+			logctx.From(ctx).Error("startup crash recovery failed", zap.Error(err))
+		} else if len(recResults) > 0 {
+			logctx.From(ctx).Info("startup crash recovery completed", zap.Int("recovered_tasks", len(recResults)))
+		}
+	}
+
 	// Initialize Portable VFS Write-Back Spool Store & Target Sink
 	var spoolStore spool.Store
 	var wbQueue *writeback.Queue
@@ -189,25 +213,11 @@ func Run(ctx context.Context, client *telegram.Client, kvd storage.Storage, opts
 	if opts.BufferType == "memory" {
 		spoolStore = spool.NewMemoryStore(opts.BufferSize)
 	} else if opts.BufferType != "none" {
-		var err error
 		spoolStore, err = spool.NewFileStore(opts.BufferDir, opts.BufferSize)
 		if err != nil {
 			return fmt.Errorf("init spool store: %w", err)
 		}
 		_ = spoolStore.Recover(ctx)
-	}
-
-	registry := NewRegistryWithContext(ctx, opts.QueueCapacity, opts.TerminalLimit, time.Now)
-	registry.SetPaused(opts.StartPaused)
-	registry.SetPool(PoolSnapshot{Size: effectivePoolSize})
-
-	var db *Database
-	var err error
-	if opts.DBPath != "" {
-		db, err = NewDatabase(opts.DBPath)
-		if err != nil {
-			logctx.From(ctx).Warn("could not initialize control database", zap.Error(err))
-		}
 	}
 
 	if spoolStore != nil {
@@ -218,12 +228,29 @@ func Run(ctx context.Context, client *telegram.Client, kvd storage.Storage, opts
 		sinkCfg := writeback.DefaultConfig(opts.OutputDir)
 		sinkCfg.Concurrency = 5
 		cb := writeback.Callbacks{
+			OnSegmentDurable: func(key spool.SegmentKey, durableBytes int64) {
+				if db != nil {
+					_ = db.DeleteSpoolSegment(key.TaskID, key.Gen, key.SegmentIndex)
+				}
+			},
 			OnTaskFinalized: func(taskID, gen, finalRelPath, shaHex string, size int64, finalErr error) {
 				if finalErr == nil {
-					if registry != nil {
-						registry.FinishTask(taskID, gen, StateSuccess, "", "", finalRelPath, false, shaHex)
-					}
 					if db != nil {
+						_ = db.RecordTargetCommit(TargetCommitRecord{
+							TaskID:          taskID,
+							Generation:      gen,
+							FinalPath:       finalRelPath,
+							ExpectedSize:    size,
+							ExpectedSHA256:  shaHex,
+							CommittedSHA256: shaHex,
+							State:           "committed",
+						})
+					}
+					var res FinishResult = FinishAcceptedNewTerminal
+					if registry != nil {
+						res = registry.FinishTask(taskID, gen, StateSuccess, "", "", finalRelPath, false, shaHex)
+					}
+					if res == FinishAcceptedNewTerminal && db != nil {
 						parts := strings.Split(taskID, ":")
 						if len(parts) == 2 {
 							var msgID int
@@ -232,10 +259,11 @@ func Run(ctx context.Context, client *telegram.Client, kvd storage.Storage, opts
 						}
 					}
 				} else {
+					var res FinishResult = FinishAcceptedNewTerminal
 					if registry != nil {
-						registry.FinishTask(taskID, gen, StateFailed, "write_error", finalErr.Error(), "", false, "")
+						res = registry.FinishTask(taskID, gen, StateFailed, "write_error", finalErr.Error(), "", false, "")
 					}
-					if db != nil {
+					if res == FinishAcceptedNewTerminal && db != nil {
 						parts := strings.Split(taskID, ":")
 						if len(parts) == 2 {
 							var msgID int
@@ -248,29 +276,35 @@ func Run(ctx context.Context, client *telegram.Client, kvd storage.Storage, opts
 		}
 		targetSink = writeback.NewTargetSink(sinkCfg, spoolStore, wbQueue, cb, logctx.From(ctx))
 		defer func() { _ = targetSink.Close() }()
-	}
 
-	iter := newTaskIter(registry, newTaskResolver(access, opts.BufferDir, opts.OutputDir, spoolStore, wbQueue))
-	dl := downloader.New(downloader.Options{
-		Pool:            pool,
-		Threads:         opts.Threads,
-		DiskWorkers:     diskWorkers,
-		FileConcurrency: opts.FileConcurrency,
-		Iter:            iter,
-		Progress:        newTaskProgress(),
-		FloodGate:       sharedGate,
-	})
+		// Recover and re-enqueue active segments from SQLite
+		if db != nil {
+			if activeSegs, err := db.GetActiveSpoolSegments(); err == nil && len(activeSegs) > 0 {
+				if fs, ok := spoolStore.(*spool.FileStore); ok {
+					for _, segRec := range activeSegs {
+						segKey := spool.SegmentKey{
+							TaskID:       segRec.TaskID,
+							Gen:          segRec.Generation,
+							SegmentIndex: segRec.SegmentIndex,
+							StartOffset:  segRec.StartOffset,
+							Length:       segRec.ExpectedLength,
+						}
+						if item, err := fs.RestoreSegment(segKey); err == nil && item != nil {
+							wbQueue.Enqueue(&writeback.Item{
+								Key:              segKey,
+								ExpectedFileSize: segRec.ExpectedLength,
+								Item:             item,
+								AddedAt:          time.Now(),
+							})
+						}
+					}
+				}
+			}
+		}
+	}
 
 	if db != nil {
 		defer db.Close()
-		// Execute SBE Startup Crash Recovery Matrix with buffer awareness
-		reconciler := NewReconcilerWithBuffer(db.DB(), opts.OutputDir, opts.BufferDir, opts.BufferType, nil, logctx.From(ctx))
-		reconciler.SetRegistry(registry)
-		if recResults, err := reconciler.ReconcileAll(ctx); err != nil {
-			logctx.From(ctx).Error("startup crash recovery failed", zap.Error(err))
-		} else if len(recResults) > 0 {
-			logctx.From(ctx).Info("startup crash recovery completed", zap.Int("recovered_tasks", len(recResults)))
-		}
 	}
 
 	slotCfg := SlotPoolConfig{

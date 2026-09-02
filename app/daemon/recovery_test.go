@@ -39,6 +39,18 @@ func setupTestDB(t *testing.T) *sql.DB {
 			updated_at INTEGER NOT NULL DEFAULT 0,
 			PRIMARY KEY (chat_id, message_id)
 		);
+		CREATE TABLE IF NOT EXISTS target_commits (
+			task_id TEXT NOT NULL,
+			generation TEXT NOT NULL,
+			final_path TEXT NOT NULL,
+			expected_size INTEGER NOT NULL,
+			expected_sha256 TEXT NOT NULL,
+			committed_sha256 TEXT NOT NULL,
+			state TEXT NOT NULL,
+			version INTEGER NOT NULL DEFAULT 1,
+			updated_at INTEGER NOT NULL,
+			PRIMARY KEY (task_id, generation)
+		);
 	`)
 	require.NoError(t, err)
 	return db
@@ -56,7 +68,13 @@ func TestReconciler_PromotesExistingFileToSuccess(t *testing.T) {
 	data := []byte("data")
 	require.NoError(t, os.WriteFile(finalPath, data, 0644))
 
-	_, err := db.Exec(`INSERT INTO download_records (chat_id, message_id, status, file_name, save_path, file_size) VALUES ('123', 1, 'downloading', 'test.mp4', 'test.mp4', 4)`)
+	sum := sha256.Sum256(data)
+	shaHex := hex.EncodeToString(sum[:])
+
+	_, err := db.Exec(`INSERT INTO target_commits (task_id, generation, final_path, expected_size, expected_sha256, committed_sha256, state, updated_at) VALUES ('123:1', '1', 'test.mp4', 4, ?, ?, 'committed', ?)`, shaHex, shaHex, time.Now().Unix())
+	require.NoError(t, err)
+
+	_, err = db.Exec(`INSERT INTO download_records (chat_id, message_id, status, file_name, save_path, file_size) VALUES ('123', 1, 'downloading', 'test.mp4', 'test.mp4', 4)`)
 	require.NoError(t, err)
 
 	r := NewReconcilerWithBuffer(db, outDir, tempDir, "memory", nil, zap.NewNop())

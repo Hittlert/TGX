@@ -164,3 +164,212 @@ func TestTargetSink_EndToEndStreamingAndReclaim(t *testing.T) {
 	_, exists1 := store.GetItem(seg1Key)
 	assert.False(t, exists1)
 }
+
+func TestTargetSink_OutOfOrderSegments_StrictSequentialSHAAndNoHoles(t *testing.T) {
+	tempSpoolDir := t.TempDir()
+	tempTargetDir := t.TempDir()
+
+	store, err := spool.NewFileStore(tempSpoolDir, 50*1024*1024)
+	require.NoError(t, err)
+	defer store.Close()
+
+	queue := NewQueue()
+
+	var finalSHA string
+	var finalizedErr error
+	var wg sync.WaitGroup
+	wg.Add(1)
+
+	cb := Callbacks{
+		OnTaskFinalized: func(taskID, gen, finalRelPath, sha256Hex string, size int64, err error) {
+			finalSHA = sha256Hex
+			finalizedErr = err
+			wg.Done()
+		},
+	}
+
+	cfg := DefaultConfig(tempTargetDir)
+	cfg.Concurrency = 2
+	sink := NewTargetSink(cfg, store, queue, cb, zap.NewNop())
+	defer sink.Close()
+
+	taskID := "task-ooo-1"
+	gen := "1"
+	finalRelPath := "videos/out_of_order.mp4"
+
+	// 2 segments: seg 0 (1MB), seg 1 (1MB)
+	seg0Data := []byte("SEGMENT_0_DATA_CONTENT_12345678")
+	seg1Data := []byte("SEGMENT_1_DATA_CONTENT_87654321")
+
+	fullPayload := append(seg0Data, seg1Data...)
+	expectedSum := sha256.Sum256(fullPayload)
+	expectedSHAHex := hex.EncodeToString(expectedSum[:])
+
+	seg0Key := spool.SegmentKey{TaskID: taskID, Gen: gen, SegmentIndex: 0, StartOffset: 0, Length: int64(len(seg0Data))}
+	seg1Key := spool.SegmentKey{TaskID: taskID, Gen: gen, SegmentIndex: 1, StartOffset: int64(len(seg0Data)), Length: int64(len(seg1Data))}
+
+	ctx := context.Background()
+	require.NoError(t, store.Reserve(ctx, seg0Key.Length+seg1Key.Length))
+
+	_, _ = store.CreateSegment(seg0Key)
+	_, _ = store.WriteAt(seg0Key, 0, seg0Data)
+	_ = store.MarkReady(seg0Key)
+
+	_, _ = store.CreateSegment(seg1Key)
+	_, _ = store.WriteAt(seg1Key, 0, seg1Data)
+	_ = store.MarkReady(seg1Key)
+
+	// Intentionally enqueue SEGMENT 1 FIRST into the queue!
+	queue.Enqueue(&Item{
+		Key:              seg1Key,
+		FinalRelPath:     finalRelPath,
+		ExpectedFileSize: int64(len(fullPayload)),
+		IsLastSegment:    true,
+		AddedAt:          time.Now(),
+	})
+
+	time.Sleep(50 * time.Millisecond)
+
+	// Enqueue SEGMENT 0 SECOND
+	queue.Enqueue(&Item{
+		Key:              seg0Key,
+		FinalRelPath:     finalRelPath,
+		ExpectedFileSize: int64(len(fullPayload)),
+		IsLastSegment:    false,
+		AddedAt:          time.Now(),
+	})
+
+	wg.Wait()
+	require.NoError(t, finalizedErr)
+	assert.Equal(t, expectedSHAHex, finalSHA)
+
+	finalPath := filepath.Join(tempTargetDir, finalRelPath)
+	diskData, err := os.ReadFile(finalPath)
+	require.NoError(t, err)
+	assert.Equal(t, fullPayload, diskData)
+}
+
+func TestTargetSink_MissingMiddle_NeverFinalizesPrematurely(t *testing.T) {
+	tempSpoolDir := t.TempDir()
+	tempTargetDir := t.TempDir()
+
+	store, err := spool.NewFileStore(tempSpoolDir, 50*1024*1024)
+	require.NoError(t, err)
+	defer store.Close()
+
+	queue := NewQueue()
+
+	finalizedChan := make(chan struct{}, 1)
+	cb := Callbacks{
+		OnTaskFinalized: func(taskID, gen, finalRelPath, sha256Hex string, size int64, err error) {
+			finalizedChan <- struct{}{}
+		},
+	}
+
+	cfg := DefaultConfig(tempTargetDir)
+	cfg.Concurrency = 2
+	sink := NewTargetSink(cfg, store, queue, cb, zap.NewNop())
+	defer sink.Close()
+
+	taskID := "task-missing-middle"
+	gen := "1"
+	finalRelPath := "videos/sparse.mp4"
+
+	// 3 segments total expected: 0 (10B), 1 (10B), 2 (10B), total 30B
+	seg0Data := []byte("0123456789")
+	seg2Data := []byte("abcdefghij")
+
+	seg0Key := spool.SegmentKey{TaskID: taskID, Gen: gen, SegmentIndex: 0, StartOffset: 0, Length: 10}
+	seg2Key := spool.SegmentKey{TaskID: taskID, Gen: gen, SegmentIndex: 2, StartOffset: 20, Length: 10}
+
+	ctx := context.Background()
+	require.NoError(t, store.Reserve(ctx, 20))
+
+	_, _ = store.CreateSegment(seg0Key)
+	_, _ = store.WriteAt(seg0Key, 0, seg0Data)
+	_ = store.MarkReady(seg0Key)
+
+	_, _ = store.CreateSegment(seg2Key)
+	_, _ = store.WriteAt(seg2Key, 0, seg2Data)
+	_ = store.MarkReady(seg2Key)
+
+	// Enqueue seg 0 and seg 2 (seg 1 is missing!)
+	queue.Enqueue(&Item{
+		Key:              seg0Key,
+		FinalRelPath:     finalRelPath,
+		ExpectedFileSize: 30,
+		IsLastSegment:    false,
+		AddedAt:          time.Now(),
+	})
+	queue.Enqueue(&Item{
+		Key:              seg2Key,
+		FinalRelPath:     finalRelPath,
+		ExpectedFileSize: 30,
+		IsLastSegment:    true, // Last segment arriving, but middle is missing!
+		AddedAt:          time.Now(),
+	})
+
+	select {
+	case <-finalizedChan:
+		t.Fatal("task must NOT be finalized prematurely when middle segment is missing!")
+	case <-time.After(200 * time.Millisecond):
+		// Success: correctly waiting for segment 1!
+	}
+}
+
+func TestTargetSink_TargetExists_ConflictFails(t *testing.T) {
+	tempSpoolDir := t.TempDir()
+	tempTargetDir := t.TempDir()
+
+	store, err := spool.NewFileStore(tempSpoolDir, 50*1024*1024)
+	require.NoError(t, err)
+	defer store.Close()
+
+	queue := NewQueue()
+
+	var finalizedErr error
+	var wg sync.WaitGroup
+	wg.Add(1)
+
+	cb := Callbacks{
+		OnTaskFinalized: func(taskID, gen, finalRelPath, sha256Hex string, size int64, err error) {
+			finalizedErr = err
+			wg.Done()
+		},
+	}
+
+	cfg := DefaultConfig(tempTargetDir)
+	cfg.Concurrency = 1
+	sink := NewTargetSink(cfg, store, queue, cb, zap.NewNop())
+	defer sink.Close()
+
+	taskID := "task-conflict"
+	gen := "1"
+	finalRelPath := "videos/conflict.mp4"
+
+	// Pre-create target file with DIFFERENT content
+	finalPath := filepath.Join(tempTargetDir, finalRelPath)
+	require.NoError(t, os.MkdirAll(filepath.Dir(finalPath), 0755))
+	require.NoError(t, os.WriteFile(finalPath, []byte("preexisting_different_content"), 0644))
+
+	segData := []byte("new_incoming_content_123456789")
+	segKey := spool.SegmentKey{TaskID: taskID, Gen: gen, SegmentIndex: 0, StartOffset: 0, Length: int64(len(segData))}
+
+	ctx := context.Background()
+	require.NoError(t, store.Reserve(ctx, segKey.Length))
+	_, _ = store.CreateSegment(segKey)
+	_, _ = store.WriteAt(segKey, 0, segData)
+	_ = store.MarkReady(segKey)
+
+	queue.Enqueue(&Item{
+		Key:              segKey,
+		FinalRelPath:     finalRelPath,
+		ExpectedFileSize: int64(len(segData)),
+		IsLastSegment:    true,
+		AddedAt:          time.Now(),
+	})
+
+	wg.Wait()
+	require.Error(t, finalizedErr)
+	assert.ErrorIs(t, finalizedErr, ErrTargetConflict)
+}

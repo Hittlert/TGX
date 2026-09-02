@@ -860,6 +860,97 @@ type TargetCommitRecord struct {
 	UpdatedAt       int64  `json:"updated_at"`
 }
 
+type SpoolSegmentRecord struct {
+	TaskID         string `json:"task_id"`
+	Generation     string `json:"generation"`
+	SegmentIndex   int    `json:"segment_index"`
+	StartOffset    int64  `json:"start_offset"`
+	ExpectedLength int64  `json:"expected_length"`
+	State          string `json:"state"`
+	Dirty          bool   `json:"dirty"`
+	Attempts       int    `json:"attempts"`
+	NextRetryAt    int64  `json:"next_retry_at"`
+	Path           string `json:"path"`
+	Checksum       string `json:"checksum"`
+}
+
+func (d *Database) RecordSpoolAttempt(taskID, generation, finalPath string, expectedSize int64, state string) error {
+	d.lock.Lock()
+	defer d.lock.Unlock()
+
+	now := time.Now().Unix()
+	_, err := d.db.Exec(`
+		INSERT INTO spool_attempts (task_id, generation, final_path, expected_size, state, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(task_id, generation) DO UPDATE SET
+			final_path = excluded.final_path,
+			expected_size = excluded.expected_size,
+			state = excluded.state,
+			updated_at = excluded.updated_at
+	`, taskID, generation, finalPath, expectedSize, state, now, now)
+	return err
+}
+
+func (d *Database) RecordSpoolSegment(rec SpoolSegmentRecord) error {
+	d.lock.Lock()
+	defer d.lock.Unlock()
+
+	dirtyInt := 0
+	if rec.Dirty {
+		dirtyInt = 1
+	}
+
+	_, err := d.db.Exec(`
+		INSERT INTO spool_segments (task_id, generation, segment_index, start_offset, expected_length, state, dirty, attempts, next_retry_at, path, checksum)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(task_id, generation, segment_index) DO UPDATE SET
+			start_offset = excluded.start_offset,
+			expected_length = excluded.expected_length,
+			state = excluded.state,
+			dirty = excluded.dirty,
+			attempts = excluded.attempts,
+			next_retry_at = excluded.next_retry_at,
+			path = excluded.path,
+			checksum = excluded.checksum
+	`, rec.TaskID, rec.Generation, rec.SegmentIndex, rec.StartOffset, rec.ExpectedLength, rec.State, dirtyInt, rec.Attempts, rec.NextRetryAt, rec.Path, rec.Checksum)
+	return err
+}
+
+func (d *Database) GetActiveSpoolSegments() ([]SpoolSegmentRecord, error) {
+	d.lock.RLock()
+	defer d.lock.RUnlock()
+
+	rows, err := d.db.Query(`
+		SELECT task_id, generation, segment_index, start_offset, expected_length, state, dirty, attempts, next_retry_at, COALESCE(path, ''), COALESCE(checksum, '')
+		FROM spool_segments
+		WHERE state IN ('ready', 'queued', 'writing_back')
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var records []SpoolSegmentRecord
+	for rows.Next() {
+		var rec SpoolSegmentRecord
+		var dirtyInt int
+		if err := rows.Scan(&rec.TaskID, &rec.Generation, &rec.SegmentIndex, &rec.StartOffset, &rec.ExpectedLength, &rec.State, &dirtyInt, &rec.Attempts, &rec.NextRetryAt, &rec.Path, &rec.Checksum); err != nil {
+			continue
+		}
+		rec.Dirty = (dirtyInt != 0)
+		records = append(records, rec)
+	}
+	return records, nil
+}
+
+func (d *Database) DeleteSpoolSegment(taskID, generation string, segmentIndex int) error {
+	d.lock.Lock()
+	defer d.lock.Unlock()
+
+	_, err := d.db.Exec(`DELETE FROM spool_segments WHERE task_id = ? AND generation = ? AND segment_index = ?`, taskID, generation, segmentIndex)
+	return err
+}
+
 func (d *Database) RecordTargetCommit(rec TargetCommitRecord) error {
 	d.lock.Lock()
 	defer d.lock.Unlock()
@@ -895,11 +986,13 @@ func (d *Database) GetTargetCommit(taskID, generation string) (*TargetCommitReco
 	err := d.db.QueryRow(`
 		SELECT task_id, generation, final_path, expected_size, expected_sha256, committed_sha256, state, version, updated_at
 		FROM target_commits
-		WHERE task_id = ? AND generation = ?
+		WHERE task_id = ? AND (generation = ? OR ? = '')
+		ORDER BY updated_at DESC
 		LIMIT 1
-	`, taskID, generation).Scan(&rec.TaskID, &rec.Generation, &rec.FinalPath, &rec.ExpectedSize, &rec.ExpectedSHA256, &rec.CommittedSHA256, &rec.State, &rec.Version, &rec.UpdatedAt)
+	`, taskID, generation, generation).Scan(&rec.TaskID, &rec.Generation, &rec.FinalPath, &rec.ExpectedSize, &rec.ExpectedSHA256, &rec.CommittedSHA256, &rec.State, &rec.Version, &rec.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
 	return &rec, nil
 }
+

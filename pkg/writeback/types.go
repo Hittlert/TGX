@@ -2,11 +2,18 @@ package writeback
 
 import (
 	"crypto/sha256"
+	"errors"
 	"hash"
 	"sync"
 	"time"
 
 	"github.com/Hittlert/TGX/pkg/spool"
+)
+
+var (
+	ErrTargetConflict  = errors.New("target file exists with mismatched identity or content")
+	ErrStaleGeneration = errors.New("writeback item generation is stale")
+	ErrIncompleteFile  = errors.New("file is incomplete, cannot finalize")
 )
 
 // Item represents a segment or whole file ready for write-back to target storage.
@@ -28,39 +35,44 @@ type Callbacks struct {
 	OnTaskFinalized  func(taskID, gen, finalRelPath, sha256Hex string, size int64, err error)
 }
 
-// TaskWriteContext tracks streaming writes, open target handles, and incremental SHA256 for an active task.
+// TaskWriteContext tracks streaming writes, open target handles, and sequential incremental SHA256.
 type TaskWriteContext struct {
-	mu           sync.Mutex
-	TaskID       string
-	Gen          string
-	FinalRelPath string
-	ExpectedSize int64
-	FileDate     int64
-	MovingPath   string
-	FinalPath    string
-	Hasher       hash.Hash
-	NextOffset   int64
-	WrittenBytes int64
-	Closed       bool
+	mu               sync.Mutex
+	TaskID           string
+	Gen              string
+	FinalRelPath     string
+	ExpectedSize     int64
+	FileDate         int64
+	MovingPath       string
+	FinalPath        string
+	Hasher           hash.Hash
+	NextSegmentIndex int
+	NextOffset       int64
+	WrittenBytes     int64
+	DurableRanges    *spool.RangeSet
+	PendingSegments  map[int]*Item
+	Closed           bool
 }
 
 func NewTaskWriteContext(taskID, gen, finalRelPath, movingPath, finalPath string, expectedSize, fileDate int64) *TaskWriteContext {
 	return &TaskWriteContext{
-		TaskID:       taskID,
-		Gen:          gen,
-		FinalRelPath: finalRelPath,
-		MovingPath:   movingPath,
-		FinalPath:    finalPath,
-		ExpectedSize: expectedSize,
-		FileDate:     fileDate,
-		Hasher:       sha256.New(),
+		TaskID:          taskID,
+		Gen:             gen,
+		FinalRelPath:    finalRelPath,
+		MovingPath:      movingPath,
+		FinalPath:       finalPath,
+		ExpectedSize:    expectedSize,
+		FileDate:        fileDate,
+		Hasher:          sha256.New(),
+		DurableRanges:   spool.NewRangeSet(),
+		PendingSegments: make(map[int]*Item),
 	}
 }
 
 // Config defines the tuning knobs for WriteBack queue and TargetSink.
 type Config struct {
 	OutputDir   string
-	Concurrency int // Number of concurrent target writers (default: 4-6)
+	Concurrency int // Number of concurrent target writers (default: 5)
 	BatchSync   bool
 	SyncPeriod  time.Duration
 }

@@ -116,20 +116,14 @@ func (q *Queue) Dequeue(ctx context.Context) (*Item, error) {
 			return pItem.item, nil
 		}
 
-		// Wait for signal or context cancellation
-		done := make(chan struct{})
-		go func() {
-			select {
-			case <-ctx.Done():
-				q.mu.Lock()
-				q.cond.Broadcast()
-				q.mu.Unlock()
-			case <-done:
-			}
-		}()
-
+		// Wait for signal or context cancellation using AfterFunc
+		stop := context.AfterFunc(ctx, func() {
+			q.mu.Lock()
+			q.cond.Broadcast()
+			q.mu.Unlock()
+		})
 		q.cond.Wait()
-		close(done)
+		stop()
 	}
 }
 

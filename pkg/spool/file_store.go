@@ -13,12 +13,12 @@ import (
 
 // FileStore implements the Store interface using portable filesystem files on SSD or HDD.
 type FileStore struct {
-	mu        sync.RWMutex
-	baseDir   string
-	capMgr    *CapacityManager
-	items     map[string]*SpoolItem // key.String() -> SpoolItem
-	files     map[string]*os.File   // key.String() -> open file handle
-	closed    bool
+	mu      sync.RWMutex
+	baseDir string
+	capMgr  *CapacityManager
+	items   map[string]*SpoolItem // key.String() -> SpoolItem
+	files   map[string]*os.File   // key.String() -> open write file handle (closed on MarkReady)
+	closed  bool
 }
 
 // NewFileStore creates a new FileStore rooted in baseDir with maximum capacity maxBytes.
@@ -103,7 +103,7 @@ func (s *FileStore) WriteAt(key SegmentKey, relOffset int64, data []byte) (int, 
 	file, fileOk := s.files[keyStr]
 	s.mu.Unlock()
 
-	if !ok || !fileOk {
+	if !ok {
 		return 0, ErrSegmentNotFound
 	}
 
@@ -112,7 +112,20 @@ func (s *FileStore) WriteAt(key SegmentKey, relOffset int64, data []byte) (int, 
 		return 0, ErrOffsetOutOfBounds
 	}
 
-	n, err := file.WriteAt(data, relOffset)
+	var n int
+	var err error
+	if fileOk && file != nil {
+		n, err = file.WriteAt(data, relOffset)
+	} else {
+		// Open on-demand if write handle was closed
+		f, openErr := os.OpenFile(s.segmentPath(key), os.O_WRONLY, 0o644)
+		if openErr != nil {
+			return 0, fmt.Errorf("reopen segment for write: %w", openErr)
+		}
+		defer f.Close()
+		n, err = f.WriteAt(data, relOffset)
+	}
+
 	if err != nil {
 		return n, fmt.Errorf("write segment file at offset %d: %w", relOffset, err)
 	}
@@ -143,18 +156,17 @@ func (s *FileStore) ReadAt(key SegmentKey, relOffset int64, p []byte) (int, erro
 	file, fileOk := s.files[keyStr]
 	s.mu.RUnlock()
 
-	if !fileOk {
-		// Try opening directly from disk if not already open
-		segPath := s.segmentPath(key)
-		f, err := os.Open(segPath)
-		if err != nil {
-			return 0, ErrSegmentNotFound
-		}
-		defer f.Close()
-		return f.ReadAt(p, relOffset)
+	if fileOk && file != nil {
+		return file.ReadAt(p, relOffset)
 	}
 
-	return file.ReadAt(p, relOffset)
+	segPath := s.segmentPath(key)
+	f, err := os.Open(segPath)
+	if err != nil {
+		return 0, ErrSegmentNotFound
+	}
+	defer f.Close()
+	return f.ReadAt(p, relOffset)
 }
 
 func (s *FileStore) Sync(key SegmentKey) error {
@@ -163,11 +175,17 @@ func (s *FileStore) Sync(key SegmentKey) error {
 	file, fileOk := s.files[keyStr]
 	s.mu.RUnlock()
 
-	if !fileOk {
-		return nil
+	if fileOk && file != nil {
+		return file.Sync()
 	}
 
-	return file.Sync()
+	segPath := s.segmentPath(key)
+	f, err := os.OpenFile(segPath, os.O_WRONLY, 0o644)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	return f.Sync()
 }
 
 func (s *FileStore) MarkReady(key SegmentKey) error {
@@ -187,9 +205,17 @@ func (s *FileStore) MarkReady(key SegmentKey) error {
 		return nil
 	}
 
-	// Ensure segment data is flushed to disk
-	if file, fileOk := s.files[keyStr]; fileOk {
-		_ = file.Sync()
+	if !item.Ranges.IsComplete(key.Length) {
+		return ErrInvalidRange
+	}
+
+	// Ensure segment data is flushed to disk before closing handle
+	if file, fileOk := s.files[keyStr]; fileOk && file != nil {
+		if err := file.Sync(); err != nil {
+			return fmt.Errorf("sync segment file %s: %w", keyStr, err)
+		}
+		_ = file.Close()
+		delete(s.files, keyStr)
 	}
 
 	item.State = StateReady
@@ -216,13 +242,15 @@ func (s *FileStore) Reclaim(key SegmentKey) error {
 		delete(s.items, keyStr)
 	}
 
-	if file, fileOk := s.files[keyStr]; fileOk {
+	if file, fileOk := s.files[keyStr]; fileOk && file != nil {
 		_ = file.Close()
 		delete(s.files, keyStr)
 	}
 
 	segPath := s.segmentPath(key)
-	_ = os.Remove(segPath)
+	if err := os.Remove(segPath); err != nil && !os.IsNotExist(err) {
+		// Retain cleanup warning
+	}
 
 	// Clean empty parent directory
 	parentDir := filepath.Dir(segPath)
@@ -255,7 +283,6 @@ func (s *FileStore) ListReadySegments() []*SpoolItem {
 }
 
 func (s *FileStore) Recover(ctx context.Context) error {
-	// Startup recovery: scans spool directories and registers ready segments
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -263,12 +290,41 @@ func (s *FileStore) Recover(ctx context.Context) error {
 		if err != nil || info == nil || info.IsDir() || filepath.Ext(path) != ".seg" {
 			return nil
 		}
-		// Segment file found
 		if info.Size() > 0 {
 			s.capMgr.ConvertReservationToUsed(info.Size())
 		}
 		return nil
 	})
+}
+
+// RestoreSegment restores a segment into the items map during crash recovery.
+func (s *FileStore) RestoreSegment(key SegmentKey) (*SpoolItem, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	keyStr := key.String()
+	segPath := s.segmentPath(key)
+	stat, err := os.Stat(segPath)
+	if err != nil {
+		return nil, err
+	}
+
+	item := &SpoolItem{
+		Key:          key,
+		ExpectedSize: key.Length,
+		Ranges:       NewRangeSet(),
+		State:        StateReady,
+		Dirty:        false,
+		CreatedAt:    time.Now(),
+		UpdatedAt:    time.Now(),
+	}
+	item.Ranges.Add(0, stat.Size())
+
+	s.items[keyStr] = item
+	s.capMgr.ConvertReservationToUsed(stat.Size())
+	s.capMgr.MarkReady(stat.Size())
+
+	return item, nil
 }
 
 func (s *FileStore) Metrics() SpoolMetrics {
@@ -279,15 +335,15 @@ func (s *FileStore) Metrics() SpoolMetrics {
 	s.mu.RUnlock()
 
 	return SpoolMetrics{
-		Mode:           s.Mode(),
+		Mode:           "disk",
 		MaxBytes:       max,
 		UsedBytes:      used,
 		ReservedBytes:  reserved,
 		ReadyBytes:     ready,
 		WritingBytes:   writing,
 		ReclaimedBytes: reclaimed,
+		Backpressured:  backpressured > 0,
 		ActiveSegments: activeSegs,
-		Backpressured:  backpressured,
 	}
 }
 
@@ -299,16 +355,12 @@ func (s *FileStore) Close() error {
 		return nil
 	}
 	s.closed = true
-	s.capMgr.Close()
 
 	for _, file := range s.files {
-		_ = file.Sync()
-		_ = file.Close()
+		if file != nil {
+			_ = file.Close()
+		}
 	}
 	s.files = make(map[string]*os.File)
-
 	return nil
 }
-
-// Ensure interface compliance
-var _ Store = (*FileStore)(nil)

@@ -15,6 +15,7 @@ type CapacityManager struct {
 	readyBytes     int64
 	writingBytes   int64
 	reclaimedBytes int64
+	backpressured  int64
 	closed         bool
 }
 
@@ -56,20 +57,22 @@ func (cm *CapacityManager) Reserve(ctx context.Context, bytes int64) error {
 			return nil
 		}
 
-		// Wait for space to be freed
-		done := make(chan struct{})
-		go func() {
-			select {
-			case <-ctx.Done():
-				cm.mu.Lock()
-				cm.cond.Broadcast()
-				cm.mu.Unlock()
-			case <-done:
-			}
-		}()
+		// P1-2: If requested chunk is larger than maxBytes, allow single in-flight allocation to prevent deadlock
+		if bytes > cm.maxBytes && allocated == 0 {
+			cm.reservedBytes += bytes
+			return nil
+		}
 
+		cm.backpressured++
+
+		// Wait for space to be freed using AfterFunc (0 goroutine leak)
+		stop := context.AfterFunc(ctx, func() {
+			cm.mu.Lock()
+			cm.cond.Broadcast()
+			cm.mu.Unlock()
+		})
 		cm.cond.Wait()
-		close(done)
+		stop()
 	}
 }
 
@@ -105,7 +108,7 @@ func (cm *CapacityManager) ConvertReservationToUsed(bytes int64) {
 	cm.usedBytes += bytes
 }
 
-// MarkReady transitions bytes from active receiving to ready for write-back.
+// MarkReady marks used bytes as ready for write-back.
 func (cm *CapacityManager) MarkReady(bytes int64) {
 	if bytes <= 0 {
 		return
@@ -116,7 +119,7 @@ func (cm *CapacityManager) MarkReady(bytes int64) {
 	cm.readyBytes += bytes
 }
 
-// MarkWritingBack transitions ready bytes to writing-back state.
+// MarkWritingBack transitions bytes from ready to writing back.
 func (cm *CapacityManager) MarkWritingBack(bytes int64) {
 	if bytes <= 0 {
 		return
@@ -126,11 +129,13 @@ func (cm *CapacityManager) MarkWritingBack(bytes int64) {
 
 	if cm.readyBytes >= bytes {
 		cm.readyBytes -= bytes
+	} else {
+		cm.readyBytes = 0
 	}
 	cm.writingBytes += bytes
 }
 
-// Reclaim frees used bytes when a segment is durably written back and deleted.
+// Reclaim frees bytes back to the capacity pool after target synchronization.
 func (cm *CapacityManager) Reclaim(bytes int64) {
 	if bytes <= 0 {
 		return
@@ -153,28 +158,19 @@ func (cm *CapacityManager) Reclaim(bytes int64) {
 	cm.cond.Broadcast()
 }
 
-// Close wakes up any waiting goroutines.
+// Snapshot returns current byte statistics.
+func (cm *CapacityManager) Snapshot() (max, used, reserved, ready, writing, reclaimed, backpressured int64) {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	return cm.maxBytes, cm.usedBytes, cm.reservedBytes, cm.readyBytes, cm.writingBytes, cm.reclaimedBytes, cm.backpressured
+}
+
+// Close closes the manager and unblocks waiting reservations.
 func (cm *CapacityManager) Close() {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
 	cm.closed = true
 	cm.cond.Broadcast()
-}
-
-// Snapshot returns a point-in-time metrics struct.
-func (cm *CapacityManager) Snapshot() (max, used, reserved, ready, writing, reclaimed int64, backpressured bool) {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
-
-	max = cm.maxBytes
-	used = cm.usedBytes
-	reserved = cm.reservedBytes
-	ready = cm.readyBytes
-	writing = cm.writingBytes
-	reclaimed = cm.reclaimedBytes
-	if cm.maxBytes > 0 && (used+reserved) >= int64(float64(cm.maxBytes)*0.95) {
-		backpressured = true
-	}
-	return
 }

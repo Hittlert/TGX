@@ -12,7 +12,7 @@ type MemoryStore struct {
 	mu      sync.RWMutex
 	capMgr  *CapacityManager
 	items   map[string]*SpoolItem // key.String() -> SpoolItem
-	buffers map[string][]byte     // key.String() -> in-memory segment byte buffer
+	buffers map[string][]byte     // key.String() -> dynamic in-memory segment byte buffer
 	closed  bool
 }
 
@@ -61,7 +61,8 @@ func (s *MemoryStore) CreateSegment(key SegmentKey) (*SpoolItem, error) {
 	}
 
 	s.items[keyStr] = item
-	s.buffers[keyStr] = make([]byte, key.Length)
+	// Dynamically allocated on WriteAt, starting empty to avoid 32MB upfront memory surge
+	s.buffers[keyStr] = nil
 
 	return item, nil
 }
@@ -74,19 +75,28 @@ func (s *MemoryStore) WriteAt(key SegmentKey, relOffset int64, data []byte) (int
 	}
 	keyStr := key.String()
 	item, ok := s.items[keyStr]
-	buf, bufOk := s.buffers[keyStr]
-	s.mu.Unlock()
-
-	if !ok || !bufOk {
+	if !ok {
+		s.mu.Unlock()
 		return 0, ErrSegmentNotFound
 	}
 
 	dataLen := int64(len(data))
 	if relOffset < 0 || relOffset+dataLen > key.Length {
+		s.mu.Unlock()
 		return 0, ErrOffsetOutOfBounds
 	}
 
+	buf := s.buffers[keyStr]
+	reqLen := relOffset + dataLen
+	if int64(len(buf)) < reqLen {
+		newBuf := make([]byte, reqLen)
+		copy(newBuf, buf)
+		buf = newBuf
+		s.buffers[keyStr] = buf
+	}
+
 	copy(buf[relOffset:relOffset+dataLen], data)
+	s.mu.Unlock()
 
 	// Update range set and capacity conversion
 	item.mu.Lock()
@@ -130,7 +140,6 @@ func (s *MemoryStore) ReadAt(key SegmentKey, relOffset int64, p []byte) (int, er
 }
 
 func (s *MemoryStore) Sync(key SegmentKey) error {
-	// RAM is always immediately accessible; no-op
 	return nil
 }
 
@@ -149,6 +158,10 @@ func (s *MemoryStore) MarkReady(key SegmentKey) error {
 
 	if item.State == StateReady {
 		return nil
+	}
+
+	if !item.Ranges.IsComplete(key.Length) {
+		return ErrInvalidRange
 	}
 
 	item.State = StateReady
@@ -174,7 +187,6 @@ func (s *MemoryStore) Reclaim(key SegmentKey) error {
 		s.capMgr.Reclaim(covered)
 		delete(s.items, keyStr)
 	}
-
 	delete(s.buffers, keyStr)
 	return nil
 }
@@ -203,7 +215,7 @@ func (s *MemoryStore) ListReadySegments() []*SpoolItem {
 }
 
 func (s *MemoryStore) Recover(ctx context.Context) error {
-	// Memory store is volatile across restarts
+	// Memory store is volatile; nothing to recover from disk
 	return nil
 }
 
@@ -215,15 +227,15 @@ func (s *MemoryStore) Metrics() SpoolMetrics {
 	s.mu.RUnlock()
 
 	return SpoolMetrics{
-		Mode:           s.Mode(),
+		Mode:           "memory",
 		MaxBytes:       max,
 		UsedBytes:      used,
 		ReservedBytes:  reserved,
 		ReadyBytes:     ready,
 		WritingBytes:   writing,
 		ReclaimedBytes: reclaimed,
+		Backpressured:  backpressured > 0,
 		ActiveSegments: activeSegs,
-		Backpressured:  backpressured,
 	}
 }
 
@@ -231,15 +243,8 @@ func (s *MemoryStore) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.closed {
-		return nil
-	}
 	s.closed = true
-	s.capMgr.Close()
-	s.buffers = make(map[string][]byte)
 	s.items = make(map[string]*SpoolItem)
+	s.buffers = make(map[string][]byte)
 	return nil
 }
-
-// Ensure interface compliance
-var _ Store = (*MemoryStore)(nil)
