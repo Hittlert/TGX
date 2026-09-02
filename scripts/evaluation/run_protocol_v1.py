@@ -32,6 +32,7 @@ def main():
     parser.add_argument("--repetitions", type=int, default=3, help="Repetitions per engine (default: 3)")
     parser.add_argument("--sweep", action="store_true", help="Run P-LMS concurrency sweep (8, 16, 32, 48)")
     parser.add_argument("--port", type=int, default=5890, help="Runner dynamic host port")
+    parser.add_argument("--skip-existing", action="store_true", help="Skip runs that have already produced summary.json")
     args = parser.parse_args()
 
     os.makedirs(f"{EVAL_DIR}/manifests", exist_ok=True)
@@ -106,6 +107,12 @@ def main():
                     with open(spec_file, "w", encoding="utf-8") as f:
                         json.dump(spec, f, indent=2)
 
+                    eval_run_dir = f"{EVAL_DIR}/baselines/tdl" if engine == "tdl" else f"{EVAL_DIR}/runs/tgx"
+                    summary_check = os.path.join(eval_run_dir, run_id, "analysis", "baseline-v1", "summary.json")
+                    if args.skip_existing and os.path.exists(summary_check):
+                        print(f"\n[SKIP] {run_id} already completed, skipping...")
+                        continue
+
                     print(f"\n>>> Running {run_id} ({engine.upper()} - {p}, conc={conc}, rep={rep_idx})...")
                     run_cmd(f"python3 {SCRIPTS_DIR}/harness.py --run-spec {spec_file} --engine-binary {bin_path} --port {args.port}")
 
@@ -119,8 +126,8 @@ def main():
             f.write("- **Protocol Version**: `1.0`\n")
             f.write("- **Evaluation Date**: " + time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()) + "\n\n")
             f.write("## Overview Matrix\n\n")
-            f.write("| Engine | Run ID | Profile | Repetition | Net Concurrency | Target Cases | Match Ratio | Orphan Residue | Avg Active Speed | Policy Verdict |\n")
-            f.write("|---|---|---|---|---|---|---|---|---|---|\n")
+            f.write("| Engine | Run ID | Profile | Rep | Net Conc | Cases | Match Ratio | Orphan | Avg Total Speed | Active Speed | Zero Stall % | Errors | Verdict |\n")
+            f.write("|---|---|---|---|---|---|---|---|---|---|---|---|---|\n")
 
             for eng_label, base_dir in [("TDL Baseline", f"{EVAL_DIR}/baselines/tdl"), ("TGX Functional", f"{EVAL_DIR}/runs/tgx")]:
                 if os.path.exists(base_dir):
@@ -138,7 +145,11 @@ def main():
                             p_id = spec_data.get("profile_id", "unknown")
                             r_num = spec_data.get("repetition", 1)
                             net_c = spec_data.get("net_concurrency", 32)
-                            f.write(f"| **{eng_label}** | `{sub}` | `{p_id}` | {r_num} | {net_c} | {s['total_cases']} | {s['completed_cases']}/{s['total_cases']} ({s['match_fraction']*100:.1f}%) | {s['orphan_residue_count']} | {s['average_active_mbps']} Mbps | **{s['verdict']}** |\n")
+                            avg_tot = s.get("average_total_mbps", s.get("average_active_mbps", 0))
+                            avg_act = s.get("average_active_mbps", 0)
+                            zero_f = s.get("zero_speed_fraction", 0) * 100
+                            err_cnt = s.get("error_count", s.get("failed_cases", 0))
+                            f.write(f"| **{eng_label}** | `{sub}` | `{p_id}` | {r_num} | {net_c} | {s['total_cases']} | {s['completed_cases']}/{s['total_cases']} ({s['match_fraction']*100:.1f}%) | {s['orphan_residue_count']} | {avg_tot} Mbps | {avg_act} Mbps | {zero_f:.1f}% | {err_cnt} | **{s['verdict']}** |\n")
 
         print(f"[✓] Comparison report written to {report_md}")
 

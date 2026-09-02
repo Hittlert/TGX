@@ -168,18 +168,34 @@ class MetricsSampler(threading.Thread):
                 if rem > 0.05:
                     time.sleep(rem)
 
-    def stop(self):
-        self.running = False
-
 def extract_artifact_metadata(engine_binary, engine):
     binary_sha = compute_sha256(engine_binary) or "unknown"
+    harness_sha = compute_sha256(__file__) if os.path.exists(__file__) else "unknown"
+    
+    # Get actual docker image digest / ID
+    img_digest = "alpine:latest"
+    try:
+        d_cmd = ["sudo", "docker", "inspect", "--format={{range .RepoDigests}}{{.}}{{end}}", "alpine:latest"]
+        d_res = subprocess.run(d_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5)
+        d_str = d_res.stdout.strip()
+        if d_str:
+            img_digest = d_str
+        else:
+            id_cmd = ["sudo", "docker", "inspect", "--format={{.Id}}", "alpine:latest"]
+            id_res = subprocess.run(id_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5)
+            if id_res.stdout.strip():
+                img_digest = id_res.stdout.strip()
+    except Exception:
+        pass
+
     meta = {
         "engine": engine,
         "source_repository": "https://github.com/Hittlert/TGX",
         "source_commit": "unknown",
         "source_dirty": False,
         "binary_sha256": binary_sha,
-        "image_digest": "alpine:latest",
+        "harness_sha256": harness_sha,
+        "image_digest": img_digest,
         "version": "unknown",
         "build_time": iso_time(),
         "go_version": "unknown",
@@ -365,11 +381,8 @@ def execute_run(run_spec, engine_binary, eval_dir="/volume2/docker/telegram_down
         "--download-threads", str(net_concurrency),
         "--file-concurrency", str(file_concurrency),
         "--dc-pool-size", str(dc_pool_size),
+        "--temp-dir", "/app/temp/tdl",
     ])
-    if engine == "tdl":
-        serve_args.extend(["--temp-dir", "/app/temp/tdl"])
-    else:
-        serve_args.extend(["--buffer-dir", "/app/buffer"])
 
     res = subprocess.run(serve_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if res.returncode != 0:
@@ -422,7 +435,6 @@ def execute_run(run_spec, engine_binary, eval_dir="/volume2/docker/telegram_down
             "message_id": int(c["message_id"]),
             "final_path": rel_path,
             "expected_size": int(c["expected_size"]),
-            "date": int(c.get("message_date", 0)),
         }
         t_sub = time.time()
         try:
@@ -455,9 +467,15 @@ def execute_run(run_spec, engine_binary, eval_dir="/volume2/docker/telegram_down
             mbps = (bps * 8) / (1024 * 1024)
             elapsed = int(time.time() - start_time)
             print(f"\r[*] Progress: {elapsed}/{duration_sec}s | Active: {active}, Queue: {q}, Speed: {mbps:.2f} Mbps      ", end="", flush=True)
-            if active == 0 and q == 0 and elapsed >= 10:
-                print("\n[*] All tasks finished ahead of duration timeout.")
-                break
+            if active == 0 and q == 0 and elapsed >= 30:
+                try:
+                    tasks_resp = http_get(f"{api_base}/api/tasks")
+                    term_count = sum(1 for t in tasks_resp if t.get("state") in ("success", "failed", "unavailable"))
+                    if term_count >= len(cases):
+                        print(f"\n[*] All {term_count}/{len(cases)} tasks finished ahead of duration timeout.")
+                        break
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -478,11 +496,21 @@ def execute_run(run_spec, engine_binary, eval_dir="/volume2/docker/telegram_down
         except Exception:
             pass
 
+    # Fetch Daemon Task Snapshots before tearing down container
+    engine_tasks = {}
+    try:
+        ts_resp = http_get(f"{api_base}/api/tasks", timeout=5)
+        if isinstance(ts_resp, list):
+            for t in ts_resp:
+                if "id" in t:
+                    engine_tasks[t["id"]] = t
+    except Exception:
+        pass
+
     log_event("run.finished")
     sampler.stop()
     sampler.join(timeout=3)
     events_fp.close()
-    errors_fp.close()
 
     # Capture process logs
     with open(process_log_file, "w", encoding="utf-8") as f:
@@ -497,7 +525,7 @@ def execute_run(run_spec, engine_binary, eval_dir="/volume2/docker/telegram_down
     subprocess.run(["sudo", "docker", "rm", "-f", container_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(2)
 
-    # 7. raw/task_results.jsonl and raw/hashes.jsonl
+    # 7. raw/task_results.jsonl, raw/errors.jsonl, and raw/hashes.jsonl
     print("[*] Generating task_results.jsonl, file_inventory.jsonl, and hashes.jsonl...")
     task_results = []
     hashes_records = []
@@ -508,6 +536,7 @@ def execute_run(run_spec, engine_binary, eval_dir="/volume2/docker/telegram_down
         expected_size = c["expected_size"]
         baseline_sha = c["baseline_sha256"]
         target_file = os.path.join(output_dir, rel_path)
+        task_id = f"{run_id}_{c['chat_id']}_{c['message_id']}"
 
         actual_size = os.path.getsize(target_file) if os.path.isfile(target_file) else 0
         actual_sha = compute_sha256(target_file) if os.path.isfile(target_file) else ""
@@ -518,19 +547,61 @@ def execute_run(run_spec, engine_binary, eval_dir="/volume2/docker/telegram_down
 
         terminal_state = "COMPLETED" if (file_present and size_match and sha_match) else "FAILED"
         
+        eng_t = engine_tasks.get(task_id, {})
+        eng_state = eng_t.get("state", "unknown")
+        admitted = (task_id in engine_tasks or task_submits.get(case_id, {}).get("submitted", False))
+        
+        err_code = None
+        err_stage = None
+        err_op = None
+        err_cause = None
+
+        if terminal_state != "COMPLETED":
+            if eng_t.get("error_class"):
+                err_code = eng_t.get("error_class")
+                err_cause = eng_t.get("error", "engine error")
+                err_stage = "engine"
+                err_op = "download"
+            elif not file_present:
+                err_code = "FILE_MISSING"
+                err_stage = "storage"
+                err_op = "verify_presence"
+                err_cause = f"expected file {rel_path} not created on disk (engine state: {eng_state})"
+            elif not size_match:
+                err_code = "SIZE_MISMATCH"
+                err_stage = "oracle"
+                err_op = "verify_size"
+                err_cause = f"expected {expected_size} bytes, actual {actual_size} bytes"
+            elif not sha_match:
+                err_code = "SHA_MISMATCH"
+                err_stage = "oracle"
+                err_op = "verify_sha256"
+                err_cause = f"expected sha {baseline_sha[:12]}, actual sha {actual_sha[:12]}"
+            
+            err_entry = {
+                "case_id": case_id,
+                "task_id": task_id,
+                "stage": err_stage or "oracle",
+                "op": err_op or "verification",
+                "error_code": err_code or "FAILED",
+                "error_cause": err_cause or "unknown failure",
+                "retryable": False,
+            }
+            errors_fp.write(json.dumps(err_entry) + "\n")
+
         t_res = {
             "case_id": case_id,
             "submitted": task_submits.get(case_id, {}).get("submitted", False),
-            "admitted": True,
+            "admitted": admitted,
             "terminal_state": terminal_state,
             "attempt_count": 1,
-            "error_code": None if terminal_state == "COMPLETED" else "VERIFICATION_FAILED",
-            "error_stage": None if terminal_state == "COMPLETED" else "oracle",
-            "error_op": None if terminal_state == "COMPLETED" else "sha_or_size_match",
-            "error_cause": None if terminal_state == "COMPLETED" else f"size({actual_size}/{expected_size}), sha({actual_sha[:8]}/{baseline_sha[:8]})",
-            "started_at": int(task_submits.get(case_id, {}).get("submitted_at", start_time)),
-            "finished_at": int(time.time()),
-            "network_unique_bytes": actual_size,
+            "error_code": err_code,
+            "error_stage": err_stage,
+            "error_op": err_op,
+            "error_cause": err_cause,
+            "started_at": int(eng_t.get("started_at") or task_submits.get(case_id, {}).get("submitted_at", start_time)),
+            "finished_at": int(eng_t.get("finished_at") or time.time()),
+            "network_unique_bytes": eng_t.get("net_downloaded", actual_size),
             "target_durable_bytes": actual_size,
         }
         task_results.append(t_res)
@@ -547,6 +618,8 @@ def execute_run(run_spec, engine_binary, eval_dir="/volume2/docker/telegram_down
             "sha_match": sha_match,
         }
         hashes_records.append(h_res)
+
+    errors_fp.close()
 
     with open(os.path.join(raw_dir, "task_results.jsonl"), "w", encoding="utf-8") as f:
         for t in task_results:
@@ -566,12 +639,21 @@ def execute_run(run_spec, engine_binary, eval_dir="/volume2/docker/telegram_down
             residue = "orphan_moving" if fl.endswith(".moving") else ("orphan_segment" if fl.endswith(".seg") else "expected_target")
             inventory.append({"path": rel, "size_bytes": sz, "classification": residue})
 
-    for root, _, files in os.walk(buffer_dir):
-        for fl in files:
-            full = os.path.join(root, fl)
-            rel = os.path.relpath(full, buffer_dir)
-            sz = os.path.getsize(full)
-            inventory.append({"path": f"buffer/{rel}", "size_bytes": sz, "classification": "buffer_residue"})
+    if os.path.exists(temp_dir):
+        for root, _, files in os.walk(temp_dir):
+            for fl in files:
+                full = os.path.join(root, fl)
+                rel = os.path.relpath(full, temp_dir)
+                sz = os.path.getsize(full)
+                inventory.append({"path": f"temp/{rel}", "size_bytes": sz, "classification": "temp_residue"})
+
+    if os.path.exists(buffer_dir):
+        for root, _, files in os.walk(buffer_dir):
+            for fl in files:
+                full = os.path.join(root, fl)
+                rel = os.path.relpath(full, buffer_dir)
+                sz = os.path.getsize(full)
+                inventory.append({"path": f"buffer/{rel}", "size_bytes": sz, "classification": "buffer_residue"})
 
     with open(os.path.join(raw_dir, "file_inventory.jsonl"), "w", encoding="utf-8") as f:
         for inv in inventory:
@@ -602,17 +684,26 @@ def evaluate_policy(run_root, policy_version="baseline-v1"):
     analysis_dir = os.path.join(run_root, "analysis", policy_version)
     os.makedirs(analysis_dir, exist_ok=True)
 
-    with open(os.path.join(raw_dir, "task_results.jsonl"), "r", encoding="utf-8") as f:
-        task_results = [json.loads(line) for line in f if line.strip()]
+    def read_jsonl(filename):
+        fp = os.path.join(raw_dir, filename)
+        if not os.path.exists(fp):
+            return []
+        res = []
+        with open(fp, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        res.append(json.loads(line))
+                    except Exception:
+                        pass
+        return res
 
-    with open(os.path.join(raw_dir, "hashes.jsonl"), "r", encoding="utf-8") as f:
-        hashes = [json.loads(line) for line in f if line.strip()]
-
-    with open(os.path.join(raw_dir, "file_inventory.jsonl"), "r", encoding="utf-8") as f:
-        inventory = [json.loads(line) for line in f if line.strip()]
-
-    with open(os.path.join(raw_dir, "metrics.jsonl"), "r", encoding="utf-8") as f:
-        metrics = [json.loads(line) for line in f if line.strip()]
+    task_results = read_jsonl("task_results.jsonl")
+    hashes = read_jsonl("hashes.jsonl")
+    inventory = read_jsonl("file_inventory.jsonl")
+    metrics = read_jsonl("metrics.jsonl")
+    errors = read_jsonl("errors.jsonl")
 
     total_cases = len(task_results)
     completed_cases = sum(1 for t in task_results if t["terminal_state"] == "COMPLETED")
@@ -621,12 +712,20 @@ def evaluate_policy(run_root, policy_version="baseline-v1"):
 
     orphan_residue = sum(1 for inv in inventory if inv["classification"] != "expected_target")
     
-    # Calculate average throughput
-    speeds = [m.get("rolling_5s_bps", 0) for m in metrics if m.get("rolling_5s_bps", 0) > 0]
-    avg_bps = sum(speeds) / len(speeds) if speeds else 0
-    avg_mbps = round((avg_bps * 8) / (1024 * 1024), 2)
+    # Calculate throughput metrics
+    all_speeds = [m.get("rolling_5s_bps", 0) for m in metrics]
+    avg_total_bps = sum(all_speeds) / len(all_speeds) if all_speeds else 0
+    avg_total_mbps = round((avg_total_bps * 8) / (1024 * 1024), 2)
+    
+    active_speeds = [s for s in all_speeds if s > 0]
+    avg_active_bps = sum(active_speeds) / len(active_speeds) if active_speeds else 0
+    avg_active_mbps = round((avg_active_bps * 8) / (1024 * 1024), 2)
 
-    verdict_status = "GO" if (match_fraction == 1.0 and orphan_residue == 0) else "NO-GO"
+    zero_speed_samples = sum(1 for s in all_speeds if s == 0)
+    zero_speed_fraction = round(zero_speed_samples / len(all_speeds), 4) if all_speeds else 0.0
+
+    # Gate checks
+    verdict_status = "GO" if (match_fraction == 1.0 and orphan_residue == 0 and len(errors) == 0) else "NO-GO"
 
     summary = {
         "policy_version": policy_version,
@@ -637,7 +736,10 @@ def evaluate_policy(run_root, policy_version="baseline-v1"):
         "failed_cases": failed_cases,
         "match_fraction": round(match_fraction, 4),
         "orphan_residue_count": orphan_residue,
-        "average_active_mbps": avg_mbps,
+        "average_total_mbps": avg_total_mbps,
+        "average_active_mbps": avg_active_mbps,
+        "zero_speed_fraction": zero_speed_fraction,
+        "error_count": len(errors),
         "verdict": verdict_status,
     }
 

@@ -86,10 +86,10 @@ def generate_profile_manifest(db_path, baseline_storage_root, profile_id, seed, 
         q = f"""
             SELECT chat_id, message_id, file_name, save_path, media_type, file_size, created_at
             FROM download_records
-            WHERE status = 'success' AND file_size >= {low} AND ({f'file_size <= {high}' if high else '1=1'})
+            WHERE status = 'success' AND chat_id LIKE '-100%' AND file_size >= {low} AND ({f'file_size <= {high}' if high else '1=1'})
               AND save_path IS NOT NULL AND save_path != ''
             ORDER BY RANDOM()
-            LIMIT {needed * 10}
+            LIMIT {needed * 20}
         """
         cursor.execute(q)
         candidates = cursor.fetchall()
@@ -114,6 +114,14 @@ def generate_profile_manifest(db_path, baseline_storage_root, profile_id, seed, 
                     baseline_file = alt
                 else:
                     continue
+
+            # Verify actual disk file matches recorded size exactly
+            try:
+                actual_size = os.path.getsize(baseline_file)
+                if actual_size != int(file_size) or actual_size <= 0:
+                    continue
+            except OSError:
+                continue
 
             seen_keys.add(key)
             group_counts[gid] = group_counts.get(gid, 0) + 1
