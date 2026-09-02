@@ -23,6 +23,7 @@ import (
 type spoolWriterAt struct {
 	store        spool.Store
 	queue        *writeback.Queue
+	db           *Database
 	task         *Task
 	taskID       string
 	gen          string
@@ -70,18 +71,32 @@ func (w *spoolWriterAt) WriteAt(p []byte, offset int64) (int, error) {
 			return n, err
 		}
 		if item.Ranges.IsComplete(segLen) {
-			_ = w.store.MarkReady(segKey)
-			if w.queue != nil {
-				isLast := (segStart+segLen >= w.fileSize)
-				w.queue.Enqueue(&writeback.Item{
-					Key:              segKey,
-					FinalRelPath:     w.finalRelPath,
-					ExpectedFileSize: w.fileSize,
-					IsLastSegment:    isLast,
-					FileDate:         w.fileDate,
-					Item:             item,
-					AddedAt:          time.Now(),
-				})
+			if err := w.store.MarkReady(segKey); err == nil {
+				if w.db != nil {
+					_ = w.db.RecordSpoolSegment(SpoolSegmentRecord{
+						TaskID:           w.taskID,
+						Generation:       w.gen,
+						SegmentIndex:     segIdx,
+						StartOffset:      segStart,
+						ExpectedLength:   segLen,
+						State:            "ready",
+						Dirty:            true,
+						FinalRelPath:     w.finalRelPath,
+						ExpectedFileSize: w.fileSize,
+					})
+				}
+				if w.queue != nil {
+					isLast := (segStart+segLen >= w.fileSize)
+					w.queue.Enqueue(&writeback.Item{
+						Key:              segKey,
+						FinalRelPath:     w.finalRelPath,
+						ExpectedFileSize: w.fileSize,
+						IsLastSegment:    isLast,
+						FileDate:         w.fileDate,
+						Item:             item,
+						AddedAt:          time.Now(),
+					})
+				}
 			}
 		}
 	}
@@ -97,6 +112,7 @@ type spoolFileElement struct {
 	file       downloader.File
 	store      spool.Store
 	queue      *writeback.Queue
+	db         *Database
 	writer     *spoolWriterAt
 	outputRoot string
 	finalPath  string
@@ -110,28 +126,42 @@ func newSpoolFileElement(
 	date int64,
 	store spool.Store,
 	queue *writeback.Queue,
+	db ...*Database,
 ) (taskElement, error) {
 	if task.IsTerminal() || (task.Context() != nil && task.Context().Err() != nil) {
 		return nil, errors.New("task attempt is no longer active")
 	}
 
+	var d *Database
+	if len(db) > 0 {
+		d = db[0]
+	}
+
 	gen := task.AttemptGen()
+	req := task.Request()
 	elem := &spoolFileElement{
 		task:       task,
 		file:       file,
 		store:      store,
 		queue:      queue,
+		db:         d,
 		outputRoot: outputRoot,
-		finalPath:  task.Request().FinalPath,
+		finalPath:  req.FinalPath,
 		date:       date,
 	}
+
+	if d != nil {
+		_ = d.RecordSpoolAttempt(req.ID, gen, req.FinalPath, file.Size(), "receiving")
+	}
+
 	elem.writer = &spoolWriterAt{
 		store:        store,
 		queue:        queue,
+		db:           d,
 		task:         task,
-		taskID:       task.Request().ID,
+		taskID:       req.ID,
 		gen:          gen,
-		finalRelPath: task.Request().FinalPath,
+		finalRelPath: req.FinalPath,
 		fileSize:     file.Size(),
 		fileDate:     date,
 	}

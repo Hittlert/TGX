@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -28,13 +29,13 @@ type TargetSink struct {
 	callbacks Callbacks
 	logger    *zap.Logger
 
-	mu         sync.RWMutex
-	tasks      map[string]*TaskWriteContext // taskID:gen -> TaskWriteContext
-	pathLocks  [targetLockShards]sync.Mutex // Fixed sharded mutexes keyed by final target path
-	ctx        context.Context
-	cancel     context.CancelFunc
-	wg         sync.WaitGroup
-	closed     bool
+	mu        sync.RWMutex
+	tasks     map[string]*TaskWriteContext // taskID:gen -> TaskWriteContext
+	pathLocks [targetLockShards]sync.Mutex // Fixed sharded mutexes keyed by final target path
+	ctx       context.Context
+	cancel    context.CancelFunc
+	wg        sync.WaitGroup
+	closed    bool
 }
 
 // NewTargetSink creates and initializes a TargetSink.
@@ -62,6 +63,11 @@ func NewTargetSink(cfg Config, store spool.Store, queue *Queue, cb Callbacks, lo
 	return sink
 }
 
+func sanitizeTaskID(taskID string) string {
+	r := strings.NewReplacer(":", "_", "/", "_", "\\", "_")
+	return r.Replace(taskID)
+}
+
 func (s *TargetSink) getPathLock(finalRelPath string) *sync.Mutex {
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(filepath.Clean(finalRelPath)))
@@ -80,8 +86,8 @@ func (s *TargetSink) getOrCreateTaskContext(item *Item) (*TaskWriteContext, erro
 	}
 
 	finalPath := filepath.Join(s.cfg.OutputDir, filepath.FromSlash(item.FinalRelPath))
-	// Generation-scoped moving path to prevent cross-generation collisions and stale residue
-	movingPath := fmt.Sprintf("%s.%s.moving", finalPath, item.Key.Gen)
+	// Generation-scoped and TaskID-scoped moving path to prevent cross-task and cross-generation collisions
+	movingPath := fmt.Sprintf("%s.%s.%s.moving", finalPath, sanitizeTaskID(item.Key.TaskID), item.Key.Gen)
 
 	if err := os.MkdirAll(filepath.Dir(finalPath), 0o755); err != nil {
 		return nil, fmt.Errorf("create destination directory: %w", err)
@@ -125,7 +131,9 @@ func (s *TargetSink) workerLoop(workerID int) {
 			}
 			s.logger.Error("failed to write-back segment to target",
 				zap.Int("worker", workerID),
-				zap.String("segment", item.Key.String()),
+				zap.String("task_id", item.Key.TaskID),
+				zap.String("generation", item.Key.Gen),
+				zap.Int("segment_index", item.Key.SegmentIndex),
 				zap.Error(processErr),
 			)
 			// Requeue if retryable and not terminal conflict
@@ -209,7 +217,6 @@ func (s *TargetSink) processItem(item *Item, readBuf []byte) error {
 	}
 
 	// Check if ALL segments of the file are durable:
-	// MUST have RangeSet fully covering [0, ExpectedSize) and WrittenBytes == ExpectedSize!
 	if taskCtx.DurableRanges.IsComplete(taskCtx.ExpectedSize) && taskCtx.WrittenBytes == taskCtx.ExpectedSize {
 		return s.finalizeTask(taskCtx, targetFile)
 	}
@@ -232,7 +239,7 @@ func (s *TargetSink) finalizeTask(taskCtx *TaskWriteContext, targetFile *os.File
 		return fmt.Errorf("moving file size mismatch (got %d, expected %d): %w", movingStat.Size(), taskCtx.ExpectedSize, ErrIncompleteFile)
 	}
 
-	// Compute verified sequential SHA256 over entire finalized file
+	// Compute verified sequential SHA256 over finalized moving file
 	shaHex, err := computeTargetSHA256(taskCtx.MovingPath)
 	if err != nil {
 		return fmt.Errorf("compute finalized moving file sha256: %w", err)
@@ -277,6 +284,7 @@ func (s *TargetSink) finalizeTask(taskCtx *TaskWriteContext, targetFile *os.File
 
 	s.logger.Info("target file successfully committed",
 		zap.String("task_id", taskCtx.TaskID),
+		zap.String("generation", taskCtx.Gen),
 		zap.String("final_path", taskCtx.FinalRelPath),
 		zap.Int64("size", taskCtx.ExpectedSize),
 		zap.String("sha256", shaHex),

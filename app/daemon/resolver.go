@@ -30,6 +30,7 @@ type taskResolver struct {
 	outputRoot string
 	spool      spool.Store
 	wbQueue    *writeback.Queue
+	db         *Database
 }
 
 func newTaskResolver(access MediaAccess, tempRoot, outputRoot string, optArgs ...any) *taskResolver {
@@ -40,6 +41,8 @@ func newTaskResolver(access MediaAccess, tempRoot, outputRoot string, optArgs ..
 			r.spool = v
 		case *writeback.Queue:
 			r.wbQueue = v
+		case *Database:
+			r.db = v
 		}
 	}
 	return r
@@ -74,15 +77,22 @@ func (r *taskResolver) Resolve(ctx context.Context, task *Task) (taskElement, er
 	if exists, err := existingFile(absolute, media.Size); err != nil {
 		return nil, NewTaskError("collision", false, err)
 	} else if exists {
-		verifiedSHA, err := verifyFinalFileIdentity(absolute, media.Size, "", request.ID)
-		if err != nil {
-			return nil, NewTaskError("collision", false, err)
+		var expectedSHA string
+		if r.db != nil {
+			if commitRec, err := r.db.GetTargetCommit(request.ID, ""); err == nil && commitRec != nil {
+				expectedSHA = commitRec.CommittedSHA256
+			}
 		}
-		return &existingElement{task: task, file: media.File, path: finalPath, sha: verifiedSHA}, nil
+		if expectedSHA != "" {
+			verifiedSHA, err := verifyFinalFileIdentity(absolute, media.Size, expectedSHA, request.ID)
+			if err == nil && verifiedSHA != "" {
+				return &existingElement{task: task, file: media.File, path: finalPath, sha: verifiedSHA}, nil
+			}
+		}
 	}
 
 	if r.spool != nil && r.wbQueue != nil {
-		spoolElem, err := newSpoolFileElement(task, media.File, r.outputRoot, media.Date, r.spool, r.wbQueue)
+		spoolElem, err := newSpoolFileElement(task, media.File, r.outputRoot, media.Date, r.spool, r.wbQueue, r.db)
 		if err != nil {
 			return nil, NewTaskError("spool", false, err)
 		}

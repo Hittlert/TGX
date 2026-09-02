@@ -95,14 +95,21 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) ([]TaskRecoveryResult, er
 		movingPath := finalPath + ".moving"
 		metaPath := finalPath + ".moving.meta"
 
-		// 1. Check if final file was already committed via SQLite target_commits record
-		stat, err := os.Stat(finalPath)
-		_, movingErr := os.Stat(movingPath)
+		movingMatches, _ := filepath.Glob(finalPath + ".*.moving")
+		hasMoving := false
+		if _, movingErr := os.Stat(movingPath); movingErr == nil {
+			hasMoving = true
+		}
+		if len(movingMatches) > 0 {
+			hasMoving = true
+		}
+
 		tempPartPath := CanonicalPartPath(r.tempDir, fileKey)
 		_, partErr := os.Stat(tempPartPath)
 		hasTempPart := (partErr == nil)
 
-		if err == nil && stat.Size() == rec.FileSize && rec.FileSize > 0 && errors.Is(movingErr, os.ErrNotExist) && !hasTempPart {
+		stat, err := os.Stat(finalPath)
+		if err == nil && stat.Size() == rec.FileSize && rec.FileSize > 0 && !hasMoving && !hasTempPart {
 			// Query target_commits table for authoritative committed SHA
 			var committedSHA string
 			_ = r.db.QueryRowContext(ctx, `SELECT committed_sha256 FROM target_commits WHERE task_id = ? ORDER BY updated_at DESC LIMIT 1`, fileKey).Scan(&committedSHA)
@@ -111,6 +118,9 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) ([]TaskRecoveryResult, er
 				verifiedSHA, verifyErr := verifyFinalFileIdentity(finalPath, rec.FileSize, committedSHA, fileKey)
 				if verifyErr == nil && verifiedSHA != "" {
 					_ = os.Remove(metaPath)
+					for _, m := range movingMatches {
+						_ = os.Remove(m)
+					}
 					if execErr := r.updateRecordSuccess(ctx, rec.ChatID, rec.MessageID, verifiedSHA); execErr != nil {
 						r.logger.Warn("failed to update record to success in recovery", zap.Error(execErr))
 					} else {
@@ -160,6 +170,9 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) ([]TaskRecoveryResult, er
 		_ = os.Remove(movingPath)
 		_ = os.Remove(metaPath)
 		_ = os.Remove(tempPartPath)
+		for _, m := range movingMatches {
+			_ = os.Remove(m)
+		}
 		actionTaken := "BUFFER_RESET_TO_PENDING"
 		if r.bufferType == "memory" {
 			actionTaken = "MEMORY_BUFFER_VOLATILE_RESET_TO_PENDING"

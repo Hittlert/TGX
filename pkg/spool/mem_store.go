@@ -10,10 +10,11 @@ import (
 const memChunkSize int64 = 64 * 1024 // 64 KiB per memory chunk
 
 type memSegmentBuffer struct {
-	chunks map[int][]byte // chunkIndex -> 64 KiB slice
+	chunks         map[int][]byte // chunkIndex -> allocated slice
+	allocatedBytes int64          // sum of len(slice) for all chunks in this segment
 }
 
-// MemoryStore implements the Store interface using chunked in-RAM buffers.
+// MemoryStore implements the Store interface using chunked in-RAM buffers with strict physical accounting.
 type MemoryStore struct {
 	mu      sync.RWMutex
 	capMgr  *CapacityManager
@@ -94,8 +95,9 @@ func (s *MemoryStore) WriteAt(key SegmentKey, relOffset int64, data []byte) (int
 		return 0, ErrOffsetOutOfBounds
 	}
 
-	// Write across 64 KiB chunks on-demand without full-segment reallocations
+	var newlyAllocatedBytes int64 = 0
 	var written int64 = 0
+
 	for written < dataLen {
 		currOffset := relOffset + written
 		chunkIdx := int(currOffset / memChunkSize)
@@ -103,11 +105,19 @@ func (s *MemoryStore) WriteAt(key SegmentKey, relOffset int64, data []byte) (int
 
 		chunk, exists := buf.chunks[chunkIdx]
 		if !exists {
-			chunk = make([]byte, memChunkSize)
+			// Size chunk physically bounded by remaining segment length
+			chunkStart := int64(chunkIdx) * memChunkSize
+			chunkLen := memChunkSize
+			if chunkStart+chunkLen > key.Length {
+				chunkLen = key.Length - chunkStart
+			}
+			chunk = make([]byte, chunkLen)
 			buf.chunks[chunkIdx] = chunk
+			buf.allocatedBytes += int64(len(chunk))
+			newlyAllocatedBytes += int64(len(chunk))
 		}
 
-		toCopy := memChunkSize - chunkOffset
+		toCopy := int64(len(chunk)) - chunkOffset
 		if toCopy > dataLen-written {
 			toCopy = dataLen - written
 		}
@@ -117,18 +127,15 @@ func (s *MemoryStore) WriteAt(key SegmentKey, relOffset int64, data []byte) (int
 	}
 	s.mu.Unlock()
 
-	// Update range set and capacity conversion
+	// Convert exact physical allocated memory in CapacityManager
+	if newlyAllocatedBytes > 0 {
+		s.capMgr.ConvertReservationToUsed(newlyAllocatedBytes)
+	}
+
 	item.mu.Lock()
-	prevCovered := item.Ranges.TotalCovered()
 	item.Ranges.Add(relOffset, relOffset+dataLen)
-	newCovered := item.Ranges.TotalCovered()
-	delta := newCovered - prevCovered
 	item.UpdatedAt = time.Now()
 	item.mu.Unlock()
-
-	if delta > 0 {
-		s.capMgr.ConvertReservationToUsed(delta)
-	}
 
 	return len(data), nil
 }
@@ -164,6 +171,9 @@ func (s *MemoryStore) ReadAt(key SegmentKey, relOffset int64, p []byte) (int, er
 
 		chunk, exists := buf.chunks[chunkIdx]
 		chunkToRead := memChunkSize - chunkOffset
+		if exists && chunkToRead > int64(len(chunk))-chunkOffset {
+			chunkToRead = int64(len(chunk)) - chunkOffset
+		}
 		if chunkToRead > toRead-read {
 			chunkToRead = toRead - read
 		}
@@ -171,7 +181,6 @@ func (s *MemoryStore) ReadAt(key SegmentKey, relOffset int64, p []byte) (int, er
 		if exists {
 			copy(p[read:read+chunkToRead], chunk[chunkOffset:chunkOffset+chunkToRead])
 		} else {
-			// Sparse region returns zero bytes
 			for i := int64(0); i < chunkToRead; i++ {
 				p[read+i] = 0
 			}
@@ -224,14 +233,21 @@ func (s *MemoryStore) Reclaim(key SegmentKey) error {
 
 	keyStr := key.String()
 	item, ok := s.items[keyStr]
+	buf, bufOk := s.buffers[keyStr]
 	if ok {
 		item.mu.Lock()
 		item.State = StateReclaimed
 		item.UpdatedAt = time.Now()
-		covered := item.Ranges.TotalCovered()
 		item.mu.Unlock()
 
-		s.capMgr.Reclaim(covered)
+		var allocated int64 = 0
+		if bufOk && buf != nil {
+			allocated = buf.allocatedBytes
+		} else {
+			allocated = item.Ranges.TotalCovered()
+		}
+
+		s.capMgr.Reclaim(allocated)
 		delete(s.items, keyStr)
 	}
 	delete(s.buffers, keyStr)

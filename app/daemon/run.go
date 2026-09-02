@@ -306,7 +306,7 @@ func Run(ctx context.Context, client *telegram.Client, kvd storage.Storage, opts
 		}
 	}
 
-	iter := newTaskIter(registry, newTaskResolver(access, opts.BufferDir, opts.OutputDir, spoolStore, wbQueue))
+	iter := newTaskIter(registry, newTaskResolver(access, opts.BufferDir, opts.OutputDir, spoolStore, wbQueue, db))
 	dl := downloader.New(downloader.Options{
 		Pool:            pool,
 		Threads:         opts.Threads,
