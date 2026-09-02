@@ -377,7 +377,12 @@ func (s *UpdatesStream) handleMessage(ctx context.Context, msgClass tg.MessageCl
 
 	if s.db != nil {
 		if err := s.db.IngestMessage(chatMsg); err != nil {
-			s.logger.Warn("failed to ingest stream message", zap.Error(err))
+			s.logger.Error("failed to ingest stream message in transaction",
+				zap.String("chat_id", chatID),
+				zap.Int("message_id", msg.ID),
+				zap.Error(err),
+			)
+			return
 		}
 	}
 

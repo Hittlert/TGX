@@ -290,9 +290,12 @@ func Run(ctx context.Context, client *telegram.Client, kvd storage.Storage, opts
 							Length:       segRec.ExpectedLength,
 						}
 						if item, err := fs.RestoreSegment(segKey); err == nil && item != nil {
+							isLast := (segRec.ExpectedFileSize > 0 && segRec.StartOffset+segRec.ExpectedLength >= segRec.ExpectedFileSize)
 							wbQueue.Enqueue(&writeback.Item{
 								Key:              segKey,
-								ExpectedFileSize: segRec.ExpectedLength,
+								FinalRelPath:     segRec.FinalRelPath,
+								ExpectedFileSize: segRec.ExpectedFileSize,
+								IsLastSegment:    isLast,
 								Item:             item,
 								AddedAt:          time.Now(),
 							})

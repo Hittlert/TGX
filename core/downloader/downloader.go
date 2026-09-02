@@ -1326,21 +1326,17 @@ func (d *Downloader) fetchSmallFile(ctx context.Context, workerID int, job *smal
 		}
 
 		var chunkSuccess bool
+		var lastFetchErr error
 		for attempt := 0; attempt < 3; attempt++ {
-			select {
-			case <-ctx.Done():
-				d.opts.Progress.OnDone(job.elem, ctx.Err())
-				budget.release(job.totalSize)
-				return
-			case <-elemCtx.Done():
+			if elemCtx.Err() != nil {
 				d.opts.Progress.OnDone(job.elem, context.Canceled)
 				budget.release(job.totalSize)
 				return
-			default:
 			}
 
 			var releaseSlot func()
 			var ticket *gate.AdmissionTicket
+
 			if d.floodGate != nil {
 				var err error
 				releaseSlot, ticket, err = d.floodGate.AcquireDataPermit(elemCtx, job.dcID)
@@ -1359,6 +1355,7 @@ func (d *Downloader) fetchSmallFile(ctx context.Context, workerID int, job *smal
 			chunkCtx, chunkCancel := context.WithTimeout(gate.WithTicket(elemCtx, ticket), 60*time.Second)
 			res, fetchErr := client.UploadGetFile(chunkCtx, req)
 			chunkCancel()
+			lastFetchErr = fetchErr
 
 			if fetchErr == nil {
 				switch uf := res.(type) {
@@ -1373,11 +1370,13 @@ func (d *Downloader) fetchSmallFile(ctx context.Context, workerID int, job *smal
 						chunkSuccess = true
 					} else {
 						fetchErr = fmt.Errorf("small file short read at offset %d: expected %d bytes, got %d", offset, expectedBytes, len(chunkBytes))
+						lastFetchErr = fetchErr
 					}
 				case *tg.UploadFileCDNRedirect:
 					cdnClient := d.opts.Pool.Client(elemCtx, uf.DCID)
 					var cdnBytes []byte
 					cdnBytes, fetchErr = d.handleCdnRedirect(elemCtx, cdnClient, client, uf, job.dcID, offset, DownloadPartSize)
+					lastFetchErr = fetchErr
 					if fetchErr == nil {
 						if len(cdnBytes) > expectedBytes {
 							cdnBytes = cdnBytes[:expectedBytes]
@@ -1388,10 +1387,12 @@ func (d *Downloader) fetchSmallFile(ctx context.Context, workerID int, job *smal
 							chunkSuccess = true
 						} else {
 							fetchErr = fmt.Errorf("cdn small file short read at offset %d: expected %d bytes, got %d", offset, expectedBytes, len(cdnBytes))
+							lastFetchErr = fetchErr
 						}
 					}
 				default:
 					fetchErr = fmt.Errorf("unexpected upload response type: %T", res)
+					lastFetchErr = fetchErr
 				}
 			}
 
@@ -1449,7 +1450,7 @@ func (d *Downloader) fetchSmallFile(ctx context.Context, workerID int, job *smal
 		}
 
 		if !chunkSuccess {
-			d.opts.Progress.OnDone(job.elem, fmt.Errorf("failed to fetch small file chunk at offset %d", offset))
+			d.opts.Progress.OnDone(job.elem, fmt.Errorf("failed to fetch small file chunk at offset %d: %w", offset, lastFetchErr))
 			budget.release(job.totalSize)
 			return
 		}

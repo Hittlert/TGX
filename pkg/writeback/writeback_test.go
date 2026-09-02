@@ -373,3 +373,150 @@ func TestTargetSink_TargetExists_ConflictFails(t *testing.T) {
 	require.Error(t, finalizedErr)
 	assert.ErrorIs(t, finalizedErr, ErrTargetConflict)
 }
+
+func TestTargetSink_IdenticalTarget_IdempotentSuccess(t *testing.T) {
+	tempSpoolDir := t.TempDir()
+	tempTargetDir := t.TempDir()
+
+	store, err := spool.NewFileStore(tempSpoolDir, 50*1024*1024)
+	require.NoError(t, err)
+	defer store.Close()
+
+	queue := NewQueue()
+
+	var finalizedErr error
+	var wg sync.WaitGroup
+	wg.Add(1)
+
+	cb := Callbacks{
+		OnTaskFinalized: func(taskID, gen, finalRelPath, sha256Hex string, size int64, err error) {
+			finalizedErr = err
+			wg.Done()
+		},
+	}
+
+	cfg := DefaultConfig(tempTargetDir)
+	cfg.Concurrency = 1
+	sink := NewTargetSink(cfg, store, queue, cb, zap.NewNop())
+	defer sink.Close()
+
+	taskID := "task-identical"
+	gen := "1"
+	finalRelPath := "videos/identical.mp4"
+
+	segData := []byte("identical_content_123456789")
+
+	// Pre-create target file with EXACT IDENTICAL content
+	finalPath := filepath.Join(tempTargetDir, finalRelPath)
+	require.NoError(t, os.MkdirAll(filepath.Dir(finalPath), 0755))
+	require.NoError(t, os.WriteFile(finalPath, segData, 0644))
+
+	segKey := spool.SegmentKey{TaskID: taskID, Gen: gen, SegmentIndex: 0, StartOffset: 0, Length: int64(len(segData))}
+
+	ctx := context.Background()
+	require.NoError(t, store.Reserve(ctx, segKey.Length))
+	_, _ = store.CreateSegment(segKey)
+	_, _ = store.WriteAt(segKey, 0, segData)
+	_ = store.MarkReady(segKey)
+
+	queue.Enqueue(&Item{
+		Key:              segKey,
+		FinalRelPath:     finalRelPath,
+		ExpectedFileSize: int64(len(segData)),
+		IsLastSegment:    true,
+		AddedAt:          time.Now(),
+	})
+
+	wg.Wait()
+	require.NoError(t, finalizedErr)
+}
+
+func TestTargetSink_CapacityRelease_ZeroDeadlock(t *testing.T) {
+	tempSpoolDir := t.TempDir()
+	tempTargetDir := t.TempDir()
+
+	// Small store capacity: only 150 bytes total capacity
+	store, err := spool.NewFileStore(tempSpoolDir, 150)
+	require.NoError(t, err)
+	defer store.Close()
+
+	queue := NewQueue()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	var finalizedErr error
+
+	cb := Callbacks{
+		OnTaskFinalized: func(taskID, gen, finalRelPath, sha256Hex string, size int64, err error) {
+			finalizedErr = err
+			wg.Done()
+		},
+	}
+
+	cfg := DefaultConfig(tempTargetDir)
+	cfg.Concurrency = 2
+	sink := NewTargetSink(cfg, store, queue, cb, zap.NewNop())
+	defer sink.Close()
+
+	taskID := "task-cap-deadlock-free"
+	gen := "1"
+	finalRelPath := "videos/cap_test.mp4"
+
+	// 2 segments: seg0 (100B), seg1 (100B), total 200B > 150B max spool capacity!
+	seg0Data := make([]byte, 100)
+	for i := range seg0Data {
+		seg0Data[i] = 'A'
+	}
+	seg1Data := make([]byte, 100)
+	for i := range seg1Data {
+		seg1Data[i] = 'B'
+	}
+
+	seg0Key := spool.SegmentKey{TaskID: taskID, Gen: gen, SegmentIndex: 0, StartOffset: 0, Length: 100}
+	seg1Key := spool.SegmentKey{TaskID: taskID, Gen: gen, SegmentIndex: 1, StartOffset: 100, Length: 100}
+
+	ctx := context.Background()
+
+	// Step 1: Write seg1 first (out of order) occupying 100 bytes of spool
+	require.NoError(t, store.Reserve(ctx, 100))
+	_, _ = store.CreateSegment(seg1Key)
+	_, _ = store.WriteAt(seg1Key, 0, seg1Data)
+	require.NoError(t, store.MarkReady(seg1Key))
+
+	// Enqueue seg1
+	queue.Enqueue(&Item{
+		Key:              seg1Key,
+		FinalRelPath:     finalRelPath,
+		ExpectedFileSize: 200,
+		IsLastSegment:    true,
+		AddedAt:          time.Now(),
+	})
+
+	// Wait for seg1 to be written back and reclaimed from Spool
+	time.Sleep(100 * time.Millisecond)
+
+	// Step 2: Now write seg0 (capacity was freed by writeback of seg1!)
+	require.NoError(t, store.Reserve(ctx, 100))
+	_, _ = store.CreateSegment(seg0Key)
+	_, _ = store.WriteAt(seg0Key, 0, seg0Data)
+	require.NoError(t, store.MarkReady(seg0Key))
+
+	// Enqueue seg0
+	queue.Enqueue(&Item{
+		Key:              seg0Key,
+		FinalRelPath:     finalRelPath,
+		ExpectedFileSize: 200,
+		IsLastSegment:    false,
+		AddedAt:          time.Now(),
+	})
+
+	wg.Wait()
+	require.NoError(t, finalizedErr)
+
+	// Verify whole file on disk
+	finalPath := filepath.Join(tempTargetDir, finalRelPath)
+	data, err := os.ReadFile(finalPath)
+	require.NoError(t, err)
+	assert.Equal(t, 200, len(data))
+	assert.Equal(t, append(seg0Data, seg1Data...), data)
+}

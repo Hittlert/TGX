@@ -355,6 +355,7 @@ func (s *FileStore) Close() error {
 		return nil
 	}
 	s.closed = true
+	s.capMgr.Close()
 
 	for _, file := range s.files {
 		if file != nil {

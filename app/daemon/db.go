@@ -428,7 +428,17 @@ func (d *Database) IngestMessage(msg ChatMessage) error {
 		hasMediaInt = 1
 	}
 
-	_, err := d.db.Exec(`
+	tx, err := d.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin ingest tx: %w", err)
+	}
+	defer func() {
+		if tx != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	_, err = tx.Exec(`
 		INSERT INTO chat_messages(chat_id, message_id, sender_id, sender_name, text, media_type, has_media, reply_to_message_id, date, created_at, updated_at)
 		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(chat_id, message_id) DO UPDATE SET
@@ -438,7 +448,7 @@ func (d *Database) IngestMessage(msg ChatMessage) error {
 			updated_at = excluded.updated_at
 	`, msg.ChatID, msg.MessageID, msg.SenderID, msg.SenderName, msg.Text, msg.MediaType, hasMediaInt, msg.ReplyToMessageID, msg.Date, now, now)
 	if err != nil {
-		return err
+		return fmt.Errorf("insert chat_message: %w", err)
 	}
 
 	if msg.HasMedia {
@@ -453,7 +463,7 @@ func (d *Database) IngestMessage(msg ChatMessage) error {
 			fileName = fmt.Sprintf("%d%s", msg.MessageID, ext)
 		}
 
-		_, err = d.db.Exec(`
+		_, err = tx.Exec(`
 			INSERT INTO download_records(chat_id, message_id, status, file_name, media_type, file_size, created_at, updated_at)
 			VALUES(?, ?, 'pending', ?, ?, ?, ?, ?)
 			ON CONFLICT(chat_id, message_id) DO UPDATE SET
@@ -461,9 +471,16 @@ func (d *Database) IngestMessage(msg ChatMessage) error {
 				media_type = excluded.media_type,
 				file_size = excluded.file_size
 		`, msg.ChatID, msg.MessageID, fileName, msg.MediaType, msg.FileSize, now, now)
+		if err != nil {
+			return fmt.Errorf("insert download_record: %w", err)
+		}
 	}
 
-	return err
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit ingest tx: %w", err)
+	}
+	tx = nil
+	return nil
 }
 
 func (d *Database) GetPendingDownloads(limit int) ([]DownloadRecord, error) {
@@ -511,6 +528,18 @@ func (d *Database) UpdateDownloadStatus(chatID string, messageID int, status str
 		downloadedAt = &now
 	}
 
+	// Check current status to ensure idempotency and prevent duplicate attempts increments
+	var currentStatus string
+	var currentAttempts int
+	_ = d.db.QueryRow(`SELECT status, attempts FROM download_records WHERE chat_id = ? AND message_id = ?`, chatID, messageID).Scan(&currentStatus, &currentAttempts)
+
+	if currentStatus == "success" && status == "success" {
+		return nil
+	}
+	if currentStatus == "failed" && status == "failed" {
+		return nil
+	}
+
 	var nextRetryAt int64 = 0
 	if status == "failed" {
 		lowerErr := strings.ToLower(errMsg)
@@ -525,12 +554,10 @@ func (d *Database) UpdateDownloadStatus(chatID string, messageID int, status str
 		} else if strings.Contains(lowerErr, "deleted") || strings.Contains(lowerErr, "unavailable") || strings.Contains(lowerErr, "message_id_invalid") {
 			nextRetryAt = now + 86400*7
 		} else {
-			var attempts int
-			_ = d.db.QueryRow(`SELECT attempts FROM download_records WHERE chat_id = ? AND message_id = ?`, chatID, messageID).Scan(&attempts)
-			if attempts >= 3 {
+			if currentAttempts >= 3 {
 				nextRetryAt = now + 86400*7
 			} else {
-				backoff := int64(300 * (1 << attempts))
+				backoff := int64(300 * (1 << currentAttempts))
 				if backoff > 86400*7 {
 					backoff = 86400 * 7
 				}
@@ -861,17 +888,19 @@ type TargetCommitRecord struct {
 }
 
 type SpoolSegmentRecord struct {
-	TaskID         string `json:"task_id"`
-	Generation     string `json:"generation"`
-	SegmentIndex   int    `json:"segment_index"`
-	StartOffset    int64  `json:"start_offset"`
-	ExpectedLength int64  `json:"expected_length"`
-	State          string `json:"state"`
-	Dirty          bool   `json:"dirty"`
-	Attempts       int    `json:"attempts"`
-	NextRetryAt    int64  `json:"next_retry_at"`
-	Path           string `json:"path"`
-	Checksum       string `json:"checksum"`
+	TaskID           string `json:"task_id"`
+	Generation       string `json:"generation"`
+	SegmentIndex     int    `json:"segment_index"`
+	StartOffset      int64  `json:"start_offset"`
+	ExpectedLength   int64  `json:"expected_length"`
+	State            string `json:"state"`
+	Dirty            bool   `json:"dirty"`
+	Attempts         int    `json:"attempts"`
+	NextRetryAt      int64  `json:"next_retry_at"`
+	Path             string `json:"path"`
+	Checksum         string `json:"checksum"`
+	FinalRelPath     string `json:"final_rel_path"`
+	ExpectedFileSize int64  `json:"expected_file_size"`
 }
 
 func (d *Database) RecordSpoolAttempt(taskID, generation, finalPath string, expectedSize int64, state string) error {
@@ -921,9 +950,10 @@ func (d *Database) GetActiveSpoolSegments() ([]SpoolSegmentRecord, error) {
 	defer d.lock.RUnlock()
 
 	rows, err := d.db.Query(`
-		SELECT task_id, generation, segment_index, start_offset, expected_length, state, dirty, attempts, next_retry_at, COALESCE(path, ''), COALESCE(checksum, '')
-		FROM spool_segments
-		WHERE state IN ('ready', 'queued', 'writing_back')
+		SELECT s.task_id, s.generation, s.segment_index, s.start_offset, s.expected_length, s.state, s.dirty, s.attempts, s.next_retry_at, COALESCE(s.path, ''), COALESCE(s.checksum, ''), COALESCE(a.final_path, ''), COALESCE(a.expected_size, 0)
+		FROM spool_segments s
+		LEFT JOIN spool_attempts a ON s.task_id = a.task_id AND s.generation = a.generation
+		WHERE s.state IN ('ready', 'queued', 'writing_back')
 	`)
 	if err != nil {
 		return nil, err
@@ -934,7 +964,11 @@ func (d *Database) GetActiveSpoolSegments() ([]SpoolSegmentRecord, error) {
 	for rows.Next() {
 		var rec SpoolSegmentRecord
 		var dirtyInt int
-		if err := rows.Scan(&rec.TaskID, &rec.Generation, &rec.SegmentIndex, &rec.StartOffset, &rec.ExpectedLength, &rec.State, &dirtyInt, &rec.Attempts, &rec.NextRetryAt, &rec.Path, &rec.Checksum); err != nil {
+		if err := rows.Scan(
+			&rec.TaskID, &rec.Generation, &rec.SegmentIndex, &rec.StartOffset, &rec.ExpectedLength,
+			&rec.State, &dirtyInt, &rec.Attempts, &rec.NextRetryAt, &rec.Path, &rec.Checksum,
+			&rec.FinalRelPath, &rec.ExpectedFileSize,
+		); err != nil {
 			continue
 		}
 		rec.Dirty = (dirtyInt != 0)

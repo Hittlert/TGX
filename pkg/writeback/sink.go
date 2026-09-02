@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"os"
 	"path/filepath"
@@ -17,6 +18,8 @@ import (
 	"go.uber.org/zap"
 )
 
+const targetLockShards = 256
+
 // TargetSink coordinates streaming write-back workers from Spool to destination storage.
 type TargetSink struct {
 	cfg       Config
@@ -25,13 +28,13 @@ type TargetSink struct {
 	callbacks Callbacks
 	logger    *zap.Logger
 
-	mu        sync.RWMutex
-	tasks     map[string]*TaskWriteContext // taskID:gen -> TaskWriteContext
-	taskLocks sync.Map                     // taskID -> *sync.Mutex (stable, never deleted during runtime)
-	ctx       context.Context
-	cancel    context.CancelFunc
-	wg        sync.WaitGroup
-	closed    bool
+	mu         sync.RWMutex
+	tasks      map[string]*TaskWriteContext // taskID:gen -> TaskWriteContext
+	pathLocks  [targetLockShards]sync.Mutex // Fixed sharded mutexes keyed by final target path
+	ctx        context.Context
+	cancel     context.CancelFunc
+	wg         sync.WaitGroup
+	closed     bool
 }
 
 // NewTargetSink creates and initializes a TargetSink.
@@ -59,9 +62,11 @@ func NewTargetSink(cfg Config, store spool.Store, queue *Queue, cb Callbacks, lo
 	return sink
 }
 
-func (s *TargetSink) getTaskLock(taskID string) *sync.Mutex {
-	val, _ := s.taskLocks.LoadOrStore(taskID, &sync.Mutex{})
-	return val.(*sync.Mutex)
+func (s *TargetSink) getPathLock(finalRelPath string) *sync.Mutex {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(filepath.Clean(finalRelPath)))
+	idx := h.Sum32() % targetLockShards
+	return &s.pathLocks[idx]
 }
 
 func (s *TargetSink) getOrCreateTaskContext(item *Item) (*TaskWriteContext, error) {
@@ -75,7 +80,8 @@ func (s *TargetSink) getOrCreateTaskContext(item *Item) (*TaskWriteContext, erro
 	}
 
 	finalPath := filepath.Join(s.cfg.OutputDir, filepath.FromSlash(item.FinalRelPath))
-	movingPath := finalPath + ".moving"
+	// Generation-scoped moving path to prevent cross-generation collisions and stale residue
+	movingPath := fmt.Sprintf("%s.%s.moving", finalPath, item.Key.Gen)
 
 	if err := os.MkdirAll(filepath.Dir(finalPath), 0o755); err != nil {
 		return nil, fmt.Errorf("create destination directory: %w", err)
@@ -133,9 +139,9 @@ func (s *TargetSink) workerLoop(workerID int) {
 }
 
 func (s *TargetSink) processItem(item *Item, readBuf []byte) error {
-	taskLock := s.getTaskLock(item.Key.TaskID)
-	taskLock.Lock()
-	defer taskLock.Unlock()
+	pathLock := s.getPathLock(item.FinalRelPath)
+	pathLock.Lock()
+	defer pathLock.Unlock()
 
 	taskCtx, err := s.getOrCreateTaskContext(item)
 	if err != nil {
@@ -153,47 +159,14 @@ func (s *TargetSink) processItem(item *Item, readBuf []byte) error {
 		return ErrStaleGeneration
 	}
 
-	// If this segment is not the next expected segment index in sequence,
-	// buffer it in PendingSegments to preserve strict sequential frontier!
-	if item.Key.SegmentIndex != taskCtx.NextSegmentIndex {
-		taskCtx.PendingSegments[item.Key.SegmentIndex] = item
-		return nil
-	}
-
-	// Open target .moving file
+	// Open target .moving file for writing at segment offset
 	targetFile, err := os.OpenFile(taskCtx.MovingPath, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return fmt.Errorf("open target moving file: %w", err)
 	}
 	defer targetFile.Close()
 
-	// 1. Process current segment
-	if err := s.writeSegmentData(taskCtx, targetFile, item, readBuf); err != nil {
-		return err
-	}
-
-	// 2. Cascade process any subsequent pending segments that can now be written
-	for {
-		nextItem, ok := taskCtx.PendingSegments[taskCtx.NextSegmentIndex]
-		if !ok {
-			break
-		}
-		delete(taskCtx.PendingSegments, taskCtx.NextSegmentIndex)
-		if err := s.writeSegmentData(taskCtx, targetFile, nextItem, readBuf); err != nil {
-			return err
-		}
-	}
-
-	// 3. Check if the ENTIRE file is complete:
-	// MUST have RangeSet covering [0, ExpectedSize) and WrittenBytes == ExpectedSize!
-	if taskCtx.DurableRanges.IsComplete(taskCtx.ExpectedSize) && taskCtx.WrittenBytes == taskCtx.ExpectedSize {
-		return s.finalizeTask(taskCtx, targetFile)
-	}
-
-	return nil
-}
-
-func (s *TargetSink) writeSegmentData(taskCtx *TaskWriteContext, targetFile *os.File, item *Item, readBuf []byte) error {
+	// Stream segment bytes from Spool into target .moving file
 	var offset int64 = 0
 	for offset < item.Key.Length {
 		toRead := int64(len(readBuf))
@@ -211,23 +184,19 @@ func (s *TargetSink) writeSegmentData(taskCtx *TaskWriteContext, targetFile *os.
 			return fmt.Errorf("write to target moving file at %d: %w", targetOffset, writeErr)
 		}
 
-		// Feed bytes strictly in offset order to streaming SHA256
-		taskCtx.Hasher.Write(readBuf[:n])
 		offset += int64(n)
-		taskCtx.WrittenBytes += int64(n)
 	}
 
 	// Sync target data to disk
 	if err := targetFile.Sync(); err != nil {
-		return fmt.Errorf("sync target file: %w", err)
+		return fmt.Errorf("sync target file %s: %w", taskCtx.MovingPath, err)
 	}
 
-	// Update frontier & range set
-	taskCtx.NextSegmentIndex++
-	taskCtx.NextOffset += item.Key.Length
+	// Update durable range set and written accounting
 	taskCtx.DurableRanges.Add(item.Key.StartOffset, item.Key.StartOffset+item.Key.Length)
+	taskCtx.WrittenBytes = taskCtx.DurableRanges.TotalCovered()
 
-	// Reclaim segment from Spool immediately to free capacity
+	// Reclaim source segment from Spool immediately to free SSD/RAM capacity
 	if err := s.store.Reclaim(item.Key); err != nil {
 		s.logger.Warn("failed to reclaim segment from spool after target sync",
 			zap.String("segment", item.Key.String()),
@@ -239,6 +208,12 @@ func (s *TargetSink) writeSegmentData(taskCtx *TaskWriteContext, targetFile *os.
 		s.callbacks.OnSegmentDurable(item.Key, item.Key.Length)
 	}
 
+	// Check if ALL segments of the file are durable:
+	// MUST have RangeSet fully covering [0, ExpectedSize) and WrittenBytes == ExpectedSize!
+	if taskCtx.DurableRanges.IsComplete(taskCtx.ExpectedSize) && taskCtx.WrittenBytes == taskCtx.ExpectedSize {
+		return s.finalizeTask(taskCtx, targetFile)
+	}
+
 	return nil
 }
 
@@ -248,7 +223,20 @@ func (s *TargetSink) finalizeTask(taskCtx *TaskWriteContext, targetFile *os.File
 	}
 	_ = targetFile.Close()
 
-	shaHex := hex.EncodeToString(taskCtx.Hasher.Sum(nil))
+	// Verify exact size of moving file before commit
+	movingStat, statErr := os.Stat(taskCtx.MovingPath)
+	if statErr != nil {
+		return fmt.Errorf("stat moving file before commit: %w", statErr)
+	}
+	if movingStat.Size() != taskCtx.ExpectedSize {
+		return fmt.Errorf("moving file size mismatch (got %d, expected %d): %w", movingStat.Size(), taskCtx.ExpectedSize, ErrIncompleteFile)
+	}
+
+	// Compute verified sequential SHA256 over entire finalized file
+	shaHex, err := computeTargetSHA256(taskCtx.MovingPath)
+	if err != nil {
+		return fmt.Errorf("compute finalized moving file sha256: %w", err)
+	}
 
 	if taskCtx.FileDate > 0 {
 		when := time.Unix(taskCtx.FileDate, 0)
@@ -258,7 +246,7 @@ func (s *TargetSink) finalizeTask(taskCtx *TaskWriteContext, targetFile *os.File
 	// Atomic non-replacing commit: moving -> final
 	if err := atomic.CommitFile(taskCtx.MovingPath, taskCtx.FinalPath); err != nil {
 		if errors.Is(err, atomic.ErrTargetExists) {
-			// P0-3 FIX: Verify existing file size and SHA256
+			// Verify existing file size and SHA256
 			existingStat, statErr := os.Stat(taskCtx.FinalPath)
 			if statErr != nil {
 				return fmt.Errorf("stat existing target file: %w", statErr)
@@ -309,7 +297,8 @@ func computeTargetSHA256(path string) (string, error) {
 	defer f.Close()
 
 	hasher := sha256.New()
-	if _, err := io.Copy(hasher, f); err != nil {
+	buf := make([]byte, 1024*1024)
+	if _, err := io.CopyBuffer(hasher, f, buf); err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(hasher.Sum(nil)), nil

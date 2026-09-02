@@ -7,12 +7,18 @@ import (
 	"time"
 )
 
-// MemoryStore implements the Store interface entirely in RAM buffers.
+const memChunkSize int64 = 64 * 1024 // 64 KiB per memory chunk
+
+type memSegmentBuffer struct {
+	chunks map[int][]byte // chunkIndex -> 64 KiB slice
+}
+
+// MemoryStore implements the Store interface using chunked in-RAM buffers.
 type MemoryStore struct {
 	mu      sync.RWMutex
 	capMgr  *CapacityManager
-	items   map[string]*SpoolItem // key.String() -> SpoolItem
-	buffers map[string][]byte     // key.String() -> dynamic in-memory segment byte buffer
+	items   map[string]*SpoolItem        // key.String() -> SpoolItem
+	buffers map[string]*memSegmentBuffer // key.String() -> chunked buffer
 	closed  bool
 }
 
@@ -21,7 +27,7 @@ func NewMemoryStore(maxBytes int64) *MemoryStore {
 	return &MemoryStore{
 		capMgr:  NewCapacityManager(maxBytes),
 		items:   make(map[string]*SpoolItem),
-		buffers: make(map[string][]byte),
+		buffers: make(map[string]*memSegmentBuffer),
 	}
 }
 
@@ -61,8 +67,9 @@ func (s *MemoryStore) CreateSegment(key SegmentKey) (*SpoolItem, error) {
 	}
 
 	s.items[keyStr] = item
-	// Dynamically allocated on WriteAt, starting empty to avoid 32MB upfront memory surge
-	s.buffers[keyStr] = nil
+	s.buffers[keyStr] = &memSegmentBuffer{
+		chunks: make(map[int][]byte),
+	}
 
 	return item, nil
 }
@@ -75,7 +82,8 @@ func (s *MemoryStore) WriteAt(key SegmentKey, relOffset int64, data []byte) (int
 	}
 	keyStr := key.String()
 	item, ok := s.items[keyStr]
-	if !ok {
+	buf, bufOk := s.buffers[keyStr]
+	if !ok || !bufOk {
 		s.mu.Unlock()
 		return 0, ErrSegmentNotFound
 	}
@@ -86,16 +94,27 @@ func (s *MemoryStore) WriteAt(key SegmentKey, relOffset int64, data []byte) (int
 		return 0, ErrOffsetOutOfBounds
 	}
 
-	buf := s.buffers[keyStr]
-	reqLen := relOffset + dataLen
-	if int64(len(buf)) < reqLen {
-		newBuf := make([]byte, reqLen)
-		copy(newBuf, buf)
-		buf = newBuf
-		s.buffers[keyStr] = buf
-	}
+	// Write across 64 KiB chunks on-demand without full-segment reallocations
+	var written int64 = 0
+	for written < dataLen {
+		currOffset := relOffset + written
+		chunkIdx := int(currOffset / memChunkSize)
+		chunkOffset := currOffset % memChunkSize
 
-	copy(buf[relOffset:relOffset+dataLen], data)
+		chunk, exists := buf.chunks[chunkIdx]
+		if !exists {
+			chunk = make([]byte, memChunkSize)
+			buf.chunks[chunkIdx] = chunk
+		}
+
+		toCopy := memChunkSize - chunkOffset
+		if toCopy > dataLen-written {
+			toCopy = dataLen - written
+		}
+
+		copy(chunk[chunkOffset:chunkOffset+toCopy], data[written:written+toCopy])
+		written += toCopy
+	}
 	s.mu.Unlock()
 
 	// Update range set and capacity conversion
@@ -122,21 +141,49 @@ func (s *MemoryStore) ReadAt(key SegmentKey, relOffset int64, p []byte) (int, er
 	}
 	keyStr := key.String()
 	buf, ok := s.buffers[keyStr]
-	s.mu.RUnlock()
-
 	if !ok {
+		s.mu.RUnlock()
 		return 0, ErrSegmentNotFound
 	}
 
-	if relOffset < 0 || relOffset >= int64(len(buf)) {
+	if relOffset < 0 || relOffset >= key.Length {
+		s.mu.RUnlock()
 		return 0, io.EOF
 	}
 
-	n := copy(p, buf[relOffset:])
-	if n < len(p) {
-		return n, io.EOF
+	toRead := int64(len(p))
+	if relOffset+toRead > key.Length {
+		toRead = key.Length - relOffset
 	}
-	return n, nil
+
+	var read int64 = 0
+	for read < toRead {
+		currOffset := relOffset + read
+		chunkIdx := int(currOffset / memChunkSize)
+		chunkOffset := currOffset % memChunkSize
+
+		chunk, exists := buf.chunks[chunkIdx]
+		chunkToRead := memChunkSize - chunkOffset
+		if chunkToRead > toRead-read {
+			chunkToRead = toRead - read
+		}
+
+		if exists {
+			copy(p[read:read+chunkToRead], chunk[chunkOffset:chunkOffset+chunkToRead])
+		} else {
+			// Sparse region returns zero bytes
+			for i := int64(0); i < chunkToRead; i++ {
+				p[read+i] = 0
+			}
+		}
+		read += chunkToRead
+	}
+	s.mu.RUnlock()
+
+	if read < int64(len(p)) {
+		return int(read), io.EOF
+	}
+	return int(read), nil
 }
 
 func (s *MemoryStore) Sync(key SegmentKey) error {
@@ -215,7 +262,6 @@ func (s *MemoryStore) ListReadySegments() []*SpoolItem {
 }
 
 func (s *MemoryStore) Recover(ctx context.Context) error {
-	// Memory store is volatile; nothing to recover from disk
 	return nil
 }
 
@@ -244,7 +290,8 @@ func (s *MemoryStore) Close() error {
 	defer s.mu.Unlock()
 
 	s.closed = true
+	s.capMgr.Close()
 	s.items = make(map[string]*SpoolItem)
-	s.buffers = make(map[string][]byte)
+	s.buffers = make(map[string]*memSegmentBuffer)
 	return nil
 }
