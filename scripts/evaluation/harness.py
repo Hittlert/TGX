@@ -171,21 +171,66 @@ class MetricsSampler(threading.Thread):
     def stop(self):
         self.running = False
 
-def execute_run(run_spec, engine_binary, api_base="http://127.0.0.1:5885", eval_dir="/volume2/docker/telegram_downloader_eval/evaluation"):
+def extract_artifact_metadata(engine_binary, engine):
+    binary_sha = compute_sha256(engine_binary) or "unknown"
+    meta = {
+        "engine": engine,
+        "source_repository": "https://github.com/Hittlert/TGX",
+        "source_commit": "unknown",
+        "source_dirty": False,
+        "binary_sha256": binary_sha,
+        "image_digest": "alpine:latest",
+        "version": "unknown",
+        "build_time": iso_time(),
+        "go_version": "unknown",
+        "os": "linux",
+        "arch": "amd64",
+    }
+    
+    try:
+        cmd = ["sudo", "docker", "run", "--rm", "-v", f"{os.path.abspath(engine_binary)}:/app/bin:ro", "alpine:latest", "/app/bin", "version"]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10)
+        output = res.stdout + res.stderr
+        for line in output.splitlines():
+            line = line.strip()
+            if "=" in line:
+                k, v = line.split("=", 1)
+                k, v = k.strip(), v.strip()
+                if k == "main_revision":
+                    meta["source_commit"] = v
+                elif k == "tdl_revision":
+                    meta["tdl_revision"] = v
+                elif k == "go_version":
+                    meta["go_version"] = v
+                elif k == "main_dirty":
+                    meta["source_dirty"] = (v.lower() == "true")
+            elif ":" in line:
+                k, v = line.split(":", 1)
+                k, v = k.strip(), v.strip()
+                if k == "Version":
+                    meta["version"] = v
+                elif k == "Commit":
+                    meta["source_commit"] = v
+                elif k == "Date":
+                    meta["build_time"] = v
+        if meta["version"] == "unknown" and meta.get("tdl_revision"):
+            meta["version"] = "1.0.0"
+    except Exception as e:
+        meta["extraction_error"] = str(e)
+    return meta
+
+def execute_run(run_spec, engine_binary, eval_dir="/volume2/docker/telegram_downloader_eval/evaluation", host_port=5890):
     run_id = run_spec["run_id"]
     engine = run_spec["engine"]
     profile_id = run_spec["profile_id"]
     duration_sec = run_spec["duration_seconds"]
     drain_timeout_sec = run_spec.get("drain_timeout_seconds", 60)
-
-    output_dir = run_spec["output_dir"]
-    buffer_dir = run_spec["buffer_dir"]
-    state_db = run_spec["state_db"]
-    log_dir = run_spec["log_dir"]
+    net_concurrency = run_spec.get("net_concurrency", 32)
+    file_concurrency = run_spec.get("file_concurrency", 5)
+    dc_pool_size = run_spec.get("dc_pool_size", 32)
     manifest_path = run_spec["manifest_path"]
 
-    # Explicit evaluation directory layout:
-    # baselines/tdl/<run_id>/raw and runs/tgx/<run_id>/raw
+    # Target directory structure: baselines/tdl/<run_id>/raw or runs/tgx/<run_id>/raw
     if engine == "tdl":
         run_root = os.path.join(eval_dir, "baselines", "tdl", run_id)
     else:
@@ -193,45 +238,56 @@ def execute_run(run_spec, engine_binary, api_base="http://127.0.0.1:5885", eval_
 
     raw_dir = os.path.join(run_root, "raw")
     os.makedirs(raw_dir, exist_ok=True)
+
+    # Scratch isolation per run
+    scratch_root = f"/volume2/docker/telegram_downloader_eval/scratch_runs/{run_id}"
+    output_dir = os.path.join(scratch_root, "output")
+    temp_dir = os.path.join(scratch_root, "temp")
+    buffer_dir = os.path.join(scratch_root, "buffer")
+    session_dir = os.path.join(scratch_root, "session")
+    log_dir = os.path.join(scratch_root, "logs")
+
+    # Clean previous run scratch if exists
+    if os.path.exists(scratch_root):
+        shutil.rmtree(scratch_root, ignore_errors=True)
+
     os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(temp_dir, exist_ok=True)
     os.makedirs(buffer_dir, exist_ok=True)
-    os.makedirs(os.path.dirname(os.path.abspath(state_db)), exist_ok=True)
+    os.makedirs(session_dir, exist_ok=True)
     os.makedirs(log_dir, exist_ok=True)
+
+    # Copy session state for independent run
+    src_session = "/volume2/docker/telegram_downloader_eval/tdl-state"
+    if os.path.exists(src_session):
+        for f_name in os.listdir(src_session):
+            s_fp = os.path.join(src_session, f_name)
+            d_fp = os.path.join(session_dir, f_name)
+            if os.path.isfile(s_fp):
+                shutil.copy2(s_fp, d_fp)
 
     print(f"\n=======================================================")
     print(f"  TGX Evaluation Protocol v1.0 - RUN: {run_id}")
     print(f"  Engine: {engine.upper()} | Profile: {profile_id} | Duration: {duration_sec}s")
-    print(f"  Raw Directory: {raw_dir}")
+    print(f"  Concurrency: net={net_concurrency}, file={file_concurrency}, pool={dc_pool_size}")
+    print(f"  Port: {host_port} | Isolated Output: {output_dir}")
+    print(f"  Raw Evidence Root: {raw_dir}")
     print(f"=======================================================")
-
-    # Isolation Check
-    for bad in ["telegram_media_downloader_us", "SpecialMedias"]:
-        if bad in output_dir or bad in buffer_dir or bad in state_db:
-            raise RuntimeError(f"FATAL: Production isolation violation! {bad} found in run paths.")
 
     # 1. raw/protocol.json
     with open(os.path.join(raw_dir, "protocol.json"), "w", encoding="utf-8") as f:
         json.dump({"protocol_version": PROTOCOL_VERSION, "protocol_sha256": PROTOCOL_SHA256}, f, indent=2)
 
     # 2. raw/run_spec.json
+    run_spec_copy = dict(run_spec)
+    run_spec_copy["output_dir"] = output_dir
+    run_spec_copy["buffer_dir"] = buffer_dir
+    run_spec_copy["log_dir"] = log_dir
     with open(os.path.join(raw_dir, "run_spec.json"), "w", encoding="utf-8") as f:
-        json.dump(run_spec, f, indent=2)
+        json.dump(run_spec_copy, f, indent=2)
 
     # 3. raw/artifact.json
-    binary_sha = compute_sha256(engine_binary) or "unknown"
-    artifact_meta = {
-        "engine": engine,
-        "source_repository": "https://github.com/Hittlert/TGX",
-        "source_commit": "1f1ebffbb8576519db6b8b53a8aa114e03468959" if engine == "tdl" else "fe16118",
-        "source_dirty": False,
-        "binary_sha256": binary_sha,
-        "image_digest": "telegram-downloader-host:1f1ebff-6bd3991" if engine == "tdl" else "telegram-downloader-host:latest",
-        "version": "1.0.0",
-        "build_time": iso_time(),
-        "go_version": "go1.26.4" if engine == "tdl" else "go1.25",
-        "os": "linux",
-        "arch": "amd64",
-    }
+    artifact_meta = extract_artifact_metadata(engine_binary, engine)
     with open(os.path.join(raw_dir, "artifact.json"), "w", encoding="utf-8") as f:
         json.dump(artifact_meta, f, indent=2)
 
@@ -244,7 +300,7 @@ def execute_run(run_spec, engine_binary, api_base="http://127.0.0.1:5885", eval_
         "target_storage_id": "synology-btrfs-volume2",
         "buffer_storage_id": "synology-nvme-ssd-volume2",
         "filesystem_types": {"downloads": "btrfs", "buffer": "btrfs"},
-        "container_identity": f"tgx-eval-{engine}-daemon",
+        "container_identity": f"tgx-eval-runner-{run_id}",
         "clock_source": "synology_system_monotonic",
     }
     with open(os.path.join(raw_dir, "environment.json"), "w", encoding="utf-8") as f:
@@ -279,6 +335,68 @@ def execute_run(run_spec, engine_binary, api_base="http://127.0.0.1:5885", eval_
         events_fp.write(json.dumps(ev) + "\n")
         events_fp.flush()
 
+    container_name = f"tgx-eval-runner-{run_id}"
+    subprocess.run(["sudo", "docker", "rm", "-f", container_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    # Launch Runner Container
+    print(f"[*] Spawning Runner Container: {container_name} on port {host_port}...")
+    serve_args = [
+        "sudo", "docker", "run", "-d",
+        "--name", container_name,
+        "-p", f"{host_port}:5000",
+        "-v", f"{os.path.abspath(engine_binary)}:/app/telegram-downloader:ro",
+        "-v", f"{output_dir}:/app/downloads",
+        "-v", f"{session_dir}:/data",
+        "-v", f"{log_dir}:/app/logs",
+        "--network", "tgx-eval-net",
+    ]
+    if engine == "tdl":
+        serve_args.extend(["-v", f"{temp_dir}:/app/temp/tdl"])
+    else:
+        serve_args.extend(["-v", f"{buffer_dir}:/app/buffer"])
+
+    serve_args.extend([
+        "alpine:latest",
+        "/app/telegram-downloader", "serve",
+        "--dir", "/app/downloads",
+        "--storage-path", "/data",
+        "--namespace", "default",
+        "--listen", "0.0.0.0:5000",
+        "--download-threads", str(net_concurrency),
+        "--file-concurrency", str(file_concurrency),
+        "--dc-pool-size", str(dc_pool_size),
+    ])
+    if engine == "tdl":
+        serve_args.extend(["--temp-dir", "/app/temp/tdl"])
+    else:
+        serve_args.extend(["--buffer-dir", "/app/buffer"])
+
+    res = subprocess.run(serve_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if res.returncode != 0:
+        raise RuntimeError(f"Failed to start container {container_name}: {res.stderr}")
+
+    api_base = f"http://127.0.0.1:{host_port}"
+
+    # Wait for daemon health
+    print(f"[*] Waiting for {container_name} to be ready at {api_base}/healthz...")
+    ready = False
+    for _ in range(30):
+        time.sleep(1)
+        try:
+            req = urllib.request.Request(f"{api_base}/healthz")
+            with urllib.request.urlopen(req, timeout=1) as resp:
+                if resp.status == 200:
+                    ready = True
+                    break
+        except Exception:
+            pass
+
+    if not ready:
+        p_logs = subprocess.run(["sudo", "docker", "logs", container_name], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        subprocess.run(["sudo", "docker", "rm", "-f", container_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        raise RuntimeError(f"Engine {engine} failed to start within 30s. Logs:\n{p_logs.stdout}")
+
+    print("[✓] Engine daemon is healthy and ready!")
     log_event("run.started", {"run_id": run_id, "cases_total": len(cases)})
 
     # Start 1s Metrics Sampler
@@ -289,7 +407,7 @@ def execute_run(run_spec, engine_binary, api_base="http://127.0.0.1:5885", eval_
     try:
         http_post(f"{api_base}/api/control", {"action": "pause"})
         log_event("daemon.paused")
-    except Exception as e:
+    except Exception:
         pass
 
     # Submit tasks
@@ -320,7 +438,7 @@ def execute_run(run_spec, engine_binary, api_base="http://127.0.0.1:5885", eval_
     try:
         http_post(f"{api_base}/api/control", {"action": "resume"})
         log_event("daemon.resumed")
-    except Exception as e:
+    except Exception:
         pass
 
     # Execute for duration_seconds
@@ -366,34 +484,29 @@ def execute_run(run_spec, engine_binary, api_base="http://127.0.0.1:5885", eval_
     events_fp.close()
     errors_fp.close()
 
-    # 6. Capture process logs
+    # Capture process logs
     with open(process_log_file, "w", encoding="utf-8") as f:
         f.write(f"=== Process Log for Run {run_id} ===\n")
         try:
-            p = subprocess.run(["docker", "logs", "--tail", "2000", f"tgx-eval-daemon"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=5)
+            p = subprocess.run(["sudo", "docker", "logs", "--tail", "2000", container_name], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=5)
             f.write(p.stdout)
         except Exception as e:
             f.write(f"Direct log capture: {e}\n")
 
-    # 7. raw/task_results.jsonl
+    # Teardown Container
+    subprocess.run(["sudo", "docker", "rm", "-f", container_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    # 7. raw/task_results.jsonl and raw/hashes.jsonl
     print("[*] Generating task_results.jsonl, file_inventory.jsonl, and hashes.jsonl...")
     task_results = []
     hashes_records = []
-    
-    # Files downloaded by daemon are placed in /volume2/docker/telegram_downloader_eval/downloads/<rel_path>
-    actual_downloads_root = "/volume2/docker/telegram_downloader_eval/downloads"
 
     for c in cases:
         case_id = c["case_id"]
         rel_path = c["expected_tgx_path"] if engine == "tgx" else c["expected_tdl_path"]
         expected_size = c["expected_size"]
         baseline_sha = c["baseline_sha256"]
-        
-        target_file = os.path.join(actual_downloads_root, rel_path)
-        if not os.path.exists(target_file):
-            alt = os.path.join(output_dir, rel_path)
-            if os.path.exists(alt):
-                target_file = alt
+        target_file = os.path.join(output_dir, rel_path)
 
         actual_size = os.path.getsize(target_file) if os.path.isfile(target_file) else 0
         actual_sha = compute_sha256(target_file) if os.path.isfile(target_file) else ""
@@ -552,10 +665,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="TGX Evaluation Protocol v1 Reference Harness")
     parser.add_argument("--run-spec", required=True, help="Path to run_spec.json")
     parser.add_argument("--engine-binary", required=True, help="Path to engine executable")
-    parser.add_argument("--api", default="http://127.0.0.1:5885")
+    parser.add_argument("--eval-dir", default="/volume2/docker/telegram_downloader_eval/evaluation")
+    parser.add_argument("--port", type=int, default=5890, help="Host port to bind runner container")
     args = parser.parse_args()
 
     with open(args.run_spec, "r", encoding="utf-8") as f:
         spec = json.load(f)
 
-    execute_run(spec, args.engine_binary, args.api)
+    execute_run(spec, args.engine_binary, eval_dir=args.eval_dir, host_port=args.port)

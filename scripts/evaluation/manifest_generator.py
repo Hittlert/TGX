@@ -75,25 +75,37 @@ def generate_profile_manifest(db_path, baseline_storage_root, profile_id, seed, 
         else:
             total_cases = 50
 
-    # Query stratified subsets directly from SQLite
+    max_per_group = max(2, int(total_cases * 0.20))
+    group_counts = {}
     selected_items = []
-    
+    seen_keys = set()
+
     def fetch_bucket_sample(low, high, needed):
-        if needed <= 0:
-            return []
+        if needed <= 0 or len(selected_items) >= total_cases:
+            return
         q = f"""
             SELECT chat_id, message_id, file_name, save_path, media_type, file_size, created_at
             FROM download_records
             WHERE status = 'success' AND file_size >= {low} AND ({f'file_size <= {high}' if high else '1=1'})
               AND save_path IS NOT NULL AND save_path != ''
             ORDER BY RANDOM()
-            LIMIT {needed * 4}
+            LIMIT {needed * 10}
         """
         cursor.execute(q)
         candidates = cursor.fetchall()
-        verified = []
+        
         for r in candidates:
+            if len(selected_items) >= total_cases:
+                break
             chat_id, msg_id, file_name, save_path, media_type, file_size, created_at = r
+            key = (str(chat_id), int(msg_id))
+            if key in seen_keys:
+                continue
+
+            gid = str(chat_id)
+            if group_counts.get(gid, 0) >= max_per_group:
+                continue
+
             clean_path = clean_relative_path(save_path)
             baseline_file = os.path.join(baseline_storage_root, clean_path)
             if not os.path.exists(baseline_file):
@@ -102,7 +114,10 @@ def generate_profile_manifest(db_path, baseline_storage_root, profile_id, seed, 
                     baseline_file = alt
                 else:
                     continue
-            verified.append({
+
+            seen_keys.add(key)
+            group_counts[gid] = group_counts.get(gid, 0) + 1
+            selected_items.append({
                 "chat_id": str(chat_id),
                 "message_id": int(msg_id),
                 "file_name": file_name or "",
@@ -113,60 +128,46 @@ def generate_profile_manifest(db_path, baseline_storage_root, profile_id, seed, 
                 "created_at": int(created_at),
                 "size_bucket": classify_bucket(file_size),
             })
-            if len(verified) >= needed:
+            if len(selected_items) >= needed:
                 break
-        return verified
 
     if profile_id == "P-S":
-        # micro: 20%, small_low: 25%, small_mid: 35%, small_high: 20%
-        selected_items.extend(fetch_bucket_sample(1, 65536, int(total_cases * 0.20)))
-        selected_items.extend(fetch_bucket_sample(65537, 262144, int(total_cases * 0.25)))
-        selected_items.extend(fetch_bucket_sample(262145, 921600, int(total_cases * 0.35)))
-        rem = total_cases - len(selected_items)
-        selected_items.extend(fetch_bucket_sample(921601, 1048576, rem))
+        # Target: 100 cases, small files (< 1MiB)
+        fetch_bucket_sample(1, 65536, int(total_cases * 0.20))
+        fetch_bucket_sample(65537, 262144, int(total_cases * 0.45))
+        fetch_bucket_sample(262145, 921600, int(total_cases * 0.80))
+        fetch_bucket_sample(921601, 1048576, total_cases)
 
     elif profile_id == "P-SM":
-        # small 80%, medium 20%
-        n_small = int(total_cases * 0.80)
-        n_med = total_cases - n_small
-        selected_items.extend(fetch_bucket_sample(65537, 1048576, n_small))
-        selected_items.extend(fetch_bucket_sample(1048577, 16777216, int(n_med * 0.50)))
-        rem = total_cases - len(selected_items)
-        selected_items.extend(fetch_bucket_sample(16777217, 134217728, rem))
+        # Target: 50 cases (80% small, 20% medium)
+        fetch_bucket_sample(65537, 1048576, int(total_cases * 0.80))
+        fetch_bucket_sample(1048577, 134217728, total_cases)
 
     elif profile_id == "P-LMS":
-        # small 80%, med 15%, large 5%
-        n_small = int(total_cases * 0.80)
-        n_med = int(total_cases * 0.15)
-        n_large = total_cases - n_small - n_med
-        selected_items.extend(fetch_bucket_sample(65537, 1048576, n_small))
-        selected_items.extend(fetch_bucket_sample(1048577, 134217728, n_med))
-        selected_items.extend(fetch_bucket_sample(268435456, None, n_large))
+        # Target: 50 cases (80% small, 15% medium, 5% large)
+        fetch_bucket_sample(65537, 1048576, int(total_cases * 0.80))
+        fetch_bucket_sample(1048577, 134217728, int(total_cases * 0.95))
+        fetch_bucket_sample(268435456, None, total_cases)
 
     elif profile_id == "P-L":
-        n_low = int(total_cases * 0.30)
-        n_mid = int(total_cases * 0.40)
-        n_high = total_cases - n_low - n_mid
-        selected_items.extend(fetch_bucket_sample(268435456, 536870912, n_low))
-        selected_items.extend(fetch_bucket_sample(536870913, 1073741824, n_mid))
-        selected_items.extend(fetch_bucket_sample(1073741825, None, n_high))
+        # Target: 20 cases (large files > 256MiB)
+        fetch_bucket_sample(268435456, 536870912, int(total_cases * 0.30))
+        fetch_bucket_sample(536870913, 1073741824, int(total_cases * 0.70))
+        fetch_bucket_sample(1073741825, None, total_cases)
 
-    # Diversity enforcement: max 20% from a single group
-    group_counts = {}
-    capped_selected = []
-    max_per_group = max(2, int(len(selected_items) * 0.20))
+    # If still below total_cases due to bucket constraints, fill from valid sizes
+    if len(selected_items) < total_cases:
+        low = 1 if profile_id == "P-S" else (268435456 if profile_id == "P-L" else 65537)
+        high = 1048576 if profile_id == "P-S" else None
+        fetch_bucket_sample(low, high, total_cases)
 
-    random.shuffle(selected_items)
-    for item in selected_items:
-        gid = item["chat_id"]
-        if group_counts.get(gid, 0) < max_per_group:
-            group_counts[gid] = group_counts.get(gid, 0) + 1
-            capped_selected.append(item)
-
-    # Compute SHA256 baseline hashes
-    print(f"[*] Calculating baseline SHA256 for {len(capped_selected)} selected cases...")
+    # Compute baseline SHA256
+    print(f"[*] Calculating baseline SHA256 for {len(selected_items)} selected cases...")
     manifest_records = []
-    for idx, item in enumerate(capped_selected, 1):
+    bucket_counts = {}
+    for idx, item in enumerate(selected_items, 1):
+        b = item["size_bucket"]
+        bucket_counts[b] = bucket_counts.get(b, 0) + 1
         sha = compute_sha256(item["baseline_path"])
         rec = {
             "case_id": f"{profile_id}-{idx:04d}",
@@ -185,6 +186,11 @@ def generate_profile_manifest(db_path, baseline_storage_root, profile_id, seed, 
             "sample_seed": seed,
         }
         manifest_records.append(rec)
+
+    total_expected_bytes = sum(r["expected_size"] for r in manifest_records)
+    print(f"[*] Profile {profile_id} Manifest Generated: {len(manifest_records)} cases, Total bytes: {total_expected_bytes / (1024*1024):.2f} MiB")
+    print(f"[*] Bucket Distribution: {bucket_counts}")
+    print(f"[*] Group Diversity: {len(group_counts)} distinct groups, Max per group: {max(group_counts.values()) if group_counts else 0}")
 
     os.makedirs(os.path.dirname(os.path.abspath(output_file)), exist_ok=True)
     with open(output_file, "w", encoding="utf-8") as f:
