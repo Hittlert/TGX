@@ -318,7 +318,20 @@ func GetMessagesBatch(ctx context.Context, c *tg.Client, peer tg.InputPeerClass,
 			if err != nil {
 				return nil, err
 			}
-			if msgs, ok := res.(*tg.MessagesChannelMessages); ok {
+			switch msgs := res.(type) {
+			case *tg.MessagesChannelMessages:
+				for _, mClass := range msgs.Messages {
+					if m, ok := mClass.(*tg.Message); ok {
+						result[m.ID] = m
+					}
+				}
+			case *tg.MessagesMessagesSlice:
+				for _, mClass := range msgs.Messages {
+					if m, ok := mClass.(*tg.Message); ok {
+						result[m.ID] = m
+					}
+				}
+			case *tg.MessagesMessages:
 				for _, mClass := range msgs.Messages {
 					if m, ok := mClass.(*tg.Message); ok {
 						result[m.ID] = m

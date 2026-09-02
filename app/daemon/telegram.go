@@ -172,6 +172,11 @@ func (a *telegramMediaAccess) Resolve(ctx context.Context, peer string, messageI
 				a.msgCache[k] = messageCacheEntry{msg: msg, expires: now.Add(60 * time.Second)}
 			}
 		}
+		if _, exists := a.msgCache[cacheKey]; !exists {
+			if singleMsg, sErr := tutil.GetSingleMessage(fetchCtx, a.pool.Default(fetchCtx), resolvedPeer.InputPeer(), messageID); sErr == nil && singleMsg != nil {
+				a.msgCache[cacheKey] = messageCacheEntry{msg: singleMsg, expires: now.Add(60 * time.Second)}
+			}
+		}
 		a.msgMu.Unlock()
 		return nil, nil
 	})
