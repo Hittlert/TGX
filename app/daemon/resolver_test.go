@@ -21,8 +21,8 @@ func (a *fakeMediaAccess) Resolve(_ context.Context, peer string, _ int) (Resolv
 
 func TestNormalizePeer(t *testing.T) {
 	for input, want := range map[string]string{
-		"-1001234567890": "1234567890",
-		"-12345":         "12345",
+		"-1001234567890": "-1001234567890",
+		"-12345":         "-12345",
 		"@username":      "username",
 		"username":       "username",
 		" 123 ":          "123",
@@ -63,8 +63,8 @@ func TestResolverPreparesMediaAndExactExistingFile(t *testing.T) {
 	if !ok || path != request.FinalPath {
 		t.Fatalf("existing result: path=%q ok=%v", path, ok)
 	}
-	if access.peers[0] != "1234567890" {
-		t.Fatalf("peer was not normalized: %#v", access.peers)
+	if access.peers[0] != request.Peer {
+		t.Fatalf("peer was not preserved: %#v", access.peers)
 	}
 	snapshot := task.Snapshot()
 	if snapshot.FileName != "file.bin" || snapshot.TotalSize != 4 || snapshot.DCID != 5 {
