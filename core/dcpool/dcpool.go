@@ -3,6 +3,7 @@ package dcpool
 import (
 	"context"
 	"fmt"
+	"io"
 	"sync"
 	"time"
 
@@ -29,6 +30,7 @@ type Pool interface {
 	Client(ctx context.Context, dc int) *tg.Client
 	Takeout(ctx context.Context, dc int) *tg.Client
 	Default(ctx context.Context) *tg.Client
+	CDN(ctx context.Context, dc int, max int64) (tg.Invoker, io.Closer, error)
 	Close() error
 }
 
@@ -236,3 +238,15 @@ func (p *pool) Takeout(ctx context.Context, dc int) *tg.Client {
 
 	return tg.NewClient(chainMiddlewares(p.invoker(ctx, dc), takeout.Middleware(takeoutID)))
 }
+
+func (p *pool) CDN(ctx context.Context, dc int, max int64) (tg.Invoker, io.Closer, error) {
+	if p.api == nil {
+		return nil, nil, fmt.Errorf("api client is nil")
+	}
+	closeInvoker, err := p.api.CDN(ctx, dc, max)
+	if err != nil {
+		return nil, nil, err
+	}
+	return closeInvoker, closeInvoker, nil
+}
+

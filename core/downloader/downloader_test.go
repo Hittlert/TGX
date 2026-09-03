@@ -190,6 +190,9 @@ func (p *fakePool) Takeout(ctx context.Context, dc int) *tg.Client {
 func (p *fakePool) Default(ctx context.Context) *tg.Client {
 	return tg.NewClient(p.invoker)
 }
+func (p *fakePool) CDN(ctx context.Context, dc int, max int64) (tg.Invoker, io.Closer, error) {
+	return p.invoker, io.NopCloser(nil), nil
+}
 func (p *fakePool) Close() error { return nil }
 
 func TestDownloader_InterleavingAndDecoupledWrite(t *testing.T) {
@@ -288,16 +291,19 @@ func (p *shortReadPool) Takeout(ctx context.Context, dc int) *tg.Client {
 func (p *shortReadPool) Default(ctx context.Context) *tg.Client {
 	return tg.NewClient(p.invoker)
 }
+func (p *shortReadPool) CDN(ctx context.Context, dc int, max int64) (tg.Invoker, io.Closer, error) {
+	return p.invoker, io.NopCloser(nil), nil
+}
 func (p *shortReadPool) Close() error { return nil }
 
 func TestDownloader_ShortReadValidationAndAutoRetry(t *testing.T) {
 	invoker := &shortReadInvoker{}
 	pool := &shortReadPool{invoker: invoker}
 
-	// 1 File with 2 parts (2MB)
+	// 1 File with 2 parts (1MB)
 	elem := &fakeElem{
-		file: &fakeFile{size: 2 * 1024 * 1024, dc: 4},
-		buf:  newMemWriterAt(2 * 1024 * 1024),
+		file: &fakeFile{size: 1024 * 1024, dc: 4},
+		buf:  newMemWriterAt(1024 * 1024),
 	}
 
 	iter := &fakeIter{elems: []*fakeElem{elem}}
@@ -1188,6 +1194,9 @@ func (p *fakeDualPool) Takeout(ctx context.Context, dc int) *tg.Client {
 }
 func (p *fakeDualPool) Default(ctx context.Context) *tg.Client {
 	return tg.NewClient(p.master)
+}
+func (p *fakeDualPool) CDN(ctx context.Context, dc int, max int64) (tg.Invoker, io.Closer, error) {
+	return p.cdn, io.NopCloser(nil), nil
 }
 func (p *fakeDualPool) Close() error { return nil }
 

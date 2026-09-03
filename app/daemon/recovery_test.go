@@ -3,330 +3,135 @@ package daemon
 import (
 	"context"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/hex"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
-	_ "modernc.org/sqlite"
 )
 
-func setupTestDB(t *testing.T) *sql.DB {
-	db, err := sql.Open("sqlite", ":memory:")
+func TestReconcileOnStartup_Matrix(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "rec.db")
+	db, err := NewDatabase(dbPath)
 	require.NoError(t, err)
-	db.SetMaxOpenConns(1)
-
-	_, err = db.Exec(`
-		CREATE TABLE download_records (
-			chat_id TEXT NOT NULL,
-			message_id INTEGER NOT NULL,
-			status TEXT NOT NULL,
-			file_name TEXT,
-			save_path TEXT,
-			media_type TEXT,
-			file_size INTEGER,
-			error TEXT,
-			attempts INTEGER NOT NULL DEFAULT 0,
-			next_retry_at INTEGER NOT NULL DEFAULT 0,
-			downloaded_at INTEGER,
-			created_at INTEGER NOT NULL DEFAULT 0,
-			updated_at INTEGER NOT NULL DEFAULT 0,
-			PRIMARY KEY (chat_id, message_id)
-		);
-		CREATE TABLE IF NOT EXISTS target_commits (
-			task_id TEXT NOT NULL,
-			generation TEXT NOT NULL,
-			final_path TEXT NOT NULL,
-			expected_size INTEGER NOT NULL,
-			expected_sha256 TEXT NOT NULL,
-			committed_sha256 TEXT NOT NULL,
-			state TEXT NOT NULL,
-			version INTEGER NOT NULL DEFAULT 1,
-			updated_at INTEGER NOT NULL,
-			PRIMARY KEY (task_id, generation)
-		);
-	`)
-	require.NoError(t, err)
-	return db
-}
-
-func TestReconciler_PromotesExistingFileToSuccess(t *testing.T) {
-	db := setupTestDB(t)
 	defer db.Close()
 
-	outDir := t.TempDir()
-	tempDir := t.TempDir()
+	ssdDir := filepath.Join(tempDir, "ssd")
+	archiveDir := filepath.Join(tempDir, "archive")
+	require.NoError(t, os.MkdirAll(ssdDir, 0o755))
+	require.NoError(t, os.MkdirAll(archiveDir, 0o755))
 
-	// Final file exists with exact size
-	finalPath := filepath.Join(outDir, "test.mp4")
-	data := []byte("data")
-	require.NoError(t, os.WriteFile(finalPath, data, 0644))
+	logger := zap.NewNop()
+	now := time.Now().Unix()
 
-	sum := sha256.Sum256(data)
-	shaHex := hex.EncodeToString(sum[:])
-
-	_, err := db.Exec(`INSERT INTO target_commits (task_id, generation, final_path, expected_size, expected_sha256, committed_sha256, state, updated_at) VALUES ('123:1', '1', 'test.mp4', 4, ?, ?, 'committed', ?)`, shaHex, shaHex, time.Now().Unix())
+	// Case 1: downloading + .part exists + no final -> delete .part, reset to pending
+	case1Rel := "chat1/file1.mp4"
+	case1Final := filepath.Join(ssdDir, case1Rel)
+	case1Part := case1Final + ".part"
+	require.NoError(t, os.MkdirAll(filepath.Dir(case1Part), 0o755))
+	require.NoError(t, os.WriteFile(case1Part, []byte("partial"), 0o644))
+	_, err = db.Execute(`
+		INSERT INTO download_records (chat_id, message_id, status, save_path, file_size, created_at, updated_at)
+		VALUES ('1', 1, 'downloading', ?, 100, ?, ?)
+	`, case1Rel, now, now)
 	require.NoError(t, err)
 
-	_, err = db.Exec(`INSERT INTO download_records (chat_id, message_id, status, file_name, save_path, file_size) VALUES ('123', 1, 'downloading', 'test.mp4', 'test.mp4', 4)`)
+	// Case 2: downloading + final exists with matching size/sha -> success
+	case2Rel := "chat2/file2.mp4"
+	case2Final := filepath.Join(ssdDir, case2Rel)
+	require.NoError(t, os.MkdirAll(filepath.Dir(case2Final), 0o755))
+	case2Payload := []byte("complete file 2 data")
+	require.NoError(t, os.WriteFile(case2Final, case2Payload, 0o644))
+	case2SHA := hex.EncodeToString(func() []byte { h := sha256.Sum256(case2Payload); return h[:] }())
+	_, err = db.Execute(`
+		INSERT INTO download_records (chat_id, message_id, status, save_path, file_size, sha256, created_at, updated_at)
+		VALUES ('2', 2, 'downloading', ?, ?, ?, ?, ?)
+	`, case2Rel, int64(len(case2Payload)), case2SHA, now, now)
 	require.NoError(t, err)
 
-	r := NewReconcilerWithBuffer(db, outDir, tempDir, "memory", nil, zap.NewNop())
-	results, err := r.ReconcileAll(context.Background())
-	require.NoError(t, err)
-	require.Equal(t, 1, len(results))
-
-	assert.Equal(t, "success", results[0].NextState)
-	assert.Equal(t, "FINAL_FILE_COMMITTED_PROMOTED_TO_SUCCESS", results[0].ActionTaken)
-
-	var newStatus string
-	err = db.QueryRow(`SELECT status FROM download_records WHERE chat_id = '123' AND message_id = 1`).Scan(&newStatus)
-	require.NoError(t, err)
-	assert.Equal(t, "success", newStatus)
-}
-
-func TestReconciler_MemoryBufferVolatileReset(t *testing.T) {
-	db := setupTestDB(t)
-	defer db.Close()
-
-	outDir := t.TempDir()
-	tempDir := t.TempDir()
-
-	_, err := db.Exec(`INSERT INTO download_records (chat_id, message_id, status, file_name, save_path, file_size) VALUES ('123', 2, 'downloading', 'missing.mp4', 'missing.mp4', 100)`)
+	// Case 3: committing + .part exists with matching sha -> atomic rename to final -> success
+	case3Rel := "chat3/file3.mp4"
+	case3Final := filepath.Join(ssdDir, case3Rel)
+	case3Part := case3Final + ".part"
+	require.NoError(t, os.MkdirAll(filepath.Dir(case3Part), 0o755))
+	case3Payload := []byte("committing part file 3 data")
+	require.NoError(t, os.WriteFile(case3Part, case3Payload, 0o644))
+	case3SHA := hex.EncodeToString(func() []byte { h := sha256.Sum256(case3Payload); return h[:] }())
+	_, err = db.Execute(`
+		INSERT INTO download_records (chat_id, message_id, status, save_path, file_size, sha256, created_at, updated_at)
+		VALUES ('3', 3, 'committing', ?, ?, ?, ?, ?)
+	`, case3Rel, int64(len(case3Payload)), case3SHA, now, now)
 	require.NoError(t, err)
 
-	r := NewReconcilerWithBuffer(db, outDir, tempDir, "memory", nil, zap.NewNop())
-	results, err := r.ReconcileAll(context.Background())
-	require.NoError(t, err)
-	require.Equal(t, 1, len(results))
-
-	assert.Equal(t, "pending", results[0].NextState)
-	assert.Equal(t, "MEMORY_BUFFER_VOLATILE_RESET_TO_PENDING", results[0].ActionTaken)
-
-	var newStatus string
-	err = db.QueryRow(`SELECT status FROM download_records WHERE chat_id = '123' AND message_id = 2`).Scan(&newStatus)
-	require.NoError(t, err)
-	assert.Equal(t, "pending", newStatus)
-}
-
-func TestTask_StaleAttemptCannotTerminateNewAttempt(t *testing.T) {
-	r := NewRegistry(10, 100, time.Now)
-	req := TaskRequest{ID: "chat1:100", Peer: "chat1", MessageID: 100, FinalPath: "chat1/file.bin", ExpectedSize: 1024}
-
-	// 1. Submit first attempt (Gen = "1")
-	_, ok, err := r.Submit(req)
-	require.NoError(t, err)
-	require.True(t, ok)
-
-	task1, err := r.Next(context.Background())
-	require.NoError(t, err)
-	require.Equal(t, "1", task1.AttemptGen())
-
-	// Simulate task1 failure
-	task1.Fail("test_error", "network drop", false)
-	snap1 := task1.Snapshot()
-	assert.Equal(t, StateFailed, snap1.State)
-
-	// 2. Retry task -> creates new attempt with Gen = "retry_..."
-	req.Retry = true
-	_, ok, err = r.Submit(req)
-	require.NoError(t, err)
-	require.True(t, ok)
-
-	task2, err := r.Next(context.Background())
-	require.NoError(t, err)
-	require.NotEqual(t, "1", task2.AttemptGen())
-	assert.Equal(t, StateResolving, task2.Snapshot().State)
-
-	// 3. Late sibling call from old task1 object: should be rejected
-	task1.Succeed("some/path", false)
-
-	// Verify task2 was NOT terminated by stale task1 call
-	snap2 := task2.Snapshot()
-	assert.Equal(t, StateResolving, snap2.State)
-	assert.False(t, task2.IsTerminal())
-}
-
-func TestTask_ImmutableAttemptPointers(t *testing.T) {
-	r := NewRegistry(10, 100, time.Now)
-	req1 := TaskRequest{ID: "chat1:100", Peer: "chat1", MessageID: 100, FinalPath: "chat1/file1.bin", ExpectedSize: 1024}
-
-	// 1. Submit first attempt
-	_, ok, err := r.Submit(req1)
-	require.NoError(t, err)
-	require.True(t, ok)
-
-	task1, err := r.Next(context.Background())
-	require.NoError(t, err)
-	require.Equal(t, "1", task1.AttemptGen())
-
-	// Fail attempt 1
-	task1.Fail("error", "net drop", false)
-	require.True(t, task1.IsTerminal())
-	require.Error(t, task1.Context().Err())
-
-	// 2. Submit retry
-	req1.Retry = true
-	_, ok, err = r.Submit(req1)
-	require.NoError(t, err)
-	require.True(t, ok)
-
-	task2, err := r.Next(context.Background())
-	require.NoError(t, err)
-	require.NotEqual(t, "1", task2.AttemptGen())
-	require.NoError(t, task2.Context().Err())
-
-	// 3. Verify task1 still holds old canceled context and old request
-	require.Error(t, task1.Context().Err())
-	require.Equal(t, StateFailed, task1.Snapshot().State)
-	require.Equal(t, StateResolving, task2.Snapshot().State)
-}
-
-func TestOrchestrator_StartupRecoveryCallbackUpdatesDB(t *testing.T) {
-	db := setupTestDB(t)
-	defer db.Close()
-
-	outDir := t.TempDir()
-
-	_, err := db.Exec(`INSERT INTO download_records (chat_id, message_id, status, file_name, save_path, file_size) VALUES ('123', 99, 'moving', 'rec.bin', 'rec.bin', 1024)`)
+	// Case 4: archive copying + .moving exists, no archive final -> delete .moving, state pending
+	case4Rel := "chat4/file4.mp4"
+	case4DstFinal := filepath.Join(archiveDir, case4Rel)
+	case4DstMoving := case4DstFinal + ".moving"
+	require.NoError(t, os.MkdirAll(filepath.Dir(case4DstMoving), 0o755))
+	require.NoError(t, os.WriteFile(case4DstMoving, []byte("moving data"), 0o644))
+	_, err = db.Execute(`
+		INSERT INTO archive_jobs (chat_id, message_id, relative_path, expected_size, sha256, state, attempts, next_retry_at, created_at, updated_at)
+		VALUES ('4', 4, ?, 100, 'sha', 'copying', 0, 0, ?, ?)
+	`, case4Rel, now, now)
 	require.NoError(t, err)
 
-	r := NewRegistry(10, 100, time.Now)
-	// Register recovered task into Registry
-	r.RegisterRecoveredTask("123:99", "1", "rec.bin", 1024)
-
-	// Callback logic
-	completeCallback := func(taskID, gen, finalPath, shaHash string) {
-		res := r.FinishTask(taskID, gen, StateSuccess, "", "", finalPath, false, shaHash)
-		if res == FinishAcceptedNewTerminal {
-			parts := strings.Split(taskID, ":")
-			if len(parts) == 2 {
-				_, _ = db.Exec(`UPDATE download_records SET status = 'success' WHERE chat_id = ? AND message_id = ?`, parts[0], 99)
-			}
-		}
-	}
-
-	completeCallback("123:99", "1", filepath.Join(outDir, "rec.bin"), "dummy_sha")
-
-	var status string
-	err = db.QueryRow(`SELECT status FROM download_records WHERE chat_id = '123' AND message_id = 99`).Scan(&status)
-	require.NoError(t, err)
-	assert.Equal(t, "success", status)
-}
-
-func TestOrchestrator_RejectsConflictingAndStaleCallbacks(t *testing.T) {
-	r := NewRegistry(10, 100, time.Now)
-	req := TaskRequest{ID: "chat1:50", Peer: "chat1", MessageID: 50, FinalPath: "file.bin", ExpectedSize: 100}
-	_, _, _ = r.Submit(req)
-	_, _ = r.Next(context.Background())
-
-	// 1. Stale generation callback: rejected
-	res := r.FinishTask("chat1:50", "stale_gen", StateSuccess, "", "", "file.bin", false, "sha")
-	assert.Equal(t, FinishRejectedStale, res)
-
-	// 2. Valid first terminal callback: accepted
-	res = r.FinishTask("chat1:50", "1", StateSuccess, "", "", "file.bin", false, "sha")
-	assert.Equal(t, FinishAcceptedNewTerminal, res)
-
-	// 3. Duplicate same terminal callback: already same terminal
-	res = r.FinishTask("chat1:50", "1", StateSuccess, "", "", "file.bin", false, "sha")
-	assert.Equal(t, FinishAlreadySameTerminal, res)
-
-	// 4. Conflicting callback: conflicting terminal
-	res = r.FinishTask("chat1:50", "1", StateFailed, "err", "msg", "", false, "")
-	assert.Equal(t, FinishConflictingTerminal, res)
-
-	// 5. Unknown task: not found
-	res = r.FinishTask("unknown:999", "1", StateSuccess, "", "", "file.bin", false, "sha")
-	assert.Equal(t, FinishNotFound, res)
-}
-
-func TestRecovery_UnfreezesCanceledFailedTasks(t *testing.T) {
-	db := setupTestDB(t)
-	defer db.Close()
-
-	outDir := t.TempDir()
-	tempDir := t.TempDir()
-
-	// Insert record that failed due to shutdown cancellation with attempts=4 and next_retry_at 7 days out
-	futureRetry := time.Now().Add(7 * 24 * time.Hour).Unix()
-	_, err := db.Exec(`INSERT INTO download_records (chat_id, message_id, status, file_name, save_path, file_size, error, attempts, next_retry_at) VALUES ('-1002313319912', 101, 'failed', 'video.mp4', 'video.mp4', 50000000, 'context canceled', 4, ?)`, futureRetry)
+	// Case 5: archive copying + archive final exists & verified -> mark archived, delete SSD duplicate
+	case5Rel := "chat5/file5.mp4"
+	case5SSDFinal := filepath.Join(ssdDir, case5Rel)
+	case5ArcFinal := filepath.Join(archiveDir, case5Rel)
+	require.NoError(t, os.MkdirAll(filepath.Dir(case5SSDFinal), 0o755))
+	require.NoError(t, os.MkdirAll(filepath.Dir(case5ArcFinal), 0o755))
+	case5Payload := []byte("verified archive file 5")
+	require.NoError(t, os.WriteFile(case5SSDFinal, case5Payload, 0o644))
+	require.NoError(t, os.WriteFile(case5ArcFinal, case5Payload, 0o644))
+	case5SHA := hex.EncodeToString(func() []byte { h := sha256.Sum256(case5Payload); return h[:] }())
+	_, err = db.Execute(`
+		INSERT INTO archive_jobs (chat_id, message_id, relative_path, expected_size, sha256, state, attempts, next_retry_at, created_at, updated_at)
+		VALUES ('5', 5, ?, ?, ?, 'copying', 0, 0, ?, ?)
+	`, case5Rel, int64(len(case5Payload)), case5SHA, now, now)
 	require.NoError(t, err)
 
-	reconciler := NewReconcilerWithBuffer(db, outDir, tempDir, "memory", nil, zap.NewNop())
-	results, err := reconciler.ReconcileAll(context.Background())
-	require.NoError(t, err)
-	require.Equal(t, 1, len(results))
-	assert.Equal(t, "pending", results[0].NextState)
-
-	// Verify DB record is reset to pending with attempts=0 and next_retry_at=0
-	var status string
-	var attempts int
-	var nextRetry int64
-	err = db.QueryRow(`SELECT status, attempts, next_retry_at FROM download_records WHERE chat_id = '-1002313319912' AND message_id = 101`).Scan(&status, &attempts, &nextRetry)
-	require.NoError(t, err)
-	assert.Equal(t, "pending", status)
-	assert.Equal(t, 0, attempts)
-	assert.Equal(t, int64(0), nextRetry)
-}
-
-func TestDatabase_UpdateDownloadStatus_ContextCanceledDoesNotIncrementAttemptsOrFreeze(t *testing.T) {
-	rawDB := setupTestDB(t)
-	defer rawDB.Close()
-
-	d := &Database{db: rawDB}
-
-	// Insert initial record
-	_, err := rawDB.Exec(`INSERT INTO download_records (chat_id, message_id, status, file_name, save_path, file_size, attempts) VALUES ('chat1', 10, 'downloading', 'file.bin', 'file.bin', 1024, 0)`)
+	// Run startup reconciliation
+	err = ReconcileOnStartup(context.Background(), db, ssdDir, archiveDir, logger)
 	require.NoError(t, err)
 
-	// Simulate shutdown / context cancellation
-	err = d.UpdateDownloadStatus("chat1", 10, "failed", "file.bin", "file.bin", "", 1024, "context canceled")
-	require.NoError(t, err)
+	// Verify Case 1: .part deleted, status is pending
+	_, err = os.Stat(case1Part)
+	assert.True(t, os.IsNotExist(err), "case 1 part file should be deleted")
+	var status1 string
+	_ = db.db.QueryRow(`SELECT status FROM download_records WHERE chat_id = '1' AND message_id = 1`).Scan(&status1)
+	assert.Equal(t, "pending", status1)
 
-	// Verify status became 'pending', attempts remains 0, next_retry_at is 0
-	var status string
-	var attempts int
-	var nextRetry int64
-	err = rawDB.QueryRow(`SELECT status, attempts, next_retry_at FROM download_records WHERE chat_id = 'chat1' AND message_id = 10`).Scan(&status, &attempts, &nextRetry)
-	require.NoError(t, err)
-	assert.Equal(t, "pending", status)
-	assert.Equal(t, 0, attempts)
-	assert.Equal(t, int64(0), nextRetry)
-}
+	// Verify Case 2: status is success
+	var status2 string
+	_ = db.db.QueryRow(`SELECT status FROM download_records WHERE chat_id = '2' AND message_id = 2`).Scan(&status2)
+	assert.Equal(t, "success", status2)
 
-func TestVerifyFinalFileIdentity_CalculatesSHA256(t *testing.T) {
-	tempDir := t.TempDir()
-	finalPath := filepath.Join(tempDir, "verified.bin")
-	data := []byte("hello world 1234567890")
-	require.NoError(t, os.WriteFile(finalPath, data, 0644))
+	// Verify Case 3: .part renamed to final, status is success
+	_, err = os.Stat(case3Part)
+	assert.True(t, os.IsNotExist(err), "case 3 part file should be renamed")
+	_, err = os.Stat(case3Final)
+	assert.NoError(t, err, "case 3 final file must exist")
+	var status3 string
+	_ = db.db.QueryRow(`SELECT status FROM download_records WHERE chat_id = '3' AND message_id = 3`).Scan(&status3)
+	assert.Equal(t, "success", status3)
 
-	sum := sha256.Sum256(data)
-	expectedSHA := hex.EncodeToString(sum[:])
+	// Verify Case 4: .moving deleted, state is pending
+	_, err = os.Stat(case4DstMoving)
+	assert.True(t, os.IsNotExist(err), "case 4 moving file should be deleted")
+	var state4 string
+	_ = db.db.QueryRow(`SELECT state FROM archive_jobs WHERE chat_id = '4' AND message_id = 4`).Scan(&state4)
+	assert.Equal(t, "pending", state4)
 
-	// 1. Exact size and empty expectedSHA -> returns computed SHA
-	sha, err := verifyFinalFileIdentity(finalPath, int64(len(data)), "", "task-1")
-	assert.NoError(t, err)
-	assert.Equal(t, expectedSHA, sha)
-
-	// 2. Exact size and matching expectedSHA -> returns computed SHA
-	sha, err = verifyFinalFileIdentity(finalPath, int64(len(data)), expectedSHA, "task-1")
-	assert.NoError(t, err)
-	assert.Equal(t, expectedSHA, sha)
-
-	// 3. Mismatching expectedSHA -> returns error
-	_, err = verifyFinalFileIdentity(finalPath, int64(len(data)), "wrong_sha", "task-1")
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "content conflict")
-
-	// 4. Size mismatch -> returns error
-	_, err = verifyFinalFileIdentity(finalPath, int64(len(data))+1, "", "task-1")
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "size mismatch")
+	// Verify Case 5: state is archived, SSD duplicate deleted
+	var state5 string
+	_ = db.db.QueryRow(`SELECT state FROM archive_jobs WHERE chat_id = '5' AND message_id = 5`).Scan(&state5)
+	assert.Equal(t, "archived", state5)
+	_, err = os.Stat(case5SSDFinal)
+	assert.True(t, os.IsNotExist(err), "case 5 SSD duplicate must be deleted after archive verified")
 }

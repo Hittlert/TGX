@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -11,23 +12,21 @@ import (
 	"github.com/flytam/filenamify"
 	"go.uber.org/zap"
 
-	"github.com/Hittlert/TGX/core/downloader"
-	atomic "github.com/Hittlert/TGX/pkg/sbe/atomic"
-	"github.com/Hittlert/TGX/pkg/spool"
-	"github.com/Hittlert/TGX/pkg/writeback"
+	"github.com/Hittlert/TGX/core/transfer"
+	"github.com/Hittlert/TGX/internal/fscommit"
 )
 
+// Orchestrator coordinates active download admissions, direct SSD writing, and archive handoff.
 type Orchestrator struct {
-	db           *Database
-	slotPool     *GlobalSlotPool
-	proxyManager *ProxyManager
-	access       TelegramAccess
-	registry     *Registry
-	logger       *zap.Logger
-	saveDir      string
-	bufferDir    string
-	spool        spool.Store
-	wbSink       *writeback.TargetSink
+	db            *Database
+	transferMgr   *transfer.TransferManager
+	ssdAdmission  *fscommit.SSDAdmission
+	archiveWorker *ArchiveWorker
+	proxyManager  *ProxyManager
+	access        TelegramAccess
+	registry      *Registry
+	logger        *zap.Logger
+	saveDir       string
 
 	runningMu   sync.Mutex
 	running     bool
@@ -35,10 +34,21 @@ type Orchestrator struct {
 	taskCancels sync.Map
 }
 
-func NewOrchestrator(db *Database, slotPool *GlobalSlotPool, proxyManager *ProxyManager, access TelegramAccess, registry *Registry, logger *zap.Logger, saveDir string) *Orchestrator {
+// NewOrchestrator creates a new direct-SSD download orchestrator.
+func NewOrchestrator(
+	db *Database,
+	transferMgr *transfer.TransferManager,
+	ssdAdmission *fscommit.SSDAdmission,
+	proxyManager *ProxyManager,
+	access TelegramAccess,
+	registry *Registry,
+	logger *zap.Logger,
+	saveDir string,
+) *Orchestrator {
 	return &Orchestrator{
 		db:           db,
-		slotPool:     slotPool,
+		transferMgr:  transferMgr,
+		ssdAdmission: ssdAdmission,
 		proxyManager: proxyManager,
 		access:       access,
 		registry:     registry,
@@ -48,18 +58,12 @@ func NewOrchestrator(db *Database, slotPool *GlobalSlotPool, proxyManager *Proxy
 	}
 }
 
-func (o *Orchestrator) SetSpool(s spool.Store) {
-	o.spool = s
+// SetArchiveWorker binds the single asynchronous archive worker.
+func (o *Orchestrator) SetArchiveWorker(w *ArchiveWorker) {
+	o.archiveWorker = w
 }
 
-func (o *Orchestrator) SetTargetSink(sink *writeback.TargetSink) {
-	o.wbSink = sink
-}
-
-func (o *Orchestrator) SetBufferDir(dir string) {
-	o.bufferDir = dir
-}
-
+// Start launches the background orchestrator loops.
 func (o *Orchestrator) Start(ctx context.Context) {
 	go o.scanLoop(ctx)
 	go o.dispatchLoop(ctx)
@@ -86,6 +90,7 @@ func (o *Orchestrator) metricsLoop(ctx context.Context) {
 	}
 }
 
+// OutputDir returns the SSD download directory.
 func (o *Orchestrator) OutputDir() string {
 	if o == nil {
 		return "."
@@ -93,18 +98,28 @@ func (o *Orchestrator) OutputDir() string {
 	return o.saveDir
 }
 
+// IsRunning returns true if the orchestrator is accepting and dispatching tasks.
 func (o *Orchestrator) IsRunning() bool {
 	o.runningMu.Lock()
 	defer o.runningMu.Unlock()
 	return o.running
 }
 
+// SetRunning updates the running state.
 func (o *Orchestrator) SetRunning(running bool) {
 	o.runningMu.Lock()
 	defer o.runningMu.Unlock()
 	o.running = running
 }
 
+// CancelTasksByChatID cancels running tasks for the given chat ID.
+func (o *Orchestrator) CancelTasksByChatID(chatID string) {
+	if o.registry != nil {
+		o.registry.CancelTasksByChatID(chatID)
+	}
+}
+
+// TriggerStreamDispatch processes a new incoming update record immediately.
 func (o *Orchestrator) TriggerStreamDispatch(ctx context.Context, record DownloadRecord) {
 	if !o.IsRunning() {
 		return
@@ -113,7 +128,7 @@ func (o *Orchestrator) TriggerStreamDispatch(ctx context.Context, record Downloa
 }
 
 func (o *Orchestrator) scanLoop(ctx context.Context) {
-	ticker := time.NewTicker(60 * time.Second)
+	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
 	for {
@@ -142,7 +157,7 @@ func (o *Orchestrator) scanLoop(ctx context.Context) {
 }
 
 func (o *Orchestrator) dispatchLoop(ctx context.Context) {
-	ticker := time.NewTicker(200 * time.Millisecond)
+	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
@@ -156,20 +171,8 @@ func (o *Orchestrator) dispatchLoop(ctx context.Context) {
 			continue
 		}
 
-		availableSlots := o.slotPool.Snapshot().AvailableSlots
-		if availableSlots <= 0 {
-			continue
-		}
-
-		limit := availableSlots * 2
-		if limit < 10 {
-			limit = 10
-		}
-		if limit > 50 {
-			limit = 50
-		}
-
-		records, err := o.db.GetPendingDownloads(limit)
+		// Concurrency check based on active file slots
+		records, err := o.db.GetPendingDownloads(32)
 		if err != nil {
 			o.logger.Error("failed to get pending downloads", zap.Error(err))
 			continue
@@ -185,8 +188,6 @@ func (o *Orchestrator) dispatchLoop(ctx context.Context) {
 			}
 			o.dispatchOneRecord(ctx, record)
 		}
-
-		time.Sleep(100 * time.Millisecond)
 	}
 }
 
@@ -207,45 +208,59 @@ func (o *Orchestrator) dispatchOneRecord(ctx context.Context, record DownloadRec
 			o.inFlight.Delete(taskID)
 		}()
 
-		// 1. Target Disk Guard
-		freeSpace, _, err := atomic.GetDiskSpace(o.saveDir)
-		if err == nil && (freeSpace < 5*1024*1024*1024 || (record.FileSize > 0 && freeSpace < uint64(record.FileSize)+500*1024*1024)) {
-			o.logger.Warn("⚠️ [Disk Guard] Insufficient target disk space, postponing task",
+		// 1. SSD Space Admission Check (real free space check & reservation)
+		releaseSSD, err := o.ssdAdmission.Reserve(taskID, record.FileSize)
+		if err != nil {
+			o.logger.Warn("⚠️ [SSD Admission] Insufficient SSD space, postponing task",
 				zap.String("task_id", taskID),
-				zap.Uint64("free_bytes", freeSpace),
-				zap.Int64("required_bytes", record.FileSize),
+				zap.Error(err),
 			)
-			_ = o.db.UpdateDownloadStatus(record.ChatID, record.MessageID, "pending", record.FileName, "", record.MediaType, record.FileSize, "target disk space below safe threshold")
+			_ = o.db.UpdateDownloadStatus(record.ChatID, record.MessageID, "pending", record.FileName, "", record.MediaType, record.FileSize, "ssd_space: insufficient disk space")
+			return
+		}
+		defer releaseSSD()
+
+		// 2. Active File Admission Slot
+		releaseSlot, err := o.transferMgr.AcquireFileSlot(taskCtx)
+		if err != nil {
+			return
+		}
+		defer releaseSlot()
+
+		// 3. Media Ingress / Resolution (done once)
+		_ = o.db.UpdateDownloadStatus(record.ChatID, record.MessageID, "resolving", record.FileName, "", record.MediaType, record.FileSize, "")
+		resolvedMedia, err := o.access.Resolve(taskCtx, record.ChatID, record.MessageID)
+		if err != nil {
+			o.logger.Warn("failed to resolve telegram media",
+				zap.String("task_id", taskID),
+				zap.Error(err),
+			)
+			errStr := strings.ToLower(err.Error())
+			status := "failed"
+			if strings.Contains(errStr, "deleted") || strings.Contains(errStr, "unavailable") || strings.Contains(errStr, "message_id_invalid") {
+				status = "unavailable"
+			}
+			_ = o.db.UpdateDownloadStatus(record.ChatID, record.MessageID, status, record.FileName, "", record.MediaType, record.FileSize, err.Error())
 			return
 		}
 
-		// 2. Buffer Disk Guard (only requires 500MB safe buffer space, sliding window handles big files)
-		if o.bufferDir != "" && o.bufferDir != o.saveDir {
-			bufFree, _, bufErr := atomic.GetDiskSpace(o.bufferDir)
-			if bufErr == nil && bufFree < 500*1024*1024 {
-				o.logger.Warn("⚠️ [Disk Guard] Insufficient buffer disk space, postponing task",
-					zap.String("task_id", taskID),
-					zap.Uint64("free_bytes", bufFree),
-				)
-				_ = o.db.UpdateDownloadStatus(record.ChatID, record.MessageID, "pending", record.FileName, "", record.MediaType, record.FileSize, "buffer disk space below safe threshold")
-				return
-			}
+		if resolvedMedia.File == nil || resolvedMedia.Size <= 0 {
+			_ = o.db.UpdateDownloadStatus(record.ChatID, record.MessageID, "unavailable", record.FileName, "", record.MediaType, record.FileSize, "message has no downloadable media")
+			return
 		}
 
-		// 3. Acquire slot only for large files (> 1MB / non-photo)
-		isLargeFile := record.FileSize > downloader.SmallFileThreshold || (record.FileSize <= 0 && record.MediaType != "photo")
-		var slotOnce sync.Once
-		releaseSlot := func() {} // no-op for small files
-		if isLargeFile {
-			_, err = o.slotPool.Acquire(taskCtx, taskID, record.FileSize)
+		// Update reservation if real resolved size differed from catalog estimate
+		if resolvedMedia.Size != record.FileSize {
+			releaseSSD()
+			releaseSSD, err = o.ssdAdmission.Reserve(taskID, resolvedMedia.Size)
 			if err != nil {
+				o.logger.Warn("⚠️ [SSD Admission] Insufficient space after resolve", zap.Error(err))
+				_ = o.db.UpdateDownloadStatus(record.ChatID, record.MessageID, "pending", record.FileName, "", record.MediaType, resolvedMedia.Size, "ssd_space: insufficient disk space")
 				return
 			}
-			// Slot released via sync.Once: either when task enters moving or on return.
-			releaseSlot = func() { slotOnce.Do(func() { o.slotPool.Release(taskID) }) }
-			defer releaseSlot()
 		}
 
+		// 4. Compute canonical path within SSD download root
 		folderName := record.TargetTitle
 		if folderName == "" {
 			folderName = record.ChatID
@@ -260,7 +275,10 @@ func (o *Orchestrator) dispatchOneRecord(ctx context.Context, record DownloadRec
 			msgTime = time.Now().Unix()
 		}
 		yearMonth := time.Unix(msgTime, 0).Format("2006_01")
-		rawName := record.FileName
+		rawName := resolvedMedia.Name
+		if rawName == "" {
+			rawName = record.FileName
+		}
 		if rawName == "" || strings.HasSuffix(rawName, ".bin") || strings.HasSuffix(rawName, ".unknown") {
 			ext := ".mp4"
 			if record.MediaType == "photo" {
@@ -274,118 +292,183 @@ func (o *Orchestrator) dispatchOneRecord(ctx context.Context, record DownloadRec
 
 		finalRelPath := filepath.Join(safeFolder, yearMonth, fmt.Sprintf("%d - %s", record.MessageID, safeFileName))
 		finalRelPath = strings.ReplaceAll(finalRelPath, "\\", "/")
+		finalAbsPath := filepath.Join(o.saveDir, filepath.FromSlash(finalRelPath))
+		partAbsPath := finalAbsPath + ".part"
 
-		_ = o.db.UpdateDownloadStatus(record.ChatID, record.MessageID, "downloading", rawName, finalRelPath, record.MediaType, record.FileSize, "")
-
+		// 5. Submit to Registry for status reporting
 		submitReq := TaskRequest{
 			ID:           taskID,
 			Peer:         record.ChatID,
 			MessageID:    record.MessageID,
 			FinalPath:    finalRelPath,
-			ExpectedSize: record.FileSize,
+			ExpectedSize: resolvedMedia.Size,
 			Retry:        record.Attempts > 0,
 		}
+		task, _ := o.registry.SubmitActive(submitReq)
+		if task != nil {
+			task.SetResolved(safeFileName, resolvedMedia.Size, resolvedMedia.DCID)
+		}
 
-		snapshot, _, err := o.registry.Submit(submitReq)
-		if err != nil {
-			_ = o.db.UpdateDownloadStatus(record.ChatID, record.MessageID, "failed", record.FileName, finalRelPath, record.MediaType, record.FileSize, err.Error())
+		// 6. Check existing final file (Idempotent success or typed collision)
+		if finInfo, err := os.Stat(finalAbsPath); err == nil {
+			if finInfo.Size() == resolvedMedia.Size {
+				actualSHA, shaErr := computeFileSHA256(finalAbsPath)
+				if shaErr == nil {
+					// Existing matches size & SHA: complete idempotently!
+					_ = o.db.CompleteDownloadAndQueueArchive(
+						record.ChatID, record.MessageID, finalRelPath,
+						finInfo.Size(), actualSHA,
+						o.archiveWorker != nil && o.archiveWorker.IsEnabled(),
+					)
+					if o.archiveWorker != nil {
+						o.archiveWorker.Wake()
+					}
+					if task != nil {
+						task.SucceedResult(PublishResult{Path: finalRelPath, SHA256: actualSHA, AlreadyExists: true, absolutePath: finalAbsPath})
+					}
+					return
+				}
+			}
+			// Size or SHA conflict: do not overwrite!
+			o.logger.Error("collision: destination exists with conflicting content",
+				zap.String("final_path", finalAbsPath),
+			)
+			if task != nil {
+				task.Fail("collision", "destination exists with conflicting content", false)
+			}
+			_ = o.db.UpdateDownloadStatus(record.ChatID, record.MessageID, "failed", rawName, finalRelPath, record.MediaType, resolvedMedia.Size, "collision: destination exists with conflicting content")
 			return
 		}
 
-		lastProgressTime := time.Now()
-		lastDownloaded := int64(0)
-		lastNetDownloaded := int64(0)
-		recordedMoving := false
-
-		for {
-			select {
-			case <-taskCtx.Done():
-				o.registry.Cancel(taskID, "task context done")
-				return
-			case <-ctx.Done():
-				o.registry.Cancel(taskID, "orchestrator shutdown")
-				return
-			default:
+		// 7. Ensure parent directory exists and create sibling .part
+		if err := os.MkdirAll(filepath.Dir(finalAbsPath), 0o755); err != nil {
+			o.logger.Error("failed to create target dir", zap.Error(err))
+			if task != nil {
+				task.Fail("path", err.Error(), false)
 			}
+			_ = o.db.UpdateDownloadStatus(record.ChatID, record.MessageID, "failed", rawName, finalRelPath, record.MediaType, resolvedMedia.Size, err.Error())
+			return
+		}
 
-			if snapshot.Downloaded > lastDownloaded || snapshot.NetDownloaded > lastNetDownloaded {
-				if snapshot.Downloaded > lastDownloaded {
-					lastDownloaded = snapshot.Downloaded
-				}
-				if snapshot.NetDownloaded > lastNetDownloaded {
-					lastNetDownloaded = snapshot.NetDownloaded
-				}
-				lastProgressTime = time.Now()
+		partFile, err := os.OpenFile(partAbsPath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
+		if err != nil {
+			o.logger.Error("failed to create part file", zap.Error(err))
+			if task != nil {
+				task.Fail("io", err.Error(), false)
 			}
+			_ = o.db.UpdateDownloadStatus(record.ChatID, record.MessageID, "failed", rawName, finalRelPath, record.MediaType, resolvedMedia.Size, err.Error())
+			return
+		}
+		_ = fscommit.Preallocate(partFile, resolvedMedia.Size)
 
-			// Track moving state
-			if snapshot.State == StatePublishing && !recordedMoving {
-				recordedMoving = true
-				_ = o.db.UpdateDownloadStatus(record.ChatID, record.MessageID, "moving", record.FileName, finalRelPath, record.MediaType, record.FileSize, "")
-				// Release network slot: TargetWriter handles the rest, network is free for other files.
-				if isLargeFile {
-					releaseSlot()
-				}
-			}
+		// 8. Update DB to 'downloading'
+		_ = o.db.UpdateDownloadStatus(record.ChatID, record.MessageID, "downloading", rawName, finalRelPath, record.MediaType, resolvedMedia.Size, "")
 
-			if snapshot.State == StateSuccess {
-				realFileName := snapshot.FileName
-				if realFileName == "" {
-					realFileName = record.FileName
-				}
-				_ = o.db.UpdateDownloadStatus(record.ChatID, record.MessageID, "success", realFileName, finalRelPath, record.MediaType, record.FileSize, "")
-				return
-			}
-			if snapshot.State == StateFailed || snapshot.State == StateUnavailable {
-				realFileName := snapshot.FileName
-				if realFileName == "" {
-					realFileName = record.FileName
-				}
-				_ = o.db.UpdateDownloadStatus(record.ChatID, record.MessageID, "failed", realFileName, finalRelPath, record.MediaType, record.FileSize, snapshot.Error)
-				return
-			}
+		// 9. Build gotd client adapter with DataGate protection
+		poolClient := o.access.Pool().Client(taskCtx, resolvedMedia.DCID)
+		clientAdapter := transfer.NewMasterClientAdapter(poolClient, o.transferMgr.Gate(), resolvedMedia.DCID)
 
-			// Watchdog: If actively downloading but no byte progress has been made for 5 minutes, abort and mark failed
-			if snapshot.State == StateDownloading && time.Since(lastProgressTime) > 5*time.Minute {
-				_ = o.db.UpdateDownloadStatus(record.ChatID, record.MessageID, "failed", record.FileName, finalRelPath, record.MediaType, record.FileSize, "download stalled / no progress for 5m")
-				o.registry.Cancel(taskID, "download stalled / no progress for 5m")
-				taskCancel()
-				return
-			}
-
-			time.Sleep(200 * time.Millisecond)
-			if s, ok := o.registry.Task(taskID); ok {
-				snapshot = s
-			} else {
-				break
+		// 10. Execute parallel chunk download with official gotd downloader
+		onProgress := func(downloaded, total int64) {
+			if task != nil {
+				task.RecordProgress(downloaded)
 			}
 		}
+
+		written, dlErr := o.transferMgr.DownloadFile(
+			taskCtx,
+			clientAdapter,
+			resolvedMedia.File.Location(),
+			resolvedMedia.Size,
+			partFile,
+			onProgress,
+		)
+
+		if dlErr != nil {
+			_ = partFile.Close()
+			_ = os.Remove(partAbsPath)
+			o.logger.Warn("gotd download failed",
+				zap.String("task_id", taskID),
+				zap.Error(dlErr),
+			)
+			if task != nil {
+				task.Fail("transfer", dlErr.Error(), false)
+			}
+			_ = o.db.UpdateDownloadStatus(record.ChatID, record.MessageID, "failed", rawName, finalRelPath, record.MediaType, resolvedMedia.Size, dlErr.Error())
+			return
+		}
+
+		// 11. Verification: exact size check, fsync, close, SHA calculation
+		stat, statErr := partFile.Stat()
+		if statErr != nil || (resolvedMedia.Size > 0 && stat.Size() != resolvedMedia.Size) {
+			_ = partFile.Close()
+			_ = os.Remove(partAbsPath)
+			errDesc := fmt.Sprintf("short write: got %d, want %d", written, resolvedMedia.Size)
+			if task != nil {
+				task.Fail("corrupt", errDesc, false)
+			}
+			_ = o.db.UpdateDownloadStatus(record.ChatID, record.MessageID, "failed", rawName, finalRelPath, record.MediaType, resolvedMedia.Size, errDesc)
+			return
+		}
+
+		_ = partFile.Sync()
+		_ = partFile.Close()
+
+		shaHex, shaErr := computeFileSHA256(partAbsPath)
+		if shaErr != nil {
+			_ = os.Remove(partAbsPath)
+			if task != nil {
+				task.Fail("hash", shaErr.Error(), false)
+			}
+			_ = o.db.UpdateDownloadStatus(record.ChatID, record.MessageID, "failed", rawName, finalRelPath, record.MediaType, resolvedMedia.Size, shaErr.Error())
+			return
+		}
+
+		// 12. Durable commit intent in DB
+		_ = o.db.PrepareDownloadCommit(record.ChatID, record.MessageID, finalRelPath, stat.Size(), shaHex)
+
+		// 13. Preserve timestamp if present
+		if resolvedMedia.Date > 0 {
+			when := time.Unix(resolvedMedia.Date, 0)
+			_ = os.Chtimes(partAbsPath, when, when)
+		}
+
+		// 14. Atomic sibling rename .part -> final
+		if err := fscommit.CommitSiblingPart(partAbsPath, finalAbsPath); err != nil {
+			_ = os.Remove(partAbsPath)
+			o.logger.Error("atomic commit failed", zap.Error(err))
+			if task != nil {
+				task.Fail("commit", err.Error(), false)
+			}
+			_ = o.db.UpdateDownloadStatus(record.ChatID, record.MessageID, "failed", rawName, finalRelPath, record.MediaType, resolvedMedia.Size, err.Error())
+			return
+		}
+
+		// 15. Complete download and queue archive in single DB transaction
+		queueArchive := o.archiveWorker != nil && o.archiveWorker.IsEnabled()
+		if err := o.db.CompleteDownloadAndQueueArchive(record.ChatID, record.MessageID, finalRelPath, stat.Size(), shaHex, queueArchive); err != nil {
+			o.logger.Error("failed to complete download in DB", zap.Error(err))
+		}
+
+		// 16. Wake archive worker
+		if o.archiveWorker != nil {
+			o.archiveWorker.Wake()
+		}
+
+		// 17. Complete task in Registry
+		if task != nil {
+			task.SucceedResult(PublishResult{
+				Path:         finalRelPath,
+				SHA256:       shaHex,
+				absolutePath: finalAbsPath,
+			})
+		}
+
+		o.logger.Info("download completed successfully",
+			zap.String("task_id", taskID),
+			zap.String("rel_path", finalRelPath),
+			zap.Int64("size", stat.Size()),
+			zap.String("sha256", shaHex),
+		)
 	}()
-}
-
-func (o *Orchestrator) CancelTasksByChatID(chatID string) {
-	cleanChatID := strings.TrimPrefix(chatID, "@")
-
-	o.taskCancels.Range(func(key, value any) bool {
-		taskID, ok := key.(string)
-		if !ok {
-			return true
-		}
-		parts := strings.Split(taskID, ":")
-		if len(parts) > 0 {
-			taskPeer := strings.TrimPrefix(parts[0], "@")
-			if taskPeer == cleanChatID || taskPeer == chatID {
-				if cancel, ok := value.(context.CancelFunc); ok && cancel != nil {
-					cancel()
-				}
-				o.slotPool.Release(taskID)
-				o.inFlight.Delete(taskID)
-			}
-		}
-		return true
-	})
-
-	if o.registry != nil {
-		o.registry.CancelTasksByChatID(chatID)
-	}
 }

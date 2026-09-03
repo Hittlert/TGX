@@ -19,10 +19,9 @@ import (
 	"github.com/gorilla/mux"
 	"go.uber.org/zap"
 
+	"github.com/Hittlert/TGX/internal/fscommit"
 	"github.com/Hittlert/TGX/pkg/consts"
-	atomic "github.com/Hittlert/TGX/pkg/sbe/atomic"
 	"github.com/Hittlert/TGX/pkg/sbe/gate"
-	"github.com/Hittlert/TGX/pkg/spool"
 )
 
 //go:embed ui/*
@@ -38,8 +37,6 @@ type WebServer struct {
 	logger       *zap.Logger
 	password     string
 	gate         *gate.FloodGate
-	spool        spool.Store
-
 	sessionsMu sync.RWMutex
 	sessions   map[string]time.Time
 	authWizard *AuthWizard
@@ -47,10 +44,6 @@ type WebServer struct {
 
 func (s *WebServer) SetAuthWizard(w *AuthWizard) {
 	s.authWizard = w
-}
-
-func (s *WebServer) SetSpool(store spool.Store) {
-	s.spool = store
 }
 
 func NewWebServer(
@@ -119,7 +112,7 @@ func (s *WebServer) Handler() http.Handler {
 		if s.orchestrator != nil {
 			path = s.orchestrator.OutputDir()
 		}
-		freeBytes, totalBytes, err := atomic.GetDiskSpace(path)
+		freeBytes, totalBytes, err := fscommit.GetDiskSpace(path)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
@@ -143,21 +136,9 @@ func (s *WebServer) Handler() http.Handler {
 			"used_human":   formatBytes(int64(usedBytes)),
 			"percent_used": fmt.Sprintf("%.1f%%", percent),
 		}
-		if s.spool != nil {
-			m := s.spool.Metrics()
-			resp["buffer"] = map[string]any{
-				"mode":            m.Mode,
-				"max_bytes":       m.MaxBytes,
-				"reserved_bytes":  m.ReservedBytes,
-				"ready_bytes":     m.ReadyBytes,
-				"writing_bytes":   m.WritingBytes,
-				"reclaimed_bytes": m.ReclaimedBytes,
-				"used_bytes":      m.UsedBytes,
-				"active_segments": m.ActiveSegments,
-				"backpressured":   m.Backpressured,
-				"max_human":       formatBytes(m.MaxBytes),
-				"used_human":      formatBytes(m.UsedBytes),
-				"ready_human":     formatBytes(m.ReadyBytes),
+		if s.db != nil {
+			if arcStats, err := s.db.GetArchiveStats(); err == nil {
+				resp["archive"] = arcStats
 			}
 		}
 		writeJSON(w, http.StatusOK, resp)
@@ -446,12 +427,7 @@ func (s *WebServer) handleGetDownloadStatus(w http.ResponseWriter, r *http.Reque
 	}
 
 	bufferUsedMB := float64(0)
-	bufferLimitMB := float64(512)
-	if s.spool != nil {
-		m := s.spool.Metrics()
-		bufferUsedMB = float64(m.UsedBytes) / (1024 * 1024)
-		bufferLimitMB = float64(m.MaxBytes) / (1024 * 1024)
-	}
+	bufferLimitMB := float64(0)
 
 	resp := map[string]any{
 		"download_speed": speedStr,

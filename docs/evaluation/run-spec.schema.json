@@ -9,10 +9,6 @@
     "run_id",
     "engine",
     "artifact_ref",
-    "expected_source_commit",
-    "expected_binary_sha256",
-    "baseline_cohort_id",
-    "manifest_sha256",
     "profile_id",
     "manifest_path",
     "sample_seed",
@@ -21,27 +17,16 @@
     "dc_pool_size",
     "duration_seconds",
     "warmup_seconds",
-    "buffer_mode",
-    "buffer_size_bytes",
-    "account_session_id",
-    "proxy_route_id",
     "output_dir",
     "buffer_dir",
     "state_db",
-    "log_dir",
-    "drain_timeout_seconds"
+    "log_dir"
   ],
   "properties": {
     "protocol_version": {"const": "1.0"},
     "run_id": {"type": "string", "minLength": 1},
     "engine": {"enum": ["tdl", "tgx"]},
     "artifact_ref": {"type": "string", "minLength": 1},
-    "expected_source_commit": {"type": "string", "pattern": "^[0-9a-f]{7,40}$"},
-    "expected_binary_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-    "baseline_cohort_id": {"type": "string", "minLength": 1},
-    "manifest_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-    "tdl_baseline_ref": {"type": "string", "minLength": 1},
-    "calibration_ref": {"type": "string", "minLength": 1},
     "profile_id": {"enum": ["P-S", "P-SM", "P-LMS", "P-L"]},
     "manifest_path": {"type": "string", "minLength": 1},
     "sample_seed": {"type": "integer", "minimum": 0},
@@ -60,11 +45,5 @@
     "state_db": {"type": "string", "minLength": 1},
     "log_dir": {"type": "string", "minLength": 1},
     "drain_timeout_seconds": {"type": "integer", "minimum": 10, "maximum": 3600}
-  },
-  "allOf": [
-    {
-      "if": {"properties": {"engine": {"const": "tgx"}}, "required": ["engine"]},
-      "then": {"required": ["tdl_baseline_ref", "calibration_ref"]}
-    }
-  ]
+  }
 }

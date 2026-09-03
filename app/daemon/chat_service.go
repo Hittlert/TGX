@@ -98,7 +98,9 @@ func (a *telegramMediaAccess) GetDialogs(ctx context.Context) ([]DialogDTO, erro
 		}
 		id := tutil.GetInputPeerID(elem.Peer)
 		if id == 0 && elem.Dialog != nil {
-			id = tutil.GetPeerID(elem.Dialog.GetPeer())
+			if d, ok := elem.Dialog.(*tg.Dialog); ok {
+				id = tutil.GetPeerID(d.GetPeer())
+			}
 		}
 		if id == 0 {
 			return nil

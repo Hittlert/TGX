@@ -1,31 +1,28 @@
 //go:build darwin
 
-package atomic
+package fscommit
 
 import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"syscall"
 
 	"golang.org/x/sys/unix"
 )
 
 func commitFile(tempPath, finalPath string) error {
-	dir := filepath.Dir(finalPath)
-
 	// In macOS / APFS, link(temp, final) + unlink(temp) guarantees non-replacing behavior
 	err := os.Link(tempPath, finalPath)
 	if err != nil {
 		if errors.Is(err, syscall.EEXIST) || os.IsExist(err) {
 			return ErrTargetExists
 		}
-		return fmt.Errorf("macOS atomic link failed: %w", err)
+		return fmt.Errorf("darwin atomic link: %w", err)
 	}
 
 	_ = os.Remove(tempPath)
-	return syncDir(dir)
+	return nil
 }
 
 func syncDir(dirPath string) error {
@@ -35,4 +32,8 @@ func syncDir(dirPath string) error {
 	}
 	defer unix.Close(dirFD)
 	return unix.Fsync(dirFD)
+}
+
+func preallocate(file *os.File, size int64) error {
+	return file.Truncate(size)
 }

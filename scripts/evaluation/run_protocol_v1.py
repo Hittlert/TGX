@@ -26,8 +26,7 @@ def run_cmd(cmd):
 
 def main():
     parser = argparse.ArgumentParser(description="TGX Evaluation Protocol v1.0 Master Controller")
-    parser.add_argument("--mode", choices=["all", "self-test", "manifests", "benchmark", "report", "tgx"], default="all")
-    parser.add_argument("--engine", choices=["all", "tdl", "tgx"], default="all", help="Which engine to execute (default: all)")
+    parser.add_argument("--mode", choices=["all", "self-test", "manifests", "benchmark", "report"], default="all")
     parser.add_argument("--duration", type=int, default=240, help="Duration seconds per run (default: 240)")
     parser.add_argument("--warmup", type=int, default=15, help="Warmup seconds (default: 15)")
     parser.add_argument("--repetitions", type=int, default=3, help="Repetitions per engine (default: 3)")
@@ -35,10 +34,6 @@ def main():
     parser.add_argument("--port", type=int, default=5890, help="Runner dynamic host port")
     parser.add_argument("--skip-existing", action="store_true", help="Skip runs that have already produced summary.json")
     args = parser.parse_args()
-
-    if args.mode == "tgx":
-        args.mode = "benchmark"
-        args.engine = "tgx"
 
     os.makedirs(f"{EVAL_DIR}/manifests", exist_ok=True)
     os.makedirs(f"{EVAL_DIR}/baselines/tdl", exist_ok=True)
@@ -59,15 +54,11 @@ def main():
 
     # 3. Paired Benchmark Execution (Section 5)
     if args.mode in ("all", "benchmark"):
-        print(f"\n>>> Executing Benchmark Suite (Engine={args.engine}, Duration={args.duration}s, Reps={args.repetitions})...")
+        print(f"\n>>> Executing Paired Benchmark Suite (Duration={args.duration}s, Reps={args.repetitions})...")
         
         rounds = []
         for rep in range(1, args.repetitions + 1):
-            if args.engine == "tgx":
-                rounds.append((rep, "tgx", TGX_BIN))
-            elif args.engine == "tdl":
-                rounds.append((rep, "tdl", TDL_BIN))
-            elif rep % 2 == 1:
+            if rep % 2 == 1:
                 rounds.append((rep, "tdl", TDL_BIN))
                 rounds.append((rep, "tgx", TGX_BIN))
             else:

@@ -462,38 +462,35 @@ func (d *Downloader) Download(ctx context.Context, globalConcurrency int) error 
 		})
 	}
 
-	// 3. Launch Dedicated Small File Disk Writers (4 Concurrent I/O Workers)
-	const smallDiskWorkers = 4
-	for sdw := 0; sdw < smallDiskWorkers; sdw++ {
-		g.Go(func() error {
-			for {
-				select {
-				case <-gctx.Done():
-					return gctx.Err()
-				case sJob, ok := <-smallWriteChan:
-					if !ok {
-						return nil
-					}
-					var finalErr error
-					if ce, ok := sJob.elem.(CancelableElem); ok && ce.IsCanceled() {
-						finalErr = context.Canceled
-					} else if sJob.err != nil {
-						finalErr = sJob.err
-					} else {
-						w := sJob.elem.To()
-						if w != nil {
-							_, writeErr := w.WriteAt(sJob.data, 0)
-							if writeErr != nil {
-								finalErr = writeErr
-							}
+	// 3. Launch Small File Serial Disk Writer (1 Dedicated I/O Worker)
+	g.Go(func() error {
+		for {
+			select {
+			case <-gctx.Done():
+				return gctx.Err()
+			case sJob, ok := <-smallWriteChan:
+				if !ok {
+					return nil
+				}
+				var finalErr error
+				if ce, ok := sJob.elem.(CancelableElem); ok && ce.IsCanceled() {
+					finalErr = context.Canceled
+				} else if sJob.err != nil {
+					finalErr = sJob.err
+				} else {
+					w := sJob.elem.To()
+					if w != nil {
+						_, writeErr := w.WriteAt(sJob.data, 0)
+						if writeErr != nil {
+							finalErr = writeErr
 						}
 					}
-					d.opts.Progress.OnDone(sJob.elem, finalErr)
-					smallBudget.release(sJob.totalSize)
 				}
+				d.opts.Progress.OnDone(sJob.elem, finalErr)
+				smallBudget.release(sJob.totalSize)
 			}
-		})
-	}
+		}
+	})
 
 	// 4. Launch 32 Fair-Multiplexed Network Workers
 	var netWg sync.WaitGroup
@@ -1364,16 +1361,16 @@ func (d *Downloader) fetchSmallFile(ctx context.Context, workerID int, job *smal
 				switch uf := res.(type) {
 				case *tg.UploadFile:
 					chunkBytes := uf.Bytes
-					if len(chunkBytes) > 0 {
-						if len(chunkBytes) > expectedBytes {
-							chunkBytes = chunkBytes[:expectedBytes]
-						}
+					if len(chunkBytes) > expectedBytes {
+						chunkBytes = chunkBytes[:expectedBytes]
+					}
+					if len(chunkBytes) == expectedBytes {
 						fileBuffer = append(fileBuffer, chunkBytes...)
 						offset += int64(len(chunkBytes))
 						chunkSuccess = true
 					} else {
-						// 0 bytes returned from Telegram means EOF reached
-						chunkSuccess = true
+						fetchErr = fmt.Errorf("small file short read at offset %d: expected %d bytes, got %d", offset, expectedBytes, len(chunkBytes))
+						lastFetchErr = fetchErr
 					}
 				case *tg.UploadFileCDNRedirect:
 					cdnClient := d.opts.Pool.Client(elemCtx, uf.DCID)
@@ -1381,15 +1378,16 @@ func (d *Downloader) fetchSmallFile(ctx context.Context, workerID int, job *smal
 					cdnBytes, fetchErr = d.handleCdnRedirect(elemCtx, cdnClient, client, uf, job.dcID, offset, DownloadPartSize)
 					lastFetchErr = fetchErr
 					if fetchErr == nil {
-						if len(cdnBytes) > 0 {
-							if len(cdnBytes) > expectedBytes {
-								cdnBytes = cdnBytes[:expectedBytes]
-							}
+						if len(cdnBytes) > expectedBytes {
+							cdnBytes = cdnBytes[:expectedBytes]
+						}
+						if len(cdnBytes) == expectedBytes {
 							fileBuffer = append(fileBuffer, cdnBytes...)
 							offset += int64(len(cdnBytes))
 							chunkSuccess = true
 						} else {
-							chunkSuccess = true
+							fetchErr = fmt.Errorf("cdn small file short read at offset %d: expected %d bytes, got %d", offset, expectedBytes, len(cdnBytes))
+							lastFetchErr = fetchErr
 						}
 					}
 				default:
@@ -1410,7 +1408,7 @@ func (d *Downloader) fetchSmallFile(ctx context.Context, workerID int, job *smal
 			if chunkSuccess {
 				d.opts.Progress.OnDownload(job.elem, ProgressState{
 					Downloaded: offset,
-					Total:      offset,
+					Total:      job.totalSize,
 				})
 				break
 			}
@@ -1456,17 +1454,6 @@ func (d *Downloader) fetchSmallFile(ctx context.Context, workerID int, job *smal
 			budget.release(job.totalSize)
 			return
 		}
-
-		if offset >= job.totalSize || (len(fileBuffer) > 0 && int64(len(fileBuffer)) == offset && offset < job.totalSize) {
-			break
-		}
-	}
-
-	actualSize := int64(len(fileBuffer))
-	if actualSize == 0 {
-		d.opts.Progress.OnDone(job.elem, errors.New("downloaded empty 0-byte file"))
-		budget.release(job.totalSize)
-		return
 	}
 
 	// Check if canceled before sending to small disk writer
@@ -1484,7 +1471,7 @@ func (d *Downloader) fetchSmallFile(ctx context.Context, workerID int, job *smal
 	case writeChan <- &smallWriteJob{
 		elem:      job.elem,
 		data:      fileBuffer,
-		totalSize: actualSize,
+		totalSize: job.totalSize,
 	}:
 	}
 }

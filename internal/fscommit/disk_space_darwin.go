@@ -1,17 +1,10 @@
 //go:build darwin
 
-package atomic
+package fscommit
 
 import (
 	"golang.org/x/sys/unix"
-	"os"
 )
-
-func preallocate(file *os.File, size int64) error {
-	// fstore_t structure for F_PREALLOCATE on Darwin
-	// If preallocation fails, fallback to standard ftruncate
-	return file.Truncate(size)
-}
 
 func getDiskSpace(path string) (uint64, uint64, error) {
 	var stat unix.Statfs_t

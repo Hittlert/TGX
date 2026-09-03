@@ -91,7 +91,6 @@ def generate_profile_manifest(db_path, baseline_storage_root, profile_id, seed, 
               AND (c.chat_type IN ('channel', 'supergroup', 'group') OR (c.chat_type IS NULL AND d.chat_id LIKE '-%'))
               AND d.file_size >= {low} AND ({f'd.file_size <= {high}' if high else '1=1'})
               AND d.save_path IS NOT NULL AND d.save_path != ''
-              AND (d.media_type IN ('document', 'video', 'audio', 'voice', 'animation', 'MessageMediaType.DOCUMENT', 'MessageMediaType.VIDEO', 'MessageMediaType.ANIMATION') OR d.media_type IS NULL OR d.media_type = '')
             ORDER BY RANDOM()
             LIMIT {needed * 20}
         """

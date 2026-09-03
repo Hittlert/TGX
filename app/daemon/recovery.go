@@ -2,236 +2,154 @@ package daemon
 
 import (
 	"context"
-	"crypto/sha256"
-	"database/sql"
-	"encoding/hex"
-	"errors"
-	"fmt"
-	"io"
 	"os"
 	"path/filepath"
+	"time"
 
 	"go.uber.org/zap"
 
-	atomicCommit "github.com/Hittlert/TGX/pkg/sbe/atomic"
+	"github.com/Hittlert/TGX/internal/fscommit"
 )
 
-// TaskRecoveryResult encapsulates differential actions performed per task.
-type TaskRecoveryResult struct {
-	FileKey     string
-	PrevState   string
-	NextState   string
-	ActionTaken string
-}
+// ReconcileOnStartup executes the Section 10 crash recovery matrix before new admissions begin.
+func ReconcileOnStartup(ctx context.Context, db *Database, ssdDir, archiveDir string, logger *zap.Logger) error {
+	archiveEnabled := archiveDir != ""
 
-// Reconciler performs differential crash recovery on non-terminal tasks at boot.
-type Reconciler struct {
-	db         *sql.DB
-	outputDir  string
-	tempDir    string
-	bufferType string
-	registry   *Registry
-	logger     *zap.Logger
-}
+	// 1. Reconcile 'committing' download_records
+	committingRecs, err := db.GetPendingCommittingDownloads()
+	if err == nil {
+		for _, rec := range committingRecs {
+			finalAbsPath := filepath.Join(ssdDir, filepath.FromSlash(rec.SavePath))
+			partAbsPath := finalAbsPath + ".part"
 
-func NewReconciler(db *sql.DB, outputDir, tempDir string, logger *zap.Logger) *Reconciler {
-	return NewReconcilerWithBuffer(db, outputDir, tempDir, "memory", nil, logger)
-}
-
-func NewReconcilerWithBuffer(db *sql.DB, outputDir, tempDir, bufferType string, _ any, logger *zap.Logger) *Reconciler {
-	return &Reconciler{
-		db:         db,
-		outputDir:  outputDir,
-		tempDir:    tempDir,
-		bufferType: bufferType,
-		logger:     logger,
-	}
-}
-
-func (r *Reconciler) SetRegistry(reg *Registry) {
-	r.registry = reg
-}
-
-// ReconcileAll runs the differential crash recovery matrix on all non-terminal tasks,
-// as well as any tasks that were interrupted/failed due to shutdown cancellation.
-func (r *Reconciler) ReconcileAll(ctx context.Context) ([]TaskRecoveryResult, error) {
-	query := `SELECT chat_id, message_id, status, COALESCE(file_name, ''), COALESCE(save_path, ''), COALESCE(file_size, 0)
-	          FROM download_records
-	          WHERE (status IN ('downloading', 'moving'))
-	             OR (status = 'failed' AND (error LIKE '%context canceled%' OR error LIKE '%context deadline exceeded%' OR error = 'canceled' OR error = 'task canceled' OR error LIKE '%forcibly closed%'))`
-	rows, err := r.db.QueryContext(ctx, query)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query download_records for recovery: %w", err)
-	}
-	defer rows.Close()
-
-	var records []struct {
-		ChatID    string
-		MessageID int
-		Status    string
-		FileName  string
-		SavePath  string
-		FileSize  int64
-	}
-	for rows.Next() {
-		var rec struct {
-			ChatID    string
-			MessageID int
-			Status    string
-			FileName  string
-			SavePath  string
-			FileSize  int64
-		}
-		if err := rows.Scan(&rec.ChatID, &rec.MessageID, &rec.Status, &rec.FileName, &rec.SavePath, &rec.FileSize); err != nil {
-			continue
-		}
-		records = append(records, rec)
-	}
-
-	var results []TaskRecoveryResult
-	for _, rec := range records {
-		fileKey := CanonicalTaskID(rec.ChatID, rec.MessageID)
-		finalPath := filepath.Join(r.outputDir, rec.SavePath)
-		movingPath := finalPath + ".moving"
-		metaPath := finalPath + ".moving.meta"
-
-		movingMatches, _ := filepath.Glob(finalPath + ".*.moving")
-		hasMoving := false
-		if _, movingErr := os.Stat(movingPath); movingErr == nil {
-			hasMoving = true
-		}
-		if len(movingMatches) > 0 {
-			hasMoving = true
-		}
-
-		tempPartPath := CanonicalPartPath(r.tempDir, fileKey)
-		_, partErr := os.Stat(tempPartPath)
-		hasTempPart := (partErr == nil)
-
-		stat, err := os.Stat(finalPath)
-		if err == nil && stat.Size() == rec.FileSize && rec.FileSize > 0 && !hasMoving && !hasTempPart {
-			// Query target_commits table for authoritative committed SHA
-			var committedSHA string
-			_ = r.db.QueryRowContext(ctx, `SELECT committed_sha256 FROM target_commits WHERE task_id = ? ORDER BY updated_at DESC LIMIT 1`, fileKey).Scan(&committedSHA)
-
-			if committedSHA != "" {
-				verifiedSHA, verifyErr := verifyFinalFileIdentity(finalPath, rec.FileSize, committedSHA, fileKey)
-				if verifyErr == nil && verifiedSHA != "" {
-					_ = os.Remove(metaPath)
-					for _, m := range movingMatches {
-						_ = os.Remove(m)
-					}
-					if execErr := r.updateRecordSuccess(ctx, rec.ChatID, rec.MessageID, verifiedSHA); execErr != nil {
-						r.logger.Warn("failed to update record to success in recovery", zap.Error(execErr))
-					} else {
-						results = append(results, TaskRecoveryResult{
-							FileKey:     fileKey,
-							PrevState:   rec.Status,
-							NextState:   "success",
-							ActionTaken: "FINAL_FILE_COMMITTED_PROMOTED_TO_SUCCESS",
-						})
-						continue
-					}
-				}
-			}
-		}
-
-		// 2. Check legacy part file
-		if partErr == nil {
-			if partStat, statErr := os.Stat(tempPartPath); statErr == nil && partStat.Size() == rec.FileSize && rec.FileSize > 0 {
-				partSHA, shaErr := computeRecoverySHA256(tempPartPath)
-				if err := atomicCommit.CommitFile(tempPartPath, finalPath); err == nil {
-					_ = r.updateRecordSuccess(ctx, rec.ChatID, rec.MessageID, partSHA)
-					results = append(results, TaskRecoveryResult{
-						FileKey:     fileKey,
-						PrevState:   rec.Status,
-						NextState:   "success",
-						ActionTaken: "LEGACY_PART_COMMITTED_TO_SUCCESS",
-					})
+			// Check if final SSD file already exists
+			if finInfo, statErr := os.Stat(finalAbsPath); statErr == nil && finInfo.Size() == rec.FileSize {
+				sha, shaErr := computeFileSHA256(finalAbsPath)
+				if shaErr == nil && (rec.SHA256 == "" || sha == rec.SHA256) {
+					_ = os.Remove(partAbsPath)
+					_ = db.CompleteDownloadAndQueueArchive(rec.ChatID, rec.MessageID, rec.SavePath, rec.FileSize, sha, archiveEnabled)
+					logger.Info("recovered committing record to success from final file",
+						zap.String("chat_id", rec.ChatID),
+						zap.Int("message_id", rec.MessageID),
+					)
 					continue
-				} else if errors.Is(err, atomicCommit.ErrTargetExists) {
-					finalSHA, err2 := computeRecoverySHA256(finalPath)
-					if shaErr == nil && err2 == nil && partSHA == finalSHA {
-						_ = os.Remove(tempPartPath)
-						_ = r.updateRecordSuccess(ctx, rec.ChatID, rec.MessageID, finalSHA)
-						results = append(results, TaskRecoveryResult{
-							FileKey:     fileKey,
-							PrevState:   rec.Status,
-							NextState:   "success",
-							ActionTaken: "LEGACY_PART_TARGET_ALREADY_EXISTS_PROMOTED",
-						})
+				}
+			}
+
+			// Check if .part file exists with matching SHA
+			if partInfo, statErr := os.Stat(partAbsPath); statErr == nil && partInfo.Size() == rec.FileSize {
+				sha, shaErr := computeFileSHA256(partAbsPath)
+				if shaErr == nil && (rec.SHA256 == "" || sha == rec.SHA256) {
+					if commitErr := fscommit.CommitSiblingPart(partAbsPath, finalAbsPath); commitErr == nil {
+						_ = db.CompleteDownloadAndQueueArchive(rec.ChatID, rec.MessageID, rec.SavePath, rec.FileSize, sha, archiveEnabled)
+						logger.Info("recovered committing record to success via atomic part commit",
+							zap.String("chat_id", rec.ChatID),
+							zap.Int("message_id", rec.MessageID),
+						)
 						continue
 					}
 				}
 			}
-		}
 
-		// 3. Reset incomplete/canceled tasks to pending so Spool engine re-downloads cleanly
-		_ = os.Remove(movingPath)
-		_ = os.Remove(metaPath)
-		_ = os.Remove(tempPartPath)
-		for _, m := range movingMatches {
-			_ = os.Remove(m)
+			// Neither valid: reset to pending
+			_ = os.Remove(partAbsPath)
+			_ = db.UpdateDownloadStatus(rec.ChatID, rec.MessageID, "pending", rec.FileName, rec.SavePath, rec.MediaType, rec.FileSize, "")
+			logger.Warn("reset incomplete committing record to pending",
+				zap.String("chat_id", rec.ChatID),
+				zap.Int("message_id", rec.MessageID),
+			)
 		}
-		actionTaken := "BUFFER_RESET_TO_PENDING"
-		if r.bufferType == "memory" {
-			actionTaken = "MEMORY_BUFFER_VOLATILE_RESET_TO_PENDING"
-		}
-		if execErr := r.updateRecordPending(ctx, rec.ChatID, rec.MessageID); execErr != nil {
-			r.logger.Warn("failed to reset record to pending in recovery", zap.Error(execErr))
-		}
-		results = append(results, TaskRecoveryResult{
-			FileKey:     fileKey,
-			PrevState:   rec.Status,
-			NextState:   "pending",
-			ActionTaken: actionTaken,
-		})
 	}
 
-	return results, nil
-}
+	// 2. Reconcile 'downloading' records interrupted by crash
+	downloadingRecs, err := db.GetStaleDownloadingRecords()
+	if err == nil {
+		for _, rec := range downloadingRecs {
+			finalAbsPath := filepath.Join(ssdDir, filepath.FromSlash(rec.SavePath))
+			partAbsPath := finalAbsPath + ".part"
 
-func (r *Reconciler) updateRecordSuccess(ctx context.Context, chatID string, msgID int, sha string) error {
-	res, err := r.db.ExecContext(ctx, `UPDATE download_records SET status = 'success', error = '' WHERE chat_id = ? AND message_id = ?`, chatID, msgID)
-	if err != nil {
-		return err
+			// Check if final SSD file exists and is complete
+			if finInfo, statErr := os.Stat(finalAbsPath); statErr == nil && rec.FileSize > 0 && finInfo.Size() == rec.FileSize {
+				sha, shaErr := computeFileSHA256(finalAbsPath)
+				if shaErr == nil {
+					_ = os.Remove(partAbsPath)
+					_ = db.CompleteDownloadAndQueueArchive(rec.ChatID, rec.MessageID, rec.SavePath, rec.FileSize, sha, archiveEnabled)
+					logger.Info("recovered stale downloading record to success from verified final",
+						zap.String("chat_id", rec.ChatID),
+						zap.Int("message_id", rec.MessageID),
+					)
+					continue
+				}
+			}
+
+			// Clean up stale .part residue and reset to pending
+			_ = os.Remove(partAbsPath)
+			_ = db.UpdateDownloadStatus(rec.ChatID, rec.MessageID, "pending", rec.FileName, rec.SavePath, rec.MediaType, rec.FileSize, "")
+			logger.Info("reset stale downloading record to pending",
+				zap.String("chat_id", rec.ChatID),
+				zap.Int("message_id", rec.MessageID),
+			)
+		}
 	}
-	rows, err := res.RowsAffected()
-	if err != nil {
-		return err
+
+	// 3. Reconcile shutdown cancellation failures to pending
+	_, _ = db.Execute(`
+		UPDATE download_records
+		SET status = 'pending', error = ''
+		WHERE status = 'failed' AND (
+			error LIKE '%context canceled%' OR
+			error LIKE '%context deadline exceeded%' OR
+			error = 'canceled' OR
+			error = 'task canceled' OR
+			error LIKE '%forcibly closed%'
+		)
+	`)
+
+	// 4. Reconcile archive jobs if archive is enabled
+	if archiveEnabled {
+		// Backlog fill: enqueue archive jobs for any successful download lacking an archive job
+		_, _ = db.Execute(`
+			INSERT OR IGNORE INTO archive_jobs (chat_id, message_id, relative_path, expected_size, sha256, state, attempts, next_retry_at, created_at, updated_at)
+			SELECT chat_id, message_id, save_path, file_size, COALESCE(sha256, ''), 'pending', 0, 0, created_at, updated_at
+			FROM download_records
+			WHERE status = 'success' AND save_path != '' AND (chat_id, message_id) NOT IN (SELECT chat_id, message_id FROM archive_jobs)
+		`)
+
+		// Reconcile 'copying' archive jobs interrupted during transfer
+		copyingJobs, err := db.GetStaleCopyingArchiveJobs()
+		if err == nil {
+			for _, job := range copyingJobs {
+				dstFinal := filepath.Join(archiveDir, filepath.FromSlash(job.RelativePath))
+				dstMoving := dstFinal + ".moving"
+				srcPath := filepath.Join(ssdDir, filepath.FromSlash(job.RelativePath))
+
+				// Check if archive final file exists and is verified
+				if finInfo, statErr := os.Stat(dstFinal); statErr == nil && finInfo.Size() == job.ExpectedSize {
+					sha, shaErr := computeFileSHA256(dstFinal)
+					if shaErr == nil && (job.SHA256 == "" || sha == job.SHA256) {
+						_ = os.Remove(dstMoving)
+						_ = db.CompleteArchiveJob(job.ChatID, job.MessageID)
+						_ = os.Remove(srcPath) // Clean up SSD duplicate
+						logger.Info("recovered copying archive job to archived",
+							zap.String("chat_id", job.ChatID),
+							zap.Int("message_id", job.MessageID),
+						)
+						continue
+					}
+				}
+
+				// Otherwise remove .moving residue and reset state to pending
+				_ = os.Remove(dstMoving)
+				_, _ = db.Execute(`UPDATE archive_jobs SET state = 'pending', updated_at = ? WHERE chat_id = ? AND message_id = ?`,
+					time.Now().Unix(), job.ChatID, job.MessageID)
+				logger.Info("reset incomplete copying archive job to pending",
+					zap.String("chat_id", job.ChatID),
+					zap.Int("message_id", job.MessageID),
+				)
+			}
+		}
 	}
-	if rows == 0 {
-		return fmt.Errorf("no record updated for %s:%d", chatID, msgID)
-	}
+
 	return nil
 }
 
-func (r *Reconciler) updateRecordPending(ctx context.Context, chatID string, msgID int) error {
-	res, err := r.db.ExecContext(ctx, `UPDATE download_records SET status = 'pending', attempts = 0, next_retry_at = 0, error = '' WHERE chat_id = ? AND message_id = ?`, chatID, msgID)
-	if err != nil {
-		return err
-	}
-	rows, err := res.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if rows == 0 {
-		return fmt.Errorf("no record updated for %s:%d", chatID, msgID)
-	}
-	return nil
-}
-
-func computeRecoverySHA256(path string) (string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-
-	hasher := sha256.New()
-	buf := make([]byte, 1024*1024)
-	if _, err := io.CopyBuffer(hasher, f, buf); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(hasher.Sum(nil)), nil
-}

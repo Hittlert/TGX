@@ -32,11 +32,12 @@ type ChatMessage struct {
 type DownloadRecord struct {
 	ChatID              string `json:"chat_id"`
 	MessageID           int    `json:"message_id"`
-	Status              string `json:"status"` // pending, downloading, success, failed, skipped
+	Status              string `json:"status"` // pending, resolving, downloading, committing, success, failed, unavailable
 	FileName            string `json:"file_name"`
 	SavePath            string `json:"save_path"`
 	MediaType           string `json:"media_type"`
 	FileSize            int64  `json:"file_size"`
+	SHA256              string `json:"sha256,omitempty"`
 	Error               string `json:"error,omitempty"`
 	CreatedAt           int64  `json:"created_at"`
 	UpdatedAt           int64  `json:"updated_at"`
@@ -46,3 +47,26 @@ type DownloadRecord struct {
 	NextRetryAt         int64  `json:"next_retry_at"`
 	TargetTitle         string `json:"target_title,omitempty"`
 }
+
+type ArchiveJob struct {
+	ChatID       string `json:"chat_id"`
+	MessageID    int    `json:"message_id"`
+	RelativePath string `json:"relative_path"`
+	ExpectedSize int64  `json:"expected_size"`
+	SHA256       string `json:"sha256"`
+	State        string `json:"state"` // pending, copying, archived, conflict
+	Attempts     int    `json:"attempts"`
+	NextRetryAt  int64  `json:"next_retry_at"`
+	LastError    string `json:"last_error,omitempty"`
+	CreatedAt    int64  `json:"created_at"`
+	UpdatedAt    int64  `json:"updated_at"`
+}
+
+type ArchiveStats struct {
+	BacklogFiles  int   `json:"archive_backlog_files"`
+	BacklogBytes  int64 `json:"archive_backlog_bytes"`
+	ActiveWorkers int   `json:"archive_active_workers"`
+	ArchivedFiles int   `json:"archive_archived_files"`
+	ConflictCount int   `json:"archive_conflict_count"`
+}
+

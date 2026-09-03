@@ -1,10 +1,11 @@
 //go:build linux
 
-package atomic
+package fscommit
 
 import (
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"syscall"
 
@@ -19,49 +20,37 @@ func commitFile(tempPath, finalPath string) error {
 
 	srcDirFD, err := unix.Open(srcDir, unix.O_RDONLY|unix.O_DIRECTORY, 0)
 	if err != nil {
-		return fmt.Errorf("failed to open src directory %s: %w", srcDir, err)
+		return fmt.Errorf("open src dir %s: %w", srcDir, err)
 	}
 	defer unix.Close(srcDirFD)
 
 	dstDirFD, err := unix.Open(dstDir, unix.O_RDONLY|unix.O_DIRECTORY, 0)
 	if err != nil {
-		return fmt.Errorf("failed to open dst directory %s: %w", dstDir, err)
+		return fmt.Errorf("open dst dir %s: %w", dstDir, err)
 	}
 	defer unix.Close(dstDirFD)
 
-	// 1. Primary path: unix.Renameat2 across directories with RENAME_NOREPLACE
+	// Primary path: unix.Renameat2 with RENAME_NOREPLACE
 	err = unix.Renameat2(srcDirFD, tempBase, dstDirFD, finalBase, unix.RENAME_NOREPLACE)
 	if err == nil {
-		_ = syncDirFD(srcDirFD)
-		return syncDirFD(dstDirFD)
+		return nil
 	}
 
-	// If target already exists, return explicit error
 	if errors.Is(err, syscall.EEXIST) || errors.Is(err, unix.EEXIST) {
 		return ErrTargetExists
 	}
 
-	// If cross-filesystem, return EXDEV explicitly to trigger streaming fallback
-	if errors.Is(err, syscall.EXDEV) || errors.Is(err, unix.EXDEV) {
-		return syscall.EXDEV
-	}
-
-	// 2. Safe Fallback: linkat + unlinkat if Renameat2 is not supported on older kernel / FS
+	// Fallback for filesystems that do not support renameat2 (e.g. older kernels/NFS/tmpfs): linkat + unlinkat
 	if errors.Is(err, syscall.ENOSYS) || errors.Is(err, syscall.EINVAL) || errors.Is(err, syscall.EOPNOTSUPP) {
 		linkErr := unix.Linkat(srcDirFD, tempBase, dstDirFD, finalBase, 0)
 		if linkErr != nil {
 			if errors.Is(linkErr, syscall.EEXIST) || errors.Is(linkErr, unix.EEXIST) {
 				return ErrTargetExists
 			}
-			if errors.Is(linkErr, syscall.EXDEV) || errors.Is(linkErr, unix.EXDEV) {
-				return syscall.EXDEV
-			}
-			return fmt.Errorf("linkat fallback failed: %w", linkErr)
+			return fmt.Errorf("linkat fallback: %w", linkErr)
 		}
-
 		_ = unix.Unlinkat(srcDirFD, tempBase, 0)
-		_ = syncDirFD(srcDirFD)
-		return syncDirFD(dstDirFD)
+		return nil
 	}
 
 	return fmt.Errorf("renameat2 failed: %w", err)
@@ -73,9 +62,13 @@ func syncDir(dirPath string) error {
 		return err
 	}
 	defer unix.Close(dirFD)
-	return syncDirFD(dirFD)
+	return unix.Fsync(dirFD)
 }
 
-func syncDirFD(dirFD int) error {
-	return unix.Fsync(dirFD)
+func preallocate(file *os.File, size int64) error {
+	err := syscall.Fallocate(int(file.Fd()), 0, 0, size)
+	if err == nil {
+		return nil
+	}
+	return file.Truncate(size)
 }

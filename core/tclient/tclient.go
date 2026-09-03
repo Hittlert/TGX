@@ -10,6 +10,7 @@ import (
 	"github.com/cenkalti/backoff/v4"
 	"github.com/go-faster/errors"
 	"github.com/gotd/contrib/clock"
+	"github.com/gotd/log/logzap"
 	tdclock "github.com/gotd/td/clock"
 	"github.com/gotd/td/exchange"
 	"github.com/gotd/td/telegram"
@@ -115,7 +116,7 @@ func New(ctx context.Context, o Options) (*telegram.Client, error) {
 		AckInterval:     50 * time.Millisecond,
 		Middlewares:     append(NewDefaultMiddlewares(ctx, o.ReconnectTimeout), o.Middlewares...),
 		Clock:           tclock,
-		Logger:          logctx.From(ctx).Named("td"),
+		Logger:          logzap.New(logctx.From(ctx).Named("td")),
 	}
 	if DC != 0 {
 		opts.DC = DC

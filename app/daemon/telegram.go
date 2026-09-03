@@ -29,6 +29,7 @@ type TelegramAccess interface {
 	Resolve(ctx context.Context, peer string, messageID int) (ResolvedMedia, error)
 	ResolveBatch(ctx context.Context, peer string, messageIDs []int) (map[int]ResolvedMedia, error)
 	SyncPeers(ctx context.Context) error
+	Pool() dcpool.Pool
 }
 
 type messageCacheEntry struct {
@@ -62,6 +63,10 @@ func newTelegramMediaAccess(parentCtx context.Context, pool dcpool.Pool, manager
 		gate:        gate,
 		msgCache:    make(map[string]messageCacheEntry),
 	}
+}
+
+func (a *telegramMediaAccess) Pool() dcpool.Pool {
+	return a.pool
 }
 
 const maxMsgCacheEntries = 1000

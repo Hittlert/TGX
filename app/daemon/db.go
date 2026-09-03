@@ -57,6 +57,7 @@ func (d *Database) initSchema() error {
 			save_path TEXT,
 			media_type TEXT,
 			file_size INTEGER,
+			sha256 TEXT,
 			error TEXT,
 			created_at INTEGER NOT NULL,
 			updated_at INTEGER NOT NULL,
@@ -68,6 +69,21 @@ func (d *Database) initSchema() error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_download_records_retry ON download_records(chat_id, status, next_retry_at, message_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_download_records_downloaded ON download_records(status, downloaded_at DESC, updated_at DESC)`,
+		`CREATE TABLE IF NOT EXISTS archive_jobs (
+			chat_id TEXT NOT NULL,
+			message_id INTEGER NOT NULL,
+			relative_path TEXT NOT NULL,
+			expected_size INTEGER NOT NULL,
+			sha256 TEXT NOT NULL,
+			state TEXT NOT NULL DEFAULT 'pending',
+			attempts INTEGER NOT NULL DEFAULT 0,
+			next_retry_at INTEGER NOT NULL DEFAULT 0,
+			last_error TEXT,
+			created_at INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL,
+			PRIMARY KEY (chat_id, message_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_archive_due ON archive_jobs(state, next_retry_at)`,
 		`CREATE TABLE IF NOT EXISTS chat_scan_cursors (
 			chat_id TEXT PRIMARY KEY,
 			cursor INTEGER NOT NULL,
@@ -165,6 +181,9 @@ func (d *Database) initSchema() error {
 			return err
 		}
 	}
+
+	// Ensure sha256 column exists on download_records
+	_, _ = d.db.Exec(`ALTER TABLE download_records ADD COLUMN sha256 TEXT`)
 
 	// Automatically migrate legacy @username primary keys to canonical numeric IDs
 	d.migrateLegacyUsernameIDs()
@@ -1029,4 +1048,292 @@ func (d *Database) GetTargetCommit(taskID, generation string) (*TargetCommitReco
 	}
 	return &rec, nil
 }
+
+// PrepareDownloadCommit records durable intent to commit an SSD download before atomic rename.
+func (d *Database) PrepareDownloadCommit(chatID string, messageID int, relPath string, size int64, sha256Hex string) error {
+	d.lock.Lock()
+	defer d.lock.Unlock()
+
+	now := time.Now().Unix()
+	_, err := d.db.Exec(`
+		UPDATE download_records
+		SET status = 'committing',
+		    save_path = ?,
+		    file_size = ?,
+		    sha256 = ?,
+		    updated_at = ?
+		WHERE chat_id = ? AND message_id = ?
+	`, relPath, size, sha256Hex, now, chatID, messageID)
+	return err
+}
+
+// CompleteDownloadAndQueueArchive atomically marks download_records.status='success'
+// and enqueues an archive_job when archive is enabled.
+func (d *Database) CompleteDownloadAndQueueArchive(chatID string, messageID int, relPath string, size int64, sha256Hex string, queueArchive bool) error {
+	d.lock.Lock()
+	defer d.lock.Unlock()
+
+	now := time.Now().Unix()
+	tx, err := d.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin complete tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	// 1. Mark download_records success
+	_, err = tx.Exec(`
+		UPDATE download_records
+		SET status = 'success',
+		    save_path = ?,
+		    file_size = ?,
+		    sha256 = ?,
+		    downloaded_at = ?,
+		    updated_at = ?,
+		    error = ''
+		WHERE chat_id = ? AND message_id = ?
+	`, relPath, size, sha256Hex, now, now, chatID, messageID)
+	if err != nil {
+		return fmt.Errorf("update download success: %w", err)
+	}
+
+	// 2. If archive enabled, enqueue archive_jobs
+	if queueArchive {
+		_, err = tx.Exec(`
+			INSERT INTO archive_jobs (
+				chat_id, message_id, relative_path, expected_size, sha256,
+				state, attempts, next_retry_at, created_at, updated_at
+			) VALUES (?, ?, ?, ?, ?, 'pending', 0, 0, ?, ?)
+			ON CONFLICT(chat_id, message_id) DO UPDATE SET
+				relative_path = excluded.relative_path,
+				expected_size = excluded.expected_size,
+				sha256 = excluded.sha256,
+				state = 'pending',
+				next_retry_at = 0,
+				updated_at = excluded.updated_at
+		`, chatID, messageID, relPath, size, sha256Hex, now, now)
+		if err != nil {
+			return fmt.Errorf("insert archive job: %w", err)
+		}
+	}
+
+	return tx.Commit()
+}
+
+// GetDueArchiveJobs retrieves pending archive jobs that are ready to run.
+func (d *Database) GetDueArchiveJobs(limit int) ([]ArchiveJob, error) {
+	d.lock.RLock()
+	defer d.lock.RUnlock()
+
+	now := time.Now().Unix()
+	rows, err := d.db.Query(`
+		SELECT chat_id, message_id, relative_path, expected_size, sha256,
+		       state, attempts, next_retry_at, COALESCE(last_error, ''), created_at, updated_at
+		FROM archive_jobs
+		WHERE state = 'pending' AND next_retry_at <= ?
+		ORDER BY created_at ASC
+		LIMIT ?
+	`, now, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var jobs []ArchiveJob
+	for rows.Next() {
+		var j ArchiveJob
+		if err := rows.Scan(
+			&j.ChatID, &j.MessageID, &j.RelativePath, &j.ExpectedSize, &j.SHA256,
+			&j.State, &j.Attempts, &j.NextRetryAt, &j.LastError, &j.CreatedAt, &j.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, j)
+	}
+	return jobs, nil
+}
+
+// ClaimArchiveJob atomically transitions an archive job from 'pending' to 'copying'.
+func (d *Database) ClaimArchiveJob(chatID string, messageID int) (bool, error) {
+	d.lock.Lock()
+	defer d.lock.Unlock()
+
+	now := time.Now().Unix()
+	res, err := d.db.Exec(`
+		UPDATE archive_jobs
+		SET state = 'copying', updated_at = ?
+		WHERE chat_id = ? AND message_id = ? AND state = 'pending'
+	`, now, chatID, messageID)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
+// CompleteArchiveJob marks an archive job as 'archived' upon verified durability.
+func (d *Database) CompleteArchiveJob(chatID string, messageID int) error {
+	d.lock.Lock()
+	defer d.lock.Unlock()
+
+	now := time.Now().Unix()
+	_, err := d.db.Exec(`
+		UPDATE archive_jobs
+		SET state = 'archived', last_error = '', updated_at = ?
+		WHERE chat_id = ? AND message_id = ?
+	`, now, chatID, messageID)
+	return err
+}
+
+// FailArchiveJob returns a failed archive attempt to 'pending' with bounded exponential retry delay (capped at 30 min).
+func (d *Database) FailArchiveJob(chatID string, messageID int, errStr string) error {
+	d.lock.Lock()
+	defer d.lock.Unlock()
+
+	now := time.Now().Unix()
+	// Read current attempts
+	var attempts int
+	_ = d.db.QueryRow(`SELECT attempts FROM archive_jobs WHERE chat_id = ? AND message_id = ?`, chatID, messageID).Scan(&attempts)
+	attempts++
+
+	// Exponential backoff: 5s * 2^attempts, capped at 1800s (30 minutes)
+	backoffSec := int64(5 * (1 << (attempts - 1)))
+	if backoffSec > 1800 || backoffSec <= 0 {
+		backoffSec = 1800
+	}
+	nextRetry := now + backoffSec
+
+	_, err := d.db.Exec(`
+		UPDATE archive_jobs
+		SET state = 'pending', attempts = ?, next_retry_at = ?, last_error = ?, updated_at = ?
+		WHERE chat_id = ? AND message_id = ?
+	`, attempts, nextRetry, errStr, now, chatID, messageID)
+	return err
+}
+
+// SetArchiveJobConflict marks an archive job as 'conflict' requiring operator intervention without overwrite.
+func (d *Database) SetArchiveJobConflict(chatID string, messageID int, errStr string) error {
+	d.lock.Lock()
+	defer d.lock.Unlock()
+
+	now := time.Now().Unix()
+	_, err := d.db.Exec(`
+		UPDATE archive_jobs
+		SET state = 'conflict', last_error = ?, updated_at = ?
+		WHERE chat_id = ? AND message_id = ?
+	`, errStr, now, chatID, messageID)
+	return err
+}
+
+// GetArchiveStats returns the aggregate archive queue status.
+func (d *Database) GetArchiveStats() (ArchiveStats, error) {
+	d.lock.RLock()
+	defer d.lock.RUnlock()
+
+	var s ArchiveStats
+	err := d.db.QueryRow(`
+		SELECT 
+			COALESCE(SUM(CASE WHEN state = 'pending' OR state = 'copying' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN state = 'pending' OR state = 'copying' THEN expected_size ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN state = 'copying' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN state = 'archived' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN state = 'conflict' THEN 1 ELSE 0 END), 0)
+		FROM archive_jobs
+	`).Scan(&s.BacklogFiles, &s.BacklogBytes, &s.ActiveWorkers, &s.ArchivedFiles, &s.ConflictCount)
+	return s, err
+}
+
+// GetPendingCommittingDownloads returns records in 'committing' status for restart recovery.
+func (d *Database) GetPendingCommittingDownloads() ([]DownloadRecord, error) {
+	d.lock.RLock()
+	defer d.lock.RUnlock()
+
+	rows, err := d.db.Query(`
+		SELECT chat_id, message_id, status, COALESCE(file_name, ''), COALESCE(save_path, ''),
+		       COALESCE(media_type, ''), COALESCE(file_size, 0), COALESCE(sha256, ''),
+		       created_at, updated_at, attempts, next_retry_at
+		FROM download_records
+		WHERE status = 'committing'
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var records []DownloadRecord
+	for rows.Next() {
+		var rec DownloadRecord
+		if err := rows.Scan(
+			&rec.ChatID, &rec.MessageID, &rec.Status, &rec.FileName, &rec.SavePath,
+			&rec.MediaType, &rec.FileSize, &rec.SHA256,
+			&rec.CreatedAt, &rec.UpdatedAt, &rec.Attempts, &rec.NextRetryAt,
+		); err != nil {
+			return nil, err
+		}
+		records = append(records, rec)
+	}
+	return records, nil
+}
+
+// GetStaleDownloadingRecords returns records in 'downloading' status that were interrupted by crash.
+func (d *Database) GetStaleDownloadingRecords() ([]DownloadRecord, error) {
+	d.lock.RLock()
+	defer d.lock.RUnlock()
+
+	rows, err := d.db.Query(`
+		SELECT chat_id, message_id, status, COALESCE(file_name, ''), COALESCE(save_path, ''),
+		       COALESCE(media_type, ''), COALESCE(file_size, 0), COALESCE(sha256, ''),
+		       created_at, updated_at, attempts, next_retry_at
+		FROM download_records
+		WHERE status = 'downloading'
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var records []DownloadRecord
+	for rows.Next() {
+		var rec DownloadRecord
+		if err := rows.Scan(
+			&rec.ChatID, &rec.MessageID, &rec.Status, &rec.FileName, &rec.SavePath,
+			&rec.MediaType, &rec.FileSize, &rec.SHA256,
+			&rec.CreatedAt, &rec.UpdatedAt, &rec.Attempts, &rec.NextRetryAt,
+		); err != nil {
+			return nil, err
+		}
+		records = append(records, rec)
+	}
+	return records, nil
+}
+
+// GetStaleCopyingArchiveJobs returns archive jobs in 'copying' status that were interrupted by crash.
+func (d *Database) GetStaleCopyingArchiveJobs() ([]ArchiveJob, error) {
+	d.lock.RLock()
+	defer d.lock.RUnlock()
+
+	rows, err := d.db.Query(`
+		SELECT chat_id, message_id, relative_path, expected_size, sha256,
+		       state, attempts, next_retry_at, COALESCE(last_error, ''), created_at, updated_at
+		FROM archive_jobs
+		WHERE state = 'copying'
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var jobs []ArchiveJob
+	for rows.Next() {
+		var j ArchiveJob
+		if err := rows.Scan(
+			&j.ChatID, &j.MessageID, &j.RelativePath, &j.ExpectedSize, &j.SHA256,
+			&j.State, &j.Attempts, &j.NextRetryAt, &j.LastError, &j.CreatedAt, &j.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, j)
+	}
+	return jobs, nil
+}
+
 

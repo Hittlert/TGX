@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/gotd/td/telegram"
@@ -17,30 +16,31 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/Hittlert/TGX/core/dcpool"
-	"github.com/Hittlert/TGX/core/downloader"
 	"github.com/Hittlert/TGX/core/logctx"
 	"github.com/Hittlert/TGX/core/storage"
 	"github.com/Hittlert/TGX/core/tclient"
+	"github.com/Hittlert/TGX/core/transfer"
+	"github.com/Hittlert/TGX/internal/fscommit"
 	"github.com/Hittlert/TGX/pkg/sbe/gate"
-	"github.com/Hittlert/TGX/pkg/spool"
-	"github.com/Hittlert/TGX/pkg/writeback"
 )
 
 type Options struct {
 	Listen           string
-	OutputDir        string
-	TempDir          string
-	BufferType       string // "memory" (default), "ssd", "none"
-	BufferDir        string
-	BufferSize       int64 // capacity in bytes
+	OutputDir        string // SSD download root
+	ArchiveDir       string // HDD archive root (optional)
+	MinFreeSpace     uint64 // minimum SSD free space reserve, default 5 GiB
+	TempDir          string // deprecated compatibility
+	BufferType       string // deprecated compatibility
+	BufferDir        string // deprecated compatibility
+	BufferSize       int64  // deprecated compatibility
 	DBPath           string
 	Password         string
 	SingboxURL       string
 	QueueCapacity    int
 	TerminalLimit    int
-	FileConcurrency  int
-	Threads          int
-	PoolSize         int
+	FileConcurrency  int // default 32
+	Threads          int // max file threads, default 8
+	PoolSize         int // max data in-flight, default 40
 	StartPaused      bool
 	ReconnectTimeout time.Duration
 	PeerSyncTimeout  time.Duration
@@ -64,60 +64,31 @@ func (o Options) withDefaults() Options {
 	if o.TempDir == "" {
 		o.TempDir = "/app/temp/tdl"
 	}
-	if o.BufferType == "" {
-		o.BufferType = "memory"
+	if o.FileConcurrency <= 0 {
+		o.FileConcurrency = 5
 	}
-	if o.BufferType == "none" {
-		if o.BufferDir == "" {
-			o.BufferDir = o.OutputDir
-		}
-		o.BufferSize = 0
-	} else {
-		if o.BufferDir == "" {
-			o.BufferDir = o.TempDir
-		}
-		if o.BufferSize == 0 {
-			switch o.BufferType {
-			case "ssd":
-				o.BufferSize = 5 * 1024 * 1024 * 1024 // 5 GiB
-			default:
-				o.BufferSize = 128 * 1024 * 1024 // 128 MiB (memory safe default)
-			}
-		}
+	if o.Threads <= 0 {
+		o.Threads = 48
+	}
+	if o.PoolSize <= 0 {
+		o.PoolSize = 48
+	}
+	if o.MinFreeSpace == 0 {
+		o.MinFreeSpace = fscommit.DefaultMinFreeSpace
 	}
 	if o.DBPath == "" {
 		o.DBPath = "/app/state/download_records.sqlite3"
 	}
-	if o.SingboxURL == "" {
-		o.SingboxURL = "http://127.0.0.1:9090"
-	}
-	if o.QueueCapacity == 0 {
+	if o.QueueCapacity <= 0 {
 		o.QueueCapacity = 1000
 	}
-	if o.TerminalLimit == 0 {
+	if o.TerminalLimit <= 0 {
 		o.TerminalLimit = 2000
 	}
-	if o.FileConcurrency == 0 {
-		o.FileConcurrency = 5
-	}
-	if o.Threads == 0 {
-		o.Threads = 48
-	}
-	if o.PoolSize == 0 {
-		o.PoolSize = 48
-	}
-	if o.PeerSyncTimeout == 0 {
+	if o.PeerSyncTimeout <= 0 {
 		o.PeerSyncTimeout = 3 * time.Minute
 	}
-	if o == (Options{
-		Namespace: "default", Listen: "0.0.0.0:18080", OutputDir: "/app/downloads", TempDir: "/app/temp/tdl",
-		BufferType: "memory", BufferDir: "/app/temp/tdl", BufferSize: 128 * 1024 * 1024,
-		DBPath: "/app/state/download_records.sqlite3", SingboxURL: "http://127.0.0.1:9090",
-		QueueCapacity: 1000, TerminalLimit: 2000, FileConcurrency: 5, Threads: 48, PoolSize: 48,
-		PeerSyncTimeout: 3 * time.Minute,
-	}) {
-		o.StartPaused = true
-	}
+	o.StartPaused = true
 	return o
 }
 
@@ -125,8 +96,11 @@ func (o Options) validate() error {
 	if _, _, err := net.SplitHostPort(o.Listen); err != nil {
 		return fmt.Errorf("invalid daemon listen address: %w", err)
 	}
-	if !filepath.IsAbs(o.OutputDir) || !filepath.IsAbs(o.TempDir) {
+	if !filepath.IsAbs(o.OutputDir) || (o.TempDir != "" && !filepath.IsAbs(o.TempDir)) {
 		return errors.New("daemon output and temp directories must be absolute")
+	}
+	if o.ArchiveDir != "" && !filepath.IsAbs(o.ArchiveDir) {
+		return errors.New("daemon archive directory must be absolute")
 	}
 	if o.FileConcurrency < 1 || o.FileConcurrency > 64 {
 		return fmt.Errorf("file concurrency must be between 1 and 64, got %d", o.FileConcurrency)
@@ -154,19 +128,21 @@ func Run(ctx context.Context, client *telegram.Client, kvd storage.Storage, opts
 	if err := opts.validate(); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(opts.TempDir, 0o755); err != nil {
-		return fmt.Errorf("create daemon temp directory: %w", err)
-	}
-	if err := os.MkdirAll(opts.BufferDir, 0o755); err != nil {
-		return fmt.Errorf("create daemon buffer directory: %w", err)
-	}
+
 	if err := os.MkdirAll(opts.OutputDir, 0o755); err != nil {
-		return fmt.Errorf("create daemon output directory: %w", err)
+		return fmt.Errorf("create output dir: %w", err)
 	}
 
-	sharedGate := gate.NewFloodGate(gate.InitialStartRate, gate.DefaultBurst)
+	listener, err := net.Listen("tcp", opts.Listen)
+	if err != nil {
+		return fmt.Errorf("bind listen address %s: %w", opts.Listen, err)
+	}
+	_ = listener.Close()
+
+	sharedGate := gate.NewFloodGate(float64(opts.PoolSize), 10)
+
 	effectivePoolSize := opts.PoolSize
-	if effectivePoolSize <= 0 {
+	if effectivePoolSize < 48 {
 		effectivePoolSize = 48
 	}
 	pool := dcpool.NewPoolWithGate(client, int64(effectivePoolSize), sharedGate,
@@ -175,151 +151,44 @@ func Run(ctx context.Context, client *telegram.Client, kvd storage.Storage, opts
 	manager := peers.Options{Storage: storage.NewPeers(kvd)}.Build(pool.Default(ctx))
 	access := newTelegramMediaAccess(ctx, pool, manager, opts.PeerSyncTimeout, sharedGate)
 
-	// Automatic disk writer concurrency: SSD buffer/direct is 32, direct HDD is 8
-	diskWorkers := 8
-	if opts.BufferType == "ssd" || opts.BufferType == "memory" {
-		diskWorkers = 32
-	}
+	// 1. Capacity & Admission Owners
+	ssdAdmission := fscommit.NewSSDAdmission(opts.OutputDir, opts.MinFreeSpace)
+	transferMgr := transfer.NewTransferManager(transfer.Options{
+		FileConcurrency: opts.FileConcurrency,
+		MaxFileThreads:  opts.Threads,
+		MaxDataInFlight: int64(opts.PoolSize),
+	})
 
 	var db *Database
-	var err error
 	if opts.DBPath != "" {
 		db, err = NewDatabase(opts.DBPath)
 		if err != nil {
 			logctx.From(ctx).Warn("could not initialize control database", zap.Error(err))
 		}
 	}
+	if db != nil {
+		defer db.Close()
+	}
+
+	// 2. Single-Worker Whole-File Archive
+	var archiveWorker *ArchiveWorker
+	if opts.ArchiveDir != "" && db != nil {
+		archiveWorker, err = NewArchiveWorker(db, opts.OutputDir, opts.ArchiveDir, logctx.From(ctx))
+		if err != nil {
+			return fmt.Errorf("init archive worker: %w", err)
+		}
+	}
+
+	// 3. Restart Crash Recovery Matrix
+	if db != nil {
+		if recErr := ReconcileOnStartup(ctx, db, opts.OutputDir, opts.ArchiveDir, logctx.From(ctx)); recErr != nil {
+			logctx.From(ctx).Warn("startup crash recovery reported warning", zap.Error(recErr))
+		}
+	}
 
 	registry := NewRegistryWithContext(ctx, opts.QueueCapacity, opts.TerminalLimit, time.Now)
 	registry.SetPaused(opts.StartPaused)
 	registry.SetPool(PoolSnapshot{Size: effectivePoolSize})
-
-	if db != nil {
-		// Execute Startup Crash Recovery Matrix with buffer awareness
-		reconciler := NewReconcilerWithBuffer(db.DB(), opts.OutputDir, opts.BufferDir, opts.BufferType, nil, logctx.From(ctx))
-		reconciler.SetRegistry(registry)
-		if recResults, err := reconciler.ReconcileAll(ctx); err != nil {
-			logctx.From(ctx).Error("startup crash recovery failed", zap.Error(err))
-		} else if len(recResults) > 0 {
-			logctx.From(ctx).Info("startup crash recovery completed", zap.Int("recovered_tasks", len(recResults)))
-		}
-	}
-
-	// Initialize Portable VFS Write-Back Spool Store & Target Sink
-	var spoolStore spool.Store
-	var wbQueue *writeback.Queue
-	var targetSink *writeback.TargetSink
-
-	if opts.BufferType == "memory" {
-		spoolStore = spool.NewMemoryStore(opts.BufferSize)
-	} else if opts.BufferType != "none" {
-		spoolStore, err = spool.NewFileStore(opts.BufferDir, opts.BufferSize)
-		if err != nil {
-			return fmt.Errorf("init spool store: %w", err)
-		}
-		_ = spoolStore.Recover(ctx)
-	}
-
-	if spoolStore != nil {
-		defer func() { _ = spoolStore.Close() }()
-		wbQueue = writeback.NewQueue()
-		defer wbQueue.Close()
-
-		sinkCfg := writeback.DefaultConfig(opts.OutputDir)
-		sinkCfg.Concurrency = 5
-		cb := writeback.Callbacks{
-			OnSegmentDurable: func(key spool.SegmentKey, durableBytes int64) {
-				if db != nil {
-					_ = db.DeleteSpoolSegment(key.TaskID, key.Gen, key.SegmentIndex)
-				}
-			},
-			OnTaskFinalized: func(taskID, gen, finalRelPath, shaHex string, size int64, finalErr error) {
-				if finalErr == nil {
-					if db != nil {
-						_ = db.RecordTargetCommit(TargetCommitRecord{
-							TaskID:          taskID,
-							Generation:      gen,
-							FinalPath:       finalRelPath,
-							ExpectedSize:    size,
-							ExpectedSHA256:  shaHex,
-							CommittedSHA256: shaHex,
-							State:           "committed",
-						})
-					}
-					var res FinishResult = FinishAcceptedNewTerminal
-					if registry != nil {
-						res = registry.FinishTask(taskID, gen, StateSuccess, "", "", finalRelPath, false, shaHex)
-					}
-					if res == FinishAcceptedNewTerminal && db != nil {
-						parts := strings.Split(taskID, ":")
-						if len(parts) == 2 {
-							var msgID int
-							_, _ = fmt.Sscanf(parts[1], "%d", &msgID)
-							_ = db.UpdateDownloadStatus(parts[0], msgID, "success", "", finalRelPath, "", 0, "")
-						}
-					}
-				} else {
-					var res FinishResult = FinishAcceptedNewTerminal
-					if registry != nil {
-						res = registry.FinishTask(taskID, gen, StateFailed, "write_error", finalErr.Error(), "", false, "")
-					}
-					if res == FinishAcceptedNewTerminal && db != nil {
-						parts := strings.Split(taskID, ":")
-						if len(parts) == 2 {
-							var msgID int
-							_, _ = fmt.Sscanf(parts[1], "%d", &msgID)
-							_ = db.UpdateDownloadStatus(parts[0], msgID, "failed", "", "", "", 0, finalErr.Error())
-						}
-					}
-				}
-			},
-		}
-		targetSink = writeback.NewTargetSink(sinkCfg, spoolStore, wbQueue, cb, logctx.From(ctx))
-		defer func() { _ = targetSink.Close() }()
-
-		// Recover and re-enqueue active segments from SQLite
-		if db != nil {
-			if activeSegs, err := db.GetActiveSpoolSegments(); err == nil && len(activeSegs) > 0 {
-				if fs, ok := spoolStore.(*spool.FileStore); ok {
-					for _, segRec := range activeSegs {
-						segKey := spool.SegmentKey{
-							TaskID:       segRec.TaskID,
-							Gen:          segRec.Generation,
-							SegmentIndex: segRec.SegmentIndex,
-							StartOffset:  segRec.StartOffset,
-							Length:       segRec.ExpectedLength,
-						}
-						if item, err := fs.RestoreSegment(segKey); err == nil && item != nil {
-							isLast := (segRec.ExpectedFileSize > 0 && segRec.StartOffset+segRec.ExpectedLength >= segRec.ExpectedFileSize)
-							wbQueue.Enqueue(&writeback.Item{
-								Key:              segKey,
-								FinalRelPath:     segRec.FinalRelPath,
-								ExpectedFileSize: segRec.ExpectedFileSize,
-								IsLastSegment:    isLast,
-								Item:             item,
-								AddedAt:          time.Now(),
-							})
-						}
-					}
-				}
-			}
-		}
-	}
-
-	iter := newTaskIter(registry, newTaskResolver(access, opts.BufferDir, opts.OutputDir, spoolStore, wbQueue, db))
-	dl := downloader.New(downloader.Options{
-		Pool:            pool,
-		Threads:         opts.Threads,
-		DiskWorkers:     diskWorkers,
-		FileConcurrency: opts.FileConcurrency,
-		Iter:            iter,
-		Progress:        newTaskProgress(),
-		FloodGate:       sharedGate,
-	})
-
-	if db != nil {
-		defer db.Close()
-	}
 
 	slotCfg := SlotPoolConfig{
 		TotalSlots:      opts.PoolSize,
@@ -328,6 +197,7 @@ func Run(ctx context.Context, client *telegram.Client, kvd storage.Storage, opts
 		MaxSlotsPerFile: opts.PoolSize,
 	}
 	slotPool := NewGlobalSlotPool(slotCfg)
+
 	statsFile := ""
 	if opts.DBPath != "" {
 		statsFile = filepath.Join(filepath.Dir(opts.DBPath), "proxy_stats.json")
@@ -338,10 +208,10 @@ func Run(ctx context.Context, client *telegram.Client, kvd storage.Storage, opts
 
 	var orchestrator *Orchestrator
 	if db != nil {
-		orchestrator = NewOrchestrator(db, slotPool, proxyManager, access, registry, logctx.From(ctx), opts.OutputDir)
-		orchestrator.SetBufferDir(opts.BufferDir)
-		orchestrator.SetSpool(spoolStore)
-		orchestrator.SetTargetSink(targetSink)
+		orchestrator = NewOrchestrator(db, transferMgr, ssdAdmission, proxyManager, access, registry, logctx.From(ctx), opts.OutputDir)
+		if archiveWorker != nil {
+			orchestrator.SetArchiveWorker(archiveWorker)
+		}
 		orchestrator.Start(groupCtx)
 
 		// Start MTProto Real-Time Push Updates Streaming Engine
@@ -349,10 +219,13 @@ func Run(ctx context.Context, client *telegram.Client, kvd storage.Storage, opts
 		SetGlobalUpdatesStream(updatesStream)
 	}
 
+	if archiveWorker != nil && archiveWorker.IsEnabled() {
+		archiveWorker.Start(groupCtx)
+	}
+
 	authWizard := NewAuthWizard(db, client, kvd, logctx.From(ctx), opts.Namespace)
 	webServer := NewWebServer(db, slotPool, proxyManager, orchestrator, access, registry, logctx.From(ctx), opts.Password, sharedGate)
 	webServer.SetAuthWizard(authWizard)
-	webServer.SetSpool(spoolStore)
 
 	server := &http.Server{
 		Addr: opts.Listen, Handler: webServer.Handler(),
@@ -371,13 +244,6 @@ func Run(ctx context.Context, client *telegram.Client, kvd storage.Storage, opts
 		return nil
 	})
 	group.Go(func() error {
-		err := dl.Download(groupCtx, opts.Threads)
-		if errors.Is(err, context.Canceled) {
-			return nil
-		}
-		return err
-	})
-	group.Go(func() error {
 		err := server.ListenAndServe()
 		if errors.Is(err, http.ErrServerClosed) {
 			return nil
@@ -393,22 +259,19 @@ func Run(ctx context.Context, client *telegram.Client, kvd storage.Storage, opts
 		if orchestrator != nil {
 			orchestrator.SetRunning(false)
 		}
-		// Graceful drain: wait 1.5s for active SBE checkpoints to flush
-		time.Sleep(1500 * time.Millisecond)
-
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		return server.Shutdown(shutdownCtx)
 	})
 
-	logctx.From(ctx).Info("TGX download daemon started",
+	logctx.From(ctx).Info("TGX direct SSD download daemon started",
 		zap.String("listen", opts.Listen),
-		zap.String("buffer_type", opts.BufferType),
-		zap.Int64("buffer_size", opts.BufferSize),
+		zap.String("output_dir", opts.OutputDir),
+		zap.String("archive_dir", opts.ArchiveDir),
+		zap.Uint64("min_free_space", opts.MinFreeSpace),
 		zap.Int("file_concurrency", opts.FileConcurrency),
 		zap.Int("threads", opts.Threads),
-		zap.Int("disk_workers", diskWorkers),
-		zap.Int("pool_size", opts.PoolSize),
+		zap.Int("max_data_in_flight", opts.PoolSize),
 		zap.Duration("peer_sync_timeout", opts.PeerSyncTimeout),
 		zap.Bool("paused", opts.StartPaused),
 	)
@@ -423,12 +286,12 @@ func startInitialPeerSync(
 	timeout time.Duration,
 	syncPeers func(context.Context) error,
 ) <-chan error {
-	result := make(chan error, 1)
+	ch := make(chan error, 1)
 	go func() {
+		defer close(ch)
 		syncCtx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
-		result <- syncPeers(syncCtx)
-		close(result)
+		ch <- syncPeers(syncCtx)
 	}()
-	return result
+	return ch
 }

@@ -97,3 +97,4 @@ htmlcov/
 .vscode/
 *.swp
 *.swo
+bin/

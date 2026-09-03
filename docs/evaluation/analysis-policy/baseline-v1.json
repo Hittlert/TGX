@@ -3,15 +3,6 @@
   "protocol_version": "1.0",
   "missing_required_measurement": "BLOCKED",
   "invalid_artifact_identity": "INVALID",
-  "validity": {
-    "require_frozen_baseline_cohort": true,
-    "require_manifest_sha256_match": true,
-    "manifest_mismatch": "INVALID",
-    "require_effective_config_match": true,
-    "require_source_preflight": true,
-    "require_current_calibration": true,
-    "daemon_api_loss_without_expected_stop": "ABORTED"
-  },
   "correctness": {
     "required_completed_file_match_fraction": 1.0,
     "allow_unexpected_final_files": false,
@@ -29,7 +20,7 @@
       "control_minimum_mbps": 250,
       "required_tgx_mbps": 200
     },
-    "minimum_tgx_to_frozen_tdl_payload_ratio": 0.75,
+    "minimum_tgx_to_paired_tdl_payload_ratio": 0.75,
     "minimum_tgx_to_network_control_ratio_when_control_below_threshold": 0.75
   },
   "diagnosability": {

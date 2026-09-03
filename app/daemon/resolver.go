@@ -3,13 +3,13 @@ package daemon
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 
-	"github.com/Hittlert/TGX/core/downloader"
-	"github.com/Hittlert/TGX/pkg/spool"
-	"github.com/Hittlert/TGX/pkg/writeback"
 	"github.com/flytam/filenamify"
+
+	"github.com/Hittlert/TGX/core/downloader"
 )
 
 type ResolvedMedia struct {
@@ -28,8 +28,6 @@ type taskResolver struct {
 	access     MediaAccess
 	tempRoot   string
 	outputRoot string
-	spool      spool.Store
-	wbQueue    *writeback.Queue
 	db         *Database
 }
 
@@ -37,10 +35,6 @@ func newTaskResolver(access MediaAccess, tempRoot, outputRoot string, optArgs ..
 	r := &taskResolver{access: access, tempRoot: tempRoot, outputRoot: outputRoot}
 	for _, arg := range optArgs {
 		switch v := arg.(type) {
-		case spool.Store:
-			r.spool = v
-		case *writeback.Queue:
-			r.wbQueue = v
 		case *Database:
 			r.db = v
 		}
@@ -59,24 +53,25 @@ func (r *taskResolver) Resolve(ctx context.Context, task *Task) (taskElement, er
 	}
 	task.SetResolved(media.Name, media.Size, media.DCID)
 
-	finalPath := request.FinalPath
-	if finalPath == "" && media.Name != "" {
-		safeMediaName, _ := filenamify.Filenamify(media.Name, filenamify.Options{Replacement: "_"})
-		if safeMediaName != "" {
-			dir := filepath.Dir(request.FinalPath)
-			finalPath = filepath.Join(dir, fmt.Sprintf("%d - %s", request.MessageID, safeMediaName))
-			finalPath = strings.ReplaceAll(finalPath, "\\", "/")
-			task.SetFinalPath(finalPath)
-		}
+	fileName := media.Name
+	if fileName == "" {
+		fileName = fmt.Sprintf("%d.bin", request.MessageID)
+	}
+	safeFileName, err := filenamify.Filenamify(fileName, filenamify.Options{Replacement: "_"})
+	if err != nil || safeFileName == "" {
+		safeFileName = fmt.Sprintf("%d.bin", request.MessageID)
 	}
 
-	absolute, err := safeOutputPath(r.outputRoot, finalPath)
-	if err != nil {
-		return nil, NewTaskError("path", false, err)
+	finalPath := request.FinalPath
+	if finalPath == "" {
+		finalPath = safeFileName
 	}
-	if exists, err := existingFile(absolute, media.Size); err != nil {
-		return nil, NewTaskError("collision", false, err)
-	} else if exists {
+
+	absolute := filepath.Join(r.outputRoot, filepath.FromSlash(finalPath))
+	if finInfo, statErr := os.Stat(absolute); statErr == nil {
+		if finInfo.Size() != media.Size {
+			return nil, NewTaskError("collision", false, fmt.Errorf("file size mismatch: expected %d, got %d", media.Size, finInfo.Size()))
+		}
 		var expectedSHA string
 		if r.db != nil {
 			if commitRec, err := r.db.GetTargetCommit(request.ID, ""); err == nil && commitRec != nil {
@@ -88,14 +83,6 @@ func (r *taskResolver) Resolve(ctx context.Context, task *Task) (taskElement, er
 			return nil, NewTaskError("collision", false, err)
 		}
 		return &existingElement{task: task, file: media.File, path: finalPath, sha: verifiedSHA}, nil
-	}
-
-	if r.spool != nil && r.wbQueue != nil {
-		spoolElem, err := newSpoolFileElement(task, media.File, r.outputRoot, media.Date, r.spool, r.wbQueue, r.db)
-		if err != nil {
-			return nil, NewTaskError("spool", false, err)
-		}
-		return spoolElem, nil
 	}
 
 	element, err := newFileElement(task, media.File, r.tempRoot, r.outputRoot, media.Date)
