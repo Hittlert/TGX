@@ -93,33 +93,52 @@ func ParseMessageLink(ctx context.Context, manager *peers.Manager, s string) (pe
 }
 
 func GetInputPeer(ctx context.Context, manager *peers.Manager, from string) (peers.Peer, error) {
-	cleanFrom := strings.TrimPrefix(from, "-100")
-	id, err := strconv.ParseInt(cleanFrom, 10, 64)
-	if err != nil {
-		id, err = strconv.ParseInt(from, 10, 64)
+	from = strings.TrimSpace(from)
+	from = strings.TrimPrefix(from, "@")
+	if from == "" {
+		return nil, errors.New("empty peer identifier")
 	}
-	if err != nil {
-		// from is username
-		p, err := manager.Resolve(ctx, from)
-		if err != nil {
-			return nil, err
+
+	// 1. Check if input is a numeric ID (standard integer or legacy Bot API prefix representation)
+	var numericID int64
+	var isNumeric bool
+	if strings.HasPrefix(from, "-100") && len(from) > 4 {
+		if id, err := strconv.ParseInt(from[4:], 10, 64); err == nil {
+			numericID = id
+			isNumeric = true
 		}
-
-		return p, nil
+	} else if id, err := strconv.ParseInt(from, 10, 64); err == nil {
+		if id < 0 {
+			numericID = -id
+		} else {
+			numericID = id
+		}
+		isNumeric = true
 	}
 
-	var p peers.Peer
-	if p, err = manager.ResolveChannelID(ctx, id); err == nil {
-		return p, nil
+	if isNumeric {
+		// Resolve via authoritative typed peers.Manager methods
+		if p, err := manager.ResolveChannelID(ctx, numericID); err == nil {
+			return p, nil
+		}
+		if p, err := manager.ResolveChatID(ctx, numericID); err == nil {
+			return p, nil
+		}
+		if p, err := manager.ResolveUserID(ctx, numericID); err == nil {
+			return p, nil
+		}
 	}
-	if p, err = manager.ResolveUserID(ctx, id); err == nil {
-		return p, nil
-	}
-	if p, err = manager.ResolveChatID(ctx, id); err == nil {
+
+	// 2. Resolve username / domain via manager
+	p, err := manager.Resolve(ctx, from)
+	if err == nil {
 		return p, nil
 	}
 
-	return nil, fmt.Errorf("failed to get result from %d：%v", id, err)
+	if isNumeric {
+		return nil, fmt.Errorf("failed to resolve peer from id %d: %w", numericID, err)
+	}
+	return nil, fmt.Errorf("failed to resolve peer %s: %w", from, err)
 }
 
 func GetPeerID(peer tg.PeerClass) int64 {

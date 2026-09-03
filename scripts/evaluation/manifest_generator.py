@@ -84,10 +84,13 @@ def generate_profile_manifest(db_path, baseline_storage_root, profile_id, seed, 
         if needed <= 0 or len(selected_items) >= total_cases:
             return
         q = f"""
-            SELECT chat_id, message_id, file_name, save_path, media_type, file_size, created_at
-            FROM download_records
-            WHERE status = 'success' AND chat_id LIKE '-100%' AND file_size >= {low} AND ({f'file_size <= {high}' if high else '1=1'})
-              AND save_path IS NOT NULL AND save_path != ''
+            SELECT d.chat_id, d.message_id, d.file_name, d.save_path, d.media_type, d.file_size, d.created_at, COALESCE(c.chat_type, 'channel') as chat_type
+            FROM download_records d
+            LEFT JOIN dialog_cache c ON d.chat_id = c.chat_id
+            WHERE d.status = 'success' 
+              AND (c.chat_type IN ('channel', 'supergroup', 'group') OR (c.chat_type IS NULL AND d.chat_id LIKE '-%'))
+              AND d.file_size >= {low} AND ({f'd.file_size <= {high}' if high else '1=1'})
+              AND d.save_path IS NOT NULL AND d.save_path != ''
             ORDER BY RANDOM()
             LIMIT {needed * 20}
         """
@@ -97,7 +100,7 @@ def generate_profile_manifest(db_path, baseline_storage_root, profile_id, seed, 
         for r in candidates:
             if len(selected_items) >= total_cases:
                 break
-            chat_id, msg_id, file_name, save_path, media_type, file_size, created_at = r
+            chat_id, msg_id, file_name, save_path, media_type, file_size, created_at, chat_type = r
             key = (str(chat_id), int(msg_id))
             if key in seen_keys:
                 continue
@@ -132,6 +135,7 @@ def generate_profile_manifest(db_path, baseline_storage_root, profile_id, seed, 
                 "clean_path": clean_path,
                 "baseline_path": baseline_file,
                 "media_type": media_type or "unknown",
+                "peer_type": chat_type,
                 "file_size": int(file_size),
                 "created_at": int(created_at),
                 "size_bucket": classify_bucket(file_size),
@@ -180,6 +184,7 @@ def generate_profile_manifest(db_path, baseline_storage_root, profile_id, seed, 
         rec = {
             "case_id": f"{profile_id}-{idx:04d}",
             "chat_id": item["chat_id"],
+            "peer_type": item.get("peer_type", "channel"),
             "message_id": item["message_id"],
             "media_type": item["media_type"],
             "dc_id": 0,

@@ -106,9 +106,5 @@ func (r *taskResolver) Resolve(ctx context.Context, task *Task) (taskElement, er
 }
 
 func normalizePeer(peer string) string {
-	peer = strings.TrimPrefix(strings.TrimSpace(peer), "@")
-	if strings.HasPrefix(peer, "-100") && len(peer) > 4 {
-		return peer[4:]
-	}
-	return strings.TrimPrefix(peer, "-")
+	return strings.TrimPrefix(strings.TrimSpace(peer), "@")
 }

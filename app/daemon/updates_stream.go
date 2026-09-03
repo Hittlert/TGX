@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -22,8 +23,9 @@ type UpdatesStream struct {
 	logger       *zap.Logger
 	dispatcher   tg.UpdateDispatcher
 
-	targetCacheMu sync.RWMutex
-	targetCache   map[string]ListenTarget
+	targetCacheMu    sync.RWMutex
+	targetByID       map[int64]ListenTarget
+	targetByUsername map[string]ListenTarget
 }
 
 var (
@@ -98,11 +100,12 @@ func GlobalUpdateHandler() tg.UpdateDispatcher {
 
 func NewUpdatesStream(db *Database, orchestrator *Orchestrator, logger *zap.Logger) *UpdatesStream {
 	s := &UpdatesStream{
-		db:           db,
-		orchestrator: orchestrator,
-		logger:       logger,
-		dispatcher:   tg.NewUpdateDispatcher(),
-		targetCache:  make(map[string]ListenTarget),
+		db:               db,
+		orchestrator:     orchestrator,
+		logger:           logger,
+		dispatcher:       tg.NewUpdateDispatcher(),
+		targetByID:       make(map[int64]ListenTarget),
+		targetByUsername: make(map[string]ListenTarget),
 	}
 	s.registerHandlers()
 	s.refreshTargetCache()
@@ -124,28 +127,28 @@ func (s *UpdatesStream) refreshTargetCache() {
 
 	s.targetCacheMu.Lock()
 	defer s.targetCacheMu.Unlock()
-	s.targetCache = make(map[string]ListenTarget)
+	s.targetByID = make(map[int64]ListenTarget)
+	s.targetByUsername = make(map[string]ListenTarget)
 	for _, t := range targets {
 		if t.Enabled {
-			s.targetCache[t.ChatID] = t
-			s.targetCache[strings.ToLower(t.ChatID)] = t
-
-			cleanID := strings.TrimPrefix(t.ChatID, "@")
-			s.targetCache[cleanID] = t
-			s.targetCache[strings.ToLower(cleanID)] = t
-
+			cleanID := strings.TrimPrefix(strings.TrimSpace(t.ChatID), "@")
 			if strings.HasPrefix(cleanID, "-100") && len(cleanID) > 4 {
-				s.targetCache[cleanID[4:]] = t
-			} else if strings.HasPrefix(cleanID, "-") && len(cleanID) > 1 {
-				s.targetCache[cleanID[1:]] = t
+				if id, err := strconv.ParseInt(cleanID[4:], 10, 64); err == nil {
+					s.targetByID[id] = t
+				}
+			} else if id, err := strconv.ParseInt(cleanID, 10, 64); err == nil {
+				if id < 0 {
+					s.targetByID[-id] = t
+				} else {
+					s.targetByID[id] = t
+				}
 			}
 
 			if t.Username != "" {
-				u := strings.TrimPrefix(t.Username, "@")
-				s.targetCache[u] = t
-				s.targetCache[strings.ToLower(u)] = t
-				s.targetCache["@"+u] = t
-				s.targetCache["@"+strings.ToLower(u)] = t
+				u := strings.ToLower(strings.TrimPrefix(strings.TrimSpace(t.Username), "@"))
+				if u != "" {
+					s.targetByUsername[u] = t
+				}
 			}
 		}
 	}
@@ -156,99 +159,51 @@ func (s *UpdatesStream) matchTarget(msg *tg.Message, e tg.Entities) (ListenTarge
 		return ListenTarget{}, false
 	}
 
-	// 1. Match by PeerID
-	peerID := extractPeerID(msg.PeerID)
-	if peerID != "" {
-		if target, ok := s.lookupTarget(peerID); ok {
-			return target, true
-		}
-	}
+	s.targetCacheMu.RLock()
+	defer s.targetCacheMu.RUnlock()
 
-	// 2. Match by FromID (for Bot direct messages or specific senders)
-	if msg.FromID != nil {
-		fromID := extractPeerID(msg.FromID)
-		if fromID != "" {
-			if target, ok := s.lookupTarget(fromID); ok {
-				return target, true
-			}
-		}
-	}
-
-	// 3. Match by Entities (Channel or User username)
+	// 1. Match by PeerID (Typed MTProto Peer)
 	switch p := msg.PeerID.(type) {
 	case *tg.PeerChannel:
+		if t, ok := s.targetByID[p.ChannelID]; ok && t.Enabled {
+			return t, true
+		}
 		if ch, ok := e.Channels[p.ChannelID]; ok && ch != nil && ch.Username != "" {
-			if target, ok := s.lookupTarget(ch.Username); ok {
-				return target, true
+			if t, ok := s.targetByUsername[strings.ToLower(ch.Username)]; ok && t.Enabled {
+				return t, true
 			}
+		}
+	case *tg.PeerChat:
+		if t, ok := s.targetByID[p.ChatID]; ok && t.Enabled {
+			return t, true
 		}
 	case *tg.PeerUser:
+		if t, ok := s.targetByID[p.UserID]; ok && t.Enabled {
+			return t, true
+		}
 		if u, ok := e.Users[p.UserID]; ok && u != nil && u.Username != "" {
-			if target, ok := s.lookupTarget(u.Username); ok {
-				return target, true
+			if t, ok := s.targetByUsername[strings.ToLower(u.Username)]; ok && t.Enabled {
+				return t, true
 			}
 		}
 	}
 
+	// 2. Match by FromID
 	if msg.FromID != nil {
-		if p, ok := msg.FromID.(*tg.PeerUser); ok {
+		switch p := msg.FromID.(type) {
+		case *tg.PeerChannel:
+			if t, ok := s.targetByID[p.ChannelID]; ok && t.Enabled {
+				return t, true
+			}
+		case *tg.PeerUser:
+			if t, ok := s.targetByID[p.UserID]; ok && t.Enabled {
+				return t, true
+			}
 			if u, ok := e.Users[p.UserID]; ok && u != nil && u.Username != "" {
-				if target, ok := s.lookupTarget(u.Username); ok {
-					return target, true
+				if t, ok := s.targetByUsername[strings.ToLower(u.Username)]; ok && t.Enabled {
+					return t, true
 				}
 			}
-		}
-	}
-
-	return ListenTarget{}, false
-}
-
-func (s *UpdatesStream) lookupTarget(key string) (ListenTarget, bool) {
-	key = strings.TrimSpace(key)
-	if key == "" {
-		return ListenTarget{}, false
-	}
-
-	s.targetCacheMu.RLock()
-	t, ok := s.targetCache[key]
-	if !ok {
-		t, ok = s.targetCache[strings.ToLower(key)]
-	}
-	if !ok {
-		clean := strings.TrimPrefix(key, "@")
-		t, ok = s.targetCache[clean]
-		if !ok {
-			t, ok = s.targetCache[strings.ToLower(clean)]
-		}
-		if !ok && strings.HasPrefix(clean, "-100") && len(clean) > 4 {
-			t, ok = s.targetCache[clean[4:]]
-		}
-	}
-	s.targetCacheMu.RUnlock()
-
-	if ok && t.Enabled {
-		return t, true
-	}
-
-	if s.db != nil {
-		var target ListenTarget
-		var enabledInt int
-		cleanKey := strings.TrimPrefix(key, "@")
-		queryKey := "%" + cleanKey + "%"
-		err := s.db.DB().QueryRow(`
-			SELECT chat_id, enabled, title, username, download_filter 
-			FROM listen_targets 
-			WHERE enabled = 1 AND (chat_id = ? OR chat_id = ? OR username LIKE ? OR chat_id LIKE ?)
-			LIMIT 1
-		`, key, "@"+cleanKey, queryKey, queryKey).Scan(
-			&target.ChatID, &enabledInt, &target.Title, &target.Username, &target.DownloadFilter,
-		)
-		if err == nil && enabledInt == 1 {
-			target.Enabled = true
-			s.targetCacheMu.Lock()
-			s.targetCache[key] = target
-			s.targetCacheMu.Unlock()
-			return target, true
 		}
 	}
 
