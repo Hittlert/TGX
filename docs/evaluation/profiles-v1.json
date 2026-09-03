@@ -15,17 +15,19 @@
   "profiles": {
     "P-S": {
       "title": "pure-small",
+      "measurement_mode": "fixed-burst-to-terminal",
       "count_distribution": {
         "micro": 0.20,
         "small_low": 0.25,
         "small_mid": 0.35,
         "small_high": 0.20
       },
-      "minimum_case_count": 100,
+      "case_count": 100,
       "required_sentinels": ["below_1MiB", "at_1MiB"]
     },
     "P-SM": {
       "title": "small-medium",
+      "measurement_mode": "duration-or-terminal",
       "count_distribution": {
         "small": 0.80,
         "medium": 0.20
@@ -41,6 +43,7 @@
     },
     "P-LMS": {
       "title": "large-medium-small",
+      "measurement_mode": "duration-or-terminal",
       "count_distribution": {
         "small": 0.80,
         "medium": 0.15,
@@ -56,6 +59,7 @@
     },
     "P-L": {
       "title": "pure-large",
+      "measurement_mode": "duration-or-terminal",
       "count_distribution": {
         "large_low": 0.30,
         "large_mid": 0.40,
@@ -73,6 +77,9 @@
   },
   "workload": {
     "minimum_duration_multiplier": 1.5,
-    "formula": "manifest_total_bytes >= control_payload_bps * duration_seconds * minimum_duration_multiplier"
+    "duration_mode_formula": "manifest_total_bytes >= control_payload_bps * duration_seconds * minimum_duration_multiplier",
+    "fixed_burst_window": "first_item_admitted_at..last_item_terminal_at",
+    "post_exhaustion_idle_rule": "exclude_from_throughput_and_stall_metrics",
+    "manifest_identity": "baseline_cohort_id + manifest_sha256"
   }
 }

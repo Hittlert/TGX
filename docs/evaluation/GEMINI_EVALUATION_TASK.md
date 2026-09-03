@@ -1,8 +1,8 @@
-# Gemini Task: Align Protocol, Run TDL Baseline, Run First TGX Functional Evaluation
+# Gemini Task: Establish One Baseline Cohort, Then Reuse It For TGX Evaluations
 
 ## Goal
 
-Evaluate and align the fixed evaluation standard, then produce a valid TDL baseline and the first TGX functional raw dataset. Do not fix TGX product bugs during this task.
+Review and implement the fixed Protocol v1 standard. Do not execute another long evaluation until the user explicitly requests it. When execution is requested, establish one valid immutable TDL Baseline Cohort, then reuse it for later TGX candidates. Do not fix TGX product bugs during evaluation work.
 
 ## Authoritative Files
 
@@ -29,7 +29,7 @@ The alignment file MUST list:
 - unresolved decisions;
 - final Protocol/schema SHA256 values used for execution.
 
-You may correct Protocol/schema files only for an executable contradiction. Record every correction in the alignment file. Once Phase A is complete, freeze their hashes before any run.
+Do not edit Protocol/schema files while implementing the harness. If you cannot agree with the current standard, append the exact objection to `STANDARD_ALIGNMENT.md` and stop before execution. Once aligned, freeze the listed hashes before any run.
 
 ## Phase B: Repair The Evaluation Harness
 
@@ -44,8 +44,14 @@ Required harness behavior:
 - OutputDir/DB/Buffer/Log are new and empty per run;
 - every manifest case appears in task results;
 - artifact identity is complete;
+- candidate source/binary matches RunSpec before submission;
+- baseline cohort and manifest hashes match before submission;
+- RunSpec configuration matches daemon effective configuration;
+- task state comes from the engine, not final-file inference;
+- timeout/cancel is distinct from engine failure;
+- container exit/OOM/signal state is captured before teardown;
 - collector joins before checksums;
-- protocol self-tests pass before real runs.
+- protocol self-tests drive the real collector/analyzer and pass before real runs.
 
 Evaluation-only code and read-only observability instrumentation may be changed. Do not fix downloader, scheduling, Spool, commit or recovery behavior during this task.
 
@@ -55,9 +61,9 @@ Use a known-good TDL binary independent of the TGX candidate source tree. Record
 
 If an independent TDL artifact cannot be established, mark Phase C `BLOCKED` and stop. Do not substitute an unidentified `dev/unknown` binary.
 
-## Phase D: TDL Baseline
+## Phase D: One-Time TDL Baseline Cohort
 
-Generate Golden manifests for `P-S`, `P-SM`, `P-LMS`, `P-L` using one frozen seed per profile.
+Generate manifests for `P-S`, `P-SM`, `P-LMS`, `P-L` exactly once. A seed is not identity: seal every manifest SHA256 and assign one `baseline_cohort_id`. Establish Golden only after two independent reference downloads match.
 
 Canonical runs:
 
@@ -72,13 +78,15 @@ repetitions=3
 
 Also run `P-LMS` with concurrency `8,16,32,48`, keeping file concurrency 5.
 
-Use the same host, isolated session copy, proxy route and target storage for all runs. Every repetition uses a new empty output root.
+Use the same host, isolated session copy, proxy route and target storage for all runs. Every repetition uses a new empty output root. Seal the TDL artifact, all raw roots, sentinels and manifests as one immutable cohort. This full suite is not rerun for later TGX code changes.
 
 ## Phase E: First TGX Functional Evaluation
 
-Use byte-identical TDL manifests. Run `P-S`, `P-SM`, `P-LMS`, `P-L` once each with canonical `32/5/32`, 240 seconds, using a fully identified TGX artifact.
+Use byte-identical frozen cohort manifests. Before TGX, run all-case metadata preflight and the fixed lightweight network sentinels. Run `P-S`, `P-SM`, `P-LMS`, `P-L` once each with canonical `32/5/32` using a fully identified TGX artifact. `P-S` is a 100-item burst; do not dilute it over a 240-second idle tail.
 
 This is a functional run, not a performance stability certification. Collect all fixed raw artifacts and apply `baseline-v1` only after raw checksums are frozen.
+
+For every later TGX change, reuse the same `baseline_cohort_id + manifest_sha256 + tdl_baseline_ref`. Run only metadata preflight, lightweight calibration and TGX. Use the frozen TDL binary only for disputed-case adjudication. Never regenerate manifests and never rerun the full TDL suite unless a Protocol baseline-invalidating identity changes.
 
 ## Stop Conditions
 
@@ -89,6 +97,10 @@ Stop and mark `BLOCKED` or `INVALID` when:
 - required metrics cannot be collected;
 - session/account safety is threatened;
 - output reuse is detected;
+- baseline cohort or manifest hash differs;
+- TGX artifact does not match expected source/binary;
+- effective daemon configuration differs from RunSpec;
+- daemon API disappears and exit state is not captured;
 - the harness self-tests fail.
 
 Do not emit GO from incomplete data.
@@ -100,6 +112,7 @@ Provide paths to:
 ```text
 docs/evaluation/STANDARD_ALIGNMENT.md
 evaluation/baselines/tdl/<baseline_id>/
+evaluation/cohorts/<baseline_cohort_id>/
 evaluation/runs/tgx/<run_ids>/
 evaluation/analysis/<policy_version>/comparison-report.md
 ```

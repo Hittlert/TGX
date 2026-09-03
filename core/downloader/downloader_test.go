@@ -294,10 +294,10 @@ func TestDownloader_ShortReadValidationAndAutoRetry(t *testing.T) {
 	invoker := &shortReadInvoker{}
 	pool := &shortReadPool{invoker: invoker}
 
-	// 1 File with 2 parts (1MB)
+	// 1 File with 2 parts (2MB)
 	elem := &fakeElem{
-		file: &fakeFile{size: 1024 * 1024, dc: 4},
-		buf:  newMemWriterAt(1024 * 1024),
+		file: &fakeFile{size: 2 * 1024 * 1024, dc: 4},
+		buf:  newMemWriterAt(2 * 1024 * 1024),
 	}
 
 	iter := &fakeIter{elems: []*fakeElem{elem}}

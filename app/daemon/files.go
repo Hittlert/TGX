@@ -11,10 +11,11 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Hittlert/TGX/core/downloader"
-	atomic "github.com/Hittlert/TGX/pkg/sbe/atomic"
+	sbeatomic "github.com/Hittlert/TGX/pkg/sbe/atomic"
 	"github.com/Hittlert/TGX/pkg/spool"
 	"github.com/Hittlert/TGX/pkg/writeback"
 )
@@ -202,13 +203,15 @@ func (e *spoolFileElement) Publish() (PublishResult, error) {
 }
 
 type trackedWriterAt struct {
-	file *os.File
-	task *Task
+	file    *os.File
+	task    *Task
+	written int64
 }
 
 func (w *trackedWriterAt) WriteAt(p []byte, offset int64) (int, error) {
 	written, err := w.file.WriteAt(p, offset)
 	if written > 0 {
+		atomic.AddInt64(&w.written, int64(written))
 		w.task.RecordWrite(offset, written)
 	}
 	return written, err
@@ -291,7 +294,11 @@ func (e *fileElement) Publish() (PublishResult, error) {
 	if err != nil {
 		return result, fmt.Errorf("stat temp file: %w", err)
 	}
-	if stat.Size() != e.file.Size() {
+	if stat.Size() == 0 {
+		_ = os.Remove(e.tempPath)
+		return result, fmt.Errorf("empty file write: 0 bytes")
+	}
+	if e.file.Size() > 0 && stat.Size() != e.file.Size() {
 		_ = os.Remove(e.tempPath)
 		return result, fmt.Errorf("short write: got %d bytes, want %d", stat.Size(), e.file.Size())
 	}
@@ -307,7 +314,7 @@ func (e *fileElement) Publish() (PublishResult, error) {
 		_ = os.Remove(e.tempPath)
 		return result, err
 	}
-	if exists, err := existingFile(absolute, e.file.Size()); err != nil {
+	if exists, err := existingFile(absolute, stat.Size()); err != nil {
 		_ = os.Remove(e.tempPath)
 		return result, err
 	} else if exists {
@@ -326,10 +333,10 @@ func (e *fileElement) Publish() (PublishResult, error) {
 		_ = os.Chtimes(e.tempPath, when, when)
 	}
 
-	if err := atomic.CommitFile(e.tempPath, absolute); err != nil {
+	if err := sbeatomic.CommitFile(e.tempPath, absolute); err != nil {
 		_ = os.Remove(e.tempPath)
-		if errors.Is(err, atomic.ErrTargetExists) {
-			if exists, checkErr := existingFile(absolute, e.file.Size()); checkErr == nil && exists {
+		if errors.Is(err, sbeatomic.ErrTargetExists) {
+			if exists, checkErr := existingFile(absolute, stat.Size()); checkErr == nil && exists {
 				return PublishResult{Path: e.finalPath, SHA256: shaHash, AlreadyExists: true, absolutePath: absolute}, nil
 			}
 			return result, fmt.Errorf("publish destination without overwrite: %w", err)
@@ -337,9 +344,7 @@ func (e *fileElement) Publish() (PublishResult, error) {
 		return result, fmt.Errorf("publish destination atomic rename: %w", err)
 	}
 
-	if err := syncDirectory(dir); err != nil {
-		return result, err
-	}
+	_ = syncDirectory(dir)
 	return PublishResult{
 		Path: e.finalPath, SHA256: shaHash, absolutePath: absolute,
 	}, nil
