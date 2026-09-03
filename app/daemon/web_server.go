@@ -145,6 +145,11 @@ func (s *WebServer) Handler() http.Handler {
 	}).Methods(http.MethodGet)
 
 	r.HandleFunc("/api/tasks", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			tasks := s.registry.Tasks()
+			writeJSON(w, http.StatusOK, tasks)
+			return
+		}
 		var req TaskRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeError(w, http.StatusBadRequest, "invalid json")
@@ -160,7 +165,7 @@ func (s *WebServer) Handler() http.Handler {
 			status = http.StatusAccepted
 		}
 		writeJSON(w, status, snap)
-	}).Methods(http.MethodPost)
+	}).Methods(http.MethodGet, http.MethodPost)
 
 	r.HandleFunc("/api/control", func(w http.ResponseWriter, r *http.Request) {
 		var req struct {

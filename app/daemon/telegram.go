@@ -14,6 +14,7 @@ import (
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
 	"golang.org/x/sync/singleflight"
+	"golang.org/x/time/rate"
 
 	"github.com/Hittlert/TGX/core/dcpool"
 	"github.com/Hittlert/TGX/core/downloader"
@@ -42,6 +43,7 @@ type telegramMediaAccess struct {
 	pool        dcpool.Pool
 	manager     *peers.Manager
 	gate        *gate.FloodGate
+	limiter     *rate.Limiter
 	syncMu      sync.Mutex
 	lastSync    time.Time
 	sf          singleflight.Group
@@ -61,6 +63,7 @@ func newTelegramMediaAccess(parentCtx context.Context, pool dcpool.Pool, manager
 		manager:     manager,
 		syncTimeout: syncTimeout,
 		gate:        gate,
+		limiter:     rate.NewLimiter(rate.Limit(25), 10),
 		msgCache:    make(map[string]messageCacheEntry),
 	}
 }
@@ -138,14 +141,13 @@ func (a *telegramMediaAccess) Resolve(ctx context.Context, peer string, messageI
 
 	// SingleFlight DoChan with daemon-owned context to isolate followers from leader cancellation
 	ch := a.sf.DoChan(batchKey, func() (interface{}, error) {
-		fetchCtx, fetchCancel := context.WithTimeout(a.parentCtx, 15*time.Second)
+		fetchCtx, fetchCancel := context.WithTimeout(a.parentCtx, 60*time.Second)
 		defer fetchCancel()
 
-		if a.gate != nil {
-			if err := a.gate.AcquireControlSlot(fetchCtx); err != nil {
+		if a.limiter != nil {
+			if err := a.limiter.Wait(fetchCtx); err != nil {
 				return nil, err
 			}
-			defer a.gate.ReleaseControlSlot()
 		}
 
 		// Prefetch entire 50-message bucket starting at bucketStart
@@ -154,10 +156,45 @@ func (a *telegramMediaAccess) Resolve(ctx context.Context, peer string, messageI
 			ids = append(ids, bucketStart+i)
 		}
 
-		messages, fetchErr := tutil.GetMessagesBatch(fetchCtx, a.pool.Default(fetchCtx), resolvedPeer.InputPeer(), ids)
+		var (
+			messages map[int]*tg.Message
+			fetchErr error
+		)
+		for attempt := 0; attempt < 3; attempt++ {
+			messages, fetchErr = tutil.GetMessagesBatch(fetchCtx, a.pool.Default(fetchCtx), resolvedPeer.InputPeer(), ids)
+			if fetchErr == nil {
+				break
+			}
+			if d, isFlood := tgerr.AsFloodWait(fetchErr); isFlood {
+				select {
+				case <-fetchCtx.Done():
+					return nil, fetchCtx.Err()
+				case <-time.After(d + time.Second):
+					continue
+				}
+			}
+			break
+		}
+
 		if fetchErr != nil {
 			// Fallback to single message
-			singleMsg, sErr := tutil.GetSingleMessage(fetchCtx, a.pool.Default(fetchCtx), resolvedPeer.InputPeer(), messageID)
+			var singleMsg *tg.Message
+			var sErr error
+			for attempt := 0; attempt < 3; attempt++ {
+				singleMsg, sErr = tutil.GetSingleMessage(fetchCtx, a.pool.Default(fetchCtx), resolvedPeer.InputPeer(), messageID)
+				if sErr == nil {
+					break
+				}
+				if d, isFlood := tgerr.AsFloodWait(sErr); isFlood {
+					select {
+					case <-fetchCtx.Done():
+						return nil, fetchCtx.Err()
+					case <-time.After(d + time.Second):
+						continue
+					}
+				}
+				break
+			}
 			if sErr != nil {
 				return nil, sErr
 			}
@@ -201,13 +238,27 @@ func (a *telegramMediaAccess) Resolve(ctx context.Context, peer string, messageI
 	}
 
 	// Fallback single message resolution
-	if a.gate != nil {
-		if err := a.gate.AcquireControlSlot(ctx); err != nil {
+	if a.limiter != nil {
+		if err := a.limiter.Wait(ctx); err != nil {
 			return ResolvedMedia{}, err
 		}
-		defer a.gate.ReleaseControlSlot()
 	}
-	msg, err := tutil.GetSingleMessage(ctx, a.pool.Default(ctx), resolvedPeer.InputPeer(), messageID)
+	var msg *tg.Message
+	for attempt := 0; attempt < 3; attempt++ {
+		msg, err = tutil.GetSingleMessage(ctx, a.pool.Default(ctx), resolvedPeer.InputPeer(), messageID)
+		if err == nil {
+			break
+		}
+		if d, isFlood := tgerr.AsFloodWait(err); isFlood {
+			select {
+			case <-ctx.Done():
+				return ResolvedMedia{}, ctx.Err()
+			case <-time.After(d + time.Second):
+				continue
+			}
+		}
+		break
+	}
 	if err != nil {
 		return ResolvedMedia{}, classifyTelegramError(err, "resolve message")
 	}
@@ -254,14 +305,28 @@ func (a *telegramMediaAccess) ResolveBatch(ctx context.Context, peer string, mes
 		return result, nil
 	}
 
-	if a.gate != nil {
-		if err := a.gate.AcquireControlSlot(ctx); err != nil {
+	if a.limiter != nil {
+		if err := a.limiter.Wait(ctx); err != nil {
 			return nil, err
 		}
-		defer a.gate.ReleaseControlSlot()
 	}
 
-	messages, err := tutil.GetMessagesBatch(ctx, a.pool.Default(ctx), resolvedPeer.InputPeer(), missingIDs)
+	var messages map[int]*tg.Message
+	for attempt := 0; attempt < 3; attempt++ {
+		messages, err = tutil.GetMessagesBatch(ctx, a.pool.Default(ctx), resolvedPeer.InputPeer(), missingIDs)
+		if err == nil {
+			break
+		}
+		if d, isFlood := tgerr.AsFloodWait(err); isFlood {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(d + time.Second):
+				continue
+			}
+		}
+		break
+	}
 	if err != nil {
 		return nil, classifyTelegramError(err, "resolve messages batch")
 	}
@@ -298,11 +363,10 @@ func (a *telegramMediaAccess) SyncPeers(ctx context.Context) error {
 		}
 		a.syncMu.Unlock()
 
-		if a.gate != nil {
-			if err := a.gate.AcquireControlSlot(a.parentCtx); err != nil {
+		if a.limiter != nil {
+			if err := a.limiter.Wait(a.parentCtx); err != nil {
 				return nil, err
 			}
-			defer a.gate.ReleaseControlSlot()
 		}
 
 		syncCtx, cancel := context.WithTimeout(a.parentCtx, a.syncTimeout)

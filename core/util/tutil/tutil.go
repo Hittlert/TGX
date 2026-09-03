@@ -235,11 +235,18 @@ func GetSingleMessage(ctx context.Context, c *tg.Client, peer tg.InputPeerClass,
 		}
 		res, err := c.ChannelsGetMessages(ctx, req)
 		if err == nil {
-			if msgs, ok := res.(*tg.MessagesChannelMessages); ok {
-				for _, mClass := range msgs.Messages {
-					if m, ok := mClass.(*tg.Message); ok && m.ID == msg {
-						return m, nil
-					}
+			var messageList []tg.MessageClass
+			switch msgs := res.(type) {
+			case *tg.MessagesChannelMessages:
+				messageList = msgs.Messages
+			case *tg.MessagesMessagesSlice:
+				messageList = msgs.Messages
+			case *tg.MessagesMessages:
+				messageList = msgs.Messages
+			}
+			for _, mClass := range messageList {
+				if m, ok := mClass.(*tg.Message); ok && m.ID == msg {
+					return m, nil
 				}
 			}
 		} else {

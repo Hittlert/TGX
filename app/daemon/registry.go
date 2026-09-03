@@ -271,6 +271,9 @@ func (r *Registry) Next(ctx context.Context) (*Task, error) {
 			r.queue = r.queue[1:]
 			state.state = StateResolving
 			state.startedAt = r.now()
+			if len(r.queue) > 0 {
+				r.signalLocked()
+			}
 			r.mu.Unlock()
 			return &Task{registry: r, state: state, attemptGen: state.attemptGen}, nil
 		}

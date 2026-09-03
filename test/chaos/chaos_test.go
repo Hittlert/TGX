@@ -3,357 +3,206 @@ package chaos
 import (
 	"context"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/hex"
-	"errors"
 	"os"
 	"path/filepath"
-	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/Hittlert/TGX/app/daemon"
-	sbeatomic "github.com/Hittlert/TGX/pkg/sbe/atomic"
-	"github.com/Hittlert/TGX/pkg/sbe/coordinator"
-	"github.com/Hittlert/TGX/pkg/sbe/lease"
-	"github.com/Hittlert/TGX/pkg/sbe/meta"
-	"github.com/Hittlert/TGX/pkg/sbe/scheduler"
-	"github.com/bits-and-blooms/bitset"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
-	_ "modernc.org/sqlite"
+
+	"github.com/Hittlert/TGX/app/daemon"
+	"github.com/Hittlert/TGX/internal/fscommit"
 )
 
-func setupMemoryDB(t *testing.T) *sql.DB {
-	db, err := sql.Open("sqlite", ":memory:")
+// TestChaos_CrashDuringPartWrite ensures an interrupted download leaves no dirty files
+// and safely resets to pending.
+func TestChaos_CrashDuringPartWrite(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "chaos.db")
+	db, err := daemon.NewDatabase(dbPath)
 	require.NoError(t, err)
-	db.SetMaxOpenConns(1)
-
-	_, err = db.Exec(`
-		CREATE TABLE download_records (
-			chat_id TEXT NOT NULL,
-			message_id INTEGER NOT NULL,
-			status TEXT NOT NULL,
-			file_name TEXT,
-			save_path TEXT,
-			media_type TEXT,
-			file_size INTEGER,
-			error TEXT,
-			created_at INTEGER NOT NULL DEFAULT 0,
-			updated_at INTEGER NOT NULL DEFAULT 0,
-			PRIMARY KEY (chat_id, message_id)
-		);
-		CREATE TABLE IF NOT EXISTS target_commits (
-			task_id TEXT NOT NULL,
-			generation TEXT NOT NULL,
-			final_path TEXT NOT NULL,
-			expected_size INTEGER NOT NULL,
-			expected_sha256 TEXT NOT NULL,
-			committed_sha256 TEXT NOT NULL,
-			state TEXT NOT NULL,
-			version INTEGER NOT NULL DEFAULT 1,
-			updated_at INTEGER NOT NULL,
-			PRIMARY KEY (task_id, generation)
-		);
-	`)
-	require.NoError(t, err)
-	return db
-}
-
-// 1. TestChaos_PowerCut_During_Part_Write
-func TestChaos_PowerCut_During_Part_Write(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "chaos_part_write_*")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpDir)
-
-	p := lease.NewPool(lease.Config{BufferBudget: 8 * 1024 * 1024, DirtyBudget: 8 * 1024 * 1024})
-	defer p.Close()
-
-	var attemptID [16]byte
-	copy(attemptID[:], []byte("chaos_att_001"))
-
-	fc, _, err := coordinator.NewFileCoordinator(coordinator.Config{
-		FileKey:   "chaos_file_1",
-		FileName:  "chaos_video.mp4",
-		TargetDir: tmpDir,
-		TotalSize: 4 * 1024 * 1024,
-		BlockSize: 2 * 1024 * 1024,
-		AttemptID: attemptID,
-		Pool:      p,
-	})
-	require.NoError(t, err)
-
-	// Simulate downloading block 0
-	bufLease, err := p.AcquireBuffer(context.Background(), 2*1024*1024)
-	require.NoError(t, err)
-	data0 := make([]byte, 2*1024*1024)
-	copy(data0, []byte("block0_data"))
-
-	require.NoError(t, fc.WriteBlock(context.Background(), 0, data0, bufLease))
-	fc.ForceCheckpoint()
-
-	// Simulate unexpected crash without finalize
-	_ = fc.Close()
-
-	// Reopen after power-cut
-	fcRecovered, recInfo, err := coordinator.NewFileCoordinator(coordinator.Config{
-		FileKey:   "chaos_file_1",
-		FileName:  "chaos_video.mp4",
-		TargetDir: tmpDir,
-		TotalSize: 4 * 1024 * 1024,
-		BlockSize: 2 * 1024 * 1024,
-		AttemptID: attemptID,
-		Pool:      p,
-	})
-	require.NoError(t, err)
-	defer fcRecovered.Close()
-
-	// Assert recovered bitmap has block 0
-	assert.True(t, recInfo.DurableBitmap.Test(0), "Block 0 must be durable after crash recovery")
-	assert.False(t, recInfo.DurableBitmap.Test(1), "Block 1 must still be missing")
-	assert.False(t, recInfo.IsComplete)
-}
-
-// 2. TestChaos_PowerCut_After_Complete_File
-func TestChaos_PowerCut_After_Complete_File(t *testing.T) {
-	db := setupMemoryDB(t)
 	defer db.Close()
 
-	outDir, err := os.MkdirTemp("", "chaos_complete_out_*")
-	require.NoError(t, err)
-	defer os.RemoveAll(outDir)
+	ssdDir := filepath.Join(tempDir, "ssd")
+	archiveDir := filepath.Join(tempDir, "archive")
+	require.NoError(t, os.MkdirAll(ssdDir, 0o755))
+	require.NoError(t, os.MkdirAll(archiveDir, 0o755))
 
-	tempDir, err := os.MkdirTemp("", "chaos_complete_tmp_*")
-	require.NoError(t, err)
-	defer os.RemoveAll(tempDir)
+	now := time.Now().Unix()
+	relPath := "channel/interrupted.mp4"
+	finalPath := filepath.Join(ssdDir, relPath)
+	partPath := finalPath + ".part"
+	require.NoError(t, os.MkdirAll(filepath.Dir(partPath), 0o755))
+	require.NoError(t, os.WriteFile(partPath, []byte("partial_chunk_1"), 0o644))
 
-	fileName := "complete_media.bin"
-	finalPath := filepath.Join(outDir, fileName)
-	data := []byte("complete_data_22_bytes")
-	require.NoError(t, os.WriteFile(finalPath, data, 0644))
-
-	// Write authoritative target_commits record in SQLite
-	sum := sha256.Sum256(data)
-	shaHex := hex.EncodeToString(sum[:])
-	_, err = db.Exec(`INSERT INTO target_commits (task_id, generation, final_path, expected_size, expected_sha256, committed_sha256, state, updated_at) VALUES ('123:42', '1', ?, 22, ?, ?, 'committed', ?)`, fileName, shaHex, shaHex, time.Now().Unix())
-	require.NoError(t, err)
-
-	// Insert database state as downloading (power cut before download_records updated)
-	_, err = db.Exec(`INSERT INTO download_records (chat_id, message_id, status, file_name, save_path, file_size) VALUES ('123', 42, 'downloading', ?, ?, 22)`, fileName, fileName)
+	_, err = db.Execute(`
+		INSERT INTO download_records (chat_id, message_id, status, save_path, file_size, created_at, updated_at)
+		VALUES ('100', 1, 'downloading', ?, 1024, ?, ?)
+	`, relPath, now, now)
 	require.NoError(t, err)
 
-	// Run Reconciler
-	r := daemon.NewReconciler(db, outDir, tempDir, zap.NewNop())
-	results, err := r.ReconcileAll(context.Background())
+	// Simulate daemon restart crash recovery
+	err = daemon.ReconcileOnStartup(context.Background(), db, ssdDir, archiveDir, zap.NewNop())
 	require.NoError(t, err)
-	require.Equal(t, 1, len(results))
 
-	assert.Equal(t, "success", results[0].NextState)
-	assert.Equal(t, "FINAL_FILE_COMMITTED_PROMOTED_TO_SUCCESS", results[0].ActionTaken)
-	assert.FileExists(t, finalPath)
+	// .part must be deleted
+	_, err = os.Stat(partPath)
+	assert.True(t, os.IsNotExist(err), "dirty .part must be cleaned up on crash recovery")
+
+	// status must be reset to pending
+	var status string
+	_ = db.DB().QueryRow(`SELECT status FROM download_records WHERE chat_id = '100' AND message_id = 1`).Scan(&status)
+	assert.Equal(t, "pending", status)
 }
 
-// 2b. TestChaos_Size_Mismatch_Final_File_Rejected
-func TestChaos_Size_Mismatch_Final_File_Rejected(t *testing.T) {
-	db := setupMemoryDB(t)
+// TestChaos_CrashDuringCommittingWithValidPart ensures an atomic commit completes on restart.
+func TestChaos_CrashDuringCommittingWithValidPart(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "chaos.db")
+	db, err := daemon.NewDatabase(dbPath)
+	require.NoError(t, err)
 	defer db.Close()
 
-	outDir, err := os.MkdirTemp("", "chaos_tamper_out_*")
+	ssdDir := filepath.Join(tempDir, "ssd")
+	archiveDir := filepath.Join(tempDir, "archive")
+	require.NoError(t, os.MkdirAll(ssdDir, 0o755))
+	require.NoError(t, os.MkdirAll(archiveDir, 0o755))
+
+	now := time.Now().Unix()
+	relPath := "channel/complete.mp4"
+	finalPath := filepath.Join(ssdDir, relPath)
+	partPath := finalPath + ".part"
+	require.NoError(t, os.MkdirAll(filepath.Dir(partPath), 0o755))
+	payload := []byte("fully downloaded payload data")
+	require.NoError(t, os.WriteFile(partPath, payload, 0o644))
+	shaHex := hex.EncodeToString(func() []byte { h := sha256.Sum256(payload); return h[:] }())
+
+	// State was committed to DB right before rename
+	_, err = db.Execute(`
+		INSERT INTO download_records (chat_id, message_id, status, save_path, file_size, sha256, created_at, updated_at)
+		VALUES ('200', 2, 'committing', ?, ?, ?, ?, ?)
+	`, relPath, int64(len(payload)), shaHex, now, now)
 	require.NoError(t, err)
-	defer os.RemoveAll(outDir)
 
-	tempDir, err := os.MkdirTemp("", "chaos_tamper_tmp_*")
-	require.NoError(t, err)
-	defer os.RemoveAll(tempDir)
-
-	fileName := "tampered_media.bin"
-	finalPath := filepath.Join(outDir, fileName)
-	tamperedData := []byte("tampered_short_data") // 19 bytes
-	require.NoError(t, os.WriteFile(finalPath, tamperedData, 0644))
-
-	_, err = db.Exec(`INSERT INTO download_records (chat_id, message_id, status, file_name, save_path, file_size) VALUES ('123', 99, 'downloading', ?, ?, 23)`, fileName, fileName)
+	// Simulate restart recovery
+	err = daemon.ReconcileOnStartup(context.Background(), db, ssdDir, archiveDir, zap.NewNop())
 	require.NoError(t, err)
 
-	// Run Reconciler: must reject mismatched size and not promote to success!
-	r := daemon.NewReconciler(db, outDir, tempDir, zap.NewNop())
-	results, err := r.ReconcileAll(context.Background())
-	require.NoError(t, err)
-	require.Equal(t, 1, len(results))
+	// .part must be atomically renamed to final
+	_, err = os.Stat(partPath)
+	assert.True(t, os.IsNotExist(err))
+	_, err = os.Stat(finalPath)
+	assert.NoError(t, err, "final file must exist after recovery")
 
-	assert.NotEqual(t, "success", results[0].NextState, "Size mismatch final file must never be promoted to success")
-	assert.Equal(t, "pending", results[0].NextState)
+	var status string
+	_ = db.DB().QueryRow(`SELECT status FROM download_records WHERE chat_id = '200' AND message_id = 2`).Scan(&status)
+	assert.Equal(t, "success", status)
+
+	// Archive job must be queued
+	var arcCount int
+	_ = db.DB().QueryRow(`SELECT COUNT(*) FROM archive_jobs WHERE chat_id = '200' AND message_id = 2`).Scan(&arcCount)
+	assert.Equal(t, 1, arcCount)
 }
 
-// 4. TestChaos_Target_Path_Collision
-func TestChaos_Target_Path_Collision(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "chaos_coll_*")
+// TestChaos_CrashDuringArchiveCopy ensures moving residue is removed and job reset to pending.
+func TestChaos_CrashDuringArchiveCopy(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "chaos.db")
+	db, err := daemon.NewDatabase(dbPath)
 	require.NoError(t, err)
-	defer os.RemoveAll(tmpDir)
+	defer db.Close()
 
-	finalPath := filepath.Join(tmpDir, "video.mp4")
-	partPath := filepath.Join(tmpDir, "video.mp4.part.001")
+	ssdDir := filepath.Join(tempDir, "ssd")
+	archiveDir := filepath.Join(tempDir, "archive")
+	require.NoError(t, os.MkdirAll(ssdDir, 0o755))
+	require.NoError(t, os.MkdirAll(archiveDir, 0o755))
 
-	require.NoError(t, os.WriteFile(finalPath, []byte("preexisting_different_data"), 0644))
-	require.NoError(t, os.WriteFile(partPath, []byte("newly_downloaded_data"), 0644))
+	now := time.Now().Unix()
+	relPath := "channel/video.mp4"
+	dstFinal := filepath.Join(archiveDir, relPath)
+	dstMoving := dstFinal + ".moving"
+	require.NoError(t, os.MkdirAll(filepath.Dir(dstMoving), 0o755))
+	require.NoError(t, os.WriteFile(dstMoving, []byte("halfway copied data"), 0o644))
 
-	// Commit must reject and preserve preexisting file
-	err = sbeatomic.CommitFile(partPath, finalPath)
-	assert.Error(t, err)
-	assert.True(t, errors.Is(err, os.ErrExist))
+	_, err = db.Execute(`
+		INSERT INTO archive_jobs (chat_id, message_id, relative_path, expected_size, sha256, state, attempts, next_retry_at, created_at, updated_at)
+		VALUES ('300', 3, ?, 1024, 'dummy_sha', 'copying', 1, 0, ?, ?)
+	`, relPath, now, now)
+	require.NoError(t, err)
 
-	existingData, _ := os.ReadFile(finalPath)
-	assert.Equal(t, "preexisting_different_data", string(existingData))
-	assert.FileExists(t, partPath)
+	err = daemon.ReconcileOnStartup(context.Background(), db, ssdDir, archiveDir, zap.NewNop())
+	require.NoError(t, err)
+
+	// .moving must be deleted
+	_, err = os.Stat(dstMoving)
+	assert.True(t, os.IsNotExist(err), "incomplete .moving file must be deleted")
+
+	// Job state must be reset to pending
+	var state string
+	_ = db.DB().QueryRow(`SELECT state FROM archive_jobs WHERE chat_id = '300' AND message_id = 3`).Scan(&state)
+	assert.Equal(t, "pending", state)
 }
 
-// 5. TestChaos_Corrupted_Slot_CRC
-func TestChaos_Corrupted_Slot_CRC(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "chaos_crc_*")
+// TestChaos_ArchiveDestinationConflict ensures conflicting destination content is never overwritten.
+func TestChaos_ArchiveDestinationConflict(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "chaos.db")
+	db, err := daemon.NewDatabase(dbPath)
 	require.NoError(t, err)
-	defer os.RemoveAll(tmpDir)
+	defer db.Close()
 
-	var att [16]byte
-	copy(att[:], []byte("att_crc_005"))
-	metaH := &meta.MetaHeader{
-		Magic:       meta.MetaMagic,
-		Version:     meta.MetaVersion,
-		AttemptID:   att,
-		TotalSize:   4 * 1024 * 1024,
-		BlockSize:   2 * 1024 * 1024,
-		TotalBlocks: 2,
-	}
-	copy(metaH.FileKeyHash[:], []byte("f5"))
+	ssdDir := filepath.Join(tempDir, "ssd")
+	archiveDir := filepath.Join(tempDir, "archive")
+	require.NoError(t, os.MkdirAll(ssdDir, 0o755))
+	require.NoError(t, os.MkdirAll(archiveDir, 0o755))
 
-	mf, _, err := meta.CreateOrOpenMetaFile(tmpDir, "sample.bin", metaH)
+	worker, err := daemon.NewArchiveWorker(db, ssdDir, archiveDir, zap.NewNop())
 	require.NoError(t, err)
 
-	// Write Gen 1 to Slot A
-	bsA := bitset.New(2)
-	bsA.Set(0)
-	_, _ = mf.WriteSlot(bsA)
+	relPath := "conflict/target.txt"
+	ssdPath := filepath.Join(ssdDir, relPath)
+	archivePath := filepath.Join(archiveDir, relPath)
+	require.NoError(t, os.MkdirAll(filepath.Dir(ssdPath), 0o755))
+	require.NoError(t, os.MkdirAll(filepath.Dir(archivePath), 0o755))
 
-	// Write Gen 2 to Slot B
-	bsB := bsA.Clone()
-	bsB.Set(1)
-	_, _ = mf.WriteSlot(bsB)
-	_ = mf.Close()
+	ssdData := []byte("brand new download data on ssd")
+	arcData := []byte("pre-existing different data on hdd")
+	require.NoError(t, os.WriteFile(ssdPath, ssdData, 0o644))
+	require.NoError(t, os.WriteFile(archivePath, arcData, 0o644))
 
-	// Corrupt Slot B
-	data, _ := os.ReadFile(mf.Path())
-	bOffset := meta.SlotBOffset(2)
-	data[bOffset+8] ^= 0xFF // Corrupt data in Slot B
-	_ = os.WriteFile(mf.Path(), data, 0644)
-
-	// Reopen -> must cleanly failover to Slot A
-	mf2, rec2, err := meta.CreateOrOpenMetaFile(tmpDir, "sample.bin", metaH)
+	now := time.Now().Unix()
+	_, err = db.Execute(`
+		INSERT INTO archive_jobs (chat_id, message_id, relative_path, expected_size, sha256, state, attempts, next_retry_at, created_at, updated_at)
+		VALUES ('400', 4, ?, ?, 'ssd_sha', 'pending', 0, 0, ?, ?)
+	`, relPath, int64(len(ssdData)), now, now)
 	require.NoError(t, err)
-	defer mf2.Close()
 
-	assert.Equal(t, "A", rec2.ValidSlot)
-	assert.Equal(t, uint64(1), rec2.LatestGen)
-	assert.True(t, rec2.DurableBitmap.Test(0))
-	assert.False(t, rec2.DurableBitmap.Test(1))
+	// Process archive job
+	worker.Wake()
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify both files are preserved intact
+	currentSSD, err := os.ReadFile(ssdPath)
+	require.NoError(t, err)
+	assert.Equal(t, ssdData, currentSSD)
+
+	currentArc, err := os.ReadFile(archivePath)
+	require.NoError(t, err)
+	assert.Equal(t, arcData, currentArc)
 }
 
-// 6. TestChaos_Both_Slots_Corrupted
-func TestChaos_Both_Slots_Corrupted(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "chaos_both_crc_*")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpDir)
+// TestChaos_SSDAdmissionCapacityRejection ensures requests exceeding available space are rejected cleanly.
+func TestChaos_SSDAdmissionCapacityRejection(t *testing.T) {
+	tempDir := t.TempDir()
+	adm := fscommit.NewSSDAdmission(tempDir, 5*1024*1024*1024)
 
-	var att [16]byte
-	copy(att[:], []byte("att_crc_both"))
-	metaH := &meta.MetaHeader{
-		Magic:       meta.MetaMagic,
-		Version:     meta.MetaVersion,
-		AttemptID:   att,
-		TotalSize:   2 * 1024 * 1024,
-		BlockSize:   2 * 1024 * 1024,
-		TotalBlocks: 1,
-	}
-	copy(metaH.FileKeyHash[:], []byte("f6"))
-
-	mf, _, _ := meta.CreateOrOpenMetaFile(tmpDir, "torn.bin", metaH)
-	bs := bitset.New(1)
-	bs.Set(0)
-	_, _ = mf.WriteSlot(bs)
-	_ = mf.Close()
-
-	// Corrupt both Slot A and Slot B
-	data, _ := os.ReadFile(mf.Path())
-	data[128+2] ^= 0xFF
-	data[meta.SlotBOffset(1)+2] ^= 0xFF
-	_ = os.WriteFile(mf.Path(), data, 0644)
-
-	// Reopen -> returns ValidSlot = NONE (fresh start, no panic)
-	mf2, rec2, err := meta.CreateOrOpenMetaFile(tmpDir, "torn.bin", metaH)
-	require.NoError(t, err)
-	defer mf2.Close()
-
-	assert.Equal(t, "NONE", rec2.ValidSlot)
-	assert.Equal(t, uint(0), rec2.DurableBitmap.Count())
-}
-
-// 7. TestChaos_FloodWait_Backpressure
-func TestChaos_FloodWait_Backpressure(t *testing.T) {
-	sched := scheduler.NewDRRScheduler()
-
-	sched.EnqueueDelay(scheduler.ChunkTask{
-		FileKey:    "flood_task",
-		BlockIndex: 0,
-		TotalSize:  1 * 1024 * 1024,
-	}, time.Now().Add(50*time.Millisecond))
-
-	_, ok := sched.NextChunk()
-	assert.False(t, ok)
-
-	time.Sleep(60 * time.Millisecond)
-	task, ok := sched.NextChunk()
-	require.True(t, ok)
-	assert.Equal(t, "flood_task", task.FileKey)
-}
-
-// 8. TestChaos_Lease_Pool_Exhaustion
-func TestChaos_Lease_Pool_Exhaustion(t *testing.T) {
-	p := lease.NewPool(lease.Config{
-		BufferBudget: 4 * 1024 * 1024, // 4MB
-		DirtyBudget:  4 * 1024 * 1024, // 4MB
-	})
-	defer p.Close()
-
-	ctx := context.Background()
-
-	// Acquire 4MB BufferLease
-	l1, err := p.AcquireBuffer(ctx, 4*1024*1024)
-	require.NoError(t, err)
-	assert.NotNil(t, l1)
-
-	// Next acquire with timeout should backpressure and time out
-	ctxTimeout, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
-	defer cancel()
-
-	_, err = p.AcquireBuffer(ctxTimeout, 2*1024*1024)
-	assert.Equal(t, context.DeadlineExceeded, err)
-
-	// Release l1 -> subsequent acquire succeeds immediately
-	l1.Release()
-
-	l2, err := p.AcquireBuffer(ctx, 2*1024*1024)
-	require.NoError(t, err)
-	l2.Release()
-}
-
-// 9. TestChaos_Graceful_Drain_Order
-func TestChaos_Graceful_Drain_Order(t *testing.T) {
-	var activeWrites int32
-
-	pool := lease.NewPool(lease.Config{})
-	defer pool.Close()
-
-	// Verify lease pool stats during shutdown
-	stats := pool.Stats()
-	assert.Equal(t, int64(0), stats.BufferUsed)
-	assert.Equal(t, int64(0), stats.DirtyUsed)
-	assert.Equal(t, int32(0), atomic.LoadInt32(&activeWrites))
+	// Attempt reservation of 100 PB (way beyond disk capacity)
+	hugeSize := int64(100 * 1024 * 1024 * 1024 * 1024 * 1024)
+	release, err := adm.Reserve("chaos:huge", hugeSize)
+	assert.Error(t, err, "huge reservation must be rejected by admission owner")
+	assert.Nil(t, release)
+	assert.Equal(t, int64(0), adm.ReservedBytes())
 }

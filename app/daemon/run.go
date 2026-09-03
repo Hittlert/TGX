@@ -141,15 +141,11 @@ func Run(ctx context.Context, client *telegram.Client, kvd storage.Storage, opts
 
 	sharedGate := gate.NewFloodGate(float64(opts.PoolSize), 10)
 
-	effectivePoolSize := opts.PoolSize
-	if effectivePoolSize < 48 {
-		effectivePoolSize = 48
-	}
-	pool := dcpool.NewPoolWithGate(client, int64(effectivePoolSize), sharedGate,
+	pool := dcpool.NewPool(client, int64(opts.PoolSize),
 		tclient.NewDefaultMiddlewares(ctx, opts.ReconnectTimeout)...)
 	defer func() { resultErr = errors.Join(resultErr, pool.Close()) }()
 	manager := peers.Options{Storage: storage.NewPeers(kvd)}.Build(pool.Default(ctx))
-	access := newTelegramMediaAccess(ctx, pool, manager, opts.PeerSyncTimeout, sharedGate)
+	access := newTelegramMediaAccess(ctx, pool, manager, opts.PeerSyncTimeout, nil)
 
 	// 1. Capacity & Admission Owners
 	ssdAdmission := fscommit.NewSSDAdmission(opts.OutputDir, opts.MinFreeSpace)
@@ -188,7 +184,7 @@ func Run(ctx context.Context, client *telegram.Client, kvd storage.Storage, opts
 
 	registry := NewRegistryWithContext(ctx, opts.QueueCapacity, opts.TerminalLimit, time.Now)
 	registry.SetPaused(opts.StartPaused)
-	registry.SetPool(PoolSnapshot{Size: effectivePoolSize})
+	registry.SetPool(PoolSnapshot{Size: opts.PoolSize})
 
 	slotCfg := SlotPoolConfig{
 		TotalSlots:      opts.PoolSize,
