@@ -35,7 +35,15 @@ func NewGatedInvoker(invoker tg.Invoker, gate *DataGate, dcID int) *GatedInvoker
 func (g *GatedInvoker) Invoke(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
 	tc, hasTask := TransferTaskFromContext(ctx)
 	if hasTask && tc.RequestCount != nil {
-		atomic.AddInt64(tc.RequestCount, 1)
+		for {
+			cur := atomic.LoadInt64(tc.RequestCount)
+			if tc.RequestBudget > 0 && cur >= tc.RequestBudget {
+				return ErrRequestBudgetExhausted
+			}
+			if atomic.CompareAndSwapInt64(tc.RequestCount, cur, cur+1) {
+				break
+			}
+		}
 	}
 
 	if g.gate != nil {

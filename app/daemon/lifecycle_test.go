@@ -304,19 +304,22 @@ func TestLifecycle_RPCRetryHandler(t *testing.T) {
 		TaskRetryHandler: func(taskCtx context.Context, event downloader.RetryEvent) {
 			retryEventFired = true
 			tc, _ := transfer.TransferTaskFromContext(taskCtx)
+			physAttemptID := fmt.Sprintf("%s-p%d", tc.AttemptID, event.Attempt)
 			EmitLifecycle(logger, LifecycleEvent{
-				Event:           EventRPCRetry,
-				TaskID:          tc.TaskID,
-				AttemptID:       tc.AttemptID,
-				ChatID:          tc.ChatID,
-				MessageID:       tc.MessageID,
-				DC:              tc.DCID,
-				Op:              event.Operation,
-				PhysicalRetries: int64(event.Attempt),
-				Error:           fmt.Sprintf("%v", event.Err),
+				Event:             EventRPCRetry,
+				TaskID:            tc.TaskID,
+				AttemptID:         tc.AttemptID,
+				PhysicalAttemptID: physAttemptID,
+				ChatID:            tc.ChatID,
+				MessageID:         tc.MessageID,
+				DC:                tc.DCID,
+				Op:                event.Operation,
+				PhysicalRetries:   int64(event.Attempt),
+				Error:             fmt.Sprintf("%v", event.Err),
 				Extra: map[string]any{
-					"operation": event.Operation,
-					"attempt":   event.Attempt,
+					"operation":           event.Operation,
+					"attempt":             event.Attempt,
+					"physical_attempt_id": physAttemptID,
 				},
 			})
 		},
@@ -409,6 +412,8 @@ func TestLifecycle_RPCRetryHandler(t *testing.T) {
 	require.Equal(t, int64(1), rpcRetryEvent.PhysicalRetries)
 	require.Equal(t, "reader.chunk", rpcRetryEvent.Extra["operation"])
 	require.Equal(t, 1, rpcRetryEvent.Extra["attempt"])
+	require.Equal(t, fmt.Sprintf("%s-p1", task.Generation()), rpcRetryEvent.PhysicalAttemptID)
+	require.Equal(t, fmt.Sprintf("%s-p1", task.Generation()), rpcRetryEvent.Extra["physical_attempt_id"])
 
 	// 2. Assert zap logger actually emitted all fields including Extra (operation, attempt)
 	var loggedRetryEntry *observer.LoggedEntry
@@ -424,6 +429,7 @@ func TestLifecycle_RPCRetryHandler(t *testing.T) {
 	logCtx := loggedRetryEntry.ContextMap()
 	require.Equal(t, task.Request().ID, logCtx["task_id"])
 	require.Equal(t, task.Generation(), logCtx["attempt_id"])
+	require.Equal(t, fmt.Sprintf("%s-p1", task.Generation()), logCtx["physical_attempt_id"])
 	require.Equal(t, "-100888", logCtx["chat_id"])
 	require.Equal(t, int64(888), logCtx["message_id"])
 	require.Equal(t, int64(targetDC), logCtx["dc"])

@@ -5,15 +5,18 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/gotd/td/bin"
+	"github.com/gotd/td/telegram/downloader"
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
 	"go.uber.org/zap"
@@ -116,6 +119,27 @@ func setupTestOrchestratorWithAccess(t *testing.T, access TelegramAccess) (*Orch
 		FileConcurrency: 4,
 		MaxFileThreads:  2,
 		MaxDataInFlight: 10,
+		TaskRetryHandler: func(taskCtx context.Context, event downloader.RetryEvent) {
+			tc, _ := transfer.TransferTaskFromContext(taskCtx)
+			physAttemptID := fmt.Sprintf("%s-p%d", tc.AttemptID, event.Attempt)
+			EmitLifecycle(zap.NewNop(), LifecycleEvent{
+				Event:             EventRPCRetry,
+				TaskID:            tc.TaskID,
+				AttemptID:         tc.AttemptID,
+				PhysicalAttemptID: physAttemptID,
+				ChatID:            tc.ChatID,
+				MessageID:         tc.MessageID,
+				DC:                tc.DCID,
+				Op:                event.Operation,
+				PhysicalRetries:   int64(event.Attempt),
+				Error:             fmt.Sprintf("%v", event.Err),
+				Extra: map[string]any{
+					"operation":           event.Operation,
+					"attempt":             event.Attempt,
+					"physical_attempt_id": physAttemptID,
+				},
+			})
+		},
 	})
 	ssdAdmission := fscommit.NewSSDAdmission(saveDir, 1<<20)
 
@@ -513,6 +537,34 @@ func TestOrchestrator_Matrix_SuccessWithPhysicalRetries(t *testing.T) {
 	if terminalEvt.WireBytes != 1024 {
 		t.Fatalf("expected lifecycle wire_bytes 1024, got %d", terminalEvt.WireBytes)
 	}
+
+	expectedPhysID := fmt.Sprintf("%s-p2", task.Generation())
+	if snap.PhysicalAttemptID != expectedPhysID {
+		t.Fatalf("expected task physical_attempt_id %s, got %s", expectedPhysID, snap.PhysicalAttemptID)
+	}
+	if terminalEvt.PhysicalAttemptID != expectedPhysID {
+		t.Fatalf("expected lifecycle terminal physical_attempt_id %s, got %s", expectedPhysID, terminalEvt.PhysicalAttemptID)
+	}
+	if terminalEvt.Extra["physical_attempt_id"] != expectedPhysID {
+		t.Fatalf("expected lifecycle extra physical_attempt_id %s, got %v", expectedPhysID, terminalEvt.Extra["physical_attempt_id"])
+	}
+
+	// Verify distinct physical attempt IDs across EventRPCRetry events
+	var rpcRetries []*LifecycleEvent
+	for i := range observedEvents {
+		if observedEvents[i].Event == EventRPCRetry && observedEvents[i].TaskID == req.ID {
+			rpcRetries = append(rpcRetries, &observedEvents[i])
+		}
+	}
+	if len(rpcRetries) != 2 {
+		t.Fatalf("expected 2 EventRPCRetry events, got %d", len(rpcRetries))
+	}
+	if rpcRetries[0].PhysicalAttemptID != fmt.Sprintf("%s-p1", task.Generation()) {
+		t.Fatalf("expected retry 1 physical attempt ID %s-p1, got %s", task.Generation(), rpcRetries[0].PhysicalAttemptID)
+	}
+	if rpcRetries[1].PhysicalAttemptID != fmt.Sprintf("%s-p2", task.Generation()) {
+		t.Fatalf("expected retry 2 physical attempt ID %s-p2, got %s", task.Generation(), rpcRetries[1].PhysicalAttemptID)
+	}
 }
 
 // 7. Production-path Wire and Replay Bytes Accounting test:
@@ -777,5 +829,142 @@ func TestOrchestrator_CanonicalPathAssertedInE2E(t *testing.T) {
 	}
 	if rec.SavePath != expectedRelPath {
 		t.Fatalf("expected DB SavePath %q, got %q", expectedRelPath, rec.SavePath)
+	}
+}
+
+// 9. Exact request budget exhaustion at boundary test:
+// Proves:
+// - Declared request budget is strictly enforced at the authoritative request/retry boundary;
+// - Requests beyond declared budget are rejected with ErrRequestBudgetExhausted;
+// - Raw invoker is NOT called beyond declared budget;
+// - Task fails cleanly with StateFailed, error class "network", non-retryable;
+// - .part file is removed, DB record is marked failed;
+// - Distinct physical attempt identity is emitted and correlated across retries and terminal event.
+func TestOrchestrator_ExactBudgetExhaustionAtBoundary(t *testing.T) {
+	var rawCalls int64
+	invoker := invokerFunc(func(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
+		atomic.AddInt64(&rawCalls, 1)
+		return tgerr.New(500, tg.ErrTimeout)
+	})
+
+	var observedEvents []LifecycleEvent
+	var obsMu sync.Mutex
+	unreg := RegisterLifecycleObserver(LifecycleObserverFunc(func(evt LifecycleEvent) {
+		obsMu.Lock()
+		defer obsMu.Unlock()
+		observedEvents = append(observedEvents, evt)
+	}))
+	defer unreg()
+
+	orch, registry, db, saveDir := setupTestOrchestrator(t, invoker, nil)
+	defer db.Close()
+
+	// MaxRetries = 2: 1 initial chunk request + 2 retries = declared budget 3
+	req := TaskRequest{
+		ID:           "case_exact_budget_exhaustion",
+		Peer:         "-1001234567",
+		MessageID:    109,
+		FinalPath:    "Exhaust/exhaust_test.mp4",
+		ExpectedSize: 1024,
+		MaxRetries:   2,
+	}
+
+	_, _, _ = registry.Submit(req)
+	task, _ := registry.Next(context.Background())
+
+	orch.downloadOne(context.Background(), task)
+
+	snap := task.Snapshot()
+	if snap.State != StateFailed {
+		t.Fatalf("expected StateFailed, got: %s (err: %s)", snap.State, snap.Error)
+	}
+	if snap.ErrorClass != "network" {
+		t.Fatalf("expected error class network, got: %s", snap.ErrorClass)
+	}
+	if snap.Retryable {
+		t.Fatalf("expected retryable=false on budget exhaustion, got %t", snap.Retryable)
+	}
+	if !strings.Contains(snap.Error, "request budget exhausted") {
+		t.Fatalf("expected 'request budget exhausted' error message, got: %s", snap.Error)
+	}
+
+	// Raw invoker was called strictly 3 times (the 4th attempt was blocked at boundary before dispatch!)
+	if rawCalls != 3 {
+		t.Fatalf("expected strictly 3 raw calls executed to Telegram, got %d", rawCalls)
+	}
+	if snap.RequestCount != 3 {
+		t.Fatalf("expected snap.RequestCount == 3, got %d", snap.RequestCount)
+	}
+
+	expectedPhysID := fmt.Sprintf("%s-p3", task.Generation())
+	if snap.PhysicalAttemptID != expectedPhysID {
+		t.Fatalf("expected task physical attempt ID %s, got %s", expectedPhysID, snap.PhysicalAttemptID)
+	}
+
+	// .part must not exist
+	finalPath := filepath.Join(saveDir, filepath.FromSlash(req.FinalPath))
+	partPath := finalPath + ".part"
+	if _, err := os.Stat(partPath); !os.IsNotExist(err) {
+		t.Fatalf("part file was not cleaned up after failure: %s", partPath)
+	}
+
+	// DB record must be failed
+	rec, err := db.GetDownloadRecord(req.Peer, req.MessageID)
+	if err != nil || rec == nil {
+		t.Fatalf("failed to query download record: %v", err)
+	}
+	if rec.Status != "failed" {
+		t.Fatalf("expected DB record status failed, got: %s", rec.Status)
+	}
+	if !strings.Contains(rec.Error, "network") || !strings.Contains(rec.Error, "request budget exhausted") {
+		t.Fatalf("expected DB error to record network class and request budget exhausted, got: %s", rec.Error)
+	}
+
+	// Verify lifecycle events
+	obsMu.Lock()
+	defer obsMu.Unlock()
+	var terminalEvt *LifecycleEvent
+	var rpcRetries []*LifecycleEvent
+	for i := range observedEvents {
+		if observedEvents[i].TaskID == req.ID {
+			if observedEvents[i].Event == EventItemTerminal {
+				terminalEvt = &observedEvents[i]
+			} else if observedEvents[i].Event == EventRPCRetry {
+				rpcRetries = append(rpcRetries, &observedEvents[i])
+			}
+		}
+	}
+
+	if terminalEvt == nil {
+		t.Fatal("expected EventItemTerminal lifecycle event for budget exhaustion failure")
+	}
+	if terminalEvt.Status != "failed" {
+		t.Fatalf("expected terminal status failed, got: %s", terminalEvt.Status)
+	}
+	if terminalEvt.ErrorClass != "network" {
+		t.Fatalf("expected terminal error_class network, got: %s", terminalEvt.ErrorClass)
+	}
+	if terminalEvt.PhysicalAttemptID != expectedPhysID {
+		t.Fatalf("expected terminal physical_attempt_id %s, got %s", expectedPhysID, terminalEvt.PhysicalAttemptID)
+	}
+	if terminalEvt.RequestCount != 3 {
+		t.Fatalf("expected terminal request_count 3, got %d", terminalEvt.RequestCount)
+	}
+	if terminalEvt.Extra["request_budget"] != int64(3) {
+		t.Fatalf("expected request_budget 3 in terminal extra, got %v", terminalEvt.Extra["request_budget"])
+	}
+
+	// Check that physical attempt IDs across retries are distinct and ordered
+	if len(rpcRetries) != 3 {
+		t.Fatalf("expected 3 EventRPCRetry events, got %d", len(rpcRetries))
+	}
+	if rpcRetries[0].PhysicalAttemptID != fmt.Sprintf("%s-p1", task.Generation()) {
+		t.Fatalf("expected retry 1 physical attempt ID %s-p1, got %s", task.Generation(), rpcRetries[0].PhysicalAttemptID)
+	}
+	if rpcRetries[1].PhysicalAttemptID != fmt.Sprintf("%s-p2", task.Generation()) {
+		t.Fatalf("expected retry 2 physical attempt ID %s-p2, got %s", task.Generation(), rpcRetries[1].PhysicalAttemptID)
+	}
+	if rpcRetries[2].PhysicalAttemptID != fmt.Sprintf("%s-p3", task.Generation()) {
+		t.Fatalf("expected retry 3 physical attempt ID %s-p3, got %s", task.Generation(), rpcRetries[2].PhysicalAttemptID)
 	}
 }

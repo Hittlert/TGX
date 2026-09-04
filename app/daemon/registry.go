@@ -40,6 +40,7 @@ type TaskRequest struct {
 	MediaType    string `json:"media_type,omitempty"`
 	FileName     string `json:"file_name,omitempty"`
 	Date         int64  `json:"date,omitempty"`
+	MaxRetries   int    `json:"max_retries,omitempty"`
 }
 
 type TaskSnapshot struct {
@@ -53,6 +54,7 @@ type TaskSnapshot struct {
 	ReplayBytes       int64     `json:"replay_bytes,omitempty"`
 	RequestCount      int64     `json:"request_count,omitempty"`
 	PhysicalRetries   int64     `json:"physical_retries,omitempty"`
+	PhysicalAttemptID string    `json:"physical_attempt_id,omitempty"`
 	Progress          float64   `json:"progress"`
 	Rolling5sBPS      int64     `json:"rolling_5s_bps"`
 	DCID              int       `json:"dc_id,omitempty"`
@@ -119,6 +121,7 @@ type taskState struct {
 	replayBytes        int64
 	requestCount       int64
 	physicalRetries    int64
+	physicalAttemptID  string
 	dcID               int
 	alreadyExists      bool
 	sha256             string
@@ -452,7 +455,7 @@ func (t *Task) SetPublishing() bool {
 	return ok
 }
 
-func (t *Task) RecordTransferTelemetry(written, wireBytes, replayBytes, reqCount, physicalRetries int64) {
+func (t *Task) RecordTransferTelemetry(written, wireBytes, replayBytes, reqCount, physicalRetries int64, physicalAttemptID ...string) {
 	if t == nil || t.state == nil {
 		return
 	}
@@ -465,6 +468,9 @@ func (t *Task) RecordTransferTelemetry(written, wireBytes, replayBytes, reqCount
 	t.state.replayBytes = replayBytes
 	t.state.requestCount = reqCount
 	t.state.physicalRetries = physicalRetries
+	if len(physicalAttemptID) > 0 && physicalAttemptID[0] != "" {
+		t.state.physicalAttemptID = physicalAttemptID[0]
+	}
 }
 
 func (t *Task) Succeed(finalPath string, alreadyExists bool) {
@@ -486,6 +492,9 @@ func (t *Task) SucceedResult(result PublishResult) {
 		if result.PhysicalRetries > 0 {
 			t.state.physicalRetries = result.PhysicalRetries
 		}
+		if result.PhysicalAttemptID != "" {
+			t.state.physicalAttemptID = result.PhysicalAttemptID
+		}
 		t.registry.mu.Unlock()
 	}
 	t.registry.finishWithGen(t.state, t.attemptGen, StateSuccess, "", "", "", "", false, "", result.Path, result.AlreadyExists, result.SHA256)
@@ -493,14 +502,15 @@ func (t *Task) SucceedResult(result PublishResult) {
 
 // FailureDisposition captures structured failure semantics across the orchestrator, registry, and db.
 type FailureDisposition struct {
-	Stage       string `json:"stage"`
-	Op          string `json:"op"`
-	Class       string `json:"class"`
-	Unavailable bool   `json:"unavailable"`
-	Retryable   bool   `json:"retryable"`
-	RetryOwner  string `json:"retry_owner,omitempty"`
-	Message     string `json:"message"`
-	Cause       error  `json:"-"`
+	Stage             string `json:"stage"`
+	Op                string `json:"op"`
+	Class             string `json:"class"`
+	Unavailable       bool   `json:"unavailable"`
+	Retryable         bool   `json:"retryable"`
+	RetryOwner        string `json:"retry_owner,omitempty"`
+	PhysicalAttemptID string `json:"physical_attempt_id,omitempty"`
+	Message           string `json:"message"`
+	Cause             error  `json:"-"`
 }
 
 func (d FailureDisposition) Error() string {
@@ -526,6 +536,11 @@ func (t *Task) FailDisposition(disp FailureDisposition) {
 	state := StateFailed
 	if disp.Unavailable {
 		state = StateUnavailable
+	}
+	if disp.PhysicalAttemptID != "" && t.state != nil {
+		t.registry.mu.Lock()
+		t.state.physicalAttemptID = disp.PhysicalAttemptID
+		t.registry.mu.Unlock()
 	}
 	t.registry.finishWithGen(t.state, t.attemptGen, state, disp.Stage, disp.Op, disp.Class, disp.Error(), disp.Retryable, disp.RetryOwner, "", false, "")
 }
@@ -866,9 +881,10 @@ func (r *Registry) snapshotTaskLocked(state *taskState, now time.Time) TaskSnaps
 		TotalSize: state.totalSize, Downloaded: state.downloaded, NetDownloaded: netDownloaded,
 		WireBytes: state.wireBytes, ReplayBytes: state.replayBytes,
 		RequestCount: state.requestCount, PhysicalRetries: state.physicalRetries,
-		Progress:     progress,
-		Rolling5sBPS: int64(state.smoothedSpeed),
-		DCID:         state.dcID, AlreadyExists: state.alreadyExists, SHA256: state.sha256,
+		PhysicalAttemptID: state.physicalAttemptID,
+		Progress:          progress,
+		Rolling5sBPS:      int64(state.smoothedSpeed),
+		DCID:              state.dcID, AlreadyExists: state.alreadyExists, SHA256: state.sha256,
 		ErrorStage: state.errorStage, ErrorOp: state.errorOp,
 		ErrorClass: state.errorClass, Error: state.errorText,
 		Retryable: state.retryable, RetryOwner: state.retryOwner,

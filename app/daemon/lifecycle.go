@@ -24,27 +24,28 @@ const (
 
 // LifecycleEvent represents a structured, correlated event across download and archive lifecycles.
 type LifecycleEvent struct {
-	Event           string         `json:"event"`
-	TaskID          string         `json:"task_id,omitempty"`
-	AttemptID       string         `json:"attempt_id,omitempty"`
-	ChatID          string         `json:"chat_id,omitempty"`
-	MessageID       int            `json:"message_id,omitempty"`
-	Stage           string         `json:"stage,omitempty"`
-	Op              string         `json:"op,omitempty"`
-	Path            string         `json:"path,omitempty"`
-	Size            int64          `json:"size,omitempty"`
-	SHA256          string         `json:"sha256,omitempty"`
-	DC              int            `json:"dc,omitempty"`
-	Error           string         `json:"error,omitempty"`
-	ErrorClass      string         `json:"error_class,omitempty"`
-	Retryable       bool           `json:"retryable,omitempty"`
-	RetryOwner      string         `json:"retry_owner,omitempty"`
-	Status          string         `json:"status,omitempty"`
-	PhysicalRetries int64          `json:"physical_retries,omitempty"`
-	RequestCount    int64          `json:"request_count,omitempty"`
-	WireBytes       int64          `json:"wire_bytes,omitempty"`
-	ReplayBytes     int64          `json:"replay_bytes,omitempty"`
-	Extra           map[string]any `json:"extra,omitempty"`
+	Event             string         `json:"event"`
+	TaskID            string         `json:"task_id,omitempty"`
+	AttemptID         string         `json:"attempt_id,omitempty"`
+	PhysicalAttemptID string         `json:"physical_attempt_id,omitempty"`
+	ChatID            string         `json:"chat_id,omitempty"`
+	MessageID         int            `json:"message_id,omitempty"`
+	Stage             string         `json:"stage,omitempty"`
+	Op                string         `json:"op,omitempty"`
+	Path              string         `json:"path,omitempty"`
+	Size              int64          `json:"size,omitempty"`
+	SHA256            string         `json:"sha256,omitempty"`
+	DC                int            `json:"dc,omitempty"`
+	Error             string         `json:"error,omitempty"`
+	ErrorClass        string         `json:"error_class,omitempty"`
+	Retryable         bool           `json:"retryable,omitempty"`
+	RetryOwner        string         `json:"retry_owner,omitempty"`
+	Status            string         `json:"status,omitempty"`
+	PhysicalRetries   int64          `json:"physical_retries,omitempty"`
+	RequestCount      int64          `json:"request_count,omitempty"`
+	WireBytes         int64          `json:"wire_bytes,omitempty"`
+	ReplayBytes       int64          `json:"replay_bytes,omitempty"`
+	Extra             map[string]any `json:"extra,omitempty"`
 }
 
 // LifecycleObserver observes emitted lifecycle events for testing and telemetry.
@@ -94,6 +95,9 @@ func EmitLifecycle(logger *zap.Logger, evt LifecycleEvent) {
 		}
 		if evt.AttemptID != "" {
 			fields = append(fields, zap.String("attempt_id", evt.AttemptID))
+		}
+		if evt.PhysicalAttemptID != "" {
+			fields = append(fields, zap.String("physical_attempt_id", evt.PhysicalAttemptID))
 		}
 		if evt.ChatID != "" {
 			fields = append(fields, zap.String("chat_id", evt.ChatID))

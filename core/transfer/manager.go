@@ -2,13 +2,20 @@ package transfer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"sync/atomic"
 
 	"github.com/gotd/td/telegram/downloader"
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
+)
+
+var (
+	// ErrRequestBudgetExhausted is returned when the declared RPC request budget is exceeded.
+	ErrRequestBudgetExhausted = errors.New("request budget exhausted")
 )
 
 const (
@@ -74,9 +81,18 @@ type TransferTaskContext struct {
 	MessageID       int
 	DCID            int
 	MaxRetries      int
+	RequestBudget   int64
 	RequestCount    *int64
 	WireBytes       *int64
 	PhysicalRetries *int64
+}
+
+// PhysicalAttemptID formats a unique identity for a physical attempt within this logical attempt.
+func (tc TransferTaskContext) PhysicalAttemptID(retry int64) string {
+	if tc.AttemptID == "" {
+		return fmt.Sprintf("p%d", retry)
+	}
+	return fmt.Sprintf("%s-p%d", tc.AttemptID, retry)
 }
 
 // ContextWithTransferTask wraps ctx with TransferTaskContext.
@@ -236,6 +252,19 @@ func (m *TransferManager) DownloadFileWithResult(
 	var fileRetries int64
 	tc, hasTask := TransferTaskFromContext(ctx)
 
+	maxRetries := DefaultMaxRetryAttempts
+	if hasTask && tc.MaxRetries > 0 {
+		maxRetries = tc.MaxRetries
+	}
+	budget := tc.RequestBudget
+	if budget <= 0 {
+		budget = ComputeRequestBudget(expectedSize, maxRetries)
+		if hasTask {
+			tc.RequestBudget = budget
+			ctx = ContextWithTransferTask(ctx, tc)
+		}
+	}
+
 	builder := m.downloader.Download(client, location).
 		WithThreads(fileThreads).
 		WithRetryHandler(func(event downloader.RetryEvent) {
@@ -272,12 +301,6 @@ func (m *TransferManager) DownloadFileWithResult(
 		replayBytes = wireBytes - downloaded
 	}
 
-	maxRetries := DefaultMaxRetryAttempts
-	if hasTask && tc.MaxRetries > 0 {
-		maxRetries = tc.MaxRetries
-	}
-	budget := ComputeRequestBudget(expectedSize, maxRetries)
-
 	res := DownloadResult{
 		Written:         downloaded,
 		WireBytes:       wireBytes,
@@ -287,6 +310,17 @@ func (m *TransferManager) DownloadFileWithResult(
 		RequestBudget:   budget,
 	}
 	if err != nil {
+		if errors.Is(err, ErrRequestBudgetExhausted) || strings.Contains(err.Error(), ErrRequestBudgetExhausted.Error()) {
+			return res, &TransferError{
+				Stage:       "transfer",
+				Op:          "invoke",
+				Class:       "network",
+				Unavailable: false,
+				Retryable:   false,
+				RetryOwner:  "gotd",
+				Cause:       ErrRequestBudgetExhausted,
+			}
+		}
 		if writeErr := writer.WriteErr(); writeErr != nil {
 			return res, &TransferError{
 				Stage:       "transfer",

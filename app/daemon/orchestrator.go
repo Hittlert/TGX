@@ -672,15 +672,27 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 		pool.CDN,
 	)
 
+	maxRetries := transfer.DefaultMaxRetryAttempts
+	if req.MaxRetries > 0 {
+		maxRetries = req.MaxRetries
+	}
+	budget := transfer.ComputeRequestBudget(authoritativeSize, maxRetries)
+
+	initPhysAttempt := fmt.Sprintf("%s-p0", gen)
 	EmitLifecycle(o.logger, LifecycleEvent{
-		Event:     EventDownloadStarted,
-		TaskID:    taskID,
-		AttemptID: gen,
-		ChatID:    chatID,
-		MessageID: msgID,
-		DC:        resolvedMedia.DCID,
-		Path:      finalRelPath,
-		Size:      authoritativeSize,
+		Event:             EventDownloadStarted,
+		TaskID:            taskID,
+		AttemptID:         gen,
+		PhysicalAttemptID: initPhysAttempt,
+		ChatID:            chatID,
+		MessageID:         msgID,
+		DC:                resolvedMedia.DCID,
+		Path:              finalRelPath,
+		Size:              authoritativeSize,
+		Extra: map[string]any{
+			"request_budget":      budget,
+			"physical_attempt_id": initPhysAttempt,
+		},
 	})
 
 	var reqCount int64
@@ -693,7 +705,8 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 		ChatID:          chatID,
 		MessageID:       msgID,
 		DCID:            resolvedMedia.DCID,
-		MaxRetries:      transfer.DefaultMaxRetryAttempts,
+		MaxRetries:      maxRetries,
+		RequestBudget:   budget,
 		RequestCount:    &reqCount,
 		WireBytes:       &wireBytes,
 		PhysicalRetries: &physicalRetries,
@@ -712,9 +725,10 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 	wireTotal := dlResult.WireBytes
 	replayBytes := dlResult.ReplayBytes
 	reqTotal := dlResult.RequestCount
-	budget := dlResult.RequestBudget
+	budget = dlResult.RequestBudget
+	physAttemptID := fmt.Sprintf("%s-p%d", gen, retries)
 
-	task.RecordTransferTelemetry(written, wireTotal, replayBytes, reqTotal, retries)
+	task.RecordTransferTelemetry(written, wireTotal, replayBytes, reqTotal, retries, physAttemptID)
 
 	if dlErr != nil {
 		_ = partFile.Close()
@@ -724,18 +738,20 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 		var disp FailureDisposition
 		if errors.As(dlErr, &tErr) {
 			disp = FailureDisposition{
-				Stage:       tErr.Stage,
-				Op:          tErr.Op,
-				Class:       tErr.Class,
-				Unavailable: tErr.Unavailable,
-				Retryable:   tErr.Retryable,
-				RetryOwner:  tErr.RetryOwner,
-				Message:     tErr.Error(),
-				Cause:       tErr.Cause,
+				Stage:             tErr.Stage,
+				Op:                tErr.Op,
+				Class:             tErr.Class,
+				Unavailable:       tErr.Unavailable,
+				Retryable:         tErr.Retryable,
+				RetryOwner:        tErr.RetryOwner,
+				PhysicalAttemptID: physAttemptID,
+				Message:           tErr.Error(),
+				Cause:             tErr.Cause,
 			}
 			o.logger.Warn("download transfer failed",
 				zap.String("task_id", taskID),
 				zap.String("logical_generation", gen),
+				zap.String("physical_attempt_id", physAttemptID),
 				zap.Int64("physical_retries", retries),
 				zap.Int64("request_count", reqTotal),
 				zap.Int64("wire_bytes", wireTotal),
@@ -748,18 +764,20 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 			)
 		} else {
 			disp = FailureDisposition{
-				Stage:       "transfer",
-				Op:          "download_file",
-				Class:       "network",
-				Unavailable: false,
-				Retryable:   false,
-				RetryOwner:  "gotd",
-				Message:     dlErr.Error(),
-				Cause:       dlErr,
+				Stage:             "transfer",
+				Op:                "download_file",
+				Class:             "network",
+				Unavailable:       false,
+				Retryable:         false,
+				RetryOwner:        "gotd",
+				PhysicalAttemptID: physAttemptID,
+				Message:           dlErr.Error(),
+				Cause:             dlErr,
 			}
 			o.logger.Warn("gotd download failed",
 				zap.String("task_id", taskID),
 				zap.String("logical_generation", gen),
+				zap.String("physical_attempt_id", physAttemptID),
 				zap.Int64("physical_retries", retries),
 				zap.Int64("request_count", reqTotal),
 				zap.Int64("wire_bytes", wireTotal),
@@ -776,6 +794,39 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 		if o.db != nil {
 			_ = o.db.FailDownloadDisposition(chatID, msgID, gen, fileName, finalRelPath, mediaType, authoritativeSize, disp)
 		}
+		status := "failed"
+		if disp.Unavailable {
+			status = "unavailable"
+		}
+		EmitLifecycle(o.logger, LifecycleEvent{
+			Event:             EventItemTerminal,
+			TaskID:            taskID,
+			AttemptID:         gen,
+			PhysicalAttemptID: physAttemptID,
+			ChatID:            chatID,
+			MessageID:         msgID,
+			Stage:             disp.Stage,
+			Op:                disp.Op,
+			Path:              finalRelPath,
+			Size:              authoritativeSize,
+			ErrorClass:        disp.Class,
+			Error:             disp.Error(),
+			Retryable:         disp.Retryable,
+			RetryOwner:        disp.RetryOwner,
+			Status:            status,
+			PhysicalRetries:   retries,
+			RequestCount:      reqTotal,
+			WireBytes:         wireTotal,
+			ReplayBytes:       replayBytes,
+			Extra: map[string]any{
+				"request_count":       reqTotal,
+				"request_budget":      budget,
+				"physical_retries":    retries,
+				"physical_attempt_id": physAttemptID,
+				"wire_bytes":          wireTotal,
+				"replay_bytes":        replayBytes,
+			},
+		})
 		return
 	}
 
@@ -990,40 +1041,45 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 
 	// 15. Complete task in Registry ONLY after both SSD commit and DB transaction succeed!
 	task.SucceedResult(PublishResult{
-		Path:            finalRelPath,
-		SHA256:          shaHex,
-		WireBytes:       wireTotal,
-		ReplayBytes:     replayBytes,
-		RequestCount:    reqTotal,
-		PhysicalRetries: retries,
-		absolutePath:    finalAbsPath,
+		Path:              finalRelPath,
+		SHA256:            shaHex,
+		WireBytes:         wireTotal,
+		ReplayBytes:       replayBytes,
+		RequestCount:      reqTotal,
+		PhysicalRetries:   retries,
+		PhysicalAttemptID: physAttemptID,
+		absolutePath:      finalAbsPath,
 	})
 	EmitLifecycle(o.logger, LifecycleEvent{
-		Event:           EventItemTerminal,
-		TaskID:          taskID,
-		AttemptID:       gen,
-		ChatID:          chatID,
-		MessageID:       msgID,
-		Path:            finalRelPath,
-		Size:            stat.Size(),
-		SHA256:          shaHex,
-		Status:          "success",
-		PhysicalRetries: retries,
-		RequestCount:    reqTotal,
-		WireBytes:       wireTotal,
-		ReplayBytes:     replayBytes,
+		Event:             EventItemTerminal,
+		TaskID:            taskID,
+		AttemptID:         gen,
+		PhysicalAttemptID: physAttemptID,
+		ChatID:            chatID,
+		MessageID:         msgID,
+		Path:              finalRelPath,
+		Size:              stat.Size(),
+		SHA256:            shaHex,
+		Status:            "success",
+		PhysicalRetries:   retries,
+		RequestCount:      reqTotal,
+		WireBytes:         wireTotal,
+		ReplayBytes:       replayBytes,
 		Extra: map[string]any{
-			"request_count":    reqTotal,
-			"request_budget":   budget,
-			"physical_retries": retries,
-			"wire_bytes":       wireTotal,
-			"committed_bytes":  stat.Size(),
-			"replay_bytes":     replayBytes,
+			"request_count":       reqTotal,
+			"request_budget":      budget,
+			"physical_retries":    retries,
+			"physical_attempt_id": physAttemptID,
+			"wire_bytes":          wireTotal,
+			"committed_bytes":     stat.Size(),
+			"replay_bytes":        replayBytes,
 		},
 	})
 
 	o.logger.Info("download completed successfully",
 		zap.String("task_id", taskID),
+		zap.String("logical_generation", gen),
+		zap.String("physical_attempt_id", physAttemptID),
 		zap.String("rel_path", finalRelPath),
 		zap.Int64("size", stat.Size()),
 		zap.String("sha256", shaHex),

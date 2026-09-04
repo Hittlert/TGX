@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -542,5 +543,68 @@ func TestGatedInvoker_RequestAndWireBytesAccounting(t *testing.T) {
 	budget := ComputeRequestBudget(1024, 20)
 	if budget != 21 {
 		t.Fatalf("expected budget 21 for 1024 bytes (1 chunk + 20 retries), got %d", budget)
+	}
+}
+
+func TestGatedInvoker_RequestBudgetExhaustionBoundary(t *testing.T) {
+	gate := NewDataGate(10)
+	var reqCount int64
+	var wireBytes int64
+
+	tc := TransferTaskContext{
+		TaskID:        "task-budget-1",
+		AttemptID:     "gen-1",
+		ChatID:        "-1001",
+		MessageID:     42,
+		DCID:          2,
+		RequestBudget: 3,
+		RequestCount:  &reqCount,
+		WireBytes:     &wireBytes,
+	}
+	ctx := ContextWithTransferTask(context.Background(), tc)
+
+	var rawCalls int64
+	mockInv := invokerFunc(func(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
+		atomic.AddInt64(&rawCalls, 1)
+		return errors.New("transient upstream error")
+	})
+
+	gated := NewGatedInvoker(mockInv, gate, 2)
+
+	// Call 1..3: allowed and reach raw invoker
+	for i := 1; i <= 3; i++ {
+		var out tg.UploadFileBox
+		err := gated.Invoke(ctx, nil, &out)
+		if err == nil || err.Error() != "transient upstream error" {
+			t.Fatalf("expected transient error on call %d, got %v", i, err)
+		}
+	}
+
+	if rawCalls != 3 {
+		t.Fatalf("expected 3 raw calls, got %d", rawCalls)
+	}
+	if reqCount != 3 {
+		t.Fatalf("expected request count 3, got %d", reqCount)
+	}
+
+	// Call 4: exceeds declared budget 3 -> blocked AT BOUNDARY, raw invoker NEVER called!
+	var out4 tg.UploadFileBox
+	err4 := gated.Invoke(ctx, nil, &out4)
+	if !errors.Is(err4, ErrRequestBudgetExhausted) {
+		t.Fatalf("expected ErrRequestBudgetExhausted on call 4, got: %v", err4)
+	}
+	if rawCalls != 3 {
+		t.Fatalf("raw invoker was called despite budget exhaustion: got %d calls, want strictly 3", rawCalls)
+	}
+	if reqCount != 3 {
+		t.Fatalf("request count should remain capped at budget 3, got %d", reqCount)
+	}
+
+	// Verify PhysicalAttemptID helper
+	if id0 := tc.PhysicalAttemptID(0); id0 != "gen-1-p0" {
+		t.Fatalf("expected physical attempt ID gen-1-p0, got %s", id0)
+	}
+	if id2 := tc.PhysicalAttemptID(2); id2 != "gen-1-p2" {
+		t.Fatalf("expected physical attempt ID gen-1-p2, got %s", id2)
 	}
 }
