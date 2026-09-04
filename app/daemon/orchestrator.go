@@ -480,6 +480,13 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 		}
 		return
 	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = partFile.Close()
+			_ = os.Remove(partAbsPath)
+		}
+	}()
 	_ = fscommit.Preallocate(partFile, authoritativeSize)
 
 	task.SetDownloading()
@@ -638,6 +645,7 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 		}
 		return
 	}
+	committed = true
 
 	// 13. Complete download and queue archive in single DB transaction
 	queueArchive := o.archiveWorker != nil && o.archiveWorker.IsEnabled()

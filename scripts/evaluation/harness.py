@@ -719,7 +719,10 @@ def classify_results(cases, engine_name, paths, task_submits, engine_tasks, time
             error_stage = "lifecycle"
             error_op = "cancel"
             error_cause = snapshot.get("error") or "task canceled"
-        elif timed_out and state in ("queued", "resolving", "downloading"):
+        elif timed_out and (
+            state in ("queued", "resolving", "downloading")
+            or run_spec.get("engine") == "tdl"
+        ):
             terminal_state = "TIMED_OUT"
             error_code = "TIMED_OUT"
             error_stage = "lifecycle"

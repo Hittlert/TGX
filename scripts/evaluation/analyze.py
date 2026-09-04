@@ -161,7 +161,12 @@ def _longest_zero_seconds(metrics):
         busy = (record.get("active_files") or 0) > 0 or (
             record.get("queued_jobs") or 0
         ) > 0
-        if busy and record.get("rolling_5s_bps") == 0:
+        unexplained = (
+            busy
+            and record.get("rolling_5s_bps") == 0
+            and (record.get("active_rpc") or 0) == 0
+        )
+        if unexplained:
             current += delta
             longest = max(longest, current)
         else:
@@ -441,7 +446,9 @@ def evaluate_policy(run_root, policy_path, overwrite=False):
         or (record.get("queued_jobs") or 0) > 0
     ]
     zero_speed_samples = sum(
-        1 for record in busy_metrics if record.get("rolling_5s_bps") == 0
+        1
+        for record in busy_metrics
+        if record.get("rolling_5s_bps") == 0 and (record.get("active_rpc") or 0) == 0
     )
     zero_speed_fraction = (
         zero_speed_samples / len(busy_metrics) if busy_metrics else 0.0
