@@ -966,12 +966,26 @@ def execute_run(run_spec, engine_binary, eval_dir, host_port=5890):
                         if snapshot.get("id")
                     }
                 except Exception as error:
-                    append_run_error(
-                        errors,
-                        "TASK_SNAPSHOT_FAILED",
-                        error,
-                        "get_tasks",
-                    )
+                    if run_spec.get("engine") == "tdl":
+                        engine_tasks = {}
+                        for task_info in task_submits.values():
+                            tid = task_info.get("task_id")
+                            if tid:
+                                try:
+                                    snap = http_json(
+                                        f"{engine.api_base}/api/tasks/{tid}"
+                                    )
+                                    if isinstance(snap, dict) and snap.get("id"):
+                                        engine_tasks[snap["id"]] = snap
+                                except Exception:
+                                    pass
+                    else:
+                        append_run_error(
+                            errors,
+                            "TASK_SNAPSHOT_FAILED",
+                            error,
+                            "get_tasks",
+                        )
                 events.write({"timestamp": iso_time(), "event": "run.finished"})
             except Exception as error:
                 measurement_timed_out = True
