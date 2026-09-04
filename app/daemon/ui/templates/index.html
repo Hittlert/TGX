@@ -1234,18 +1234,20 @@
             dataType: "json",
             success: function (res) {
               layer.close(loading_idx);
-              if (res.ok && res.dialog) {
-                var dialog = res.dialog;
+              if (res.ok && (res.dialog || res.target)) {
+                var dialog = res.dialog || res.target;
                 dialog.enabled = true;
-                dialog.priority = 0;
-                dialog.last_read_message_id = dialog.top_message_id || 0;
-                dialog.download_filter = '';
-                dialog.upload_telegram_chat_id = '';
+                dialog.priority = dialog.priority || 0;
+                dialog.last_read_message_id = dialog.last_read_message_id || dialog.top_message_id || 0;
+                dialog.download_filter = dialog.download_filter || '';
+                dialog.upload_telegram_chat_id = dialog.upload_telegram_chat_id || '';
                 dialog.scan_status = {};
 
                 var existing = find_target_row(target_key(dialog.chat_id));
                 if (existing) {
                   existing.enabled = true;
+                  existing.top_message_id = dialog.top_message_id || existing.top_message_id;
+                  existing.last_read_message_id = dialog.last_read_message_id || existing.last_read_message_id;
                 } else {
                   target_rows.unshift(dialog);
                 }
@@ -1259,6 +1261,7 @@
               layer.close(loading_idx);
               var err = 'Add failed';
               if (xhr.responseJSON && xhr.responseJSON.error) err = xhr.responseJSON.error;
+              else if (xhr.responseText) err = xhr.responseText;
               layer.msg(err);
             }
           });
@@ -1319,6 +1322,7 @@
             layer.close(loading_idx);
             var message = 'Save failed';
             if (err.responseJSON && err.responseJSON.error) message = err.responseJSON.error;
+            else if (err.responseText) message = err.responseText;
             layer.msg(message);
           }
         });
@@ -1340,43 +1344,46 @@
         var is_checked = $(this).prop('checked');
         var original_checked = !is_checked;
         var toggle_elem = $(this);
-        if (row) {
-          row.enabled = is_checked;
+        if (!row) {
+          toggle_elem.prop('checked', original_checked);
+          return;
         }
+        row.enabled = is_checked;
         card.toggleClass('is-enabled', is_checked);
         update_target_count();
 
-        if (row) {
-          $.ajax({
-            url: "api/target/update",
-            type: "post",
-            contentType: "application/json",
-            data: JSON.stringify({
-              chat_id: normalized_listen_chat_id(row),
-              username: row.username || '',
-              title: row.title || '',
-              type: row.type || '',
-              enabled: is_checked
-            }),
-            dataType: "json",
-            success: function (res) {
-              if (!res || !res.ok) {
-                if (row) row.enabled = original_checked;
-                card.toggleClass('is-enabled', original_checked);
-                toggle_elem.prop('checked', original_checked);
-                update_target_count();
-                layer.msg((res && res.error) || 'Update failed', { icon: 2 });
-              }
-            },
-            error: function (xhr) {
-              if (row) row.enabled = original_checked;
+        $.ajax({
+          url: "api/target/update",
+          type: "post",
+          contentType: "application/json",
+          data: JSON.stringify({
+            chat_id: normalized_listen_chat_id(row),
+            username: row.username || '',
+            title: row.title || '',
+            type: row.type || '',
+            enabled: is_checked
+          }),
+          dataType: "json",
+          success: function (res) {
+            if (!res || !res.ok) {
+              row.enabled = original_checked;
               card.toggleClass('is-enabled', original_checked);
               toggle_elem.prop('checked', original_checked);
               update_target_count();
-              layer.msg('Update failed: ' + (xhr.responseText || xhr.statusText), { icon: 2 });
+              layer.msg((res && res.error) || 'Update failed', { icon: 2 });
             }
-          });
-        }
+          },
+          error: function (xhr) {
+            row.enabled = original_checked;
+            card.toggleClass('is-enabled', original_checked);
+            toggle_elem.prop('checked', original_checked);
+            update_target_count();
+            var errMsg = 'Update failed';
+            if (xhr.responseJSON && xhr.responseJSON.error) errMsg = xhr.responseJSON.error;
+            else if (xhr.responseText) errMsg = xhr.responseText;
+            layer.msg(errMsg, { icon: 2 });
+          }
+        });
       });
 
       $('#target_list').on('click', '.btn-config', function () {
@@ -1393,6 +1400,7 @@
         var row = find_target_row(card.attr('data-chat-key'));
         if (row && row.top_message_id) {
           card.find('.target-cursor').val(row.top_message_id);
+          row.last_read_message_id = row.top_message_id;
           sync_target_row(card);
         }
       });

@@ -876,17 +876,7 @@ func (s *WebServer) handleListenTargets(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *WebServer) handleUpdateSingleTarget(w http.ResponseWriter, r *http.Request) {
-	var item struct {
-		ChatID               string  `json:"chat_id"`
-		Enabled              *bool   `json:"enabled"`
-		Priority             *int    `json:"priority"`
-		LastReadMessageID    *int    `json:"last_read_message_id"`
-		DownloadFilter       *string `json:"download_filter"`
-		UploadTelegramChatID *string `json:"upload_telegram_chat_id"`
-		Title                string  `json:"title"`
-		Username             string  `json:"username"`
-		Type                 string  `json:"type"`
-	}
+	var item UpdateSingleTargetRequestDTO
 	if err := json.NewDecoder(r.Body).Decode(&item); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid json")
 		return
@@ -897,7 +887,7 @@ func (s *WebServer) handleUpdateSingleTarget(w http.ResponseWriter, r *http.Requ
 	}
 
 	canonicalChatID := item.ChatID
-	if strings.HasPrefix(item.ChatID, "@") {
+	if strings.HasPrefix(item.ChatID, "@") && s.access != nil {
 		info, err := s.access.ResolvePeerInfo(r.Context(), item.ChatID)
 		if err == nil && info.ChatID != "" {
 			canonicalChatID = info.ChatID
@@ -913,7 +903,10 @@ func (s *WebServer) handleUpdateSingleTarget(w http.ResponseWriter, r *http.Requ
 		}
 	}
 
-	targets, _ := s.db.GetListenTargets()
+	var targets []ListenTarget
+	if s.db != nil {
+		targets, _ = s.db.GetListenTargets()
+	}
 	var target ListenTarget
 	found := false
 	for _, t := range targets {
@@ -953,9 +946,11 @@ func (s *WebServer) handleUpdateSingleTarget(w http.ResponseWriter, r *http.Requ
 		target.Username = item.Username
 	}
 
-	if err := s.db.SaveSingleListenTarget(target); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
+	if s.db != nil {
+		if err := s.db.SaveSingleListenTarget(target); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
 	}
 
 	if !target.Enabled && s.orchestrator != nil {
@@ -969,9 +964,9 @@ func (s *WebServer) handleUpdateSingleTarget(w http.ResponseWriter, r *http.Requ
 		stream.refreshTargetCache()
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":     true,
-		"target": target,
+	writeJSON(w, http.StatusOK, UpdateSingleTargetResponseDTO{
+		OK:     true,
+		Target: target,
 	})
 }
 
@@ -1006,7 +1001,7 @@ func (s *WebServer) handleDialogs(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	decorated := make([]map[string]any, 0, len(targets)+len(rawDialogs))
+	decorated := make([]TargetDialogDTO, 0, len(targets)+len(rawDialogs))
 	seenIDs := make(map[string]bool)
 
 	// 1. First append all configured business targets from database
@@ -1030,27 +1025,34 @@ func (s *WebServer) handleDialogs(w http.ResponseWriter, r *http.Request) {
 		} else if s.db != nil {
 			_ = s.db.DB().QueryRow(`SELECT COALESCE(MAX(message_id), 0) FROM chat_messages WHERE chat_id = ?`, t.ChatID).Scan(&topMsgID)
 		}
+		if topMsgID == 0 {
+			if cursor > 0 {
+				topMsgID = cursor
+			} else if t.LastReadMessageID > 0 {
+				topMsgID = t.LastReadMessageID
+			}
+		}
 
-		decorated = append(decorated, map[string]any{
-			"id":                      t.ChatID,
-			"chat_id":                 t.ChatID,
-			"title":                   t.Title,
-			"username":                t.Username,
-			"type":                    t.ChatType,
-			"pinned":                  false,
-			"unread_count":            0,
-			"top_message_id":          topMsgID,
-			"last_read_message_id":    cursor,
-			"is_target":               t.Enabled,
-			"enabled":                 t.Enabled,
-			"target_enabled":          t.Enabled,
-			"priority":                t.Priority,
-			"download_filter":         t.DownloadFilter,
-			"upload_telegram_chat_id": t.UploadTelegramChatID,
-			"last_message_at":         lastMsgDate,
-			"last_scan_finished_at":   lastMsgDate,
-			"last_scan_started_at":    lastMsgDate,
-			"updated_at":              t.UpdatedAt,
+		decorated = append(decorated, TargetDialogDTO{
+			ID:                   t.ChatID,
+			ChatID:               t.ChatID,
+			Title:                t.Title,
+			Username:             t.Username,
+			Type:                 t.ChatType,
+			Pinned:               false,
+			UnreadCount:          0,
+			TopMessageID:         topMsgID,
+			LastReadMessageID:    cursor,
+			IsTarget:             t.Enabled,
+			Enabled:              t.Enabled,
+			TargetEnabled:        t.Enabled,
+			Priority:             t.Priority,
+			DownloadFilter:       t.DownloadFilter,
+			UploadTelegramChatID: t.UploadTelegramChatID,
+			LastMessageAt:        lastMsgDate,
+			LastScanFinishedAt:   lastMsgDate,
+			LastScanStartedAt:    lastMsgDate,
+			UpdatedAt:            t.UpdatedAt,
 		})
 	}
 
@@ -1060,32 +1062,32 @@ func (s *WebServer) handleDialogs(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		seenIDs[d.ChatID] = true
-		decorated = append(decorated, map[string]any{
-			"id":                      d.ChatID,
-			"chat_id":                 d.ChatID,
-			"title":                   d.Title,
-			"username":                d.Username,
-			"type":                    d.Type,
-			"pinned":                  d.Pinned,
-			"unread_count":            d.UnreadCount,
-			"top_message_id":          d.TopMessageID,
-			"last_read_message_id":    0,
-			"is_target":               false,
-			"enabled":                 false,
-			"target_enabled":          false,
-			"priority":                0,
-			"download_filter":         "",
-			"upload_telegram_chat_id": "",
-			"last_message_at":         0,
-			"last_scan_finished_at":   0,
-			"last_scan_started_at":    0,
-			"updated_at":              0,
+		decorated = append(decorated, TargetDialogDTO{
+			ID:                   d.ChatID,
+			ChatID:               d.ChatID,
+			Title:                d.Title,
+			Username:             d.Username,
+			Type:                 d.Type,
+			Pinned:               d.Pinned,
+			UnreadCount:          d.UnreadCount,
+			TopMessageID:         d.TopMessageID,
+			LastReadMessageID:    0,
+			IsTarget:             false,
+			Enabled:              false,
+			TargetEnabled:        false,
+			Priority:             0,
+			DownloadFilter:       "",
+			UploadTelegramChatID: "",
+			LastMessageAt:        0,
+			LastScanFinishedAt:   0,
+			LastScanStartedAt:    0,
+			UpdatedAt:            0,
 		})
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":      true,
-		"dialogs": decorated,
+	writeJSON(w, http.StatusOK, DialogsResponseDTO{
+		OK:      true,
+		Dialogs: decorated,
 	})
 }
 
@@ -1130,12 +1132,7 @@ func (s *WebServer) handleResolveTarget(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *WebServer) handleAddTarget(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Query  string `json:"query"`
-		Target string `json:"target"`
-		ChatID string `json:"chat_id"`
-		Title  string `json:"title"`
-	}
+	var req AddTargetRequestDTO
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16*1024)).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid json")
 		return
@@ -1161,12 +1158,13 @@ func (s *WebServer) handleAddTarget(w http.ResponseWriter, r *http.Request) {
 	}
 
 	targetItem := ListenTarget{
-		ChatID:   info.ChatID,
-		Title:    info.Title,
-		Username: info.Username,
-		ChatType: info.Type,
-		Enabled:  true,
-		Priority: 0,
+		ChatID:            info.ChatID,
+		Title:             info.Title,
+		Username:          info.Username,
+		ChatType:          info.Type,
+		Enabled:           true,
+		Priority:          0,
+		LastReadMessageID: info.TopMessageID,
 	}
 	if s.db != nil {
 		if err := s.db.SaveSingleListenTarget(targetItem); err != nil {
@@ -1182,60 +1180,80 @@ func (s *WebServer) handleAddTarget(w http.ResponseWriter, r *http.Request) {
 		stream.refreshTargetCache()
 	}
 
-	dialogObj := map[string]any{
-		"id":                      info.ID,
-		"chat_id":                 info.ChatID,
-		"title":                   info.Title,
-		"username":                info.Username,
-		"type":                    info.Type,
-		"enabled":                 true,
-		"priority":                0,
-		"download_filter":         "",
-		"upload_telegram_chat_id": "",
-		"top_message_id":          info.TopMessageID,
+	dialogObj := TargetDialogDTO{
+		ID:                   info.ChatID,
+		ChatID:               info.ChatID,
+		Title:                info.Title,
+		Username:             info.Username,
+		Type:                 info.Type,
+		TopMessageID:         info.TopMessageID,
+		LastReadMessageID:    info.TopMessageID,
+		Enabled:              true,
+		TargetEnabled:        true,
+		IsTarget:             true,
+		Priority:             0,
+		DownloadFilter:       "",
+		UploadTelegramChatID: "",
+		UpdatedAt:            time.Now().Unix(),
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":     true,
-		"peer":   info,
-		"dialog": dialogObj,
-		"target": dialogObj,
+	writeJSON(w, http.StatusOK, AddTargetResponseDTO{
+		OK:     true,
+		Peer:   info,
+		Dialog: dialogObj,
+		Target: dialogObj,
 	})
 }
 
 func (s *WebServer) handleTargetProgress(w http.ResponseWriter, r *http.Request) {
+	if s.db == nil {
+		writeError(w, http.StatusServiceUnavailable, "database not available")
+		return
+	}
+
 	targets, err := s.db.GetListenTargets()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
-	stats, _ := s.db.GetTargetProgressStats()
+	stats, statsErr := s.db.GetTargetProgressStats()
+	if statsErr != nil {
+		writeError(w, http.StatusInternalServerError, "failed to get target progress stats: "+statsErr.Error())
+		return
+	}
 
-	progressList := make([]map[string]any, 0, len(targets))
+	progressList := make([]TargetProgressItemDTO, 0, len(targets))
 	for _, t := range targets {
-		cursor, _ := s.db.GetScanCursor(t.ChatID)
+		cursor, cursorErr := s.db.GetScanCursor(t.ChatID)
+		scanStatus := "ok"
+		scanErrStr := ""
+		if cursorErr != nil {
+			scanStatus = "error"
+			scanErrStr = cursorErr.Error()
+		}
 		st := stats[t.ChatID]
 
-		progressList = append(progressList, map[string]any{
-			"chat_id":              t.ChatID,
-			"title":                t.Title,
-			"enabled":              t.Enabled,
-			"last_read_message_id": cursor,
-			"scan_status":          "ok",
-			"total_files":          st.TotalFiles,
-			"downloaded_files":     st.DownloadedFiles,
-			"pending_files":        st.PendingFiles,
-			"processing_files":     st.ProcessingFiles,
-			"failed_files":         st.FailedFiles,
-			"skipped_files":        st.SkippedFiles,
-			"downloaded_bytes":     st.DownloadedBytes,
+		progressList = append(progressList, TargetProgressItemDTO{
+			ChatID:            t.ChatID,
+			Title:             t.Title,
+			Enabled:           t.Enabled,
+			LastReadMessageID: cursor,
+			ScanStatus:        scanStatus,
+			ScanError:         scanErrStr,
+			TotalFiles:        st.TotalFiles,
+			DownloadedFiles:   st.DownloadedFiles,
+			PendingFiles:      st.PendingFiles,
+			ProcessingFiles:   st.ProcessingFiles,
+			FailedFiles:       st.FailedFiles,
+			SkippedFiles:      st.SkippedFiles,
+			DownloadedBytes:   st.DownloadedBytes,
 		})
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":       true,
-		"progress": progressList,
+	writeJSON(w, http.StatusOK, TargetProgressResponseDTO{
+		OK:       true,
+		Progress: progressList,
 	})
 }
 
@@ -1253,14 +1271,22 @@ func (s *WebServer) handleChatContext(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	limitBefore := 15
-	limitAfter := 15
-	if limitStr := r.URL.Query().Get("limit"); limitStr != "" {
+	limit := 30
+	if limitStr := strings.TrimSpace(r.URL.Query().Get("limit")); limitStr != "" {
 		if l, err := strconv.Atoi(limitStr); err == nil && l > 0 {
-			limitBefore = l / 2
-			limitAfter = l - limitBefore
+			limit = l
 		}
 	}
+	if limit > 100 {
+		limit = 100
+	}
+	if limit < 1 {
+		limit = 1
+	}
+
+	limitBefore := limit / 2
+	limitAfter := limit - limitBefore
+
 	if lb, err := strconv.Atoi(r.URL.Query().Get("limit_before")); err == nil && lb > 0 {
 		limitBefore = lb
 	}
@@ -1303,24 +1329,25 @@ func (s *WebServer) handleChatContext(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	msgList := make([]map[string]any, 0, len(msgs))
+	msgList := make([]ChatContextMessageDTO, 0, len(msgs))
 	for _, m := range msgs {
-		msgList = append(msgList, map[string]any{
-			"chat_id":             m.ChatID,
-			"message_id":          m.MessageID,
-			"sender_id":           m.SenderID,
-			"sender_name":         m.SenderName,
-			"text":                m.Text,
-			"media_type":          m.MediaType,
-			"has_media":           m.HasMedia,
-			"reply_to_message_id": m.ReplyToMessageID,
-			"date":                m.Date,
+		msgList = append(msgList, ChatContextMessageDTO{
+			ChatID:           m.ChatID,
+			MessageID:        m.MessageID,
+			SenderID:         m.SenderID,
+			SenderName:       m.SenderName,
+			Text:             m.Text,
+			MediaType:        m.MediaType,
+			HasMedia:         m.HasMedia,
+			ReplyToMessageID: m.ReplyToMessageID,
+			Date:             m.Date,
 		})
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":       true,
-		"messages": msgList,
+	writeJSON(w, http.StatusOK, ChatContextResponseDTO{
+		OK:       true,
+		Messages: msgList,
+		Limit:    limit,
 	})
 }
 

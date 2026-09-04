@@ -104,3 +104,107 @@ type ResolvedMedia struct {
 	Date      int64
 	MediaType string
 }
+
+// Target-related DTOs for Issue #12
+
+type TargetDialogDTO struct {
+	ID                   string `json:"id"`
+	ChatID               string `json:"chat_id"`
+	Title                string `json:"title"`
+	Username             string `json:"username"`
+	Type                 string `json:"type"`
+	Pinned               bool   `json:"pinned"`
+	UnreadCount          int    `json:"unread_count"`
+	TopMessageID         int    `json:"top_message_id"`
+	LastReadMessageID    int    `json:"last_read_message_id"`
+	IsTarget             bool   `json:"is_target"`
+	Enabled              bool   `json:"enabled"`
+	TargetEnabled        bool   `json:"target_enabled"`
+	Priority             int    `json:"priority"`
+	DownloadFilter       string `json:"download_filter"`
+	UploadTelegramChatID string `json:"upload_telegram_chat_id"`
+	LastMessageAt        int64  `json:"last_message_at"`
+	LastScanFinishedAt   int64  `json:"last_scan_finished_at"`
+	LastScanStartedAt    int64  `json:"last_scan_started_at"`
+	UpdatedAt            int64  `json:"updated_at"`
+}
+
+type DialogsResponseDTO struct {
+	OK      bool              `json:"ok"`
+	Dialogs []TargetDialogDTO `json:"dialogs"`
+	Error   string            `json:"error,omitempty"`
+}
+
+type AddTargetRequestDTO struct {
+	Query  string `json:"query"`
+	Target string `json:"target"`
+	ChatID string `json:"chat_id"`
+	Title  string `json:"title"`
+}
+
+type AddTargetResponseDTO struct {
+	OK     bool            `json:"ok"`
+	Peer   DialogDTO       `json:"peer,omitempty"`
+	Dialog TargetDialogDTO `json:"dialog,omitempty"`
+	Target TargetDialogDTO `json:"target,omitempty"`
+	Error  string          `json:"error,omitempty"`
+}
+
+type UpdateSingleTargetRequestDTO struct {
+	ChatID               string  `json:"chat_id"`
+	Enabled              *bool   `json:"enabled"`
+	Priority             *int    `json:"priority"`
+	LastReadMessageID    *int    `json:"last_read_message_id"`
+	DownloadFilter       *string `json:"download_filter"`
+	UploadTelegramChatID *string `json:"upload_telegram_chat_id"`
+	Title                string  `json:"title"`
+	Username             string  `json:"username"`
+	Type                 string  `json:"type"`
+}
+
+type UpdateSingleTargetResponseDTO struct {
+	OK     bool         `json:"ok"`
+	Target ListenTarget `json:"target,omitempty"`
+	Error  string       `json:"error,omitempty"`
+}
+
+type TargetProgressItemDTO struct {
+	ChatID            string `json:"chat_id"`
+	Title             string `json:"title"`
+	Enabled           bool   `json:"enabled"`
+	LastReadMessageID int    `json:"last_read_message_id"`
+	ScanStatus        string `json:"scan_status"`
+	ScanError         string `json:"scan_error,omitempty"`
+	TotalFiles        int    `json:"total_files"`
+	DownloadedFiles   int    `json:"downloaded_files"`
+	PendingFiles      int    `json:"pending_files"`
+	ProcessingFiles   int    `json:"processing_files"`
+	FailedFiles       int    `json:"failed_files"`
+	SkippedFiles      int    `json:"skipped_files"`
+	DownloadedBytes   int64  `json:"downloaded_bytes"`
+}
+
+type TargetProgressResponseDTO struct {
+	OK       bool                    `json:"ok"`
+	Progress []TargetProgressItemDTO `json:"progress"`
+	Error    string                  `json:"error,omitempty"`
+}
+
+type ChatContextMessageDTO struct {
+	ChatID           string `json:"chat_id"`
+	MessageID        int    `json:"message_id"`
+	SenderID         string `json:"sender_id"`
+	SenderName       string `json:"sender_name"`
+	Text             string `json:"text"`
+	MediaType        string `json:"media_type"`
+	HasMedia         bool   `json:"has_media"`
+	ReplyToMessageID int    `json:"reply_to_message_id,omitempty"`
+	Date             int64  `json:"date"`
+}
+
+type ChatContextResponseDTO struct {
+	OK       bool                    `json:"ok"`
+	Messages []ChatContextMessageDTO `json:"messages"`
+	Limit    int                     `json:"limit"`
+	Error    string                  `json:"error,omitempty"`
+}

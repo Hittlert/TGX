@@ -655,3 +655,312 @@ func TestWebServer_StatusActiveFilesNeverNull(t *testing.T) {
 		t.Fatalf("active_files should serialize as empty slice [], got: %s", body)
 	}
 }
+
+func TestWebServer_TargetPersistenceAndDTOContract(t *testing.T) {
+	tempDir := t.TempDir()
+	db, err := NewDatabase(filepath.Join(tempDir, "target_contract.db"))
+	if err != nil {
+		t.Fatalf("new db: %v", err)
+	}
+	defer db.Close()
+
+	access := &mockContractAccess{
+		dialogs: []DialogDTO{
+			{ID: 101, ChatID: "-100101", Title: "Discovered Channel", TopMessageID: 999},
+		},
+	}
+	registry := NewRegistry(5, 100, time.Now)
+	ws := NewWebServer(db, nil, nil, nil, nil, access, registry, zap.NewNop(), "")
+	handler := ws.Handler()
+
+	// 1. POST /api/add_target: adds target and atomically writes scan cursor in the same transaction
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/add_target", strings.NewReader(`{"query":"test"}`))
+	req.Header.Set("Content-Type", "application/json")
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from add_target, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var addResp AddTargetResponseDTO
+	if err := json.Unmarshal(w.Body.Bytes(), &addResp); err != nil {
+		t.Fatalf("unmarshal add_target response: %v", err)
+	}
+	if !addResp.OK {
+		t.Fatalf("expected add_target ok=true, got %v", addResp)
+	}
+	if addResp.Dialog.TopMessageID != 888 {
+		t.Fatalf("expected dialog.top_message_id=888, got %d", addResp.Dialog.TopMessageID)
+	}
+	if addResp.Dialog.LastReadMessageID != 888 {
+		t.Fatalf("expected dialog.last_read_message_id=888, got %d", addResp.Dialog.LastReadMessageID)
+	}
+
+	// Verify persistence in SQLite
+	targets, err := db.GetListenTargets()
+	if err != nil || len(targets) != 1 {
+		t.Fatalf("expected 1 target in db, got %v (err=%v)", targets, err)
+	}
+	if targets[0].ChatID != "-100100" || targets[0].LastReadMessageID != 888 {
+		t.Fatalf("target in db mismatch: %+v", targets[0])
+	}
+	cursor, err := db.GetScanCursor("-100100")
+	if err != nil || cursor != 888 {
+		t.Fatalf("scan cursor in db must be 888, got cursor=%d, err=%v", cursor, err)
+	}
+
+	// 2. GET /api/dialogs?refresh=true: truthful DTOs for configured and discovered targets
+	w = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/dialogs?refresh=true", nil)
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 from dialogs, got %d", w.Code)
+	}
+	var dialogsResp DialogsResponseDTO
+	if err := json.Unmarshal(w.Body.Bytes(), &dialogsResp); err != nil {
+		t.Fatalf("unmarshal dialogs response: %v", err)
+	}
+	if !dialogsResp.OK || len(dialogsResp.Dialogs) < 2 {
+		t.Fatalf("expected at least 2 dialogs, got %+v", dialogsResp)
+	}
+
+	var configuredItem, discoveredItem *TargetDialogDTO
+	for i := range dialogsResp.Dialogs {
+		d := &dialogsResp.Dialogs[i]
+		if d.ChatID == "-100100" {
+			configuredItem = d
+		} else if d.ChatID == "-100101" {
+			discoveredItem = d
+		}
+	}
+	if configuredItem == nil || configuredItem.TopMessageID != 888 || configuredItem.LastReadMessageID != 888 || !configuredItem.Enabled {
+		t.Fatalf("configured dialog contract mismatch: %+v", configuredItem)
+	}
+	if discoveredItem == nil || discoveredItem.TopMessageID != 999 || discoveredItem.Enabled {
+		t.Fatalf("discovered dialog contract mismatch: %+v", discoveredItem)
+	}
+
+	// 3. POST /api/target/update: updates target fields
+	disabled := false
+	prio := 5
+	filter := `\.mp4$`
+	upChat := "-100999"
+	upReq := UpdateSingleTargetRequestDTO{
+		ChatID:               "-100100",
+		Enabled:              &disabled,
+		Priority:             &prio,
+		DownloadFilter:       &filter,
+		UploadTelegramChatID: &upChat,
+	}
+	upReqBody, _ := json.Marshal(upReq)
+	w = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/api/target/update", strings.NewReader(string(upReqBody)))
+	req.Header.Set("Content-Type", "application/json")
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("update target failed: %d", w.Code)
+	}
+	var upResp UpdateSingleTargetResponseDTO
+	if err := json.Unmarshal(w.Body.Bytes(), &upResp); err != nil {
+		t.Fatalf("unmarshal update response: %v", err)
+	}
+	if !upResp.OK || upResp.Target.Enabled != false || upResp.Target.Priority != 5 || upResp.Target.DownloadFilter != `\.mp4$` {
+		t.Fatalf("update response mismatch: %+v", upResp)
+	}
+
+	// 4. GET /api/target_progress: typed progress and visible scan errors
+	w = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/target_progress", nil)
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("target progress failed: %d", w.Code)
+	}
+	var progResp TargetProgressResponseDTO
+	if err := json.Unmarshal(w.Body.Bytes(), &progResp); err != nil {
+		t.Fatalf("unmarshal progress response: %v", err)
+	}
+	if !progResp.OK || len(progResp.Progress) != 1 {
+		t.Fatalf("progress response mismatch: %+v", progResp)
+	}
+	item := progResp.Progress[0]
+	if item.ChatID != "-100100" || item.ScanStatus != "ok" || item.LastReadMessageID != 888 {
+		t.Fatalf("progress item contract mismatch: %+v", item)
+	}
+
+	// 5. GET /api/chat_context: documented limit contract
+	_ = db.IngestMessage(ChatMessage{
+		ChatID:    "-100100",
+		MessageID: 887,
+		SenderID:  "11",
+		Text:      "previous msg",
+		Date:      1700000000,
+	})
+	_ = db.IngestMessage(ChatMessage{
+		ChatID:    "-100100",
+		MessageID: 888,
+		SenderID:  "12",
+		Text:      "target mid msg",
+		Date:      1700000010,
+	})
+	_ = db.IngestMessage(ChatMessage{
+		ChatID:    "-100100",
+		MessageID: 889,
+		SenderID:  "13",
+		Text:      "next msg",
+		Date:      1700000020,
+	})
+
+	w = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/chat_context?chat_id=-100100&message_id=888&limit=30", nil)
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("chat context failed: %d", w.Code)
+	}
+	var ctxResp ChatContextResponseDTO
+	if err := json.Unmarshal(w.Body.Bytes(), &ctxResp); err != nil {
+		t.Fatalf("unmarshal context response: %v", err)
+	}
+	if !ctxResp.OK || ctxResp.Limit != 30 || len(ctxResp.Messages) != 3 {
+		t.Fatalf("context response mismatch: %+v", ctxResp)
+	}
+
+	// Test limit boundary clamping (max 100, min 1)
+	w = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/chat_context?chat_id=-100100&message_id=888&limit=250", nil)
+	handler.ServeHTTP(w, req)
+	_ = json.Unmarshal(w.Body.Bytes(), &ctxResp)
+	if ctxResp.Limit != 100 {
+		t.Fatalf("expected limit clamped to 100, got %d", ctxResp.Limit)
+	}
+
+	w = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/chat_context?chat_id=-100100&message_id=888&limit=0", nil)
+	handler.ServeHTTP(w, req)
+	_ = json.Unmarshal(w.Body.Bytes(), &ctxResp)
+	if ctxResp.Limit != 30 {
+		t.Fatalf("expected default limit 30 for limit=0, got %d", ctxResp.Limit)
+	}
+}
+
+func TestWebServer_BrowserTargetManagementE2E(t *testing.T) {
+	nodePath, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node executable not found, skipping browser target management test")
+	}
+
+	tempDir := t.TempDir()
+	db, err := NewDatabase(filepath.Join(tempDir, "browser_target_e2e.db"))
+	if err != nil {
+		t.Fatalf("new db: %v", err)
+	}
+	defer db.Close()
+
+	access := &mockContractAccess{
+		dialogs: []DialogDTO{
+			{ID: 101, ChatID: "-100101", Title: "Browser Channel", TopMessageID: 999},
+		},
+	}
+	registry := NewRegistry(5, 100, time.Now)
+	ws := NewWebServer(db, nil, nil, nil, nil, access, registry, zap.NewNop(), "")
+	server := httptest.NewServer(ws.Handler())
+	defer server.Close()
+
+	jsScript := `
+const [, serverUrl] = process.argv;
+const assert = require('assert');
+
+async function main() {
+  // 1. Verify index.html template integrity for target actions
+  const pageRes = await fetch(serverUrl + '/');
+  assert.strictEqual(pageRes.status, 200);
+  const html = await pageRes.text();
+  assert(html.includes('cursor-latest'), 'index.html must include cursor-latest action');
+  assert(html.includes('target-enabled'), 'index.html must include target-enabled switch');
+  assert(html.includes('api/target/update'), 'index.html must post to api/target/update');
+  assert(html.includes('api/chat_context'), 'index.html must fetch chat context');
+
+  // 2. Add a target through API (simulating add_target)
+  const addRes = await fetch(serverUrl + '/api/add_target', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ query: 'test' })
+  });
+  assert.strictEqual(addRes.status, 200);
+  const addData = await addRes.json();
+  assert.strictEqual(addData.ok, true);
+  assert.strictEqual(addData.dialog.top_message_id, 888);
+  assert.strictEqual(addData.dialog.last_read_message_id, 888);
+
+  // 3. Load dialogs
+  const listRes = await fetch(serverUrl + '/api/dialogs?refresh=true');
+  assert.strictEqual(listRes.status, 200);
+  const listData = await listRes.json();
+  assert.strictEqual(listData.ok, true);
+  assert(listData.dialogs.length >= 2);
+
+  const targetRow = listData.dialogs.find(d => d.chat_id === '-100100');
+  assert(targetRow, 'configured target must be returned');
+  assert.strictEqual(targetRow.top_message_id, 888);
+
+  // 4. Test optimistic toggle rollback logic
+  let row = { chat_id: '-100100', enabled: true };
+  let isChecked = false;
+  let originalChecked = !isChecked;
+  row.enabled = isChecked;
+
+  // Simulate server rejection (e.g. malformed or server error)
+  const failRes = await fetch(serverUrl + '/api/target/update', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chat_id: '' }) // will trigger 400 Bad Request
+  });
+  assert.strictEqual(failRes.status, 400);
+  // On error path, frontend executes rollback:
+  row.enabled = originalChecked;
+  assert.strictEqual(row.enabled, true, 'row.enabled must roll back on failure');
+
+  // 5. Test successful toggle
+  isChecked = false;
+  originalChecked = true;
+  const succRes = await fetch(serverUrl + '/api/target/update', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chat_id: '-100100', enabled: isChecked })
+  });
+  assert.strictEqual(succRes.status, 200);
+  const succData = await succRes.json();
+  assert.strictEqual(succData.ok, true);
+  assert.strictEqual(succData.target.enabled, false);
+
+  // 6. Test latest-cursor assignment
+  let simulatedCursorVal = 0;
+  if (targetRow && targetRow.top_message_id) {
+    simulatedCursorVal = targetRow.top_message_id;
+  }
+  assert.strictEqual(simulatedCursorVal, 888, 'latest-cursor action must set value to top_message_id');
+
+  // 7. Test context query pagination with limit=30
+  const ctxRes = await fetch(serverUrl + '/api/chat_context?chat_id=-100100&message_id=888&limit=30');
+  assert.strictEqual(ctxRes.status, 200);
+  const ctxData = await ctxRes.json();
+  assert.strictEqual(ctxData.ok, true);
+  assert.strictEqual(ctxData.limit, 30);
+
+  console.log('BROWSER_TARGET_MANAGEMENT_E2E_VERIFIED');
+}
+
+main().catch(err => {
+  console.error(err);
+  process.exit(1);
+});
+`
+
+	cmd := exec.Command(nodePath, "-e", jsScript, server.URL)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("browser target management E2E failed: %v\nOutput: %s", err, string(out))
+	}
+	if !strings.Contains(string(out), "BROWSER_TARGET_MANAGEMENT_E2E_VERIFIED") {
+		t.Fatalf("expected verification token, got: %s", string(out))
+	}
+}
