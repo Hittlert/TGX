@@ -417,8 +417,9 @@
       });
 
       // System Storage
-      update_system_storage();
-      setInterval(update_system_storage, 15000);
+      if (!window.EventSource) {
+        update_system_storage();
+      }
 
       // ==========================================
       // Telegram Web Auth Wizard & Multi-Account Controller
@@ -996,6 +997,7 @@
         }
         return (unit_idx === 0 ? current.toFixed(0) : current.toFixed(1)) + ' ' + units[unit_idx];
       }
+      var format_bytes = format_downloaded_bytes;
 
       function target_progress_key(row) {
         return target_key(row.chat_id);
@@ -1058,6 +1060,7 @@
       }
 
       function load_target_progress() {
+        if (sse_active) return;
         if (!target_loaded || target_progress_loading) return;
         target_progress_loading = true;
         $.ajax({
@@ -1423,8 +1426,8 @@
         if (tab_name === 'downloading') {
           if (!sse_active) {
             update_download_list_int = self.setInterval(update_download_list, 2000);
+            update_download_list();
           }
-          update_download_list();
         } else if (tab_name === 'downloaded') {
           reload_downloaded_data();
         } else if (tab_name === 'targets') {
@@ -1681,75 +1684,90 @@
         $('#already_download_mobile_list').html(html);
       }
 
+      function render_download_jobs(result) {
+        var activeCount = result ? result.length : 0;
+        $("#active_downloading_count").text(activeCount);
+
+        var container = $("#download_jobs_list");
+        if (!result || result.length === 0) {
+          container.html(
+            '<div class="apple-empty-state" style="grid-column: 1 / -1; padding: 48px 0; text-align: center; color: var(--apple-text-muted);">' +
+            '<i class="layui-icon layui-icon-download-circle" style="font-size: 42px; display: block; margin-bottom: 10px; opacity: 0.5;"></i>' +
+            '<div style="font-size: 15px; font-weight: 500;">No active downloads</div>' +
+            '<div style="font-size: 12px; margin-top: 4px;">Tasks will appear here automatically when downloading.</div>' +
+            '</div>'
+          );
+          return;
+        }
+
+        var activeKeys = {};
+        for (var i = 0; i < result.length; i++) {
+          var item = result[i];
+          var chatId = item.chat_id || item.peer || item.chat || '';
+          var msgId = item.id !== undefined ? item.id : (item.message_id !== undefined ? item.message_id : '');
+          var key = (item.key || (chatId + '-' + msgId));
+          activeKeys[key] = true;
+
+          var rawPct = item.download_progress !== undefined ? item.download_progress : (item.progress !== undefined ? item.progress : 0);
+          var pct = (parseFloat(rawPct) || 0).toFixed(1);
+          var filename = item.filename || item.file_name || (item.final_path ? item.final_path.split('/').pop() : ('file_' + msgId));
+          var speed = item.download_speed || (item.rolling_5s_bps !== undefined ? (format_bytes(item.rolling_5s_bps) + '/s') : '0 B/s');
+          var totalSizeStr = (typeof item.total_size === 'number') ? format_bytes(item.total_size) : (item.total_size || '0 B');
+          var chatTitle = item.chat || item.target_title || chatId;
+
+          var card = container.find('.apple-download-card[data-key="' + key + '"]');
+
+          if (card.length > 0) {
+            // In-place dynamic update without re-rendering DOM
+            card.find('.download-card-name').text(filename).attr('title', filename);
+            card.find('.download-card-speed').text(speed.indexOf('⚡') === 0 ? speed : ('⚡ ' + speed));
+            card.find('.progress-bar-fill').css('width', pct + '%');
+            card.find('.progress-pct-text').text(pct + '%');
+            card.find('.download-meta-size').text(totalSizeStr);
+          } else {
+            container.find('.apple-empty-state').remove();
+
+            var html = '<div class="apple-download-card" data-key="' + key + '">' +
+              '<div class="download-card-header">' +
+              '  <div class="download-card-name" title="' + escape_html(filename) + '">' + escape_html(filename) + '</div>' +
+              '  <span class="download-card-speed">' + escape_html(speed.indexOf('⚡') === 0 ? speed : ('⚡ ' + speed)) + '</span>' +
+              '</div>' +
+              '<div class="download-card-meta">' +
+              '  <span class="download-meta-item">📁 <strong>' + escape_html(chatTitle) + '</strong></span>' +
+              '  <span>•</span>' +
+              '  <span class="download-meta-item">ID: <code>' + escape_html(msgId) + '</code></span>' +
+              '  <span>•</span>' +
+              '  <span class="download-meta-item download-meta-size">' + escape_html(totalSizeStr) + '</span>' +
+              '</div>' +
+              '<div class="apple-progress-track"><div class="progress-bar-fill" style="width: ' + pct + '%;"></div></div>' +
+              '<div class="download-card-footer">' +
+              '  <span class="download-status-chip">⚡ Downloading</span>' +
+              '  <span style="font-family: var(--font-mono); font-weight: 700; color: var(--apple-text-main);" class="progress-pct-text">' + pct + '%</span>' +
+              '</div>' +
+              '</div>';
+            container.append(html);
+          }
+        }
+
+        // Remove finished cards
+        container.find('.apple-download-card').each(function () {
+          var k = $(this).attr('data-key');
+          if (!activeKeys[k]) {
+            $(this).remove();
+          }
+        });
+      }
+
       function update_download_list() {
+        if (sse_active) return;
         $.ajax({
           url: "get_download_list?already_down=false",
           type: "get",
           dataType: "json",
           success: function (result) {
-            var activeCount = result ? result.length : 0;
-            $("#active_downloading_count").text(activeCount);
-
-            var container = $("#download_jobs_list");
-            if (!result || result.length === 0) {
-              container.html(
-                '<div class="apple-empty-state" style="grid-column: 1 / -1; padding: 48px 0; text-align: center; color: var(--apple-text-muted);">' +
-                '<i class="layui-icon layui-icon-download-circle" style="font-size: 42px; display: block; margin-bottom: 10px; opacity: 0.5;"></i>' +
-                '<div style="font-size: 15px; font-weight: 500;">No active downloads</div>' +
-                '<div style="font-size: 12px; margin-top: 4px;">Tasks will appear here automatically when downloading.</div>' +
-                '</div>'
-              );
-              return;
+            if (!sse_active) {
+              render_download_jobs(result);
             }
-
-            var activeKeys = {};
-            for (var i = 0; i < result.length; i++) {
-              var item = result[i];
-              var key = (item.chat_id || item.chat) + '-' + item.id;
-              activeKeys[key] = true;
-
-              var pct = (parseFloat(item.download_progress) || 0).toFixed(1);
-              var card = container.find('.apple-download-card[data-key="' + key + '"]');
-
-              if (card.length > 0) {
-                // In-place dynamic update without re-rendering DOM
-                card.find('.download-card-name').text(item.filename).attr('title', item.filename);
-                card.find('.download-card-speed').text(item.download_speed || '0 B/s');
-                card.find('.progress-bar-fill').css('width', pct + '%');
-                card.find('.progress-pct-text').text(pct + '%');
-                card.find('.download-meta-size').text(item.total_size || '0 B');
-              } else {
-                container.find('.apple-empty-state').remove();
-
-                var html = '<div class="apple-download-card" data-key="' + key + '">' +
-                  '<div class="download-card-header">' +
-                  '  <div class="download-card-name" title="' + escape_html(item.filename) + '">' + escape_html(item.filename) + '</div>' +
-                  '  <span class="download-card-speed">⚡ ' + escape_html(item.download_speed || '0 B/s') + '</span>' +
-                  '</div>' +
-                  '<div class="download-card-meta">' +
-                  '  <span class="download-meta-item">📁 <strong>' + escape_html(item.chat) + '</strong></span>' +
-                  '  <span>•</span>' +
-                  '  <span class="download-meta-item">ID: <code>' + escape_html(item.id) + '</code></span>' +
-                  '  <span>•</span>' +
-                  '  <span class="download-meta-item download-meta-size">' + escape_html(item.total_size) + '</span>' +
-                  '</div>' +
-                  '<div class="apple-progress-track"><div class="progress-bar-fill" style="width: ' + pct + '%;"></div></div>' +
-                  '<div class="download-card-footer">' +
-                  '  <span class="download-status-chip">⚡ Downloading</span>' +
-                  '  <span style="font-family: var(--font-mono); font-weight: 700; color: var(--apple-text-main);" class="progress-pct-text">' + pct + '%</span>' +
-                  '</div>' +
-                  '</div>';
-                container.append(html);
-              }
-            }
-
-            // Remove finished cards
-            container.find('.apple-download-card').each(function () {
-              var k = $(this).attr('data-key');
-              if (!activeKeys[k]) {
-                $(this).remove();
-              }
-            });
           }
         });
       }
@@ -1789,6 +1807,7 @@
       }
 
       function update_system_storage() {
+        if (sse_active) return;
         $.ajax({
           url: "api/system/storage",
           type: "get",
@@ -1803,6 +1822,7 @@
       }
 
       function update_download_status() {
+        if (sse_active) return;
         $.ajax({
           url: "get_download_status",
           type: "get",
@@ -2116,7 +2136,6 @@
 
           // 1. Download speed & sparkline
           if (data.speed_human) {
-            $('#download_speed').html(data.speed_human);
             $('#download_speed_title').html(data.speed_human);
           }
           if (data.speed_bps !== undefined) {
@@ -2132,18 +2151,21 @@
           var activeFilesCount = 0;
           if (data.gate) {
             activeFilesCount = data.gate.active_files || 0;
-            $('#slot_used').html(data.gate.active_files || 0);
-            $('#slot_total').html(data.gate.file_concurrency || 5);
+            var fileConcurrency = data.gate.file_concurrency || 5;
+            var poolText = '⚡ 槽位待命 (0/' + fileConcurrency + ')';
+            if (activeFilesCount > 0) {
+              poolText = '⚡ ' + activeFilesCount + ' 个文件下载中 (' + activeFilesCount + '/' + fileConcurrency + ')';
+            }
+            $('#media_pool_status').html(poolText);
+            $('#media_pool_status').attr('title', '点击管理全局并发线程槽位池 (当前 ' + activeFilesCount + ' 个活动文件，已占用 ' + activeFilesCount + '/' + fileConcurrency + ' 槽位)');
           }
-          var poolText = '⚡ 槽位待命 (0/64)';
-          if (activeFilesCount > 0) {
-            poolText = '⚡ ' + activeFilesCount + ' 个文件下载中';
-          }
-          $('#media_pool_status').html(poolText);
 
           // 4. SSD admission
-          if (data.ssd && data.ssd.reserved_bytes !== undefined) {
-            $('#ssd_reserved_val').html(format_bytes(data.ssd.reserved_bytes));
+          if (data.ssd) {
+            var reserved = data.ssd.reserved_bytes !== undefined ? data.ssd.reserved_bytes : data.ssd.ssd_reserved_bytes;
+            if (reserved !== undefined && $('#ssd_reserved_val').length > 0) {
+              $('#ssd_reserved_val').html(format_bytes(reserved));
+            }
           }
 
           // 5. Storage metrics
@@ -2165,10 +2187,9 @@
             update_target_progress_nodes();
           }
 
-          // 7. Active files list on downloading tab
-          var activeTab = $('.apple-segmented-control .segmented-item.is-active').attr('data-tab');
-          if (activeTab === 'downloading') {
-            update_download_list();
+          // 7. Active files list
+          if (data.active_files !== undefined) {
+            render_download_jobs(data.active_files);
           }
         }
 
@@ -2195,6 +2216,13 @@
           start_fallback_polling();
         };
       }
+
+      // Exported handlers on window for test harnesses and external control
+      window.load_dialogs = load_dialogs;
+      window.add_target = add_target;
+      window.open_context_viewer = open_context_viewer;
+      window.render_mobile_downloaded_cards = render_mobile_downloaded_cards;
+      window.update_mobile_pagination_ui = update_mobile_pagination_ui;
 
       setup_sse_telemetry();
 

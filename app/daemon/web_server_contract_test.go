@@ -2,9 +2,11 @@ package daemon
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os/exec"
@@ -880,6 +882,13 @@ func TestWebServer_BrowserTargetManagementE2E(t *testing.T) {
 	}
 	defer db.Close()
 
+	_ = db.IngestMessage(ChatMessage{
+		ChatID:    "-100100",
+		MessageID: 888,
+		Text:      "Target message 888",
+		Date:      time.Now().Unix(),
+	})
+
 	access := &mockContractAccess{
 		dialogs: []DialogDTO{
 			{ID: 101, ChatID: "-100101", Title: "Browser Channel", TopMessageID: 999},
@@ -893,9 +902,10 @@ func TestWebServer_BrowserTargetManagementE2E(t *testing.T) {
 	jsScript := `
 const [, serverUrl] = process.argv;
 const assert = require('assert');
+const vm = require('vm');
 
 async function main() {
-  // 1. Verify index.html template integrity for target actions
+  // 1. Verify index.html template integrity from production handler
   const pageRes = await fetch(serverUrl + '/');
   assert.strictEqual(pageRes.status, 200);
   const html = await pageRes.text();
@@ -904,72 +914,289 @@ async function main() {
   assert(html.includes('api/target/update'), 'index.html must post to api/target/update');
   assert(html.includes('api/chat_context'), 'index.html must fetch chat context');
 
-  // 2. Add a target through API (simulating add_target)
-  const addRes = await fetch(serverUrl + '/api/add_target', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ query: 'test' })
-  });
-  assert.strictEqual(addRes.status, 200);
-  const addData = await addRes.json();
-  assert.strictEqual(addData.ok, true);
-  assert.strictEqual(addData.dialog.top_message_id, 888);
-  assert.strictEqual(addData.dialog.last_read_message_id, 888);
+  // 2. Extract delivered script containing target management logic
+  const scriptTags = [...html.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/gi)];
+  const inlineScript = scriptTags.find(m => m[1].includes('load_dialogs'));
+  assert(inlineScript, 'index.html must include delivered script defining load_dialogs');
+  const deliveredCode = inlineScript[1];
 
-  // 3. Load dialogs
-  const listRes = await fetch(serverUrl + '/api/dialogs?refresh=true');
-  assert.strictEqual(listRes.status, 200);
-  const listData = await listRes.json();
-  assert.strictEqual(listData.ok, true);
-  assert(listData.dialogs.length >= 2);
+  // 3  // 4. Setup browser DOM & Ajax harness connected to live Go test server
+  let promptValue = '';
+  let layerMsgs = [];
+  let targetListHTML = '';
+  let contextMsgHTML = '';
+  const buttonClickHandlers = {};
+  const delegatedHandlers = {
+    change: {},
+    click: {}
+  };
 
-  const targetRow = listData.dialogs.find(d => d.chat_id === '-100100');
-  assert(targetRow, 'configured target must be returned');
-  assert.strictEqual(targetRow.top_message_id, 888);
-
-  // 4. Test optimistic toggle rollback logic
-  let row = { chat_id: '-100100', enabled: true };
-  let isChecked = false;
-  let originalChecked = !isChecked;
-  row.enabled = isChecked;
-
-  // Simulate server rejection (e.g. malformed or server error)
-  const failRes = await fetch(serverUrl + '/api/target/update', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ chat_id: '' }) // will trigger 400 Bad Request
-  });
-  assert.strictEqual(failRes.status, 400);
-  // On error path, frontend executes rollback:
-  row.enabled = originalChecked;
-  assert.strictEqual(row.enabled, true, 'row.enabled must roll back on failure');
-
-  // 5. Test successful toggle
-  isChecked = false;
-  originalChecked = true;
-  const succRes = await fetch(serverUrl + '/api/target/update', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ chat_id: '-100100', enabled: isChecked })
-  });
-  assert.strictEqual(succRes.status, 200);
-  const succData = await succRes.json();
-  assert.strictEqual(succData.ok, true);
-  assert.strictEqual(succData.target.enabled, false);
-
-  // 6. Test latest-cursor assignment
-  let simulatedCursorVal = 0;
-  if (targetRow && targetRow.top_message_id) {
-    simulatedCursorVal = targetRow.top_message_id;
+  class MockEventSource {
+    constructor(url) {
+      this.listeners = {};
+      this.onerror = null;
+    }
+    addEventListener() {}
   }
-  assert.strictEqual(simulatedCursorVal, 888, 'latest-cursor action must set value to top_message_id');
 
-  // 7. Test context query pagination with limit=30
-  const ctxRes = await fetch(serverUrl + '/api/chat_context?chat_id=-100100&message_id=888&limit=30');
-  assert.strictEqual(ctxRes.status, 200);
-  const ctxData = await ctxRes.json();
-  assert.strictEqual(ctxData.ok, true);
-  assert.strictEqual(ctxData.limit, 30);
+  function makeCardElem(chatKey, initialCursor = '0') {
+    let checked = true;
+    let cursorVal = String(initialCursor);
+    const classes = new Set(['apple-target-card', 'is-enabled']);
+    const cardElem = {
+      attr: (k) => k === 'data-chat-key' ? chatKey : '',
+      closest: (sel) => cardElem,
+      find: (sel) => {
+        if (sel === '.target-cursor') {
+          return {
+            val: (v) => {
+              if (v !== undefined) {
+                cursorVal = String(v);
+                return cardElem;
+              }
+              return cursorVal;
+            }
+          };
+        }
+        return createDOMWrapper(sel);
+      },
+      toggleClass: (cls, state) => {
+        if (state) classes.add(cls);
+        else classes.delete(cls);
+        return cardElem;
+      },
+      hasClass: (cls) => classes.has(cls),
+      prop: (propName, val) => {
+        if (val !== undefined) {
+          checked = Boolean(val);
+          return cardElem;
+        }
+        return checked;
+      }
+    };
+    return cardElem;
+  }
+
+  let inFlightAjax = 0;
+  const ajaxCompleteWaiters = [];
+  function notifyAjaxDone() {
+    inFlightAjax--;
+    if (inFlightAjax <= 0) {
+      while (ajaxCompleteWaiters.length) {
+        ajaxCompleteWaiters.shift()();
+      }
+    }
+  }
+
+  function waitForAjax() {
+    if (inFlightAjax <= 0) return Promise.resolve();
+    return new Promise(resolve => ajaxCompleteWaiters.push(resolve));
+  }
+
+  function createDOMWrapper(sel) {
+    if (typeof sel === 'object' && sel !== null) {
+      return new Proxy(sel, {
+        get(t, prop) {
+          if (typeof prop === 'symbol') return undefined;
+          if (prop in t) return t[prop];
+          return (...args) => createDOMWrapper(t);
+        }
+      });
+    }
+
+    if (typeof sel === 'string' && (sel === '#reload_dialogs' || sel === '#add_target_btn' || sel === '#save_targets')) {
+      return {
+        on: (evt, fn) => {
+          if (evt === 'click') buttonClickHandlers[sel] = fn;
+        }
+      };
+    }
+
+    if (sel === '#target_list') {
+      return {
+        html: (content) => {
+          if (content !== undefined) targetListHTML = content;
+          return targetListHTML;
+        },
+        on: (evt, subSel, fn) => {
+          if (!delegatedHandlers[evt]) delegatedHandlers[evt] = {};
+          delegatedHandlers[evt][subSel] = fn;
+        }
+      };
+    }
+
+    if (sel === '#context_msg_list') {
+      return {
+        html: (content) => {
+          if (content !== undefined) contextMsgHTML = content;
+          return contextMsgHTML;
+        }
+      };
+    }
+
+    const target = {
+      length: 1,
+      0: { scrollIntoView: () => {} },
+      is: () => false,
+      val: () => '',
+      text: () => '',
+      html: () => '',
+      width: () => 1024,
+      get: () => ({ getContext: () => ({ clearRect: () => {}, beginPath: () => {}, moveTo: () => {}, lineTo: () => {}, stroke: () => {}, fill: () => {} }) })
+    };
+    return new Proxy(target, {
+      get(t, prop) {
+        if (typeof prop === 'symbol') return undefined;
+        if (prop in t) return t[prop];
+        return (...args) => createDOMWrapper(String(sel) + '.' + String(prop));
+      }
+    });
+  }
+
+  const sandbox = {
+    console, JSON, parseInt, parseFloat, String, Array, Object, Date, Math,
+    setTimeout: (fn, ms) => setTimeout(fn, ms || 0),
+    clearTimeout: (id) => clearTimeout(id),
+    setInterval: () => 2,
+    clearInterval: () => {},
+    location: { reload: () => {} },
+    window: {},
+    document: {},
+    encodeURIComponent,
+    layui: {
+      use: (mods, cb) => { cb(); },
+      $: (sel) => createDOMWrapper(sel),
+      layer: {
+        msg: (m) => { layerMsgs.push(m); return 1; },
+        prompt: (opts, cb) => { cb(promptValue, 1); },
+        open: (opts) => {
+          const layero = {
+            find: (sel) => {
+              if (sel === '#context_msg_list') {
+                return {
+                  html: (h) => { if (h !== undefined) contextMsgHTML = h; return contextMsgHTML; },
+                  find: (sub) => createDOMWrapper(sub)
+                };
+              }
+              return createDOMWrapper(sel);
+            },
+            on: () => {}
+          };
+          if (opts.success) opts.success(layero);
+        },
+        close: () => {},
+        load: () => 1
+      },
+      table: { render: () => {}, reload: () => {}, on: () => {} }
+    }
+  };
+
+  sandbox.layui.$.trim = (s) => (s || '').trim();
+  sandbox.layui.$.ajax = (opts) => {
+    inFlightAjax++;
+    const url = new URL(opts.url, serverUrl + '/').toString();
+    const fetchOpts = {
+      method: (opts.type || 'GET').toUpperCase(),
+      headers: {}
+    };
+    if (opts.contentType) fetchOpts.headers['Content-Type'] = opts.contentType;
+    if (opts.data) fetchOpts.body = typeof opts.data === 'string' ? opts.data : JSON.stringify(opts.data);
+
+    fetch(url, fetchOpts).then(async (res) => {
+      const text = await res.text();
+      let json = null;
+      try { json = JSON.parse(text); } catch (_) {}
+      if (res.ok) {
+        if (opts.success) opts.success(json !== null ? json : text);
+      } else {
+        if (opts.error) opts.error({ status: res.status, responseText: text, responseJSON: json });
+      }
+    }).catch((err) => {
+      if (opts.error) opts.error(err);
+    }).finally(() => {
+      if (opts.complete) opts.complete();
+      notifyAjaxDone();
+    });
+  };
+
+  sandbox.window = sandbox;
+  sandbox.window.EventSource = MockEventSource;
+
+  // Execute the exact delivered JavaScript inside VM sandbox
+  const context = vm.createContext(sandbox);
+  vm.runInContext(deliveredCode, context);
+
+  // 4. Test Case 1: Execute delivered reload_dialogs button click against live Go server
+  assert(buttonClickHandlers['#reload_dialogs'], 'reload_dialogs button click handler must be wired');
+  buttonClickHandlers['#reload_dialogs']();
+  await waitForAjax();
+
+  assert(targetListHTML.includes('Browser Channel'), 'Channel -100101 must be rendered in target list');
+  assert(targetListHTML.includes('cursor-latest'), 'cursor-latest action must render when top_message_id > 0');
+
+  // 5. Test Case 2: Execute delivered add_target button click against live Go server
+  assert(buttonClickHandlers['#add_target_btn'], 'add_target_btn button click handler must be wired');
+  promptValue = 'test';
+  layerMsgs = [];
+  buttonClickHandlers['#add_target_btn']();
+  await waitForAjax();
+
+  assert(targetListHTML.includes('-100100'), 'Added target -100100 must be rendered in target list');
+  assert(layerMsgs.some(m => String(m).includes('Target added')), 'Must display success message for add_target');
+
+  // 6. Test Case 3: Execute delivered target-enabled toggle with server rejection -> rollback verification
+  const toggleHandler = delegatedHandlers.change['.target-enabled'];
+  assert(toggleHandler, 'shipped change handler for .target-enabled must be registered');
+
+  // Temporarily hook $.ajax to simulate a 400 Bad Request error
+  const origAjax = sandbox.layui.$.ajax;
+  sandbox.layui.$.ajax = (opts) => {
+    if (opts.url === 'api/target/update') {
+      opts.error({ status: 400, responseText: 'Bad Request', responseJSON: { error: 'Injected toggle failure' } });
+      return;
+    }
+    origAjax(opts);
+  };
+
+  const card100 = makeCardElem('-100100');
+  card100.prop('checked', false); // user unchecks checkbox
+  layerMsgs = [];
+  toggleHandler.call(card100);
+
+  // Assert rollback on failure
+  assert.strictEqual(card100.prop('checked'), true, 'Checkbox must roll back to true on failure');
+  assert.strictEqual(card100.hasClass('is-enabled'), true, 'Card is-enabled class must roll back to true on failure');
+  assert(layerMsgs.some(m => String(m).includes('Update failed') || String(m).includes('Injected toggle failure')), 'Must display failure message');
+
+  // Restore live $.ajax
+  sandbox.layui.$.ajax = origAjax;
+
+  // 7. Test Case 4: Execute delivered target-enabled toggle with live server success
+  card100.prop('checked', false);
+  toggleHandler.call(card100);
+  await waitForAjax();
+
+  assert.strictEqual(card100.prop('checked'), false, 'Checkbox must remain false after successful toggle');
+
+  // 8. Test Case 5: Execute delivered cursor-latest click action
+  const latestHandler = delegatedHandlers.click['.cursor-latest'];
+  assert(latestHandler, 'shipped click handler for .cursor-latest must be registered');
+
+  const card101 = makeCardElem('-100101', '50');
+  latestHandler.call(card101);
+
+  assert.strictEqual(card101.find('.target-cursor').val(), '999', 'Latest cursor button must set input value to top_message_id (999)');
+
+  // 9. Test Case 6: Execute delivered context viewer button action against live server
+  const contextHandler = delegatedHandlers.click['.btn-context'];
+  assert(contextHandler, 'shipped click handler for .btn-context must be registered');
+
+  contextMsgHTML = '';
+  contextHandler.call(card100);
+  await waitForAjax();
+
+  assert(contextMsgHTML.includes('#888'), 'Context viewer must render message #888 returned by server');
+  assert(contextMsgHTML.includes('Target message 888'), 'Context viewer must render message text from server');
 
   console.log('BROWSER_TARGET_MANAGEMENT_E2E_VERIFIED');
 }
@@ -1352,17 +1579,18 @@ func TestWebServer_BrowserSSETelemetryE2E(t *testing.T) {
 	jsScript := `
 const [, serverUrl] = process.argv;
 const assert = require('assert');
+const vm = require('vm');
 
 async function main() {
-  // 1. Verify index.html template integrity for SSE controller and single-stream policy
+  // 1. Fetch delivered index.html from production handler
   const pageRes = await fetch(serverUrl + '/');
-  assert.strictEqual(pageRes.status, 200);
+  assert.strictEqual(pageRes.status, 200, 'index.html must be served with 200 OK');
   const html = await pageRes.text();
   assert(html.includes("new EventSource('api/events')"), 'index.html must instantiate EventSource');
   assert(html.includes("stop_fallback_polling()"), 'index.html must stop fallback polling on SSE');
   assert(html.includes("stop_target_progress_poll()"), 'index.html must stop progress polling on SSE');
 
-  // 2. Fetch /api/events directly and parse the initial SSE snapshot
+  // 2. Fetch live /api/events directly and parse the authoritative SSE snapshot
   const sseRes = await fetch(serverUrl + '/api/events');
   assert.strictEqual(sseRes.status, 200);
   assert(sseRes.headers.get('content-type').includes('text/event-stream'));
@@ -1384,53 +1612,243 @@ async function main() {
   assert(receivedText.includes('target_progress'), 'snapshot must contain target_progress');
   assert(receivedText.includes('storage'), 'snapshot must contain storage metrics');
   assert(receivedText.includes('gate'), 'snapshot must contain gate metrics');
+  assert(receivedText.includes('active_files'), 'snapshot must contain active_files');
 
-  // 3. Simulate browser state transitions
-  let sse_active = false;
-  let status_poll_timer = null;
-  let target_progress_poll_int = 0;
-  let update_download_list_int = 0;
+  // 3. Extract the delivered JavaScript controller from index.html
+  const scriptTags = [...html.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/gi)];
+  const inlineScript = scriptTags.find(m => m[1].includes('setup_sse_telemetry'));
+  assert(inlineScript, 'index.html must include delivered script containing setup_sse_telemetry');
+  const deliveredCode = inlineScript[1];
 
-  function start_fallback_polling() {
-    if (status_poll_timer) return;
-    status_poll_timer = 999;
+  // 4. Setup simulated browser runtime harness
+  const downloadCards = new Map();
+  let activeEventSources = [];
+  let ajaxCalls = [];
+  let intervals = new Map();
+  let nextIntervalId = 100;
+  let speedTitle = '';
+  let poolStatus = '';
+  let segmentedClickHandler = null;
+
+  class MockEventSource {
+    constructor(url) {
+      this.url = url;
+      this.listeners = {};
+      this.onerror = null;
+      activeEventSources.push(this);
+    }
+    addEventListener(type, fn) {
+      this.listeners[type] = this.listeners[type] || [];
+      this.listeners[type].push(fn);
+    }
+    emit(type, data) {
+      const list = this.listeners[type] || [];
+      for (const fn of list) {
+        fn({ data: JSON.stringify(data) });
+      }
+    }
   }
-  function stop_fallback_polling() {
-    status_poll_timer = null;
+
+  function createDOMWrapper(sel) {
+    if (typeof sel === 'object' && sel !== null) {
+      return new Proxy(sel, {
+        get(t, prop) {
+          if (typeof prop === 'symbol') return undefined;
+          if (prop in t) return t[prop];
+          return (...args) => createDOMWrapper(t);
+        }
+      });
+    }
+
+    if (sel === '#download_jobs_list') {
+      return {
+        find(childSel) {
+          if (childSel.startsWith('.apple-download-card[data-key=')) {
+            const match = childSel.match(/data-key=\"([^\"]+)\"/);
+            const key = match ? match[1] : '';
+            if (downloadCards.has(key)) {
+              const card = downloadCards.get(key);
+              return {
+                length: 1,
+                find(propSel) {
+                  const node = {
+                    text(v) { if (v !== undefined) { card[propSel + '_text'] = v; return node; } return card[propSel + '_text'] || ''; },
+                    attr(k, v) { if (v !== undefined) { card[propSel + '_' + k] = v; return node; } return card[propSel + '_' + k] || ''; },
+                    css(k, v) { card[propSel + '_css'] = v; return node; }
+                  };
+                  return node;
+                }
+              };
+            }
+            return { length: 0 };
+          }
+          if (childSel === '.apple-empty-state') {
+            return { remove: () => {} };
+          }
+          if (childSel === '.apple-download-card') {
+            return {
+              each(fn) {
+                for (const [key, card] of [...downloadCards.entries()]) {
+                  const elem = {
+                    attr: (a) => a === 'data-key' ? key : '',
+                    remove: () => downloadCards.delete(key)
+                  };
+                  fn.call(elem);
+                }
+              }
+            };
+          }
+          return { length: 0 };
+        },
+        append(htmlStr) {
+          const match = htmlStr.match(/data-key=\"([^\"]+)\"/);
+          const key = match ? match[1] : String(downloadCards.size + 1);
+          const existing = downloadCards.get(key);
+          downloadCards.set(key, { key, html: htmlStr, appendCount: (existing ? existing.appendCount : 0) + 1 });
+        },
+        html(v) {
+          if (v && v.includes('apple-empty-state')) {
+            downloadCards.clear();
+          }
+        }
+      };
+    }
+
+    if (sel === '#download_speed_title') {
+      return { html: (v) => { speedTitle = v; }, text: (v) => { speedTitle = v; } };
+    }
+    if (sel === '#media_pool_status') {
+      return { html: (v) => { poolStatus = v; }, attr: () => {} };
+    }
+    if (sel === '.apple-segmented-control') {
+      return {
+        on(evt, child, fn) {
+          if (evt === 'click') {
+            segmentedClickHandler = fn;
+          }
+        }
+      };
+    }
+
+    const target = {
+      length: 1,
+      is: () => false,
+      get: () => ({ getContext: () => ({ clearRect: () => {}, beginPath: () => {}, moveTo: () => {}, lineTo: () => {}, stroke: () => {}, fill: () => {} }) })
+    };
+    return new Proxy(target, {
+      get(t, prop) {
+        if (typeof prop === 'symbol') return undefined;
+        if (prop in t) return t[prop];
+        return (...args) => createDOMWrapper(String(sel) + '.' + String(prop));
+      }
+    });
   }
-  function start_target_progress_poll() {
-    if (sse_active) return;
-    target_progress_poll_int = 888;
+
+  const sandbox = {
+    console, JSON, parseInt, parseFloat, String, Array, Object, Date, Math,
+    setTimeout: () => 1,
+    clearTimeout: () => {},
+    setInterval: (fn, ms) => {
+      const id = ++nextIntervalId;
+      intervals.set(id, { fn, ms });
+      return id;
+    },
+    clearInterval: (id) => {
+      intervals.delete(id);
+    },
+    location: { reload: () => {} },
+    window: {},
+    document: {},
+    layui: {
+      use: (mods, cb) => { cb(); },
+      $: (sel) => createDOMWrapper(sel),
+      layer: { msg: () => {}, confirm: () => {}, close: () => {}, load: () => 1 },
+      table: { render: () => {}, reload: () => {}, on: () => {} }
+    }
+  };
+  sandbox.layui.$.ajax = (opts) => {
+    ajaxCalls.push({ url: opts.url, type: opts.type });
+  };
+  sandbox.window = sandbox;
+  sandbox.window.EventSource = MockEventSource;
+
+  // Execute the exact delivered JavaScript controller inside the VM sandbox
+  const context = vm.createContext(sandbox);
+  vm.runInContext(deliveredCode, context);
+
+  // 5. Assert exactly one EventSource telemetry connection created
+  assert.strictEqual(activeEventSources.length, 1, 'Browser must create exactly one EventSource telemetry connection');
+  assert.strictEqual(activeEventSources[0].url, 'api/events');
+
+  const sseInstance = activeEventSources[0];
+  const telemetryUrls = ['get_download_list', 'get_download_status', 'api/system/storage', 'api/target_progress'];
+
+  // 6. Healthy SSE Snapshot: renders cards directly without ANY HTTP telemetry polling
+  ajaxCalls = [];
+  sseInstance.emit('snapshot', {
+    speed_human: '12.4 MB/s',
+    gate: { active_files: 2, file_concurrency: 5 },
+    active_files: [
+      { chat_id: '-100555', id: 101, filename: 'video_101.mp4', progress: 45.5, download_speed: '6.2 MB/s', total_size: 104857600 },
+      { chat_id: '-100555', id: 102, filename: 'video_102.mp4', progress: 78.0, download_speed: '6.2 MB/s', total_size: 209715200 }
+    ]
+  });
+
+  assert.strictEqual(speedTitle, '12.4 MB/s', 'Speed must render from SSE snapshot');
+  assert(poolStatus.includes('2 个文件下载中 (2/5)'), 'Gate slot status must render from SSE snapshot');
+  assert.strictEqual(downloadCards.size, 2, 'Must render exactly 2 active download cards from SSE snapshot');
+  assert(downloadCards.has('-100555-101'));
+  assert(downloadCards.has('-100555-102'));
+
+  let telemetryCalls = ajaxCalls.filter(c => telemetryUrls.some(u => c.url.includes(u)));
+  assert.strictEqual(telemetryCalls.length, 0, 'No HTTP telemetry requests must occur while SSE delivers snapshots');
+
+  // 7. Tab switching during healthy SSE: does NOT start parallel polling
+  assert(segmentedClickHandler, 'segmented control click handler must be wired');
+  segmentedClickHandler.call({ attr: (a) => a === 'data-tab' ? 'downloading' : '' });
+  segmentedClickHandler.call({ attr: (a) => a === 'data-tab' ? 'targets' : '' });
+
+  telemetryCalls = ajaxCalls.filter(c => telemetryUrls.some(u => c.url.includes(u)));
+  assert.strictEqual(telemetryCalls.length, 0, 'Tab switching while SSE is healthy must not initiate parallel HTTP polling');
+
+  // 8. Network disconnect (SSE error): fallback polling engages
+  sseInstance.onerror();
+  assert(intervals.size >= 1, 'Fallback polling timer must engage upon SSE disconnect');
+
+  // Trigger fallback interval tick
+  for (const [, item] of intervals.entries()) {
+    if (item.ms === 5000) {
+      item.fn();
+    }
   }
-  function stop_target_progress_poll() {
-    target_progress_poll_int = 0;
+  telemetryCalls = ajaxCalls.filter(c => telemetryUrls.some(u => c.url.includes(u)));
+  assert(telemetryCalls.length > 0, 'Fallback polling must trigger telemetry HTTP requests while SSE is unavailable');
+
+  // 9. Reconnect recovery: full snapshot restores state without duplicate cards, stops fallback polling
+  ajaxCalls = [];
+  sseInstance.emit('snapshot', {
+    speed_human: '18.0 MB/s',
+    gate: { active_files: 2, file_concurrency: 5 },
+    active_files: [
+      { chat_id: '-100555', id: 101, filename: 'video_101.mp4', progress: 95.0, download_speed: '9.0 MB/s', total_size: 104857600 },
+      { chat_id: '-100555', id: 103, filename: 'video_103.mp4', progress: 12.0, download_speed: '9.0 MB/s', total_size: 52428800 }
+    ]
+  });
+
+  assert.strictEqual(downloadCards.size, 2, 'Card count after reconnect snapshot must be exactly 2');
+  assert(downloadCards.has('-100555-101'), 'Existing task 101 must remain');
+  assert(!downloadCards.has('-100555-102'), 'Finished task 102 must be removed');
+  assert(downloadCards.has('-100555-103'), 'New task 103 must be added');
+  assert.strictEqual(downloadCards.get('-100555-101').appendCount, 1, 'Task 101 must be updated in place without duplicate DOM append');
+
+  // Trigger fallback tick again to verify it is disengaged
+  for (const [, item] of intervals.entries()) {
+    if (item.ms === 5000) {
+      item.fn();
+    }
   }
-
-  // Initial State: SSE receives snapshot
-  function handleSSE() {
-    sse_active = true;
-    stop_fallback_polling();
-    stop_target_progress_poll();
-    update_download_list_int = 0;
-  }
-
-  handleSSE();
-  assert.strictEqual(sse_active, true);
-  assert.strictEqual(status_poll_timer, null, 'polling timer must be null when SSE is active');
-
-  // User navigates to targets tab
-  start_target_progress_poll();
-  assert.strictEqual(target_progress_poll_int, 0, 'progress polling timer must not start when SSE is active');
-
-  // Network drops (SSE error)
-  sse_active = false;
-  start_fallback_polling();
-  assert.notStrictEqual(status_poll_timer, null, 'fallback polling must engage when SSE fails');
-
-  // Network restores (SSE receives update)
-  handleSSE();
-  assert.strictEqual(sse_active, true);
-  assert.strictEqual(status_poll_timer, null, 'fallback polling must disengage upon SSE recovery');
+  telemetryCalls = ajaxCalls.filter(c => telemetryUrls.some(u => c.url.includes(u)));
+  assert.strictEqual(telemetryCalls.length, 0, 'Fallback HTTP polling must disengage after SSE recovers');
 
   console.log('BROWSER_SSE_TELEMETRY_E2E_VERIFIED');
 }
@@ -1516,14 +1934,220 @@ func TestWebServer_FrontendCleanlinessAndStaticCheck(t *testing.T) {
 		}
 	}
 
-	// 4. Verify no unreferenced CryptoJS directory in embedded static assets
+	// 4. Verify no unreferenced CryptoJS or request directory in embedded static assets
 	staticEntries, err := uiFS.ReadDir("ui/static")
 	if err != nil {
 		t.Fatalf("read ui/static: %v", err)
 	}
 	for _, entry := range staticEntries {
-		if strings.Contains(strings.ToLower(entry.Name()), "crypto") {
+		name := strings.ToLower(entry.Name())
+		if strings.Contains(name, "crypto") {
 			t.Fatalf("unreferenced CryptoJS tree must not exist in ui/static: %s", entry.Name())
 		}
+		if name == "request" {
+			t.Fatalf("unreferenced request directory must not exist in ui/static: %s", entry.Name())
+		}
+	}
+
+	// 5. Authored-JS Unused-Binding Static Analysis Gate
+	findUnusedBindings := func(tmplName, tmplContent string) []string {
+		scriptRe := regexp.MustCompile(`(?s)<script\b[^>]*>(.*?)</script>`)
+		declRe := regexp.MustCompile(`\b(?:var|let|const)\s+([a-zA-Z_$][0-9a-zA-Z_$]*)\b|\bfunction\s+([a-zA-Z_$][0-9a-zA-Z_$]*)\s*\(`)
+		var unused []string
+		for _, scriptMatch := range scriptRe.FindAllStringSubmatch(tmplContent, -1) {
+			code := scriptMatch[1]
+			declMatches := declRe.FindAllStringSubmatch(code, -1)
+			declared := make(map[string]int)
+			for _, dm := range declMatches {
+				sym := dm[1]
+				if sym == "" {
+					sym = dm[2]
+				}
+				if sym != "" {
+					declared[sym]++
+				}
+			}
+			for sym, declCount := range declared {
+				tokenRe := regexp.MustCompile(`\b` + regexp.QuoteMeta(sym) + `\b`)
+				allMatches := tokenRe.FindAllString(tmplContent, -1)
+				if len(allMatches) <= declCount {
+					unused = append(unused, fmt.Sprintf("%s:%s", tmplName, sym))
+				}
+			}
+		}
+		return unused
+	}
+
+	// Assert 0 unused bindings in authored index.html
+	if unusedIndex := findUnusedBindings("index.html", indexStr); len(unusedIndex) > 0 {
+		t.Fatalf("found unused JavaScript bindings in index.html: %v", unusedIndex)
+	}
+	// Assert 0 unused bindings in authored login.html
+	if unusedLogin := findUnusedBindings("login.html", loginStr); len(unusedLogin) > 0 {
+		t.Fatalf("found unused JavaScript bindings in login.html: %v", unusedLogin)
+	}
+	// Assert the analysis gate has teeth by testing detection on dummy snippet
+	dummySnippet := `<html><body><script>var dead_token = 123; function used_fn() { return 1; } used_fn();</script></body></html>`
+	if dummyUnused := findUnusedBindings("dummy", dummySnippet); len(dummyUnused) != 1 || dummyUnused[0] != "dummy:dead_token" {
+		t.Fatalf("static analysis gate must catch unused binding, got: %v", dummyUnused)
+	}
+
+	// 6. Representative Desktop and Mobile Render Acceptance
+	nodePath, err := exec.LookPath("node")
+	if err != nil {
+		return // Node not installed in environment, skip browser render check
+	}
+
+	renderScript := `
+const fs = require('fs');
+const vm = require('vm');
+const assert = require('assert');
+
+const input = JSON.parse(fs.readFileSync(0, 'utf8'));
+const html = input.html;
+const css = input.css;
+
+// Verify responsive media query rules in stylesheet
+assert(css.includes('@media (max-width: 768px)'), 'index.css must declare @media (max-width: 768px)');
+assert(css.includes('.mobile-job-list'), 'index.css must style .mobile-job-list');
+assert(css.includes('.apple-mobile-pagination'), 'index.css must style .apple-mobile-pagination');
+
+const scriptTags = [...html.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/gi)];
+const code = scriptTags.find(m => m[1].includes('render_mobile_downloaded_cards'))[1];
+
+function runWithWindowWidth(width) {
+  let mobileCardsHtml = '';
+  let pageIndicatorText = '';
+  let prevDisabled = null;
+  let nextDisabled = null;
+  let modalArea = null;
+  let tableRenderOpts = null;
+
+  function createDOM(sel) {
+    if (sel === '#already_download_mobile_list') {
+      return { html: (h) => { if (h !== undefined) mobileCardsHtml = h; return mobileCardsHtml; } };
+    }
+    if (sel === '#mobile_page_indicator') {
+      return { text: (t) => { if (t !== undefined) pageIndicatorText = t; return pageIndicatorText; } };
+    }
+    if (sel === '#mobile_prev_page') {
+      return {
+        prop: (p, v) => { if (p === 'disabled') prevDisabled = v; return prevDisabled; },
+        on: () => {}
+      };
+    }
+    if (sel === '#mobile_next_page') {
+      return {
+        prop: (p, v) => { if (p === 'disabled') nextDisabled = v; return nextDisabled; },
+        on: () => {}
+      };
+    }
+    const target = {
+      length: 1,
+      0: { scrollIntoView: () => {} },
+      is: () => false,
+      val: () => '',
+      text: () => '',
+      html: () => '',
+      width: () => width,
+      get: () => ({ getContext: () => ({ clearRect: () => {}, beginPath: () => {}, moveTo: () => {}, lineTo: () => {}, stroke: () => {}, fill: () => {} }) })
+    };
+    return new Proxy(target, {
+      get(t, prop) {
+        if (typeof prop === 'symbol') return undefined;
+        if (prop in t) return t[prop];
+        return (...args) => createDOM(String(sel) + '.' + String(prop));
+      }
+    });
+  }
+
+  const sandbox = {
+    console, JSON, parseInt, parseFloat, String, Array, Object, Date, Math,
+    setTimeout: () => 1, clearTimeout: () => {}, setInterval: () => 2, clearInterval: () => {},
+    location: { reload: () => {} }, window: {}, document: {},
+    encodeURIComponent,
+    layui: {
+      use: (mods, cb) => { cb(); },
+      $: (sel) => createDOM(sel),
+      layer: {
+        msg: () => {},
+        prompt: () => {},
+        open: (opts) => { modalArea = opts.area; },
+        close: () => {},
+        load: () => 1
+      },
+      table: {
+        render: (opts) => { tableRenderOpts = opts; return {}; },
+        reload: () => {},
+        on: () => {}
+      }
+    }
+  };
+  sandbox.layui.$.trim = (s) => (s || '').trim();
+  sandbox.layui.$.ajax = () => {};
+  sandbox.window = sandbox;
+  sandbox.window.EventSource = function() { this.addEventListener = () => {}; };
+
+  vm.createContext(sandbox);
+  vm.runInContext(code, sandbox);
+
+  return {
+    openContextViewer: (chatId, title, mid) => {
+      sandbox.window.open_context_viewer(chatId, title, mid);
+      return modalArea;
+    },
+    parseTableData: (res) => {
+      tableRenderOpts.parseData(res);
+      return { text: pageIndicatorText, prevDisabled, nextDisabled, cardsHtml: mobileCardsHtml };
+    }
+  };
+}
+
+// 1. Desktop Render Check (width: 1280)
+const desktop = runWithWindowWidth(1280);
+const desktopModal = desktop.openContextViewer('-1001', 'Channel', 10);
+assert.strictEqual(desktopModal[0], '760px', 'Desktop context viewer width must be 760px');
+assert.strictEqual(desktopModal[1], '620px', 'Desktop context viewer height must be 620px');
+
+// 2. Mobile Render Check (width: 375)
+const mobile = runWithWindowWidth(375);
+const mobileModal = mobile.openContextViewer('-1001', 'Channel', 10);
+assert.strictEqual(mobileModal[0], '95%', 'Mobile context viewer width must be 95%');
+assert.strictEqual(mobileModal[1], '90%', 'Mobile context viewer height must be 90%');
+
+// Test mobile cards & pagination page 1 of 3
+const page1 = mobile.parseTableData({
+  count: 120, limit: 50, page: 1,
+  data: [{ id: 1, filename: 'mobile_doc.pdf', total_size: '1.5 MB', chat: 'Channel', completed_at: 1700000000 }]
+});
+assert.strictEqual(page1.text, 'Page 1 / 3');
+assert.strictEqual(page1.prevDisabled, true, 'Prev must be disabled on page 1');
+assert.strictEqual(page1.nextDisabled, false, 'Next must be enabled on page 1 of 3');
+assert(page1.cardsHtml.includes('mobile_doc.pdf'), 'Mobile card must contain filename');
+
+// Test mobile pagination page 3 of 3
+const page3 = mobile.parseTableData({ count: 120, limit: 50, page: 3, data: [] });
+assert.strictEqual(page3.text, 'Page 3 / 3');
+assert.strictEqual(page3.prevDisabled, false, 'Prev must be enabled on page 3 of 3');
+assert.strictEqual(page3.nextDisabled, true, 'Next must be disabled on page 3 of 3');
+
+console.log('RESPONSIVE_RENDER_ACCEPTANCE_VERIFIED');
+`
+	payload, err := json.Marshal(map[string]string{
+		"html": indexStr,
+		"css":  cssStr,
+	})
+	if err != nil {
+		t.Fatalf("marshal render payload: %v", err)
+	}
+
+	cmd := exec.Command(nodePath, "-e", renderScript)
+	cmd.Stdin = bytes.NewReader(payload)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("responsive render acceptance failed: %v\nOutput: %s", err, string(out))
+	}
+	if !strings.Contains(string(out), "RESPONSIVE_RENDER_ACCEPTANCE_VERIFIED") {
+		t.Fatalf("expected verification token, got: %s", string(out))
 	}
 }

@@ -531,10 +531,14 @@ func (s *WebServer) collectTelemetrySnapshot() map[string]any {
 	ssdInfo := map[string]any{
 		"ssd_reserved_bytes":  int64(0),
 		"ssd_available_bytes": int64(0),
+		"reserved_bytes":      int64(0),
+		"available_bytes":     int64(0),
 	}
 	if s.ssdAdmission != nil {
 		ssdInfo["ssd_reserved_bytes"] = s.ssdAdmission.ReservedBytes()
 		ssdInfo["ssd_available_bytes"] = s.ssdAdmission.AvailableBytes()
+		ssdInfo["reserved_bytes"] = s.ssdAdmission.ReservedBytes()
+		ssdInfo["available_bytes"] = s.ssdAdmission.AvailableBytes()
 	}
 	snap["ssd"] = ssdInfo
 
