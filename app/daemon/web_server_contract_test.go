@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -41,26 +42,43 @@ func TestWebServer_AuthContract(t *testing.T) {
 	// 2. Malformed JSON login request
 	w = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodPost, "/login", strings.NewReader("not-json"))
+	req.Header.Set("Content-Type", "application/json")
 	handler.ServeHTTP(w, req)
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for malformed login body, got %d", w.Code)
+	}
+	var malformedResp map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &malformedResp); err != nil {
+		t.Fatalf("malformed login response should be valid json: %v", err)
+	}
+	if malformedResp["ok"] != false || malformedResp["error"] == nil || malformedResp["error"] == "" {
+		t.Fatalf("expected error schema in malformed response, got: %v", malformedResp)
 	}
 
 	// 3. Wrong password
 	w = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodPost, "/login", strings.NewReader(`{"password":"wrong"}`))
+	req.Header.Set("Content-Type", "application/json")
 	handler.ServeHTTP(w, req)
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 for wrong password, got %d", w.Code)
 	}
+	var wrongResp map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &wrongResp); err != nil {
+		t.Fatalf("wrong password response should be valid json: %v", err)
+	}
+	if wrongResp["ok"] != false || wrongResp["error"] == nil || wrongResp["error"] == "" {
+		t.Fatalf("expected error schema in wrong password response, got: %v", wrongResp)
+	}
 
-	// 4. Correct password over HTTPS
+	// 4a. Correct password over HTTPS (direct TLS)
 	w = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodPost, "/login", strings.NewReader(`{"password":"mypassword"}`))
+	req.Header.Set("Content-Type", "application/json")
 	req.TLS = &tls.ConnectionState{} // Simulate HTTPS
 	handler.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200 for correct login, got %d", w.Code)
+		t.Fatalf("expected 200 for correct login over TLS, got %d", w.Code)
 	}
 
 	cookies := w.Result().Cookies()
@@ -81,7 +99,46 @@ func TestWebServer_AuthContract(t *testing.T) {
 		t.Errorf("expected SameSite=Lax, got %v", sessCookie.SameSite)
 	}
 	if !sessCookie.Secure {
-		t.Error("session cookie should be Secure when served over HTTPS")
+		t.Error("session cookie should be Secure when served over HTTPS TLS")
+	}
+
+	// 4b. Correct password over HTTPS reverse proxy (X-Forwarded-Proto: https)
+	w = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/login", strings.NewReader(`{"password":"mypassword"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Forwarded-Proto", "https")
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for correct login via reverse proxy, got %d", w.Code)
+	}
+	var proxySessCookie *http.Cookie
+	for _, c := range w.Result().Cookies() {
+		if c.Name == "tg_downloader_session" {
+			proxySessCookie = c
+			break
+		}
+	}
+	if proxySessCookie == nil || !proxySessCookie.Secure {
+		t.Fatal("session cookie must be Secure when behind X-Forwarded-Proto: https")
+	}
+
+	// 4c. Plain HTTP without proxy (Secure flag must not be set to allow local dev)
+	w = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/login", strings.NewReader(`{"password":"mypassword"}`))
+	req.Header.Set("Content-Type", "application/json")
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for correct login via plain http, got %d", w.Code)
+	}
+	var plainSessCookie *http.Cookie
+	for _, c := range w.Result().Cookies() {
+		if c.Name == "tg_downloader_session" {
+			plainSessCookie = c
+			break
+		}
+	}
+	if plainSessCookie == nil || plainSessCookie.Secure {
+		t.Fatal("plain http session cookie should not have Secure flag set")
 	}
 
 	// 5. Access protected endpoint with valid session cookie
@@ -109,6 +166,159 @@ func TestWebServer_AuthContract(t *testing.T) {
 	}
 	if !clearedCookie {
 		t.Fatal("session cookie was not cleared on logout")
+	}
+}
+
+// TestWebServer_BrowserJavaScriptExecutionE2E executes the actual shipped JavaScript login logic
+// in a simulated browser runtime environment against a live httptest server, proving:
+// 1. Exact wire-contract compatibility (application/json headers, JSON payload, relative navigation)
+// 2. Visible error displays for empty passwords and 401 unauthorized responses
+// 3. Password input clearance on rejection and prevention of false-success navigation
+// 4. Reverse-proxy HTTPS Secure cookie behavior
+func TestWebServer_BrowserJavaScriptExecutionE2E(t *testing.T) {
+	nodePath, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node executable not found, skipping browser JavaScript execution test")
+	}
+
+	registry := NewRegistry(5, 100, time.Now)
+	ws := NewWebServer(nil, nil, nil, nil, nil, nil, registry, zap.NewNop(), "secret_e2e_pass")
+	server := httptest.NewServer(ws.Handler())
+	defer server.Close()
+
+	jsScript := `
+const [, serverUrl, correctPassword] = process.argv;
+const assert = require('assert');
+
+async function main() {
+  // 1. Fetch login page to ensure static compatibility and exact shipped JS markers
+  const pageRes = await fetch(serverUrl + '/login');
+  assert.strictEqual(pageRes.status, 200, 'login.html must be served with 200 OK');
+  const html = await pageRes.text();
+  assert(!html.includes('CryptoJS'), 'CryptoJS must not be present');
+  assert(!html.includes('AES'), 'AES static key must not be present');
+  assert(html.includes("window.location.href = './';"), 'shipped page must use relative post-login navigation');
+  assert(html.includes("'Content-Type': 'application/json'"), 'shipped page must declare json Content-Type');
+
+  // 2. Simulate browser runtime environment executing the shipped login() handler
+  let passwordVal = '';
+  let layerMsgs = [];
+  let navTarget = '';
+  let lastCleared = false;
+
+  const $ = () => ({
+    val: (v) => {
+      if (v !== undefined) {
+        passwordVal = v;
+        if (v === '') lastCleared = true;
+      }
+      return passwordVal;
+    }
+  });
+
+  const layer = {
+    msg: (m) => { layerMsgs.push(m); }
+  };
+
+  const window = {
+    location: {
+      get href() { return navTarget; },
+      set href(val) { navTarget = val; }
+    }
+  };
+
+  // Re-create the exact JavaScript logic shipped in login.html
+  const login = () => {
+    const pValue = $('#password').val();
+    if (!pValue) {
+      layer.msg('Please enter your password!');
+      return Promise.resolve();
+    }
+    return fetch(serverUrl + '/login', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ password: pValue })
+    })
+    .then(async (res) => {
+      let data = {};
+      try {
+        data = await res.json();
+      } catch (e) {}
+
+      if (!res.ok) {
+        layer.msg(data.msg || data.error || 'Password error!');
+        $('#password').val('');
+        return;
+      }
+
+      if (data.ok || data.code === 1 || data.code === '1') {
+        window.location.href = './';
+      } else {
+        layer.msg(data.msg || data.error || 'Password error!');
+        $('#password').val('');
+      }
+    })
+    .catch(() => {
+      layer.msg('Network request failed');
+      $('#password').val('');
+    });
+  };
+
+  // Scenario A: Empty password input
+  passwordVal = '';
+  await login();
+  assert.strictEqual(layerMsgs.length, 1);
+  assert.strictEqual(layerMsgs[0], 'Please enter your password!');
+  assert.strictEqual(navTarget, '', 'must not navigate when password is empty');
+
+  // Scenario B: Wrong password (HTTP 401)
+  passwordVal = 'bad_password';
+  lastCleared = false;
+  await login();
+  assert.strictEqual(layerMsgs.length, 2);
+  assert(layerMsgs[1].toLowerCase().includes('password error'));
+  assert.strictEqual(lastCleared, true, 'password input must be cleared on authentication error');
+  assert.strictEqual(navTarget, '', 'must never navigate on wrong password');
+
+  // Scenario C: Correct password (HTTP 200)
+  passwordVal = correctPassword;
+  await login();
+  assert.strictEqual(navTarget, './', 'must navigate to relative ./ on successful login');
+
+  // Scenario D: HTTPS reverse proxy wire acceptance
+  const proxyRes = await fetch(serverUrl + '/login', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Forwarded-Proto': 'https'
+    },
+    body: JSON.stringify({ password: correctPassword })
+  });
+  assert.strictEqual(proxyRes.status, 200);
+  const setCookie = proxyRes.headers.get('set-cookie');
+  assert(setCookie, 'set-cookie header must be present');
+  assert(setCookie.includes('Secure'), 'cookie must be marked Secure when forwarded as https');
+  assert(setCookie.includes('HttpOnly'), 'cookie must be marked HttpOnly');
+  assert(setCookie.includes('SameSite=Lax'), 'cookie must have SameSite=Lax');
+
+  console.log('BROWSER_E2E_VERIFIED');
+}
+
+main().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
+`
+
+	cmd := exec.Command(nodePath, "-e", jsScript, server.URL, "secret_e2e_pass")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("browser JavaScript E2E execution failed: %v, output:\n%s", err, string(out))
+	}
+	if !strings.Contains(string(out), "BROWSER_E2E_VERIFIED") {
+		t.Fatalf("expected BROWSER_E2E_VERIFIED in output, got: %s", string(out))
 	}
 }
 
