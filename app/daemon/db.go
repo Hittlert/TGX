@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -537,6 +538,35 @@ func (d *Database) GetPendingDownloads(limit int) ([]DownloadRecord, error) {
 	return records, nil
 }
 
+// GetDownloadRecord retrieves a single download record by chatID and messageID.
+func (d *Database) GetDownloadRecord(chatID string, messageID int) (*DownloadRecord, error) {
+	d.lock.RLock()
+	defer d.lock.RUnlock()
+
+	var rec DownloadRecord
+	var savePath, sha sql.NullString
+	err := d.db.QueryRow(`
+		SELECT chat_id, message_id, status, file_name, save_path, media_type, file_size, COALESCE(sha256, ''), attempts
+		FROM download_records
+		WHERE chat_id = ? AND message_id = ?
+	`, chatID, messageID).Scan(
+		&rec.ChatID, &rec.MessageID, &rec.Status, &rec.FileName, &savePath, &rec.MediaType, &rec.FileSize, &sha, &rec.Attempts,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if savePath.Valid {
+		rec.SavePath = savePath.String
+	}
+	if sha.Valid {
+		rec.SHA256 = sha.String
+	}
+	return &rec, nil
+}
+
 func (d *Database) UpdateDownloadStatus(chatID string, messageID int, status string, fileName, savePath, mediaType string, fileSize int64, errMsg string) error {
 	d.lock.Lock()
 	defer d.lock.Unlock()
@@ -573,15 +603,13 @@ func (d *Database) UpdateDownloadStatus(chatID string, messageID int, status str
 		} else if strings.Contains(lowerErr, "deleted") || strings.Contains(lowerErr, "unavailable") || strings.Contains(lowerErr, "message_id_invalid") {
 			nextRetryAt = now + 86400*7
 		} else {
-			if currentAttempts >= 3 {
-				nextRetryAt = now + 86400*7
-			} else {
-				backoff := int64(300 * (1 << currentAttempts))
-				if backoff > 86400*7 {
-					backoff = 86400 * 7
-				}
-				nextRetryAt = now + backoff
+			// Transient network / I/O error: exponential backoff capped at 30 minutes (1800s).
+			// Do NOT freeze transient tasks for 7 days!
+			backoff := int64(60 * (1 << currentAttempts))
+			if backoff > 1800 {
+				backoff = 1800
 			}
+			nextRetryAt = now + backoff
 		}
 	}
 
@@ -1055,7 +1083,7 @@ func (d *Database) PrepareDownloadCommit(chatID string, messageID int, relPath s
 	defer d.lock.Unlock()
 
 	now := time.Now().Unix()
-	_, err := d.db.Exec(`
+	res, err := d.db.Exec(`
 		UPDATE download_records
 		SET status = 'committing',
 		    save_path = ?,
@@ -1064,7 +1092,17 @@ func (d *Database) PrepareDownloadCommit(chatID string, messageID int, relPath s
 		    updated_at = ?
 		WHERE chat_id = ? AND message_id = ?
 	`, relPath, size, sha256Hex, now, chatID, messageID)
-	return err
+	if err != nil {
+		return err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return fmt.Errorf("no download record found to commit for chat=%s msg=%d", chatID, messageID)
+	}
+	return nil
 }
 
 // CompleteDownloadAndQueueArchive atomically marks download_records.status='success'
@@ -1081,7 +1119,7 @@ func (d *Database) CompleteDownloadAndQueueArchive(chatID string, messageID int,
 	defer tx.Rollback()
 
 	// 1. Mark download_records success
-	_, err = tx.Exec(`
+	res, err := tx.Exec(`
 		UPDATE download_records
 		SET status = 'success',
 		    save_path = ?,
@@ -1094,6 +1132,13 @@ func (d *Database) CompleteDownloadAndQueueArchive(chatID string, messageID int,
 	`, relPath, size, sha256Hex, now, now, chatID, messageID)
 	if err != nil {
 		return fmt.Errorf("update download success: %w", err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("check rows affected: %w", err)
+	}
+	if rows == 0 {
+		return fmt.Errorf("no download record found to complete for chat=%s msg=%d", chatID, messageID)
 	}
 
 	// 2. If archive enabled, enqueue archive_jobs

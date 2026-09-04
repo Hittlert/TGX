@@ -15,16 +15,16 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/Hittlert/TGX/core/dcpool"
-	"github.com/Hittlert/TGX/core/downloader"
 	"github.com/Hittlert/TGX/core/logctx"
 	"github.com/Hittlert/TGX/core/storage"
 	"github.com/Hittlert/TGX/core/tclient"
+	"github.com/Hittlert/TGX/core/transfer"
 	"github.com/Hittlert/TGX/pkg/consts"
 	"github.com/Hittlert/TGX/pkg/key"
 	"github.com/Hittlert/TGX/pkg/prog"
-	"github.com/Hittlert/TGX/pkg/sbe/gate"
 	"github.com/Hittlert/TGX/pkg/tmessage"
 	"github.com/Hittlert/TGX/pkg/utils"
+	"golang.org/x/sync/errgroup"
 )
 
 type Options struct {
@@ -54,10 +54,8 @@ type parser struct {
 }
 
 func Run(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Options) (rerr error) {
-	sharedGate := gate.NewFloodGate(40.0, 10)
-	pool := dcpool.NewPoolWithGate(c,
+	pool := dcpool.NewPool(c,
 		int64(viper.GetInt(consts.FlagPoolSize)),
-		sharedGate,
 		tclient.NewDefaultMiddlewares(ctx, viper.GetDuration(consts.FlagReconnectTimeout))...)
 	defer multierr.AppendInvoke(&rerr, multierr.Close(pool))
 
@@ -106,20 +104,28 @@ func Run(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Opti
 		prog.EnablePS(ctx, dlProgress)
 	}
 
-	options := downloader.Options{
-		Pool:      pool,
-		Threads:   viper.GetInt(consts.FlagThreads),
-		Iter:      it,
-		Progress:  newProgress(dlProgress, it, opts),
-		FloodGate: sharedGate,
-	}
 	limit := viper.GetInt(consts.FlagLimit)
+	if limit <= 0 {
+		limit = 4
+	}
+	threads := viper.GetInt(consts.FlagThreads)
+	if threads <= 0 {
+		threads = 8
+	}
+
+	transferMgr := transfer.NewTransferManager(transfer.Options{
+		FileConcurrency: limit,
+		MaxFileThreads:  threads,
+		MaxDataInFlight: int64(viper.GetInt(consts.FlagPoolSize)),
+	})
+	clientAdapter := transfer.NewGatedClient(pool.DefaultInvoker(ctx), transferMgr.Gate(), 0, pool.CDN)
+	p := newProgress(dlProgress, it, opts)
 
 	logctx.From(ctx).Info("Start download",
 		zap.String("dir", opts.Dir),
 		zap.Bool("rewrite_ext", opts.RewriteExt),
 		zap.Bool("skip_same", opts.SkipSame),
-		zap.Int("threads", options.Threads),
+		zap.Int("threads", threads),
 		zap.Int("limit", limit))
 
 	color.Green("All files will be downloaded to '%s' dir", opts.Dir)
@@ -143,10 +149,41 @@ func Run(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Opti
 		}
 	}()
 
-	if limit > 0 {
-		options.FileConcurrency = limit
+	g, gctx := errgroup.WithContext(ctx)
+	sem := make(chan struct{}, limit)
+
+	for it.Next(gctx) {
+		elem := it.Value()
+		p.OnAdd(elem)
+
+		select {
+		case sem <- struct{}{}:
+		case <-gctx.Done():
+			break
+		}
+
+		g.Go(func() error {
+			defer func() { <-sem }()
+
+			_, dlErr := transferMgr.DownloadFile(
+				gctx,
+				clientAdapter,
+				elem.Location(),
+				elem.Size(),
+				elem.To(),
+				func(downloaded, total int64) {
+					p.OnDownload(elem, downloaded, total)
+				},
+			)
+			p.OnDone(elem, dlErr)
+			return dlErr
+		})
 	}
-	return downloader.New(options).Download(ctx, options.Threads)
+
+	if err := g.Wait(); err != nil {
+		return err
+	}
+	return it.Err()
 }
 
 func collectDialogs(parsers []parser) ([][]*tmessage.Dialog, error) {

@@ -4,10 +4,12 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"io"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/gotd/td/bin"
 	"github.com/gotd/td/tg"
 )
 
@@ -214,3 +216,123 @@ func TestTransferManager_DownloadFile(t *testing.T) {
 		t.Fatalf("sha256 mismatch: got %s, want %s", actualHex, expectedHex)
 	}
 }
+
+func TestRangeTracker(t *testing.T) {
+	rt := NewRangeTracker()
+	if !rt.IsComplete(0) {
+		t.Errorf("zero size should be complete")
+	}
+
+	// 1. Partial write: [0, 5) for 2MB expected
+	rt.AddRange(0, 5)
+	if rt.IsComplete(2097152) {
+		t.Errorf("expected incomplete for 5/2097152 bytes")
+	}
+	if rt.CoveredBytes() != 5 {
+		t.Errorf("expected 5 covered bytes, got %d", rt.CoveredBytes())
+	}
+
+	// 2. Overlapping and out-of-order writes
+	rt.AddRange(5, 100)
+	rt.AddRange(50, 150) // overlaps
+	if rt.CoveredBytes() != 150 {
+		t.Errorf("expected 150 covered bytes after overlap merge, got %d", rt.CoveredBytes())
+	}
+
+	// 3. Gap write: [200, 300) leaves [150, 200) gap
+	rt.AddRange(200, 300)
+	if rt.IsComplete(300) {
+		t.Errorf("expected incomplete due to gap [150, 200)")
+	}
+
+	// 4. Fill the gap: [150, 200)
+	rt.AddRange(150, 200)
+	if !rt.IsComplete(300) {
+		t.Errorf("expected complete once gap is filled")
+	}
+	if rt.CoveredBytes() != 300 {
+		t.Errorf("expected 300 covered bytes, got %d", rt.CoveredBytes())
+	}
+}
+
+func TestDownloadFile_ShortResponseRejected(t *testing.T) {
+	mgr := NewTransferManager(Options{
+		MaxFileThreads: 4,
+	})
+
+	// Fake client that only serves 5 bytes when 2097152 bytes (2 MiB) are requested
+	fake := &fakeClient{
+		data:     []byte("hello"),
+		partSize: GotdPartSize,
+	}
+
+	location := &tg.InputDocumentFileLocation{
+		ID:         999,
+		AccessHash: 888,
+	}
+
+	memWriter := &MemoryWriterAt{buf: make([]byte, 2097152)}
+
+	_, err := mgr.DownloadFile(
+		context.Background(),
+		fake,
+		location,
+		2097152,
+		memWriter,
+		nil,
+	)
+	if err == nil {
+		t.Fatalf("expected error for short response, got nil")
+	}
+}
+
+type mockRawInvoker struct {
+	invoked bool
+	err     error
+}
+
+func (m *mockRawInvoker) Invoke(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
+	m.invoked = true
+	return m.err
+}
+
+type nopCloser struct{}
+
+func (nopCloser) Close() error { return nil }
+
+func TestGatedClient_InvokerAndCDN(t *testing.T) {
+	gate := NewDataGate(2)
+	raw := &mockRawInvoker{}
+	gatedInv := NewGatedInvoker(raw, gate, 1)
+
+	// Invoke through GatedInvoker
+	err := gatedInv.Invoke(context.Background(), nil, nil)
+	if err != nil {
+		t.Fatalf("unexpected invoke error: %v", err)
+	}
+	if !raw.invoked {
+		t.Fatal("expected raw.Invoke to be called")
+	}
+	if gate.InFlight() != 0 {
+		t.Fatalf("expected 0 in flight after invoke, got %d", gate.InFlight())
+	}
+
+	// Test GatedClient with CDN
+	cdnInvoker := &mockRawInvoker{}
+	cdnCalled := false
+	client := NewGatedClient(raw, gate, 1, func(ctx context.Context, dc int, max int64) (tg.Invoker, io.Closer, error) {
+		cdnCalled = true
+		return cdnInvoker, nopCloser{}, nil
+	})
+
+	cdnClient, closer, err := client.CDN(context.Background(), 2, 1024)
+	if err != nil {
+		t.Fatalf("failed to get CDN: %v", err)
+	}
+	if !cdnCalled || cdnClient == nil || closer == nil {
+		t.Fatal("expected CDN to be returned")
+	}
+	_ = closer.Close()
+}
+
+

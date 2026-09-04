@@ -1,5 +1,11 @@
 package daemon
 
+import (
+	"strings"
+
+	"github.com/gotd/td/tg"
+)
+
 type ListenTarget struct {
 	ChatID               string `json:"chat_id"`
 	Enabled              bool   `json:"enabled"`
@@ -69,4 +75,31 @@ type ArchiveStats struct {
 	ArchivedFiles int   `json:"archive_archived_files"`
 	ConflictCount int   `json:"archive_conflict_count"`
 }
+
+type PublishResult struct {
+	Path          string `json:"path"`
+	SHA256        string `json:"sha256,omitempty"`
+	AlreadyExists bool   `json:"already_exists,omitempty"`
+	AsyncMoving   bool   `json:"async_moving,omitempty"`
+	absolutePath  string
+}
+
+func normalizePeer(peer string) string {
+	return strings.TrimPrefix(strings.TrimSpace(peer), "@")
+}
+
+type MediaFile interface {
+	Location() tg.InputFileLocationClass
+	Size() int64
+	DC() int
+}
+
+type ResolvedMedia struct {
+	File MediaFile
+	Name string
+	Size int64
+	DCID int
+	Date int64
+}
+
 

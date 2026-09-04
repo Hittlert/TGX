@@ -107,10 +107,10 @@ func TestReconcileOnStartup_Matrix(t *testing.T) {
 	_ = db.db.QueryRow(`SELECT status FROM download_records WHERE chat_id = '1' AND message_id = 1`).Scan(&status1)
 	assert.Equal(t, "pending", status1)
 
-	// Verify Case 2: status is success
+	// Verify Case 2: status is reset to pending (downloading without commit intent)
 	var status2 string
 	_ = db.db.QueryRow(`SELECT status FROM download_records WHERE chat_id = '2' AND message_id = 2`).Scan(&status2)
-	assert.Equal(t, "success", status2)
+	assert.Equal(t, "pending", status2)
 
 	// Verify Case 3: .part renamed to final, status is success
 	_, err = os.Stat(case3Part)

@@ -296,3 +296,18 @@ func TestRecordProgressAndRecordWriteSeparation(t *testing.T) {
 		t.Fatalf("Rolling5sBPS=%d, want %d (double counting detected!)", snap.Rolling5sBPS, 5<<20)
 	}
 }
+
+func TestNormalizePeer(t *testing.T) {
+	for input, want := range map[string]string{
+		"-1001234567890": "-1001234567890",
+		"-12345":         "-12345",
+		"@username":      "username",
+		"username":       "username",
+		" 123 ":          "123",
+	} {
+		if got := normalizePeer(input); got != want {
+			t.Fatalf("normalizePeer(%q)=%q, want %q", input, got, want)
+		}
+	}
+}
+

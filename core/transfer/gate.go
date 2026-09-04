@@ -52,6 +52,11 @@ func (g *DataGate) MaxInFlight() int64 {
 	return g.maxInFlight
 }
 
+// Max returns the configured capacity limit (alias for MaxInFlight).
+func (g *DataGate) Max() int64 {
+	return g.MaxInFlight()
+}
+
 // TriggerFloodWait registers a server-issued FloodWait for the specified DC.
 func (g *DataGate) TriggerFloodWait(dc int, d time.Duration) {
 	if g == nil || d <= 0 {

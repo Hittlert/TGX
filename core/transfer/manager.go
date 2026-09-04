@@ -8,19 +8,16 @@ import (
 
 	"github.com/gotd/td/telegram/downloader"
 	"github.com/gotd/td/tg"
-	"golang.org/x/sync/semaphore"
 )
 
 const (
-	DefaultFileConcurrency = 32
+	DefaultFileConcurrency = 5
 	DefaultMaxFileThreads  = 8
 	GotdPartSize           = 512 * 1024 // 512 KiB gotd protocol chunk size
 )
 
-// TransferManager coordinates active-file admission and delegates chunk transport
-// to the official gotd downloader.
+// TransferManager manages gotd parallel transport and global RPC rate limits.
 type TransferManager struct {
-	fileSem        *semaphore.Weighted
 	fileCapacity   int
 	activeFiles    int64
 	maxFileThreads int
@@ -36,7 +33,7 @@ type Options struct {
 	RetryHandler    downloader.RetryHandler
 }
 
-// NewTransferManager creates an active-file manager with the official gotd downloader.
+// NewTransferManager creates a manager with the official gotd downloader and DataGate.
 func NewTransferManager(opts Options) *TransferManager {
 	if opts.FileConcurrency <= 0 {
 		opts.FileConcurrency = DefaultFileConcurrency
@@ -58,7 +55,6 @@ func NewTransferManager(opts Options) *TransferManager {
 	}
 
 	return &TransferManager{
-		fileSem:        semaphore.NewWeighted(int64(opts.FileConcurrency)),
 		fileCapacity:   opts.FileConcurrency,
 		maxFileThreads: opts.MaxFileThreads,
 		gate:           gate,
@@ -81,21 +77,12 @@ func (m *TransferManager) ActiveFiles() int64 {
 	return atomic.LoadInt64(&m.activeFiles)
 }
 
-// AcquireFileSlot acquires 1 active file admission permit.
-func (m *TransferManager) AcquireFileSlot(ctx context.Context) (func(), error) {
-	if err := m.fileSem.Acquire(ctx, 1); err != nil {
-		return nil, err
+// FileConcurrency returns the maximum concurrent active files capacity.
+func (m *TransferManager) FileConcurrency() int {
+	if m == nil {
+		return 0
 	}
-	atomic.AddInt64(&m.activeFiles, 1)
-
-	var released int32
-	release := func() {
-		if atomic.CompareAndSwapInt32(&released, 0, 1) {
-			atomic.AddInt64(&m.activeFiles, -1)
-			m.fileSem.Release(1)
-		}
-	}
-	return release, nil
+	return m.fileCapacity
 }
 
 // ComputeFileThreads derives worker goroutines for one file based on logical work.
@@ -124,6 +111,9 @@ func (m *TransferManager) DownloadFile(
 	dest io.WriterAt,
 	onProgress func(downloaded, total int64),
 ) (int64, error) {
+	atomic.AddInt64(&m.activeFiles, 1)
+	defer atomic.AddInt64(&m.activeFiles, -1)
+
 	fileThreads := m.ComputeFileThreads(expectedSize)
 	writer := NewCountingWriterAt(dest, expectedSize, onProgress)
 
@@ -134,6 +124,11 @@ func (m *TransferManager) DownloadFile(
 	downloaded := writer.Downloaded()
 	if err != nil {
 		return downloaded, fmt.Errorf("gotd parallel download: %w", err)
+	}
+
+	if expectedSize > 0 && !writer.IsComplete(expectedSize) {
+		covered := writer.CoveredBytes()
+		return downloaded, fmt.Errorf("incomplete download coverage: covered %d of %d expected bytes", covered, expectedSize)
 	}
 
 	return downloaded, nil

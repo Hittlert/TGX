@@ -10,7 +10,7 @@ import (
 )
 
 func TestOptionsDefaultsAndValidation(t *testing.T) {
-	opts := (Options{}).withDefaults()
+	opts := DefaultOptions()
 	if opts.Listen != "0.0.0.0:18080" || opts.OutputDir != "/app/downloads" || opts.TempDir != "/app/temp/tdl" {
 		t.Fatalf("unexpected path defaults: %#v", opts)
 	}
@@ -28,6 +28,15 @@ func TestOptionsDefaultsAndValidation(t *testing.T) {
 	}
 	if err := opts.validate(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestOptionsPreservesExplicitStartPausedFalse(t *testing.T) {
+	opts := DefaultOptions()
+	opts.StartPaused = false
+	opts = opts.withDefaults()
+	if opts.StartPaused {
+		t.Fatalf("explicit StartPaused=false was overwritten by withDefaults")
 	}
 }
 

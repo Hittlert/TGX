@@ -52,13 +52,6 @@ type ResolveRequest struct {
 }
 
 func (a *telegramMediaAccess) GetDialogs(ctx context.Context) ([]DialogDTO, error) {
-	if a.gate != nil {
-		if err := a.gate.AcquireControlSlot(ctx); err != nil {
-			return nil, err
-		}
-		defer a.gate.ReleaseControlSlot()
-	}
-
 	var result []DialogDTO
 	seenUsers := make(map[string]tg.UserClass)
 	seenChats := make(map[string]tg.ChatClass)

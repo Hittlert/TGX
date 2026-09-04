@@ -14,7 +14,6 @@ import (
 	"github.com/go-faster/errors"
 	pw "github.com/jedib0t/go-pretty/v6/progress"
 
-	"github.com/Hittlert/TGX/core/downloader"
 	"github.com/Hittlert/TGX/core/util/fsutil"
 	"github.com/Hittlert/TGX/pkg/prog"
 	"github.com/Hittlert/TGX/pkg/utils"
@@ -37,33 +36,31 @@ func newProgress(p pw.Writer, it *iter, opts Options) *progress {
 	}
 }
 
-func (p *progress) OnAdd(elem downloader.Elem) {
-	tracker := prog.AppendTracker(p.pw, utils.Byte.FormatBinaryBytes, p.processMessage(elem), elem.File().Size())
-	p.trackers.Store(elem.(*iterElem).id, tracker)
+func (p *progress) OnAdd(elem *iterElem) {
+	tracker := prog.AppendTracker(p.pw, utils.Byte.FormatBinaryBytes, p.processMessage(elem), elem.Size())
+	p.trackers.Store(elem.id, tracker)
 }
 
-func (p *progress) OnDownload(elem downloader.Elem, state downloader.ProgressState) {
-	tracker, ok := p.trackers.Load(elem.(*iterElem).id)
+func (p *progress) OnDownload(elem *iterElem, downloaded, total int64) {
+	tracker, ok := p.trackers.Load(elem.id)
 	if !ok {
 		return
 	}
 
 	t := tracker.(*pw.Tracker)
-	t.UpdateTotal(state.Total)
-	t.SetValue(state.Downloaded)
+	t.UpdateTotal(total)
+	t.SetValue(downloaded)
 }
 
-func (p *progress) OnDone(elem downloader.Elem, err error) {
-	e := elem.(*iterElem)
-
-	tracker, ok := p.trackers.Load(e.id)
+func (p *progress) OnDone(elem *iterElem, err error) {
+	tracker, ok := p.trackers.Load(elem.id)
 	if !ok {
 		return
 	}
 	t := tracker.(*pw.Tracker)
 
-	if err := e.to.Close(); err != nil {
-		p.fail(t, elem, errors.Wrap(err, "close file"))
+	if closeErr := elem.to.Close(); closeErr != nil {
+		p.fail(t, elem, errors.Wrap(closeErr, "close file"))
 		return
 	}
 
@@ -71,13 +68,13 @@ func (p *progress) OnDone(elem downloader.Elem, err error) {
 		if !errors.Is(err, context.Canceled) { // don't report user cancel
 			p.fail(t, elem, errors.Wrap(err, "progress"))
 		}
-		_ = os.Remove(e.to.Name()) // just try to remove temp file, ignore error
+		_ = os.Remove(elem.to.Name()) // just try to remove temp file, ignore error
 		return
 	}
 
-	p.it.Finish(e.logicalPos)
+	p.it.Finish(elem.logicalPos)
 
-	if err := p.donePost(e); err != nil {
+	if err := p.donePost(elem); err != nil {
 		p.fail(t, elem, errors.Wrap(err, "post file"))
 		return
 	}
@@ -113,20 +110,19 @@ func (p *progress) donePost(elem *iterElem) error {
 	return nil
 }
 
-func (p *progress) fail(t *pw.Tracker, elem downloader.Elem, err error) {
+func (p *progress) fail(t *pw.Tracker, elem *iterElem, err error) {
 	p.pw.Log(color.RedString("%s error: %s", p.elemString(elem), err.Error()))
 	t.MarkAsErrored()
 }
 
-func (p *progress) processMessage(elem downloader.Elem) string {
+func (p *progress) processMessage(elem *iterElem) string {
 	return p.elemString(elem)
 }
 
-func (p *progress) elemString(elem downloader.Elem) string {
-	e := elem.(*iterElem)
+func (p *progress) elemString(elem *iterElem) string {
 	return fmt.Sprintf("%s(%d):%d -> %s",
-		e.from.VisibleName(),
-		e.from.ID(),
-		e.fromMsg.ID,
-		strings.TrimSuffix(e.to.Name(), tempExt))
+		elem.from.VisibleName(),
+		elem.from.ID(),
+		elem.fromMsg.ID,
+		strings.TrimSuffix(elem.to.Name(), tempExt))
 }

@@ -20,7 +20,6 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/Hittlert/TGX/core/dcpool"
-	"github.com/Hittlert/TGX/core/downloader"
 	"github.com/Hittlert/TGX/core/logctx"
 	"github.com/Hittlert/TGX/core/tmedia"
 	"github.com/Hittlert/TGX/core/util/fsutil"
@@ -65,7 +64,7 @@ type iter struct {
 	counter        *atomic.Int64
 	skippedDeleted *atomic.Int64 // count of skipped deleted messages
 	deletedIDs     []string      // IDs of deleted messages (format: "dialogID/messageID")
-	elem           chan downloader.Elem
+	elem           chan *iterElem
 	err            error
 }
 
@@ -119,7 +118,7 @@ func newIter(pool dcpool.Pool, manager *peers.Manager, dialog [][]*tmessage.Dial
 		counter:        atomic.NewInt64(-1),
 		skippedDeleted: atomic.NewInt64(0),
 		deletedIDs:     make([]string, 0),
-		elem:           make(chan downloader.Elem, 10), // grouped message buffer
+		elem:           make(chan *iterElem, 10), // grouped message buffer
 		err:            nil,
 	}, nil
 }
@@ -321,7 +320,7 @@ func (i *iter) processGrouped(ctx context.Context, message *tg.Message, from pee
 	return hasValid, !hasValid
 }
 
-func (i *iter) Value() downloader.Elem {
+func (i *iter) Value() *iterElem {
 	return <-i.elem
 }
 

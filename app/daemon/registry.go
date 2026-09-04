@@ -286,6 +286,19 @@ func (r *Registry) Next(ctx context.Context) (*Task, error) {
 	}
 }
 
+func (r *Registry) Requeue(t *Task) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	state := t.state
+	if state == nil || isTerminal(state.state) {
+		return errors.New("cannot requeue terminal task")
+	}
+	state.state = StateQueued
+	r.queue = append(r.queue, state)
+	r.signalLocked()
+	return nil
+}
+
 func (r *Registry) SetPaused(paused bool) {
 	r.mu.Lock()
 	r.paused = paused
@@ -788,12 +801,14 @@ func validateRequest(request TaskRequest) error {
 	if request.ExpectedSize < 0 {
 		return errors.New("expected_size cannot be negative")
 	}
-	if request.FinalPath == "" || strings.ContainsAny(request.FinalPath, "\\\x00") || strings.HasPrefix(request.FinalPath, "/") {
-		return errors.New("final_path must be a relative slash-separated path")
-	}
-	cleaned := path.Clean(request.FinalPath)
-	if cleaned != request.FinalPath || cleaned == ".." || strings.HasPrefix(cleaned, "../") {
-		return fmt.Errorf("final_path escapes output root: %q", request.FinalPath)
+	if request.FinalPath != "" {
+		if strings.ContainsAny(request.FinalPath, "\\\x00") || strings.HasPrefix(request.FinalPath, "/") {
+			return errors.New("final_path must be a relative slash-separated path")
+		}
+		cleaned := path.Clean(request.FinalPath)
+		if cleaned != request.FinalPath || cleaned == ".." || strings.HasPrefix(cleaned, "../") {
+			return fmt.Errorf("final_path escapes output root: %q", request.FinalPath)
+		}
 	}
 	return nil
 }

@@ -19,9 +19,9 @@ import (
 	"github.com/gorilla/mux"
 	"go.uber.org/zap"
 
+	"github.com/Hittlert/TGX/core/transfer"
 	"github.com/Hittlert/TGX/internal/fscommit"
 	"github.com/Hittlert/TGX/pkg/consts"
-	"github.com/Hittlert/TGX/pkg/sbe/gate"
 )
 
 //go:embed ui/*
@@ -29,17 +29,17 @@ var uiFS embed.FS
 
 type WebServer struct {
 	db           *Database
-	slotPool     *GlobalSlotPool
+	transferMgr  *transfer.TransferManager
+	ssdAdmission *fscommit.SSDAdmission
 	proxyManager *ProxyManager
 	orchestrator *Orchestrator
 	access       TelegramAccess
 	registry     *Registry
 	logger       *zap.Logger
 	password     string
-	gate         *gate.FloodGate
-	sessionsMu sync.RWMutex
-	sessions   map[string]time.Time
-	authWizard *AuthWizard
+	sessionsMu   sync.RWMutex
+	sessions     map[string]time.Time
+	authWizard   *AuthWizard
 }
 
 func (s *WebServer) SetAuthWizard(w *AuthWizard) {
@@ -48,25 +48,25 @@ func (s *WebServer) SetAuthWizard(w *AuthWizard) {
 
 func NewWebServer(
 	db *Database,
-	slotPool *GlobalSlotPool,
+	transferMgr *transfer.TransferManager,
+	ssdAdmission *fscommit.SSDAdmission,
 	proxyManager *ProxyManager,
 	orchestrator *Orchestrator,
 	access TelegramAccess,
 	registry *Registry,
 	logger *zap.Logger,
 	password string,
-	fg *gate.FloodGate,
 ) *WebServer {
 	return &WebServer{
 		db:           db,
-		slotPool:     slotPool,
+		transferMgr:  transferMgr,
+		ssdAdmission: ssdAdmission,
 		proxyManager: proxyManager,
 		orchestrator: orchestrator,
 		access:       access,
 		registry:     registry,
 		logger:       logger,
 		password:     password,
-		gate:         fg,
 		sessions:     make(map[string]time.Time),
 	}
 }
@@ -93,16 +93,19 @@ func (s *WebServer) Handler() http.Handler {
 
 	// Gate Diagnostics (live adaptive controller state)
 	r.HandleFunc("/api/gate", func(w http.ResponseWriter, r *http.Request) {
-		resp := map[string]any{
-			"max_data_in_flight":    gate.MaxDataInFlight,
-			"max_control_in_flight": gate.MaxControlInFlight,
+		resp := map[string]any{}
+		if s.transferMgr != nil {
+			g := s.transferMgr.Gate()
+			if g != nil {
+				resp["max_data_in_flight"] = g.Max()
+				resp["data_in_flight"] = g.InFlight()
+			}
+			resp["active_files"] = s.transferMgr.ActiveFiles()
+			resp["file_concurrency"] = s.transferMgr.FileConcurrency()
 		}
-		if s.gate != nil {
-			resp["current_rate"] = s.gate.CurrentRate()
-			resp["base_rate"] = s.gate.BaseRate()
-			resp["data_in_flight"] = s.gate.DataInFlight()
-			resp["control_in_flight"] = s.gate.ControlInFlight()
-			resp["max_data_cap"] = s.gate.MaxDataCap()
+		if s.ssdAdmission != nil {
+			resp["ssd_reserved_bytes"] = s.ssdAdmission.ReservedBytes()
+			resp["ssd_available_bytes"] = s.ssdAdmission.AvailableBytes()
 		}
 		writeJSON(w, http.StatusOK, resp)
 	}).Methods(http.MethodGet)
@@ -407,7 +410,6 @@ func (s *WebServer) handleDownloadStateChange(w http.ResponseWriter, r *http.Req
 }
 
 func (s *WebServer) handleGetDownloadStatus(w http.ResponseWriter, r *http.Request) {
-	snap := s.slotPool.Snapshot()
 	daemonStatus := s.registry.Status()
 
 	speedBytes := daemonStatus.Rolling5sBPS
@@ -427,39 +429,63 @@ func (s *WebServer) handleGetDownloadStatus(w http.ResponseWriter, r *http.Reque
 	}
 
 	state := "running"
-	if !s.orchestrator.IsRunning() {
+	if s.orchestrator != nil && !s.orchestrator.IsRunning() {
 		state = "paused"
 	}
 
-	bufferUsedMB := float64(0)
-	bufferLimitMB := float64(0)
+	var activeFiles int64
+	var fileConcurrency int
+	var dataInFlight int64
+	var maxInFlight int64
+	if s.transferMgr != nil {
+		activeFiles = s.transferMgr.ActiveFiles()
+		fileConcurrency = s.transferMgr.FileConcurrency()
+		if s.transferMgr.Gate() != nil {
+			dataInFlight = s.transferMgr.Gate().InFlight()
+			maxInFlight = s.transferMgr.Gate().Max()
+		}
+	}
+
+	slotUtil := 0.0
+	if fileConcurrency > 0 {
+		slotUtil = float64(activeFiles) / float64(fileConcurrency) * 100
+	}
+
+	var reservedBytes, availableBytes int64
+	if s.ssdAdmission != nil {
+		reservedBytes = s.ssdAdmission.ReservedBytes()
+		availableBytes = s.ssdAdmission.AvailableBytes()
+	}
 
 	resp := map[string]any{
 		"download_speed": speedStr,
 		"speed_bps":      speedBytes,
 		"download_state": state,
 		"slot_pool": map[string]any{
-			"total_slots":          snap.TotalSlots,
-			"used_slots":           snap.UsedSlots,
-			"available_slots":      snap.AvailableSlots,
-			"max_active_files":     snap.MaxActiveFiles,
-			"active_files_count":   snap.ActiveFilesCount,
-			"slot_unit_mb":         snap.SlotUnitMB,
-			"max_slots_per_file":   snap.MaxSlotsPerFile,
-			"slot_utilization_pct": snap.SlotUtilizationPct,
-			"utilization_pct":      snap.SlotUtilizationPct,
-			"file_utilization_pct": snap.FileUtilizationPct,
+			"total_slots":          fileConcurrency,
+			"used_slots":           activeFiles,
+			"available_slots":      fileConcurrency - int(activeFiles),
+			"max_active_files":     fileConcurrency,
+			"active_files_count":   activeFiles,
+			"slot_unit_mb":         1,
+			"max_slots_per_file":   1,
+			"slot_utilization_pct": slotUtil,
+			"utilization_pct":      slotUtil,
+			"file_utilization_pct": slotUtil,
+		},
+		"transfer_manager": map[string]any{
+			"active_files":     activeFiles,
+			"file_concurrency": fileConcurrency,
+			"data_in_flight":   dataInFlight,
+			"max_in_flight":    maxInFlight,
+		},
+		"ssd_admission": map[string]any{
+			"reserved_bytes":  reservedBytes,
+			"available_bytes": availableBytes,
 		},
 		"media_pool": map[string]any{
 			"active_files": len(filesMap),
 			"files":        filesMap,
-		},
-		"sbe_stats": map[string]any{
-			"engine_version":  consts.EffectiveVersion(),
-			"buffer_used_mb":  bufferUsedMB,
-			"buffer_limit_mb": bufferLimitMB,
-			"dirty_used_mb":   bufferUsedMB,
-			"target_writer":   true,
 		},
 		"total_download_task": 0,
 		"total_download_byte": formatBytes(0),
@@ -1094,12 +1120,15 @@ func (s *WebServer) handleChatContext(w http.ResponseWriter, r *http.Request) {
 
 func (s *WebServer) handleConcurrencySettings(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet {
-		snap := s.slotPool.Snapshot()
+		fileConcurrency := 32
+		if s.transferMgr != nil {
+			fileConcurrency = s.transferMgr.FileConcurrency()
+		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"ok": true,
 			"settings": map[string]any{
-				"max_active_files":   snap.MaxActiveFiles,
-				"global_thread_pool": snap.TotalSlots,
+				"max_active_files":   fileConcurrency,
+				"global_thread_pool": fileConcurrency,
 				"disable_ipv6":       true,
 			},
 		})

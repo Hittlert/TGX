@@ -21,7 +21,6 @@ import (
 	"github.com/Hittlert/TGX/core/tclient"
 	"github.com/Hittlert/TGX/core/transfer"
 	"github.com/Hittlert/TGX/internal/fscommit"
-	"github.com/Hittlert/TGX/pkg/sbe/gate"
 )
 
 type Options struct {
@@ -48,7 +47,9 @@ type Options struct {
 }
 
 func DefaultOptions() Options {
-	return (Options{}).withDefaults()
+	opts := (Options{}).withDefaults()
+	opts.StartPaused = true
+	return opts
 }
 
 func (o Options) withDefaults() Options {
@@ -88,7 +89,6 @@ func (o Options) withDefaults() Options {
 	if o.PeerSyncTimeout <= 0 {
 		o.PeerSyncTimeout = 3 * time.Minute
 	}
-	o.StartPaused = true
 	return o
 }
 
@@ -139,13 +139,11 @@ func Run(ctx context.Context, client *telegram.Client, kvd storage.Storage, opts
 	}
 	_ = listener.Close()
 
-	sharedGate := gate.NewFloodGate(float64(opts.PoolSize), 10)
-
 	pool := dcpool.NewPool(client, int64(opts.PoolSize),
 		tclient.NewDefaultMiddlewares(ctx, opts.ReconnectTimeout)...)
 	defer func() { resultErr = errors.Join(resultErr, pool.Close()) }()
 	manager := peers.Options{Storage: storage.NewPeers(kvd)}.Build(pool.Default(ctx))
-	access := newTelegramMediaAccess(ctx, pool, manager, opts.PeerSyncTimeout, nil)
+	access := newTelegramMediaAccess(ctx, pool, manager, opts.PeerSyncTimeout)
 
 	// 1. Capacity & Admission Owners
 	ssdAdmission := fscommit.NewSSDAdmission(opts.OutputDir, opts.MinFreeSpace)
@@ -186,14 +184,6 @@ func Run(ctx context.Context, client *telegram.Client, kvd storage.Storage, opts
 	registry.SetPaused(opts.StartPaused)
 	registry.SetPool(PoolSnapshot{Size: opts.PoolSize})
 
-	slotCfg := SlotPoolConfig{
-		TotalSlots:      opts.PoolSize,
-		MaxActiveFiles:  opts.FileConcurrency,
-		SlotUnitMB:      2,
-		MaxSlotsPerFile: opts.PoolSize,
-	}
-	slotPool := NewGlobalSlotPool(slotCfg)
-
 	statsFile := ""
 	if opts.DBPath != "" {
 		statsFile = filepath.Join(filepath.Dir(opts.DBPath), "proxy_stats.json")
@@ -220,7 +210,7 @@ func Run(ctx context.Context, client *telegram.Client, kvd storage.Storage, opts
 	}
 
 	authWizard := NewAuthWizard(db, client, kvd, logctx.From(ctx), opts.Namespace)
-	webServer := NewWebServer(db, slotPool, proxyManager, orchestrator, access, registry, logctx.From(ctx), opts.Password, sharedGate)
+	webServer := NewWebServer(db, transferMgr, ssdAdmission, proxyManager, orchestrator, access, registry, logctx.From(ctx), opts.Password)
 	webServer.SetAuthWizard(authWizard)
 
 	server := &http.Server{

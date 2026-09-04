@@ -7,7 +7,6 @@ import (
 	"github.com/gotd/td/telegram/peers"
 	"github.com/gotd/td/tg"
 
-	"github.com/Hittlert/TGX/core/downloader"
 	"github.com/Hittlert/TGX/core/tmedia"
 )
 
@@ -23,8 +22,6 @@ type iterElem struct {
 
 	opts Options
 }
-
-func (i *iterElem) File() downloader.File { return i }
 
 func (i *iterElem) To() io.WriterAt { return i.to }
 

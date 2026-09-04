@@ -6,7 +6,6 @@ require (
 	github.com/AlecAivazis/survey/v2 v2.3.7
 	github.com/bcicen/jstream v1.0.1
 	github.com/beevik/ntp v1.5.0
-	github.com/bits-and-blooms/bitset v1.25.0
 	github.com/cenkalti/backoff/v4 v4.3.0
 	github.com/expr-lang/expr v1.17.8
 	github.com/fatih/color v1.19.0

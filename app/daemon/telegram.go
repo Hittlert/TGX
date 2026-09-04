@@ -17,10 +17,8 @@ import (
 	"golang.org/x/time/rate"
 
 	"github.com/Hittlert/TGX/core/dcpool"
-	"github.com/Hittlert/TGX/core/downloader"
 	"github.com/Hittlert/TGX/core/tmedia"
 	"github.com/Hittlert/TGX/core/util/tutil"
-	"github.com/Hittlert/TGX/pkg/sbe/gate"
 )
 
 type TelegramAccess interface {
@@ -42,7 +40,6 @@ type telegramMediaAccess struct {
 	parentCtx   context.Context
 	pool        dcpool.Pool
 	manager     *peers.Manager
-	gate        *gate.FloodGate
 	limiter     *rate.Limiter
 	syncMu      sync.Mutex
 	lastSync    time.Time
@@ -53,7 +50,7 @@ type telegramMediaAccess struct {
 	msgCache map[string]messageCacheEntry
 }
 
-func newTelegramMediaAccess(parentCtx context.Context, pool dcpool.Pool, manager *peers.Manager, syncTimeout time.Duration, gate *gate.FloodGate) *telegramMediaAccess {
+func newTelegramMediaAccess(parentCtx context.Context, pool dcpool.Pool, manager *peers.Manager, syncTimeout time.Duration) *telegramMediaAccess {
 	if parentCtx == nil {
 		parentCtx = context.Background()
 	}
@@ -62,7 +59,6 @@ func newTelegramMediaAccess(parentCtx context.Context, pool dcpool.Pool, manager
 		pool:        pool,
 		manager:     manager,
 		syncTimeout: syncTimeout,
-		gate:        gate,
 		limiter:     rate.NewLimiter(rate.Limit(25), 10),
 		msgCache:    make(map[string]messageCacheEntry),
 	}
@@ -440,7 +436,7 @@ type telegramFile struct {
 	media *tmedia.Media
 }
 
-var _ downloader.File = telegramFile{}
+var _ MediaFile = telegramFile{}
 
 func (f telegramFile) Location() tg.InputFileLocationClass { return f.media.InputFileLoc }
 func (f telegramFile) Size() int64                         { return f.media.Size }

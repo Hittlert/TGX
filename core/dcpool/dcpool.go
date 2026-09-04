@@ -16,7 +16,6 @@ import (
 
 	"github.com/Hittlert/TGX/core/logctx"
 	"github.com/Hittlert/TGX/core/middlewares/takeout"
-	"github.com/Hittlert/TGX/pkg/sbe/gate"
 )
 
 var testMode = false
@@ -30,6 +29,8 @@ type Pool interface {
 	Client(ctx context.Context, dc int) *tg.Client
 	Takeout(ctx context.Context, dc int) *tg.Client
 	Default(ctx context.Context) *tg.Client
+	Invoker(ctx context.Context, dc int) tg.Invoker
+	DefaultInvoker(ctx context.Context) tg.Invoker
 	CDN(ctx context.Context, dc int, max int64) (tg.Invoker, io.Closer, error)
 	Close() error
 }
@@ -41,7 +42,6 @@ type pool struct {
 	dcLocks     map[int]*sync.Mutex
 	dcLocksMu   sync.Mutex
 	middlewares []telegram.Middleware
-	floodGate   *gate.FloodGate
 
 	invokers   map[int]tg.Invoker
 	closes     map[int]func() error
@@ -50,16 +50,11 @@ type pool struct {
 }
 
 func NewPool(c *telegram.Client, size int64, middlewares ...telegram.Middleware) Pool {
-	return NewPoolWithGate(c, size, nil, middlewares...)
-}
-
-func NewPoolWithGate(c *telegram.Client, size int64, fg *gate.FloodGate, middlewares ...telegram.Middleware) Pool {
 	return &pool{
 		api:         c,
 		size:        size,
 		dcLocks:     make(map[int]*sync.Mutex),
 		middlewares: middlewares,
-		floodGate:   fg,
 		invokers:    make(map[int]tg.Invoker),
 		closes:      make(map[int]func() error),
 		dcFailures:  make(map[int]time.Time),
@@ -83,6 +78,14 @@ func (p *pool) getDCLock(dc int) *sync.Mutex {
 
 func (p *pool) Client(ctx context.Context, dc int) *tg.Client {
 	return tg.NewClient(p.invoker(ctx, dc))
+}
+
+func (p *pool) Invoker(ctx context.Context, dc int) tg.Invoker {
+	return p.invoker(ctx, dc)
+}
+
+func (p *pool) DefaultInvoker(ctx context.Context) tg.Invoker {
+	return p.invoker(ctx, p.current())
 }
 
 func (p *pool) invoker(ctx context.Context, dc int) tg.Invoker {
@@ -135,18 +138,12 @@ func (p *pool) invoker(ctx context.Context, dc int) tg.Invoker {
 			}
 			if d, isFlood := tgerr.AsFloodWait(err); isFlood {
 				logctx.From(ctx).Warn("DC transfer flood wait, backing off", zap.Int("dc", dc), zap.Duration("wait", d))
-				if p.floodGate != nil {
-					p.floodGate.TriggerFloodWait(dc, d)
-				}
 				select {
 				case <-ctx.Done():
 					return failedInvoker{dc: dc, err: ctx.Err()}
 				case <-time.After(d + 1*time.Second):
 				}
 				continue
-			}
-			if p.floodGate != nil {
-				p.floodGate.TriggerTransportError(err)
 			}
 			select {
 			case <-ctx.Done():
@@ -160,9 +157,6 @@ func (p *pool) invoker(ctx context.Context, dc int) tg.Invoker {
 		p.mu.Lock()
 		p.dcFailures[dc] = time.Now()
 		p.mu.Unlock()
-		if p.floodGate != nil {
-			p.floodGate.TriggerTransportError(err)
-		}
 		logctx.From(ctx).Error("create invoker", zap.Int("dc_id", dc), zap.Error(err))
 		return failedInvoker{dc: dc, err: err}
 	}
@@ -171,9 +165,6 @@ func (p *pool) invoker(ctx context.Context, dc int) tg.Invoker {
 	delete(p.dcFailures, dc)
 	p.closes[dc] = invoker.Close
 	mws := p.middlewares
-	if p.floodGate != nil {
-		mws = append([]telegram.Middleware{p.floodGate.Middleware(dc)}, mws...)
-	}
 	p.invokers[dc] = chainMiddlewares(invoker, mws...)
 	res := p.invokers[dc]
 	p.mu.Unlock()
@@ -191,9 +182,6 @@ func (f failedInvoker) Invoke(ctx context.Context, input bin.Encoder, output bin
 }
 
 func (p *pool) Default(ctx context.Context) *tg.Client {
-	if p.floodGate != nil {
-		return tg.NewClient(chainMiddlewares(p.api, p.floodGate.Middleware(p.current())))
-	}
 	return tg.NewClient(p.api)
 }
 

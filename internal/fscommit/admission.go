@@ -79,6 +79,18 @@ func (a *SSDAdmission) ReservedBytes() int64 {
 	return a.totalReserved
 }
 
+// AvailableBytes returns the currently available bytes above minFreeSpace.
+func (a *SSDAdmission) AvailableBytes() int64 {
+	if a == nil {
+		return 0
+	}
+	stats, err := a.Stats()
+	if err != nil {
+		return 0
+	}
+	return stats.AvailableBytes
+}
+
 // Reserve checks real SSD free space and reserves expectedSize bytes for taskID.
 // If space is below minFreeSpace + expectedSize, it returns ErrInsufficientSSDSpace.
 // It returns an idempotent release function that must be called when the task completes, fails, or cancels.
