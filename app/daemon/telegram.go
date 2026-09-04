@@ -137,16 +137,9 @@ func (a *telegramMediaAccess) Resolve(ctx context.Context, peer string, messageI
 		return ResolvedMedia{}, classifyTelegramError(err, "resolve peer")
 	}
 
-	// Deterministic bucket key: bucketStart is aligned to 50-message boundary
-	bucketStart := (messageID / 50) * 50
-	if bucketStart == 0 {
-		bucketStart = 1
-	}
-	batchKey := fmt.Sprintf("batch:%s:%d", peer, bucketStart)
-
 	// SingleFlight DoChan with daemon-owned context to isolate followers from leader cancellation
-	ch := a.sf.DoChan(batchKey, func() (interface{}, error) {
-		fetchCtx, fetchCancel := context.WithTimeout(a.parentCtx, 180*time.Second)
+	ch := a.sf.DoChan(cacheKey, func() (interface{}, error) {
+		fetchCtx, fetchCancel := context.WithTimeout(a.parentCtx, 30*time.Second)
 		defer fetchCancel()
 
 		if a.limiter != nil {
@@ -155,22 +148,14 @@ func (a *telegramMediaAccess) Resolve(ctx context.Context, peer string, messageI
 			}
 		}
 
-		// Prefetch entire 50-message bucket starting at bucketStart
-		ids := make([]int, 0, 50)
-		for i := 0; i < 50; i++ {
-			ids = append(ids, bucketStart+i)
-		}
-
-		var (
-			messages map[int]*tg.Message
-			fetchErr error
-		)
+		var singleMsg *tg.Message
+		var sErr error
 		for attempt := 0; attempt < 3; attempt++ {
-			messages, fetchErr = tutil.GetMessagesBatch(fetchCtx, a.pool.Default(fetchCtx), resolvedPeer.InputPeer(), ids)
-			if fetchErr == nil {
+			singleMsg, sErr = tutil.GetSingleMessage(fetchCtx, a.pool.Default(fetchCtx), resolvedPeer.InputPeer(), messageID)
+			if sErr == nil {
 				break
 			}
-			if d, isFlood := tgerr.AsFloodWait(fetchErr); isFlood {
+			if d, isFlood := tgerr.AsFloodWait(sErr); isFlood {
 				select {
 				case <-fetchCtx.Done():
 					return nil, fetchCtx.Err()
@@ -178,60 +163,32 @@ func (a *telegramMediaAccess) Resolve(ctx context.Context, peer string, messageI
 					continue
 				}
 			}
-			break
-		}
-
-		if fetchErr != nil {
-			// Fallback to single message
-			var singleMsg *tg.Message
-			var sErr error
-			for attempt := 0; attempt < 3; attempt++ {
-				singleMsg, sErr = tutil.GetSingleMessage(fetchCtx, a.pool.Default(fetchCtx), resolvedPeer.InputPeer(), messageID)
-				if sErr == nil {
-					break
-				}
-				if d, isFlood := tgerr.AsFloodWait(sErr); isFlood {
-					select {
-					case <-fetchCtx.Done():
-						return nil, fetchCtx.Err()
-					case <-time.After(d + time.Second):
-						continue
-					}
-				}
+			if errors.Is(sErr, context.Canceled) || errors.Is(sErr, context.DeadlineExceeded) {
 				break
 			}
-			if sErr != nil {
-				return nil, sErr
-			}
-			a.msgMu.Lock()
-			a.cleanExpiredCacheLocked(time.Now())
-			a.msgCache[cacheKey] = messageCacheEntry{msg: singleMsg, expires: time.Now().Add(60 * time.Second)}
-			a.msgMu.Unlock()
-			return nil, nil
+			time.Sleep(200 * time.Millisecond)
+		}
+		if sErr != nil {
+			return nil, sErr
 		}
 
 		a.msgMu.Lock()
-		now := time.Now()
-		a.cleanExpiredCacheLocked(now)
-		for _, msg := range messages {
-			if msg != nil {
-				k := fmt.Sprintf("%s:%d", peer, msg.ID)
-				a.msgCache[k] = messageCacheEntry{msg: msg, expires: now.Add(60 * time.Second)}
-			}
-		}
-		if _, exists := a.msgCache[cacheKey]; !exists {
-			if singleMsg, sErr := tutil.GetSingleMessage(fetchCtx, a.pool.Default(fetchCtx), resolvedPeer.InputPeer(), messageID); sErr == nil && singleMsg != nil {
-				a.msgCache[cacheKey] = messageCacheEntry{msg: singleMsg, expires: now.Add(60 * time.Second)}
-			}
-		}
+		a.cleanExpiredCacheLocked(time.Now())
+		a.msgCache[cacheKey] = messageCacheEntry{msg: singleMsg, expires: time.Now().Add(60 * time.Second)}
 		a.msgMu.Unlock()
-		return nil, nil
+		return singleMsg, nil
 	})
 
 	select {
 	case <-ctx.Done():
 		return ResolvedMedia{}, ctx.Err()
-	case <-ch:
+	case res := <-ch:
+		if res.Err != nil {
+			return ResolvedMedia{}, classifyTelegramError(res.Err, "resolve message")
+		}
+		if msg, ok := res.Val.(*tg.Message); ok && msg != nil {
+			return a.mediaFromMessage(peer, messageID, msg)
+		}
 	}
 
 	// Read from populated cache
@@ -242,36 +199,7 @@ func (a *telegramMediaAccess) Resolve(ctx context.Context, peer string, messageI
 		return a.mediaFromMessage(peer, messageID, entry.msg)
 	}
 
-	// Fallback single message resolution
-	if a.limiter != nil {
-		if err := a.limiter.Wait(ctx); err != nil {
-			return ResolvedMedia{}, err
-		}
-	}
-	var msg *tg.Message
-	for attempt := 0; attempt < 3; attempt++ {
-		msg, err = tutil.GetSingleMessage(ctx, a.pool.Default(ctx), resolvedPeer.InputPeer(), messageID)
-		if err == nil {
-			break
-		}
-		if d, isFlood := tgerr.AsFloodWait(err); isFlood {
-			select {
-			case <-ctx.Done():
-				return ResolvedMedia{}, ctx.Err()
-			case <-time.After(d + time.Second):
-				continue
-			}
-		}
-		break
-	}
-	if err != nil {
-		return ResolvedMedia{}, classifyTelegramError(err, "resolve message")
-	}
-	a.msgMu.Lock()
-	a.cleanExpiredCacheLocked(time.Now())
-	a.msgCache[cacheKey] = messageCacheEntry{msg: msg, expires: time.Now().Add(60 * time.Second)}
-	a.msgMu.Unlock()
-	return a.mediaFromMessage(peer, messageID, msg)
+	return ResolvedMedia{}, fmt.Errorf("the message %s/%d: %w", peer, messageID, tutil.ErrMessageDeleted)
 }
 
 func (a *telegramMediaAccess) ResolveBatch(ctx context.Context, peer string, messageIDs []int) (map[int]ResolvedMedia, error) {
