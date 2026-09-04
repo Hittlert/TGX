@@ -177,4 +177,3 @@ func ReconcileOnStartup(ctx context.Context, db *Database, ssdDir, archiveDir st
 
 	return nil
 }
-

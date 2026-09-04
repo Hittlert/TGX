@@ -310,4 +310,3 @@ func TestNormalizePeer(t *testing.T) {
 		}
 	}
 }
-

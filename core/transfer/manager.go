@@ -44,12 +44,13 @@ func (e *TransferError) Unwrap() error {
 
 // TransferManager manages gotd parallel transport and global RPC rate limits.
 type TransferManager struct {
-	fileCapacity   int64
-	activeFiles    int64
-	maxFileThreads int
-	gate           *DataGate
-	downloader     *downloader.Downloader
+	fileCapacity    int64
+	activeFiles     int64
+	maxFileThreads  int
+	downloader      *downloader.Downloader
+	gate            *DataGate
 	physicalRetries int64
+	userRetry       downloader.RetryHandler
 }
 
 // Options configures the TransferManager.
@@ -77,6 +78,7 @@ func NewTransferManager(opts Options) *TransferManager {
 		fileCapacity:   int64(opts.FileConcurrency),
 		maxFileThreads: opts.MaxFileThreads,
 		gate:           gate,
+		userRetry:      opts.RetryHandler,
 	}
 
 	dl := downloader.NewDownloader().
@@ -155,29 +157,47 @@ func (m *TransferManager) ComputeFileThreads(expectedSize int64) int {
 	return threads
 }
 
-// DownloadFile downloads a Telegram file directly into dest using the official gotd parallel downloader.
-func (m *TransferManager) DownloadFile(
+// DownloadResult contains physical transport telemetry for one download execution.
+type DownloadResult struct {
+	Written         int64
+	PhysicalRetries int64
+}
+
+// DownloadFileWithResult downloads a Telegram file directly into dest and returns execution telemetry.
+func (m *TransferManager) DownloadFileWithResult(
 	ctx context.Context,
 	client downloader.Client,
 	location tg.InputFileLocationClass,
 	expectedSize int64,
 	dest io.WriterAt,
 	onProgress func(downloaded, total int64),
-) (int64, error) {
+) (DownloadResult, error) {
 	atomic.AddInt64(&m.activeFiles, 1)
 	defer atomic.AddInt64(&m.activeFiles, -1)
 
 	fileThreads := m.ComputeFileThreads(expectedSize)
 	writer := NewCountingWriterAt(dest, expectedSize, onProgress)
 
+	var fileRetries int64
 	builder := m.downloader.Download(client, location).
-		WithThreads(fileThreads)
+		WithThreads(fileThreads).
+		WithRetryHandler(func(event downloader.RetryEvent) {
+			atomic.AddInt64(&m.physicalRetries, 1)
+			atomic.AddInt64(&fileRetries, 1)
+			if m.userRetry != nil {
+				m.userRetry(event)
+			}
+		})
 
 	_, err := builder.Parallel(ctx, writer)
 	downloaded := writer.Downloaded()
+	res := DownloadResult{
+		Written:         downloaded,
+		PhysicalRetries: atomic.LoadInt64(&fileRetries),
+	}
 	if err != nil {
 		if writeErr := writer.WriteErr(); writeErr != nil {
-			return downloaded, &TransferError{
+			return res, &TransferError{
 				Stage:       "transfer",
 				Op:          "write_chunk",
 				Class:       "io",
@@ -188,7 +208,7 @@ func (m *TransferManager) DownloadFile(
 			}
 		}
 		if ctx.Err() != nil {
-			return downloaded, &TransferError{
+			return res, &TransferError{
 				Stage:       "transfer",
 				Op:          "download",
 				Class:       "canceled",
@@ -199,7 +219,7 @@ func (m *TransferManager) DownloadFile(
 			}
 		}
 		if tgerr.Is(err, "FILE_REFERENCE_EXPIRED", "FILEREF_INVALID", "FILE_ID_INVALID", "LOCATION_INVALID") {
-			return downloaded, &TransferError{
+			return res, &TransferError{
 				Stage:       "transfer",
 				Op:          "download",
 				Class:       "unavailable",
@@ -209,7 +229,7 @@ func (m *TransferManager) DownloadFile(
 				Cause:       err,
 			}
 		}
-		return downloaded, &TransferError{
+		return res, &TransferError{
 			Stage:       "transfer",
 			Op:          "download",
 			Class:       "network",
@@ -223,7 +243,7 @@ func (m *TransferManager) DownloadFile(
 	if expectedSize > 0 && !writer.IsComplete(expectedSize) {
 		covered := writer.CoveredBytes()
 		covErr := fmt.Errorf("incomplete download coverage: covered %d of %d expected bytes", covered, expectedSize)
-		return downloaded, &TransferError{
+		return res, &TransferError{
 			Stage:       "transfer",
 			Op:          "verify_coverage",
 			Class:       "corrupt",
@@ -234,5 +254,18 @@ func (m *TransferManager) DownloadFile(
 		}
 	}
 
-	return downloaded, nil
+	return res, nil
+}
+
+// DownloadFile downloads a Telegram file directly into dest using the official gotd parallel downloader.
+func (m *TransferManager) DownloadFile(
+	ctx context.Context,
+	client downloader.Client,
+	location tg.InputFileLocationClass,
+	expectedSize int64,
+	dest io.WriterAt,
+	onProgress func(downloaded, total int64),
+) (int64, error) {
+	res, err := m.DownloadFileWithResult(ctx, client, location, expectedSize, dest, onProgress)
+	return res.Written, err
 }

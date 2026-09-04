@@ -367,4 +367,3 @@ func TestWebServer_StatusActiveFilesNeverNull(t *testing.T) {
 		t.Fatalf("active_files should serialize as empty slice [], got: %s", body)
 	}
 }
-

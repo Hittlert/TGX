@@ -102,5 +102,3 @@ type ResolvedMedia struct {
 	Date      int64
 	MediaType string
 }
-
-

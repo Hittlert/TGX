@@ -44,23 +44,23 @@ type TaskRequest struct {
 
 type TaskSnapshot struct {
 	TaskRequest
-	State         TaskState `json:"state"`
-	FileName      string    `json:"file_name,omitempty"`
-	TotalSize     int64     `json:"total_size"`
-	Downloaded    int64     `json:"downloaded"`
-	NetDownloaded int64     `json:"net_downloaded,omitempty"`
-	Progress      float64   `json:"progress"`
-	Rolling5sBPS  int64     `json:"rolling_5s_bps"`
-	DCID          int       `json:"dc_id,omitempty"`
-	AlreadyExists bool      `json:"already_exists,omitempty"`
-	SHA256        string    `json:"sha256,omitempty"`
+	State             TaskState `json:"state"`
+	FileName          string    `json:"file_name,omitempty"`
+	TotalSize         int64     `json:"total_size"`
+	Downloaded        int64     `json:"downloaded"`
+	NetDownloaded     int64     `json:"net_downloaded,omitempty"`
+	Progress          float64   `json:"progress"`
+	Rolling5sBPS      int64     `json:"rolling_5s_bps"`
+	DCID              int       `json:"dc_id,omitempty"`
+	AlreadyExists     bool      `json:"already_exists,omitempty"`
+	SHA256            string    `json:"sha256,omitempty"`
 	ErrorClass        string    `json:"error_class,omitempty"`
 	Error             string    `json:"error,omitempty"`
 	AttemptGeneration string    `json:"attempt_generation,omitempty"`
 	AttemptCount      int       `json:"attempt_count,omitempty"`
 	CreatedAt         int64     `json:"created_at"`
-	StartedAt     int64     `json:"started_at,omitempty"`
-	FinishedAt    int64     `json:"finished_at,omitempty"`
+	StartedAt         int64     `json:"started_at,omitempty"`
+	FinishedAt        int64     `json:"finished_at,omitempty"`
 }
 
 type PoolSnapshot struct {
@@ -444,12 +444,42 @@ func (t *Task) SucceedResult(result PublishResult) {
 	t.registry.finishWithGen(t.state, t.attemptGen, StateSuccess, "", "", result.Path, result.AlreadyExists, result.SHA256)
 }
 
-func (t *Task) Fail(class, message string, unavailable bool) {
+// FailureDisposition captures structured failure semantics across the orchestrator, registry, and db.
+type FailureDisposition struct {
+	Stage       string `json:"stage"`
+	Op          string `json:"op"`
+	Class       string `json:"class"`
+	Unavailable bool   `json:"unavailable"`
+	Retryable   bool   `json:"retryable"`
+	RetryOwner  string `json:"retry_owner,omitempty"`
+	Message     string `json:"message"`
+	Cause       error  `json:"-"`
+}
+
+func (d FailureDisposition) Error() string {
+	if d.Message != "" {
+		return d.Message
+	}
+	if d.Cause != nil {
+		return d.Cause.Error()
+	}
+	return fmt.Sprintf("[%s:%s] %s", d.Stage, d.Op, d.Class)
+}
+
+func (t *Task) FailDisposition(disp FailureDisposition) {
 	state := StateFailed
-	if unavailable {
+	if disp.Unavailable {
 		state = StateUnavailable
 	}
-	t.registry.finishWithGen(t.state, t.attemptGen, state, class, message, "", false, "")
+	t.registry.finishWithGen(t.state, t.attemptGen, state, disp.Class, disp.Error(), "", false, "")
+}
+
+func (t *Task) Fail(class, message string, unavailable bool) {
+	t.FailDisposition(FailureDisposition{
+		Class:       class,
+		Message:     message,
+		Unavailable: unavailable,
+	})
 }
 
 func (t *Task) RecordProgress(downloaded int64) {

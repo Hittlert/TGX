@@ -221,12 +221,12 @@ type mockE2EPool struct {
 	invoker tg.Invoker
 }
 
-func (p *mockE2EPool) Client(ctx context.Context, dc int) *tg.Client { return tg.NewClient(p.invoker) }
-func (p *mockE2EPool) Takeout(ctx context.Context, dc int) *tg.Client { return tg.NewClient(p.invoker) }
+func (p *mockE2EPool) Client(ctx context.Context, dc int) *tg.Client         { return tg.NewClient(p.invoker) }
+func (p *mockE2EPool) Takeout(ctx context.Context, dc int) *tg.Client        { return tg.NewClient(p.invoker) }
 func (p *mockE2EPool) TakeoutInvoker(ctx context.Context, dc int) tg.Invoker { return p.invoker }
-func (p *mockE2EPool) Default(ctx context.Context) *tg.Client { return tg.NewClient(p.invoker) }
-func (p *mockE2EPool) Invoker(ctx context.Context, dc int) tg.Invoker { return p.invoker }
-func (p *mockE2EPool) DefaultInvoker(ctx context.Context) tg.Invoker { return p.invoker }
+func (p *mockE2EPool) Default(ctx context.Context) *tg.Client                { return tg.NewClient(p.invoker) }
+func (p *mockE2EPool) Invoker(ctx context.Context, dc int) tg.Invoker        { return p.invoker }
+func (p *mockE2EPool) DefaultInvoker(ctx context.Context) tg.Invoker         { return p.invoker }
 func (p *mockE2EPool) CDN(ctx context.Context, dc int, max int64) (tg.Invoker, io.Closer, error) {
 	return p.invoker, nopCloser{}, nil
 }
@@ -274,7 +274,7 @@ func (m *mockTelegramAccess) ResolveBatch(ctx context.Context, peer string, mess
 	return nil, nil
 }
 func (m *mockTelegramAccess) SyncPeers(ctx context.Context) error { return nil }
-func (m *mockTelegramAccess) Pool() dcpool.Pool                  { return m.pool }
+func (m *mockTelegramAccess) Pool() dcpool.Pool                   { return m.pool }
 
 func TestUpdatesStream_EndToEnd_Pipeline(t *testing.T) {
 	tempDir := t.TempDir()
@@ -391,4 +391,3 @@ func TestUpdatesStream_EndToEnd_Pipeline(t *testing.T) {
 		t.Fatalf("expected 1 archive job for message 8877, got %v", jobs)
 	}
 }
-

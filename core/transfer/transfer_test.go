@@ -477,6 +477,3 @@ func TestDownloadFile_CanceledContext_ClassifiedAsCanceled(t *testing.T) {
 		t.Error("expected Retryable to be false for cancellation")
 	}
 }
-
-
-

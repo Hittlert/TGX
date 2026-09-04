@@ -1306,6 +1306,16 @@ func (d *Database) SetArchiveJobConflict(chatID string, messageID int, errStr st
 	return err
 }
 
+// FailDownloadDisposition records download failure or unavailability using a structured FailureDisposition,
+// preventing confusion over positional boolean parameters.
+func (d *Database) FailDownloadDisposition(
+	chatID string, messageID int, generation string,
+	fileName, savePath, mediaType string, fileSize int64,
+	disp FailureDisposition,
+) error {
+	return d.FailDownload(chatID, messageID, generation, fileName, savePath, mediaType, fileSize, disp.Error(), disp.Unavailable)
+}
+
 // FailDownload records download failure or unavailability, strictly honoring attempt generation
 // and never overwriting terminal 'success'.
 func (d *Database) FailDownload(chatID string, messageID int, generation string, fileName, savePath, mediaType string, fileSize int64, errMsg string, isUnavailable bool) error {
@@ -1496,5 +1506,3 @@ func (d *Database) GetStaleCopyingArchiveJobs() ([]ArchiveJob, error) {
 	}
 	return jobs, nil
 }
-
-
