@@ -132,7 +132,13 @@ def parse_binary_version(output):
             if key == "main_revision":
                 metadata["source_commit"] = value
             elif key == "main_dirty":
-                metadata["source_dirty"] = value.lower() == "true"
+                val = value.lower()
+                if val == "true":
+                    metadata["source_dirty"] = True
+                elif val == "false":
+                    metadata["source_dirty"] = False
+                else:
+                    metadata["source_dirty"] = "unknown"
             elif key == "go_version":
                 metadata["go_version"] = value
             elif key == "tdl_revision":
@@ -147,7 +153,13 @@ def parse_binary_version(output):
             elif key == "Date":
                 metadata["build_time"] = value
             elif key in ("Dirty", "dirty"):
-                metadata["source_dirty"] = value.lower() == "true"
+                val = value.lower()
+                if val == "true":
+                    metadata["source_dirty"] = True
+                elif val == "false":
+                    metadata["source_dirty"] = False
+                else:
+                    metadata["source_dirty"] = "unknown"
             continue
         parts = line.split()
         if len(parts) == 2 and parts[0].startswith("go") and "/" in parts[1]:
@@ -157,6 +169,37 @@ def parse_binary_version(output):
     if metadata["version"] == "unknown" and metadata.get("tdl_revision"):
         metadata["version"] = metadata["tdl_revision"]
     return metadata
+
+
+def observe_binary_platform(engine_binary):
+    binary_path = Path(engine_binary).resolve()
+    if not binary_path.is_file():
+        return "unknown", "unknown"
+    try:
+        with binary_path.open("rb") as stream:
+            header = stream.read(64)
+            if len(header) >= 20 and header[:4] == b"\x7fELF":
+                import struct
+
+                e_machine = struct.unpack("<H", header[18:20])[0]
+                arch_map = {62: "amd64", 183: "arm64", 3: "386", 40: "arm"}
+                return "linux", arch_map.get(e_machine, f"unknown({e_machine})")
+            if len(header) >= 8 and (
+                header[:4] in (b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe")
+            ):
+                import struct
+
+                cputype = struct.unpack("<I", header[4:8])[0]
+                arch_map = {
+                    0x01000007: "amd64",
+                    7: "amd64",
+                    0x0100000C: "arm64",
+                    12: "arm64",
+                }
+                return "darwin", arch_map.get(cputype, f"unknown({cputype})")
+    except Exception:
+        pass
+    return "unknown", "unknown"
 
 
 def inspect_runner_image(docker_command, runner_image):
@@ -206,6 +249,12 @@ def extract_artifact_metadata(run_spec, engine_binary):
         timeout=30,
     )
     metadata = parse_binary_version(result.stdout + result.stderr)
+    if metadata.get("os") == "unknown" or metadata.get("arch") == "unknown":
+        obs_os, obs_arch = observe_binary_platform(engine_binary)
+        if metadata.get("os") == "unknown" and obs_os != "unknown":
+            metadata["os"] = obs_os
+        if metadata.get("arch") == "unknown" and obs_arch != "unknown":
+            metadata["arch"] = obs_arch
     metadata.update(
         {
             "engine": run_spec["engine"],
@@ -731,10 +780,15 @@ def classify_results(cases, engine_name, paths, task_submits, engine_tasks, time
             error_stage = "lifecycle"
             error_op = "cancel"
             error_cause = snapshot.get("error") or "task canceled"
-        elif timed_out and (
-            state in ("queued", "resolving", "downloading")
-            or engine_name == "tdl"
+        elif state in ("failed", "unavailable") or (
+            snapshot.get("error") and not target.is_file()
         ):
+            terminal_state = "FAILED"
+            error_code = snapshot.get("error_class") or "ENGINE_FAILED"
+            error_stage = "engine"
+            error_op = "download"
+            error_cause = snapshot.get("error") or "task failed in engine"
+        elif timed_out:
             terminal_state = "TIMED_OUT"
             error_code = "TIMED_OUT"
             error_stage = "lifecycle"

@@ -16,20 +16,31 @@ import (
 //go:embed version.tmpl
 var version string
 
-func isSourceDirty() bool {
+func isSourceDirty() string {
 	if consts.Dirty != "" {
-		return consts.Dirty == "true"
+		if consts.Dirty == "true" {
+			return "true"
+		}
+		if consts.Dirty == "false" {
+			return "false"
+		}
+		return consts.Dirty
 	}
 	bi, ok := debug.ReadBuildInfo()
 	if !ok {
-		return false
+		return "unknown"
 	}
 	for _, s := range bi.Settings {
 		if s.Key == "vcs.modified" {
-			return s.Value == "true"
+			if s.Value == "true" {
+				return "true"
+			}
+			if s.Value == "false" {
+				return "false"
+			}
 		}
 	}
-	return false
+	return "unknown"
 }
 
 func NewVersion() *cobra.Command {

@@ -23,6 +23,33 @@ RAW_ARTIFACTS = (
     "process.log",
 )
 
+RUN_SPEC_REQUIRED_FIELDS = (
+    "protocol_version",
+    "protocol_sha256",
+    "run_id",
+    "engine",
+    "artifact_ref",
+    "source_repository",
+    "expected_source_commit",
+    "expected_binary_sha256",
+    "profile_id",
+    "manifest_path",
+    "manifest_sha256",
+    "baseline_cohort_id",
+    "sample_seed",
+    "net_concurrency",
+    "file_concurrency",
+    "dc_pool_size",
+    "duration_seconds",
+    "warmup_seconds",
+    "scratch_root",
+    "session_source_dir",
+    "runner_image",
+    "docker_command",
+    "api_base",
+    "environment",
+)
+
 def compute_sha256(path):
     digest = hashlib.sha256()
     with open(path, "rb") as stream:
@@ -209,6 +236,10 @@ def evaluate_policy(run_root, policy_path, overwrite=False):
         else:
             invalid_reasons.extend(_artifact_identity_problems(artifact))
 
+            for field in RUN_SPEC_REQUIRED_FIELDS:
+                if field not in run_spec or run_spec[field] is None:
+                    invalid_reasons.append(f"RunSpec is missing required field: {field}")
+
             protocol = read_json(raw_path / "protocol.json")
             if run_spec.get("protocol_version") != protocol.get("protocol_version"):
                 invalid_reasons.append("RunSpec protocol version does not match raw protocol")
@@ -288,6 +319,25 @@ def evaluate_policy(run_root, policy_path, overwrite=False):
                 if not environment.get(field):
                     invalid_reasons.append(f"environment field is missing: {field}")
 
+            effective = environment.get("effective_daemon_config")
+            if isinstance(effective, dict):
+                if (
+                    effective.get("file_concurrency") is not None
+                    and effective.get("file_concurrency") != run_spec.get("file_concurrency")
+                ):
+                    invalid_reasons.append(
+                        f"effective file concurrency {effective.get('file_concurrency')} "
+                        f"does not match RunSpec {run_spec.get('file_concurrency')}"
+                    )
+                if (
+                    effective.get("dc_pool_size") is not None
+                    and effective.get("dc_pool_size") != run_spec.get("dc_pool_size")
+                ):
+                    invalid_reasons.append(
+                        f"effective dc pool size {effective.get('dc_pool_size')} "
+                        f"does not match RunSpec {run_spec.get('dc_pool_size')}"
+                    )
+
             process_log = (raw_path / "process.log").read_text(
                 encoding="utf-8", errors="replace"
             )
@@ -305,6 +355,34 @@ def evaluate_policy(run_root, policy_path, overwrite=False):
                     )
                 if re.search(r'"OOMKilled"\s*:\s*true', state):
                     failure_reasons.append("container was OOM-killed")
+
+                state_json_str = state.split("restart_count=")[0].strip()
+                parsed_state = {}
+                if state_json_str:
+                    try:
+                        parsed_state = json.loads(state_json_str)
+                    except json.JSONDecodeError:
+                        pass
+
+                exit_code = parsed_state.get("ExitCode")
+                if exit_code is None:
+                    exit_match = re.search(r'"ExitCode"\s*:\s*(-?\d+)', state)
+                    if exit_match:
+                        exit_code = int(exit_match.group(1))
+                if exit_code is not None and exit_code != 0:
+                    failure_reasons.append(
+                        f"container exited with non-zero exit code {exit_code}"
+                    )
+
+                running = parsed_state.get("Running")
+                if running is None:
+                    run_match = re.search(
+                        r'"Running"\s*:\s*(true|false)', state, re.IGNORECASE
+                    )
+                    if run_match:
+                        running = run_match.group(1).lower() == "true"
+                if running is False:
+                    failure_reasons.append("container stopped unexpectedly")
 
             required_error_fields = policy.get("diagnosability", {}).get(
                 "required_error_fields", []

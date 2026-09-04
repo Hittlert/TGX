@@ -110,12 +110,18 @@ def create_raw_fixture(
     write_json(
         raw / "run_spec.json",
         {
+            "api_base": "http://127.0.0.1:5000",
+            "artifact_ref": "/app/telegram-downloader",
             "baseline_cohort_id": "p-s-fixture",
             "dc_pool_size": 32,
+            "docker_command": ["docker"],
+            "duration_seconds": 300,
             "engine": engine,
+            "environment": {"fixture": True},
             "expected_binary_sha256": "2" * 64,
             "expected_source_commit": "1" * 40,
             "file_concurrency": 5,
+            "manifest_path": "/app/manifests/P-S.jsonl",
             "manifest_sha256": compute_sha256(raw / "manifest.jsonl"),
             "net_concurrency": 32,
             "paired_tdl_artifact_sha256": "3" * 64,
@@ -126,6 +132,12 @@ def create_raw_fixture(
             "protocol_sha256": protocol_sha256,
             "protocol_version": "1.0",
             "run_id": "fixture-run",
+            "runner_image": "alpine:latest",
+            "sample_seed": 42,
+            "scratch_root": "/tmp/scratch",
+            "session_source_dir": "/tmp/session",
+            "source_repository": "https://example.invalid/tgx",
+            "warmup_seconds": 15,
         },
     )
     if paired_attested_case_ids is not None:
@@ -230,7 +242,7 @@ def create_raw_fixture(
     write_jsonl(raw / "errors.jsonl", errors)
     (raw / "process.log").write_text(
         'fixture process log\n=== Container State ===\n'
-        '{"OOMKilled":false,"Running":true} restart_count=0\n',
+        '{"ExitCode":0,"OOMKilled":false,"Running":true} restart_count=0\n',
         encoding="utf-8",
     )
 
@@ -643,6 +655,114 @@ class EvaluationSelfTest(unittest.TestCase):
         with self.assertRaises(ValueError) as cm:
             validate_artifact(run_spec, artifact_missing_build)
         self.assertIn("does not report build_time", str(cm.exception))
+
+    def test_classify_results_preserves_engine_failure_on_timeout(self):
+        cases = [
+            {
+                "case_id": "P-S-0001",
+                "chat_id": 12345,
+                "message_id": 1,
+                "expected_size": 100,
+                "baseline_sha256": "a" * 64,
+                "expected_tgx_path": "a/b/c.bin",
+                "expected_tdl_path": "a/b/c.bin",
+            }
+        ]
+        task_submits = {"P-S-0001": {"task_id": "t1", "submitted": True, "error": None}}
+        engine_tasks = {"t1": {"state": "failed", "error": "disk write error", "error_class": "io"}}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            class DummyPaths:
+                output = Path(temp_dir)
+
+            task_results, hashes, errors = classify_results(
+                cases, "tdl", DummyPaths(), task_submits, engine_tasks, timed_out=True
+            )
+            self.assertEqual(len(task_results), 1)
+            self.assertEqual(task_results[0]["terminal_state"], "FAILED")
+            self.assertEqual(len(errors), 1)
+            self.assertEqual(errors[0]["error_code"], "io")
+            self.assertEqual(errors[0]["stage"], "engine")
+
+    def test_analyzer_rejects_nonzero_exit_or_stopped_container(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "run_fail"
+            raw = create_raw_fixture(root)
+            (raw / "process.log").write_text(
+                'fixture process log\n=== Container State ===\n'
+                '{"ExitCode":1,"OOMKilled":false,"Running":false} restart_count=0\n',
+                encoding="utf-8",
+            )
+            (raw / "checksums.sha256").unlink()
+            seal_raw_directory(raw)
+            summary = evaluate_policy(root, POLICY_PATH)
+            self.assertIn(summary.get("verdict"), ("NO-GO", "INVALID"))
+            self.assertTrue(
+                any(
+                    "non-zero exit code" in reason or "stopped unexpectedly" in reason
+                    for reason in summary.get("failure_reasons", [])
+                )
+            )
+
+    def test_analyzer_rejects_run_spec_missing_schema_fields(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "run_bad_spec"
+            raw = create_raw_fixture(root)
+            spec = json.loads((raw / "run_spec.json").read_text(encoding="utf-8"))
+            del spec["artifact_ref"]
+            del spec["duration_seconds"]
+            write_json(raw / "run_spec.json", spec)
+            (raw / "checksums.sha256").unlink()
+            seal_raw_directory(raw)
+            summary = evaluate_policy(root, POLICY_PATH)
+            self.assertEqual(summary.get("verdict"), "INVALID")
+            self.assertTrue(
+                any(
+                    "RunSpec is missing required field" in reason
+                    for reason in summary.get("invalid_reasons", [])
+                )
+            )
+
+    def test_find_matching_baseline_rejects_manifest_sha_mismatch(self):
+        from run_protocol_v1 import find_matching_baseline
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            eval_dir = Path(temp_dir)
+            baseline_dir = eval_dir / "baselines" / "tdl" / "run_base"
+            raw = create_raw_fixture(baseline_dir, engine="tdl")
+            summary_dir = baseline_dir / "analysis" / "baseline-v1"
+            summary_dir.mkdir(parents=True)
+            write_json(summary_dir / "summary.json", {"verdict": "GO"})
+            spec = json.loads((raw / "run_spec.json").read_text(encoding="utf-8"))
+            matched = find_matching_baseline(eval_dir, spec, False, "baseline-v1")
+            self.assertIsNotNone(matched)
+
+            spec_mismatched = dict(spec)
+            spec_mismatched["manifest_sha256"] = "0" * 64
+            not_matched = find_matching_baseline(
+                eval_dir, spec_mismatched, False, "baseline-v1"
+            )
+            self.assertIsNone(not_matched)
+
+    def test_effective_daemon_config_mismatch_rejected(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "run_config_mismatch"
+            raw = create_raw_fixture(root)
+            env = json.loads((raw / "environment.json").read_text(encoding="utf-8"))
+            env["effective_daemon_config"] = {
+                "file_concurrency": 99,
+                "dc_pool_size": 32,
+            }
+            write_json(raw / "environment.json", env)
+            (raw / "checksums.sha256").unlink()
+            seal_raw_directory(raw)
+            summary = evaluate_policy(root, POLICY_PATH)
+            self.assertEqual(summary.get("verdict"), "INVALID")
+            self.assertTrue(
+                any(
+                    "effective file concurrency" in reason
+                    for reason in summary.get("invalid_reasons", [])
+                )
+            )
 
 
 

@@ -198,6 +198,7 @@ def find_matching_baseline(eval_dir, spec, include_artifact, policy_version):
         return None
     identity_fields = [
         "profile_id",
+        "manifest_sha256",
         "net_concurrency",
         "file_concurrency",
         "dc_pool_size",
@@ -233,6 +234,8 @@ def find_matching_baseline(eval_dir, spec, include_artifact, policy_version):
                     f"{compute_sha256(raw_manifest)[:16]}"
                 )
         if existing_cohort_id != spec.get("baseline_cohort_id"):
+            continue
+        if existing.get("manifest_sha256") != spec.get("manifest_sha256"):
             continue
         if all(existing.get(field) == spec.get(field) for field in identity_fields):
             return {
