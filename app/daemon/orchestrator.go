@@ -269,6 +269,16 @@ func (o *Orchestrator) SubmitRecord(record DownloadRecord) error {
 		Retry:        record.Attempts > 0,
 	}
 	_, _, err := o.registry.Submit(req)
+	if err == nil {
+		EmitLifecycle(o.logger, LifecycleEvent{
+			Event:     EventItemIngested,
+			TaskID:    taskID,
+			ChatID:    record.ChatID,
+			MessageID: record.MessageID,
+			Path:      record.SavePath,
+			Size:      record.FileSize,
+		})
+	}
 	return err
 }
 
@@ -380,12 +390,15 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 			zap.String("task_id", taskID),
 			zap.Error(err),
 		)
-		errStr := strings.ToLower(err.Error())
-		isUnavailable := strings.Contains(errStr, "deleted") || strings.Contains(errStr, "unavailable") || strings.Contains(errStr, "message_id_invalid")
+		isUnavailable := IsUnavailable(err)
+		errClass := ErrorClass(err)
+		if isUnavailable {
+			errClass = "unavailable"
+		}
 		disp := FailureDisposition{
 			Stage:       "resolve",
 			Op:          "get_message",
-			Class:       "unavailable",
+			Class:       errClass,
 			Unavailable: isUnavailable,
 			Retryable:   !isUnavailable,
 			RetryOwner:  "none",
@@ -396,6 +409,20 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 		if o.db != nil {
 			_ = o.db.FailDownloadDisposition(chatID, msgID, gen, req.FileName, req.FinalPath, req.MediaType, req.ExpectedSize, disp)
 		}
+		EmitLifecycle(o.logger, LifecycleEvent{
+			Event:      EventItemTerminal,
+			TaskID:     taskID,
+			AttemptID:  gen,
+			ChatID:     chatID,
+			MessageID:  msgID,
+			Stage:      disp.Stage,
+			Op:         disp.Op,
+			ErrorClass: disp.Class,
+			Error:      disp.Error(),
+			Retryable:  disp.Retryable,
+			RetryOwner: disp.RetryOwner,
+			Status:     "failed",
+		})
 		return
 	}
 
@@ -413,11 +440,36 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 		if o.db != nil {
 			_ = o.db.FailDownloadDisposition(chatID, msgID, gen, req.FileName, req.FinalPath, req.MediaType, 0, disp)
 		}
+		EmitLifecycle(o.logger, LifecycleEvent{
+			Event:      EventItemTerminal,
+			TaskID:     taskID,
+			AttemptID:  gen,
+			ChatID:     chatID,
+			MessageID:  msgID,
+			Stage:      disp.Stage,
+			Op:         disp.Op,
+			ErrorClass: disp.Class,
+			Error:      disp.Error(),
+			Retryable:  disp.Retryable,
+			RetryOwner: disp.RetryOwner,
+			Status:     "unavailable",
+		})
 		return
 	}
 
 	task.SetResolved(resolvedMedia.Name, resolvedMedia.Size, resolvedMedia.DCID)
 	authoritativeSize := resolvedMedia.Size
+
+	EmitLifecycle(o.logger, LifecycleEvent{
+		Event:     EventItemResolved,
+		TaskID:    taskID,
+		AttemptID: gen,
+		ChatID:    chatID,
+		MessageID: msgID,
+		DC:        resolvedMedia.DCID,
+		Size:      resolvedMedia.Size,
+		Path:      resolvedMedia.Name,
+	})
 
 	// 2. Canonical Path Planning
 	targetTitle := req.TargetTitle
@@ -543,6 +595,15 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 		}
 	}
 	task.SetDownloading()
+	EmitLifecycle(o.logger, LifecycleEvent{
+		Event:     EventItemAdmitted,
+		TaskID:    taskID,
+		AttemptID: gen,
+		ChatID:    chatID,
+		MessageID: msgID,
+		Path:      finalRelPath,
+		Size:      authoritativeSize,
+	})
 
 	// 6. Ensure parent directory exists (ONLY after durable DB acceptance)
 	if err := os.MkdirAll(filepath.Dir(finalAbsPath), 0o755); err != nil {
@@ -609,6 +670,25 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 		resolvedMedia.DCID,
 		pool.CDN,
 	)
+
+	EmitLifecycle(o.logger, LifecycleEvent{
+		Event:     EventDownloadStarted,
+		TaskID:    taskID,
+		AttemptID: gen,
+		ChatID:    chatID,
+		MessageID: msgID,
+		DC:        resolvedMedia.DCID,
+		Path:      finalRelPath,
+		Size:      authoritativeSize,
+	})
+
+	taskCtx = transfer.ContextWithTransferTask(taskCtx, transfer.TransferTaskContext{
+		TaskID:    taskID,
+		AttemptID: gen,
+		ChatID:    chatID,
+		MessageID: msgID,
+		DCID:      resolvedMedia.DCID,
+	})
 
 	dlResult, dlErr := o.transferMgr.DownloadFileWithResult(
 		taskCtx,
@@ -773,6 +853,16 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 			task.FailDisposition(disp)
 			return
 		}
+		EmitLifecycle(o.logger, LifecycleEvent{
+			Event:     EventSSDCommitPrepared,
+			TaskID:    taskID,
+			AttemptID: gen,
+			ChatID:    chatID,
+			MessageID: msgID,
+			Path:      finalRelPath,
+			Size:      stat.Size(),
+			SHA256:    shaHex,
+		})
 	}
 
 	// 11. Preserve timestamp if present
@@ -803,6 +893,15 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 		return
 	}
 	committed = true
+	EmitLifecycle(o.logger, LifecycleEvent{
+		Event:     EventSSDCommitted,
+		TaskID:    taskID,
+		AttemptID: gen,
+		ChatID:    chatID,
+		MessageID: msgID,
+		Path:      finalRelPath,
+		Size:      stat.Size(),
+	})
 
 	// 13. Complete download and queue archive in single DB transaction
 	queueArchive := o.archiveWorker != nil && o.archiveWorker.IsEnabled()
@@ -822,6 +921,18 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 			task.FailDisposition(disp)
 			return
 		}
+		if queueArchive {
+			EmitLifecycle(o.logger, LifecycleEvent{
+				Event:     EventArchiveQueued,
+				TaskID:    taskID,
+				AttemptID: gen,
+				ChatID:    chatID,
+				MessageID: msgID,
+				Path:      finalRelPath,
+				Size:      stat.Size(),
+				SHA256:    shaHex,
+			})
+		}
 	}
 
 	// 14. Wake archive worker
@@ -834,6 +945,17 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 		Path:         finalRelPath,
 		SHA256:       shaHex,
 		absolutePath: finalAbsPath,
+	})
+	EmitLifecycle(o.logger, LifecycleEvent{
+		Event:     EventItemTerminal,
+		TaskID:    taskID,
+		AttemptID: gen,
+		ChatID:    chatID,
+		MessageID: msgID,
+		Path:      finalRelPath,
+		Size:      stat.Size(),
+		SHA256:    shaHex,
+		Status:    "success",
 	})
 
 	o.logger.Info("download completed successfully",

@@ -54,8 +54,12 @@ type TaskSnapshot struct {
 	DCID              int       `json:"dc_id,omitempty"`
 	AlreadyExists     bool      `json:"already_exists,omitempty"`
 	SHA256            string    `json:"sha256,omitempty"`
+	ErrorStage        string    `json:"error_stage,omitempty"`
+	ErrorOp           string    `json:"error_op,omitempty"`
 	ErrorClass        string    `json:"error_class,omitempty"`
 	Error             string    `json:"error,omitempty"`
+	Retryable         bool      `json:"retryable,omitempty"`
+	RetryOwner        string    `json:"retry_owner,omitempty"`
 	AttemptGeneration string    `json:"attempt_generation,omitempty"`
 	AttemptCount      int       `json:"attempt_count,omitempty"`
 	CreatedAt         int64     `json:"created_at"`
@@ -110,8 +114,12 @@ type taskState struct {
 	dcID               int
 	alreadyExists      bool
 	sha256             string
+	errorStage         string
+	errorOp            string
 	errorClass         string
 	errorText          string
+	retryable          bool
+	retryOwner         string
 	createdAt          time.Time
 	startedAt          time.Time
 	finishedAt         time.Time
@@ -441,7 +449,7 @@ func (t *Task) Succeed(finalPath string, alreadyExists bool) {
 }
 
 func (t *Task) SucceedResult(result PublishResult) {
-	t.registry.finishWithGen(t.state, t.attemptGen, StateSuccess, "", "", result.Path, result.AlreadyExists, result.SHA256)
+	t.registry.finishWithGen(t.state, t.attemptGen, StateSuccess, "", "", "", "", false, "", result.Path, result.AlreadyExists, result.SHA256)
 }
 
 // FailureDisposition captures structured failure semantics across the orchestrator, registry, and db.
@@ -457,13 +465,22 @@ type FailureDisposition struct {
 }
 
 func (d FailureDisposition) Error() string {
-	if d.Message != "" {
-		return d.Message
+	msg := d.Message
+	if msg == "" && d.Cause != nil {
+		msg = d.Cause.Error()
 	}
-	if d.Cause != nil {
-		return d.Cause.Error()
+	if d.Stage != "" || d.Op != "" {
+		owner := d.RetryOwner
+		if owner == "" {
+			owner = "none"
+		}
+		class := d.Class
+		if class == "" {
+			class = "error"
+		}
+		return fmt.Sprintf("[%s:%s:%s] %s (owner=%s, retryable=%t)", d.Stage, d.Op, class, msg, owner, d.Retryable)
 	}
-	return fmt.Sprintf("[%s:%s] %s", d.Stage, d.Op, d.Class)
+	return msg
 }
 
 func (t *Task) FailDisposition(disp FailureDisposition) {
@@ -471,7 +488,7 @@ func (t *Task) FailDisposition(disp FailureDisposition) {
 	if disp.Unavailable {
 		state = StateUnavailable
 	}
-	t.registry.finishWithGen(t.state, t.attemptGen, state, disp.Class, disp.Error(), "", false, "")
+	t.registry.finishWithGen(t.state, t.attemptGen, state, disp.Stage, disp.Op, disp.Class, disp.Error(), disp.Retryable, disp.RetryOwner, "", false, "")
 }
 
 func (t *Task) Fail(class, message string, unavailable bool) {
@@ -572,7 +589,7 @@ func (t *Task) update(update func(*taskState)) {
 	}
 }
 
-func (r *Registry) finishWithGen(state *taskState, gen string, status TaskState, class, message, finalPath string, already bool, sha256 string) bool {
+func (r *Registry) finishWithGen(state *taskState, gen string, status TaskState, stage, op, class, message string, retryable bool, retryOwner string, finalPath string, already bool, sha256 string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if gen != "" && state.attemptGen != gen {
@@ -582,8 +599,12 @@ func (r *Registry) finishWithGen(state *taskState, gen string, status TaskState,
 		return false
 	}
 	state.state = status
+	state.errorStage = stage
+	state.errorOp = op
 	state.errorClass = class
 	state.errorText = message
+	state.retryable = retryable
+	state.retryOwner = retryOwner
 	state.alreadyExists = already
 	state.sha256 = sha256
 	state.finishedAt = r.now()
@@ -807,7 +828,9 @@ func (r *Registry) snapshotTaskLocked(state *taskState, now time.Time) TaskSnaps
 		Progress:     progress,
 		Rolling5sBPS: int64(state.smoothedSpeed),
 		DCID:         state.dcID, AlreadyExists: state.alreadyExists, SHA256: state.sha256,
+		ErrorStage: state.errorStage, ErrorOp: state.errorOp,
 		ErrorClass: state.errorClass, Error: state.errorText,
+		Retryable: state.retryable, RetryOwner: state.retryOwner,
 		AttemptGeneration: attemptGen, AttemptCount: attemptCount,
 		CreatedAt: state.createdAt.Unix(), StartedAt: unixOrZero(state.startedAt),
 		FinishedAt: unixOrZero(state.finishedAt),

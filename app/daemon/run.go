@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gotd/td/telegram"
+	"github.com/gotd/td/telegram/downloader"
 	"github.com/gotd/td/telegram/peers"
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
@@ -140,10 +141,27 @@ func Run(ctx context.Context, client *telegram.Client, kvd storage.Storage, opts
 
 	// 1. Capacity & Admission Owners
 	ssdAdmission := fscommit.NewSSDAdmission(opts.OutputDir, opts.MinFreeSpace)
+	logger := logctx.From(ctx)
 	transferMgr := transfer.NewTransferManager(transfer.Options{
 		FileConcurrency: opts.FileConcurrency,
 		MaxFileThreads:  opts.Threads,
 		MaxDataInFlight: int64(opts.PoolSize),
+		TaskRetryHandler: func(taskCtx context.Context, event downloader.RetryEvent) {
+			tc, _ := transfer.TransferTaskFromContext(taskCtx)
+			EmitLifecycle(logger, LifecycleEvent{
+				Event:     EventRPCRetry,
+				TaskID:    tc.TaskID,
+				AttemptID: tc.AttemptID,
+				ChatID:    tc.ChatID,
+				MessageID: tc.MessageID,
+				DC:        tc.DCID,
+				Error:     fmt.Sprintf("%v", event.Err),
+				Extra: map[string]any{
+					"operation": event.Operation,
+					"attempt":   event.Attempt,
+				},
+			})
+		},
 	})
 
 	var db *Database

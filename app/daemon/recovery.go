@@ -2,6 +2,8 @@ package daemon
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 
@@ -12,12 +14,14 @@ import (
 
 // ReconcileOnStartup executes the Section 10 crash recovery matrix before new admissions begin.
 func ReconcileOnStartup(ctx context.Context, db *Database, ssdDir, archiveDir string, logger *zap.Logger) error {
+	var errs []error
 	archiveEnabled := archiveDir != ""
 
 	// 1. Reconcile 'committing' download_records: only promote if matching proof exists
 	committingRecs, err := db.GetPendingCommittingDownloads()
 	if err != nil {
 		logger.Error("failed to get pending committing downloads during recovery", zap.Error(err))
+		errs = append(errs, fmt.Errorf("get pending committing: %w", err))
 	} else {
 		for _, rec := range committingRecs {
 			finalAbsPath := filepath.Join(ssdDir, filepath.FromSlash(rec.SavePath))
@@ -30,6 +34,7 @@ func ReconcileOnStartup(ctx context.Context, db *Database, ssdDir, archiveDir st
 					_ = os.Remove(partAbsPath)
 					if completeErr := db.CompleteDownloadAndQueueArchive(rec.ChatID, rec.MessageID, rec.AttemptGeneration, rec.SavePath, rec.FileSize, sha, archiveEnabled); completeErr != nil {
 						logger.Error("failed to complete recovered committing download", zap.String("chat_id", rec.ChatID), zap.Int("message_id", rec.MessageID), zap.Error(completeErr))
+						errs = append(errs, fmt.Errorf("complete recovered committing (%s:%d): %w", rec.ChatID, rec.MessageID, completeErr))
 					} else {
 						logger.Info("recovered committing record to success from final file",
 							zap.String("chat_id", rec.ChatID),
@@ -47,6 +52,7 @@ func ReconcileOnStartup(ctx context.Context, db *Database, ssdDir, archiveDir st
 					if commitErr := fscommit.CommitSiblingPart(partAbsPath, finalAbsPath); commitErr == nil {
 						if completeErr := db.CompleteDownloadAndQueueArchive(rec.ChatID, rec.MessageID, rec.AttemptGeneration, rec.SavePath, rec.FileSize, sha, archiveEnabled); completeErr != nil {
 							logger.Error("failed to complete atomic part commit during recovery", zap.String("chat_id", rec.ChatID), zap.Int("message_id", rec.MessageID), zap.Error(completeErr))
+							errs = append(errs, fmt.Errorf("complete atomic part commit (%s:%d): %w", rec.ChatID, rec.MessageID, completeErr))
 						} else {
 							logger.Info("recovered committing record to success via atomic part commit",
 								zap.String("chat_id", rec.ChatID),
@@ -62,6 +68,7 @@ func ReconcileOnStartup(ctx context.Context, db *Database, ssdDir, archiveDir st
 			_ = os.Remove(partAbsPath)
 			if updateErr := db.UpdateDownloadStatus(rec.ChatID, rec.MessageID, "pending", rec.FileName, rec.SavePath, rec.MediaType, rec.FileSize, ""); updateErr != nil {
 				logger.Error("failed to reset incomplete committing record to pending", zap.String("chat_id", rec.ChatID), zap.Int("message_id", rec.MessageID), zap.Error(updateErr))
+				errs = append(errs, fmt.Errorf("reset incomplete committing (%s:%d): %w", rec.ChatID, rec.MessageID, updateErr))
 			} else {
 				logger.Warn("reset incomplete committing record to pending",
 					zap.String("chat_id", rec.ChatID),
@@ -76,6 +83,7 @@ func ReconcileOnStartup(ctx context.Context, db *Database, ssdDir, archiveDir st
 	downloadingRecs, err := db.GetStaleDownloadingRecords()
 	if err != nil {
 		logger.Error("failed to get stale downloading records during recovery", zap.Error(err))
+		errs = append(errs, fmt.Errorf("get stale downloading: %w", err))
 	} else {
 		for _, rec := range downloadingRecs {
 			finalAbsPath := filepath.Join(ssdDir, filepath.FromSlash(rec.SavePath))
@@ -85,6 +93,7 @@ func ReconcileOnStartup(ctx context.Context, db *Database, ssdDir, archiveDir st
 			_ = os.Remove(partAbsPath)
 			if updateErr := db.UpdateDownloadStatus(rec.ChatID, rec.MessageID, "pending", rec.FileName, rec.SavePath, rec.MediaType, rec.FileSize, ""); updateErr != nil {
 				logger.Error("failed to reset stale downloading record to pending", zap.String("chat_id", rec.ChatID), zap.Int("message_id", rec.MessageID), zap.Error(updateErr))
+				errs = append(errs, fmt.Errorf("reset stale downloading (%s:%d): %w", rec.ChatID, rec.MessageID, updateErr))
 			} else {
 				logger.Info("reset stale downloading record to pending",
 					zap.String("chat_id", rec.ChatID),
@@ -101,6 +110,7 @@ func ReconcileOnStartup(ctx context.Context, db *Database, ssdDir, archiveDir st
 		WHERE status IN ('resolving', 'moving')
 	`); execErr != nil {
 		logger.Error("failed to reconcile resolving/moving records", zap.Error(execErr))
+		errs = append(errs, fmt.Errorf("reconcile resolving/moving: %w", execErr))
 	}
 
 	// 4. Reconcile shutdown cancellation failures to pending
@@ -116,6 +126,7 @@ func ReconcileOnStartup(ctx context.Context, db *Database, ssdDir, archiveDir st
 		)
 	`); execErr != nil {
 		logger.Error("failed to reconcile cancellation failures", zap.Error(execErr))
+		errs = append(errs, fmt.Errorf("reconcile cancellation failures: %w", execErr))
 	}
 
 	// 5. Reconcile archive jobs if archive is enabled
@@ -129,12 +140,14 @@ func ReconcileOnStartup(ctx context.Context, db *Database, ssdDir, archiveDir st
 			  AND (chat_id, message_id) NOT IN (SELECT chat_id, message_id FROM archive_jobs)
 		`); execErr != nil {
 			logger.Error("failed to backlog fill archive jobs", zap.Error(execErr))
+			errs = append(errs, fmt.Errorf("backlog fill archive jobs: %w", execErr))
 		}
 
 		// Reconcile 'copying' / 'moving' archive jobs interrupted during transfer
 		copyingJobs, err := db.GetStaleCopyingArchiveJobs()
 		if err != nil {
 			logger.Error("failed to get stale copying archive jobs during recovery", zap.Error(err))
+			errs = append(errs, fmt.Errorf("get stale copying archive jobs: %w", err))
 		} else {
 			for _, job := range copyingJobs {
 				dstFinal := filepath.Join(archiveDir, filepath.FromSlash(job.RelativePath))
@@ -148,6 +161,7 @@ func ReconcileOnStartup(ctx context.Context, db *Database, ssdDir, archiveDir st
 						_ = os.Remove(dstMoving)
 						if completeErr := db.RecoverArchiveJobComplete(job.ChatID, job.MessageID, job.ClaimID, job.SHA256); completeErr != nil {
 							logger.Error("failed to complete recovered copying archive job", zap.String("chat_id", job.ChatID), zap.Int("message_id", job.MessageID), zap.Error(completeErr))
+							errs = append(errs, fmt.Errorf("complete recovered copying archive (%s:%d): %w", job.ChatID, job.MessageID, completeErr))
 						} else {
 							_ = os.Remove(srcPath) // Clean up SSD duplicate
 							logger.Info("recovered copying archive job to archived",
@@ -163,6 +177,7 @@ func ReconcileOnStartup(ctx context.Context, db *Database, ssdDir, archiveDir st
 				_ = os.Remove(dstMoving)
 				if execErr := db.RecoverStaleArchiveJob(job.ChatID, job.MessageID, job.ClaimID); execErr != nil {
 					logger.Error("failed to reset incomplete copying archive job to pending", zap.String("chat_id", job.ChatID), zap.Int("message_id", job.MessageID), zap.Error(execErr))
+					errs = append(errs, fmt.Errorf("reset incomplete copying archive (%s:%d): %w", job.ChatID, job.MessageID, execErr))
 				} else {
 					logger.Info("reset incomplete copying archive job to pending",
 						zap.String("chat_id", job.ChatID),
@@ -173,5 +188,8 @@ func ReconcileOnStartup(ctx context.Context, db *Database, ssdDir, archiveDir st
 		}
 	}
 
+	if len(errs) > 0 {
+		return errors.Join(errs...)
+	}
 	return nil
 }

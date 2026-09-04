@@ -785,8 +785,8 @@ def classify_results(cases, engine_name, paths, task_submits, engine_tasks, time
         ):
             terminal_state = "FAILED"
             error_code = snapshot.get("error_class") or "ENGINE_FAILED"
-            error_stage = "engine"
-            error_op = "download"
+            error_stage = snapshot.get("error_stage") or "engine"
+            error_op = snapshot.get("error_op") or "download"
             error_cause = snapshot.get("error") or "task failed in engine"
         elif timed_out:
             terminal_state = "TIMED_OUT"
@@ -799,8 +799,8 @@ def classify_results(cases, engine_name, paths, task_submits, engine_tasks, time
             error_code = snapshot.get("error_class") or (
                 "FILE_MISSING" if not target.is_file() else "VERIFICATION_FAILED"
             )
-            error_stage = "engine" if snapshot.get("error_class") else "oracle"
-            error_op = "download" if snapshot.get("error_class") else "verify_file"
+            error_stage = snapshot.get("error_stage") or ("engine" if snapshot.get("error_class") else "oracle")
+            error_op = snapshot.get("error_op") or ("download" if snapshot.get("error_class") else "verify_file")
             error_cause = snapshot.get("error") or (
                 f"expected size/SHA {expected_size}/{expected_sha[:12]}, "
                 f"actual {actual_size}/{actual_sha[:12]}"
@@ -819,7 +819,8 @@ def classify_results(cases, engine_name, paths, task_submits, engine_tasks, time
                     "op": error_op,
                     "error_code": error_code,
                     "error_cause": error_cause,
-                    "retryable": False,
+                    "retryable": bool(snapshot.get("retryable", False)),
+                    "retry_owner": snapshot.get("retry_owner", "none"),
                 }
             )
         task_results.append(

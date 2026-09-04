@@ -135,6 +135,29 @@ func (w *ArchiveWorker) runLoop(ctx context.Context) {
 	}
 }
 
+// ProcessNext claims and processes a single due archive job.
+// Returns true if a job was found and processed, false otherwise.
+func (w *ArchiveWorker) ProcessNext(ctx context.Context) bool {
+	if !w.IsEnabled() {
+		return false
+	}
+	jobs, err := w.db.GetDueArchiveJobs(1)
+	if err != nil || len(jobs) == 0 {
+		return false
+	}
+
+	job := jobs[0]
+	claimID := fmt.Sprintf("%d-%d", time.Now().UnixNano(), os.Getpid())
+	claimed, err := w.db.ClaimArchiveJob(job.ChatID, job.MessageID, claimID)
+	if err != nil || !claimed {
+		return false
+	}
+	job.ClaimID = claimID
+
+	w.processJob(ctx, job)
+	return true
+}
+
 func (w *ArchiveWorker) processJob(ctx context.Context, job ArchiveJob) {
 	// 0. Strict validation of invariant: job must have valid non-empty SHA256 proof
 	if strings.TrimSpace(job.SHA256) == "" {
@@ -184,6 +207,17 @@ func (w *ArchiveWorker) processJob(ctx context.Context, job ArchiveJob) {
 		zap.String("rel_path", job.RelativePath),
 		zap.Int64("size", job.ExpectedSize),
 	)
+
+	EmitLifecycle(w.logger, LifecycleEvent{
+		Event:     EventArchiveStarted,
+		TaskID:    fmt.Sprintf("%s:%d", job.ChatID, job.MessageID),
+		AttemptID: job.ClaimID,
+		ChatID:    job.ChatID,
+		MessageID: job.MessageID,
+		Path:      job.RelativePath,
+		Size:      job.ExpectedSize,
+		SHA256:    job.SHA256,
+	})
 
 	// 1. Check if archive target already exists
 	if dstInfo, err := os.Stat(dstPath); err == nil {
@@ -311,12 +345,30 @@ func (w *ArchiveWorker) processJob(ctx context.Context, job ArchiveJob) {
 		w.logger.Error("failed to mark archive complete in DB", zap.Error(err))
 		return
 	}
+	EmitLifecycle(w.logger, LifecycleEvent{
+		Event:     EventArchiveCommitted,
+		TaskID:    fmt.Sprintf("%s:%d", job.ChatID, job.MessageID),
+		AttemptID: job.ClaimID,
+		ChatID:    job.ChatID,
+		MessageID: job.MessageID,
+		Path:      job.RelativePath,
+		Size:      job.ExpectedSize,
+		SHA256:    job.SHA256,
+	})
 
 	// 8. Delete SSD source only after archive final is durable and DB committed
 	if err := os.Remove(srcPath); err != nil {
 		w.logger.Warn("failed to delete SSD source file after archive success", zap.Error(err))
 	} else {
 		_ = fscommit.FsyncDir(filepath.Dir(srcPath))
+		EmitLifecycle(w.logger, LifecycleEvent{
+			Event:     EventArchiveSourceRemoved,
+			TaskID:    fmt.Sprintf("%s:%d", job.ChatID, job.MessageID),
+			AttemptID: job.ClaimID,
+			ChatID:    job.ChatID,
+			MessageID: job.MessageID,
+			Path:      job.RelativePath,
+		})
 	}
 
 	w.logger.Info("archive completed successfully",

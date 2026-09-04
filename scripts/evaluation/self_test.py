@@ -683,6 +683,43 @@ class EvaluationSelfTest(unittest.TestCase):
             self.assertEqual(errors[0]["error_code"], "io")
             self.assertEqual(errors[0]["stage"], "engine")
 
+    def test_classify_results_preserves_typed_error_attribution(self):
+        cases = [
+            {
+                "case_id": "P-S-0002",
+                "chat_id": 1,
+                "message_id": 2,
+                "expected_size": 200,
+                "baseline_sha256": "b" * 64,
+                "expected_tgx_path": "x/y/z.bin",
+                "expected_tdl_path": "x/y/z.bin",
+            }
+        ]
+        task_submits = {"P-S-0002": {"task_id": "t2", "submitted": True, "error": None}}
+        engine_tasks = {
+            "t2": {
+                "state": "failed",
+                "error": "write error",
+                "error_class": "io",
+                "error_stage": "transfer",
+                "error_op": "write_chunk",
+                "retryable": False,
+                "retry_owner": "none",
+            }
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            class DummyPaths:
+                output = Path(temp_dir)
+
+            task_results, hashes, errors = classify_results(
+                cases, "tgx", DummyPaths(), task_submits, engine_tasks, timed_out=False
+            )
+            self.assertEqual(len(errors), 1)
+            self.assertEqual(errors[0]["stage"], "transfer")
+            self.assertEqual(errors[0]["op"], "write_chunk")
+            self.assertEqual(errors[0]["retryable"], False)
+            self.assertEqual(errors[0]["retry_owner"], "none")
+
     def test_analyzer_rejects_nonzero_exit_or_stopped_container(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir) / "run_fail"

@@ -42,6 +42,28 @@ func (e *TransferError) Unwrap() error {
 	return e.Cause
 }
 
+type taskCtxKey struct{}
+
+// TransferTaskContext preserves task, attempt generation, and DC correlation for transfer-level retries.
+type TransferTaskContext struct {
+	TaskID    string
+	AttemptID string
+	ChatID    string
+	MessageID int
+	DCID      int
+}
+
+// ContextWithTransferTask wraps ctx with TransferTaskContext.
+func ContextWithTransferTask(ctx context.Context, tc TransferTaskContext) context.Context {
+	return context.WithValue(ctx, taskCtxKey{}, tc)
+}
+
+// TransferTaskFromContext extracts TransferTaskContext from ctx.
+func TransferTaskFromContext(ctx context.Context) (TransferTaskContext, bool) {
+	tc, ok := ctx.Value(taskCtxKey{}).(TransferTaskContext)
+	return tc, ok
+}
+
 // TransferManager manages gotd parallel transport and global RPC rate limits.
 type TransferManager struct {
 	fileCapacity    int64
@@ -51,14 +73,16 @@ type TransferManager struct {
 	gate            *DataGate
 	physicalRetries int64
 	userRetry       downloader.RetryHandler
+	taskRetry       func(context.Context, downloader.RetryEvent)
 }
 
 // Options configures the TransferManager.
 type Options struct {
-	FileConcurrency int
-	MaxFileThreads  int
-	MaxDataInFlight int64
-	RetryHandler    downloader.RetryHandler
+	FileConcurrency  int
+	MaxFileThreads   int
+	MaxDataInFlight  int64
+	RetryHandler     downloader.RetryHandler
+	TaskRetryHandler func(context.Context, downloader.RetryEvent)
 }
 
 // NewTransferManager creates a manager with the official gotd downloader and DataGate.
@@ -79,6 +103,7 @@ func NewTransferManager(opts Options) *TransferManager {
 		maxFileThreads: opts.MaxFileThreads,
 		gate:           gate,
 		userRetry:      opts.RetryHandler,
+		taskRetry:      opts.TaskRetryHandler,
 	}
 
 	dl := downloader.NewDownloader().
@@ -186,6 +211,9 @@ func (m *TransferManager) DownloadFileWithResult(
 			atomic.AddInt64(&fileRetries, 1)
 			if m.userRetry != nil {
 				m.userRetry(event)
+			}
+			if m.taskRetry != nil {
+				m.taskRetry(ctx, event)
 			}
 		})
 
