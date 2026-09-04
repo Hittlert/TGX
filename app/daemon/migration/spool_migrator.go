@@ -64,6 +64,7 @@ type MigrationReport struct {
 	Quarantined       int          `json:"quarantined"`
 	AlreadyMigrated   int          `json:"already_migrated"`
 	DroppedTables     []string     `json:"dropped_tables,omitempty"`
+	PlannedCleanFiles []string     `json:"planned_clean_files,omitempty"`
 	CleanedFiles      []string     `json:"cleaned_files,omitempty"`
 	Items             []ItemReport `json:"items"`
 }
@@ -75,9 +76,11 @@ func Run(ctx context.Context, opts MigrationOptions) (*MigrationReport, error) {
 	}
 
 	report := &MigrationReport{
-		DBPath: opts.DBPath,
-		DryRun: opts.DryRun,
-		Items:  make([]ItemReport, 0),
+		DBPath:            opts.DBPath,
+		DryRun:            opts.DryRun,
+		PlannedCleanFiles: make([]string, 0),
+		CleanedFiles:      make([]string, 0),
+		Items:             make([]ItemReport, 0),
 	}
 
 	// 1. Check SQLite database existence
@@ -95,7 +98,10 @@ func Run(ctx context.Context, opts MigrationOptions) (*MigrationReport, error) {
 	legacyTableCandidates := []string{"target_commits", "spool_attempts", "spool_segments", "spool_cleanup"}
 	for _, tbl := range legacyTableCandidates {
 		var exists int
-		_ = db.QueryRowContext(ctx, "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?", tbl).Scan(&exists)
+		err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?", tbl).Scan(&exists)
+		if err != nil {
+			return report, fmt.Errorf("check legacy table %s existence: %w", tbl, err)
+		}
 		if exists > 0 {
 			report.LegacyTablesFound = append(report.LegacyTablesFound, tbl)
 		}
@@ -103,7 +109,10 @@ func Run(ctx context.Context, opts MigrationOptions) (*MigrationReport, error) {
 
 	// Check if download_records exists
 	var drExists int
-	_ = db.QueryRowContext(ctx, "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='download_records'").Scan(&drExists)
+	err = db.QueryRowContext(ctx, "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='download_records'").Scan(&drExists)
+	if err != nil {
+		return report, fmt.Errorf("check download_records existence: %w", err)
+	}
 
 	// 3. Inventory target_commits if present
 	type commitEntry struct {
@@ -117,14 +126,19 @@ func Run(ctx context.Context, opts MigrationOptions) (*MigrationReport, error) {
 	var commits []commitEntry
 	if contains(report.LegacyTablesFound, "target_commits") {
 		rows, err := db.QueryContext(ctx, "SELECT chat_id, message_id, COALESCE(save_path, ''), COALESCE(file_size, 0), COALESCE(sha256, ''), COALESCE(committed_at, 0) FROM target_commits")
-		if err == nil {
-			defer rows.Close()
-			for rows.Next() {
-				var c commitEntry
-				if err := rows.Scan(&c.chatID, &c.messageID, &c.savePath, &c.fileSize, &c.sha256Hex, &c.committedAt); err == nil {
-					commits = append(commits, c)
-				}
+		if err != nil {
+			return report, fmt.Errorf("query target_commits: %w", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var c commitEntry
+			if err := rows.Scan(&c.chatID, &c.messageID, &c.savePath, &c.fileSize, &c.sha256Hex, &c.committedAt); err != nil {
+				return report, fmt.Errorf("scan target_commits row: %w", err)
 			}
+			commits = append(commits, c)
+		}
+		if err := rows.Err(); err != nil {
+			return report, fmt.Errorf("iterate target_commits: %w", err)
 		}
 	}
 
@@ -138,14 +152,19 @@ func Run(ctx context.Context, opts MigrationOptions) (*MigrationReport, error) {
 	var attempts []attemptEntry
 	if contains(report.LegacyTablesFound, "spool_attempts") {
 		rows, err := db.QueryContext(ctx, "SELECT chat_id, message_id, COALESCE(state, ''), COALESCE(updated_at, 0) FROM spool_attempts")
-		if err == nil {
-			defer rows.Close()
-			for rows.Next() {
-				var a attemptEntry
-				if err := rows.Scan(&a.chatID, &a.messageID, &a.state, &a.updatedAt); err == nil {
-					attempts = append(attempts, a)
-				}
+		if err != nil {
+			return report, fmt.Errorf("query spool_attempts: %w", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var a attemptEntry
+			if err := rows.Scan(&a.chatID, &a.messageID, &a.state, &a.updatedAt); err != nil {
+				return report, fmt.Errorf("scan spool_attempts row: %w", err)
 			}
+			attempts = append(attempts, a)
+		}
+		if err := rows.Err(); err != nil {
+			return report, fmt.Errorf("iterate spool_attempts: %w", err)
 		}
 	}
 
@@ -164,14 +183,19 @@ func Run(ctx context.Context, opts MigrationOptions) (*MigrationReport, error) {
 	var legacyDR []legacyRecordEntry
 	if drExists > 0 {
 		rows, err := db.QueryContext(ctx, "SELECT chat_id, message_id, status, COALESCE(file_name, ''), COALESCE(save_path, ''), COALESCE(file_size, 0), COALESCE(sha256, ''), created_at, updated_at FROM download_records WHERE status IN ('moving', 'segmenting', 'spooling', 'transferring')")
-		if err == nil {
-			defer rows.Close()
-			for rows.Next() {
-				var r legacyRecordEntry
-				if err := rows.Scan(&r.chatID, &r.messageID, &r.status, &r.fileName, &r.savePath, &r.fileSize, &r.sha256Hex, &r.createdAt, &r.updatedAt); err == nil {
-					legacyDR = append(legacyDR, r)
-				}
+		if err != nil {
+			return report, fmt.Errorf("query legacy download_records: %w", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var r legacyRecordEntry
+			if err := rows.Scan(&r.chatID, &r.messageID, &r.status, &r.fileName, &r.savePath, &r.fileSize, &r.sha256Hex, &r.createdAt, &r.updatedAt); err != nil {
+				return report, fmt.Errorf("scan legacy download_records row: %w", err)
 			}
+			legacyDR = append(legacyDR, r)
+		}
+		if err := rows.Err(); err != nil {
+			return report, fmt.Errorf("iterate legacy download_records: %w", err)
 		}
 	}
 
@@ -262,14 +286,21 @@ func Run(ctx context.Context, opts MigrationOptions) (*MigrationReport, error) {
 
 	// 9. Inspect BufferDir for orphaned spool/segment artifacts
 	if opts.BufferDir != "" {
-		if fi, err := os.Stat(opts.BufferDir); err == nil && fi.IsDir() {
-			_ = filepath.Walk(opts.BufferDir, func(p string, info os.FileInfo, err error) error {
-				if err != nil || info.IsDir() {
+		if fi, err := os.Stat(opts.BufferDir); err != nil {
+			if !os.IsNotExist(err) {
+				return report, fmt.Errorf("stat buffer directory: %w", err)
+			}
+		} else if fi.IsDir() {
+			err := filepath.Walk(opts.BufferDir, func(p string, info os.FileInfo, err error) error {
+				if err != nil {
+					return fmt.Errorf("walk buffer path %s: %w", p, err)
+				}
+				if info.IsDir() {
 					return nil
 				}
 				name := info.Name()
 				if strings.HasSuffix(name, ".spool") || strings.HasSuffix(name, ".part") || strings.Contains(name, "segment") {
-					report.CleanedFiles = append(report.CleanedFiles, p)
+					report.PlannedCleanFiles = append(report.PlannedCleanFiles, p)
 					report.Items = append(report.Items, ItemReport{
 						SourceTable: "buffer_filesystem",
 						SavePath:    p,
@@ -280,6 +311,9 @@ func Run(ctx context.Context, opts MigrationOptions) (*MigrationReport, error) {
 				}
 				return nil
 			})
+			if err != nil {
+				return report, fmt.Errorf("inspect buffer directory: %w", err)
+			}
 		}
 	}
 
@@ -377,7 +411,15 @@ func Run(ctx context.Context, opts MigrationOptions) (*MigrationReport, error) {
 		}
 	}
 
-	// 12. Drop legacy tables if requested
+	// 12. Clean orphaned buffer files on disk BEFORE dropping legacy tables and committing
+	for _, p := range report.PlannedCleanFiles {
+		if err := os.Remove(p); err != nil {
+			return report, fmt.Errorf("clean buffer file %s: %w", p, err)
+		}
+		report.CleanedFiles = append(report.CleanedFiles, p)
+	}
+
+	// 13. Drop legacy tables if requested
 	if opts.DropLegacyTables && len(report.LegacyTablesFound) > 0 {
 		for _, tbl := range report.LegacyTablesFound {
 			_, err = tx.ExecContext(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s", tbl))
@@ -390,11 +432,6 @@ func Run(ctx context.Context, opts MigrationOptions) (*MigrationReport, error) {
 
 	if err := tx.Commit(); err != nil {
 		return report, fmt.Errorf("commit migration transaction: %w", err)
-	}
-
-	// 13. Clean orphaned buffer files on disk
-	for _, p := range report.CleanedFiles {
-		_ = os.Remove(p)
 	}
 
 	return report, nil

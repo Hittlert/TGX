@@ -113,8 +113,11 @@ func TestMigration_DryRunReportsAllDispositions(t *testing.T) {
 	if report.ResetPending != 2 {
 		t.Fatalf("expected 2 reset pending, got %d", report.ResetPending)
 	}
-	if len(report.CleanedFiles) != 1 {
-		t.Fatalf("expected 1 cleaned buffer file, got %d", len(report.CleanedFiles))
+	if len(report.PlannedCleanFiles) != 1 {
+		t.Fatalf("expected 1 planned clean file, got %d", len(report.PlannedCleanFiles))
+	}
+	if len(report.CleanedFiles) != 0 {
+		t.Fatalf("expected 0 cleaned buffer files in dry run, got %d", len(report.CleanedFiles))
 	}
 
 	// Verify DB is UNTOUCHED
@@ -379,5 +382,229 @@ func TestMigration_SourceDeletionGate(t *testing.T) {
 			}
 			return nil
 		})
+	}
+}
+
+// 7. Acceptance Test: Malformed legacy schema aborts without dropping evidence.
+func TestMigration_MalformedLegacySchemaAbortsWithoutDroppingEvidence(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "malformed.sqlite3")
+
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("failed to open sqlite: %v", err)
+	}
+	// Incompatible target_commits schema missing chat_id / message_id
+	_, err = db.Exec(`CREATE TABLE target_commits (bad_col TEXT NOT NULL);`)
+	db.Close()
+	if err != nil {
+		t.Fatalf("failed to create malformed table: %v", err)
+	}
+
+	opts := migration.MigrationOptions{
+		DBPath:           dbPath,
+		DropLegacyTables: true,
+	}
+
+	report, err := migration.Run(context.Background(), opts)
+	if err == nil {
+		t.Fatal("expected error due to malformed schema, got nil")
+	}
+	_ = report
+
+	// Verify evidence was NOT dropped: target_commits must still exist
+	verifyDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("failed to open sqlite for verification: %v", err)
+	}
+	defer verifyDB.Close()
+
+	var tblCount int
+	err = verifyDB.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='target_commits'").Scan(&tblCount)
+	if err != nil || tblCount != 1 {
+		t.Fatalf("legacy evidence was dropped! target_commits count: %d, err: %v", tblCount, err)
+	}
+}
+
+// 8. Acceptance Test: Row scan failure aborts without dropping evidence.
+func TestMigration_RowScanFailureAbortsWithoutDroppingEvidence(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "scan_fail.sqlite3")
+
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("failed to open sqlite: %v", err)
+	}
+	// Normal schema but SQLite dynamic typing allows string in integer column
+	_, err = db.Exec(`
+		CREATE TABLE spool_attempts (
+			chat_id TEXT NOT NULL,
+			message_id INTEGER NOT NULL,
+			state TEXT,
+			updated_at INTEGER,
+			PRIMARY KEY (chat_id, message_id)
+		);
+		INSERT INTO spool_attempts (chat_id, message_id, state, updated_at)
+		VALUES ('-1001', 'corrupt_non_int_message_id', 'spooling', 1700000000);
+	`)
+	db.Close()
+	if err != nil {
+		t.Fatalf("failed to setup scan fail table: %v", err)
+	}
+
+	opts := migration.MigrationOptions{
+		DBPath:           dbPath,
+		DropLegacyTables: true,
+	}
+
+	report, err := migration.Run(context.Background(), opts)
+	if err == nil {
+		t.Fatal("expected error due to row scan failure, got nil")
+	}
+	_ = report
+
+	// Verify evidence was NOT dropped: spool_attempts must still exist
+	verifyDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("failed to open sqlite for verification: %v", err)
+	}
+	defer verifyDB.Close()
+
+	var tblCount int
+	err = verifyDB.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='spool_attempts'").Scan(&tblCount)
+	if err != nil || tblCount != 1 {
+		t.Fatalf("legacy evidence was dropped! spool_attempts count: %d, err: %v", tblCount, err)
+	}
+}
+
+// 9. Acceptance Test: Traversal failure in BufferDir aborts without dropping evidence.
+func TestMigration_TraversalFailureAbortsWithoutDroppingEvidence(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "traversal_fail.sqlite3")
+	bufferDir := filepath.Join(tempDir, "buffer")
+	if err := os.MkdirAll(bufferDir, 0o755); err != nil {
+		t.Fatalf("failed to create buffer dir: %v", err)
+	}
+
+	unreadableDir := filepath.Join(bufferDir, "unreadable_sub")
+	if err := os.MkdirAll(unreadableDir, 0o000); err != nil {
+		t.Fatalf("failed to create unreadable dir: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chmod(unreadableDir, 0o755)
+	})
+
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("failed to open sqlite: %v", err)
+	}
+	_, err = db.Exec(`
+		CREATE TABLE target_commits (
+			chat_id TEXT NOT NULL,
+			message_id INTEGER NOT NULL,
+			save_path TEXT,
+			file_size INTEGER,
+			sha256 TEXT,
+			committed_at INTEGER,
+			PRIMARY KEY (chat_id, message_id)
+		);
+	`)
+	db.Close()
+	if err != nil {
+		t.Fatalf("failed to setup legacy table: %v", err)
+	}
+
+	opts := migration.MigrationOptions{
+		DBPath:           dbPath,
+		BufferDir:        bufferDir,
+		DropLegacyTables: true,
+	}
+
+	report, err := migration.Run(context.Background(), opts)
+	if err == nil {
+		t.Fatal("expected error due to traversal failure, got nil")
+	}
+	_ = report
+
+	// Verify evidence was NOT dropped: target_commits must still exist
+	verifyDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("failed to open sqlite for verification: %v", err)
+	}
+	defer verifyDB.Close()
+
+	var tblCount int
+	err = verifyDB.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='target_commits'").Scan(&tblCount)
+	if err != nil || tblCount != 1 {
+		t.Fatalf("legacy evidence was dropped! target_commits count: %d, err: %v", tblCount, err)
+	}
+}
+
+// 10. Acceptance Test: Removal failure of buffer file aborts transaction without dropping evidence.
+func TestMigration_RemovalFailureAbortsWithoutDroppingEvidence(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "removal_fail.sqlite3")
+	bufferDir := filepath.Join(tempDir, "buffer")
+	roSubDir := filepath.Join(bufferDir, "ro_sub")
+	if err := os.MkdirAll(roSubDir, 0o755); err != nil {
+		t.Fatalf("failed to create ro subdir: %v", err)
+	}
+
+	spoolFile := filepath.Join(roSubDir, "test.spool")
+	if err := os.WriteFile(spoolFile, []byte("unremovable spool data"), 0o644); err != nil {
+		t.Fatalf("failed to write spool file: %v", err)
+	}
+
+	// Make parent directory read-only so removing files inside it fails with permission denied
+	if err := os.Chmod(roSubDir, 0o555); err != nil {
+		t.Fatalf("failed to chmod ro subdir: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chmod(roSubDir, 0o755)
+	})
+
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("failed to open sqlite: %v", err)
+	}
+	_, err = db.Exec(`
+		CREATE TABLE target_commits (
+			chat_id TEXT NOT NULL,
+			message_id INTEGER NOT NULL,
+			save_path TEXT,
+			file_size INTEGER,
+			sha256 TEXT,
+			committed_at INTEGER,
+			PRIMARY KEY (chat_id, message_id)
+		);
+	`)
+	db.Close()
+	if err != nil {
+		t.Fatalf("failed to setup legacy table: %v", err)
+	}
+
+	opts := migration.MigrationOptions{
+		DBPath:           dbPath,
+		BufferDir:        bufferDir,
+		DropLegacyTables: true,
+	}
+
+	report, err := migration.Run(context.Background(), opts)
+	if err == nil {
+		t.Fatal("expected error due to buffer removal failure, got nil")
+	}
+	_ = report
+
+	// Verify evidence was NOT dropped: target_commits must still exist in sqlite
+	verifyDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("failed to open sqlite for verification: %v", err)
+	}
+	defer verifyDB.Close()
+
+	var tblCount int
+	err = verifyDB.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='target_commits'").Scan(&tblCount)
+	if err != nil || tblCount != 1 {
+		t.Fatalf("legacy evidence was dropped! target_commits count: %d, err: %v", tblCount, err)
 	}
 }

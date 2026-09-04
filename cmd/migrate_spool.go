@@ -53,6 +53,9 @@ func NewMigrateSpool() *cobra.Command {
 			if len(report.DroppedTables) > 0 {
 				fmt.Printf("Dropped Tables:   %v\n", report.DroppedTables)
 			}
+			if len(report.PlannedCleanFiles) > 0 {
+				fmt.Printf("Planned Buffer Clean: %d\n", len(report.PlannedCleanFiles))
+			}
 			if len(report.CleanedFiles) > 0 {
 				fmt.Printf("Cleaned Files:    %d\n", len(report.CleanedFiles))
 			}
