@@ -48,6 +48,12 @@ func (d *Database) Close() error {
 	return d.db.Close()
 }
 
+var (
+	ErrStateConflict  = errors.New("state conflict: invalid state transition")
+	ErrStaleAttempt   = errors.New("stale attempt: generation mismatch")
+	ErrAlreadySuccess = errors.New("download already completed successfully")
+)
+
 func (d *Database) initSchema() error {
 	queries := []string{
 		`CREATE TABLE IF NOT EXISTS download_records (
@@ -66,6 +72,7 @@ func (d *Database) initSchema() error {
 			processing_started_at INTEGER,
 			attempts INTEGER NOT NULL DEFAULT 0,
 			next_retry_at INTEGER NOT NULL DEFAULT 0,
+			attempt_generation TEXT NOT NULL DEFAULT '',
 			PRIMARY KEY (chat_id, message_id)
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_download_records_retry ON download_records(chat_id, status, next_retry_at, message_id)`,
@@ -132,49 +139,11 @@ func (d *Database) initSchema() error {
 			created_at INTEGER NOT NULL,
 			updated_at INTEGER NOT NULL
 		)`,
-		`CREATE TABLE IF NOT EXISTS spool_attempts (
-			task_id TEXT NOT NULL,
-			generation TEXT NOT NULL,
-			final_path TEXT NOT NULL,
-			expected_size INTEGER NOT NULL,
-			state TEXT NOT NULL,
-			created_at INTEGER NOT NULL,
-			updated_at INTEGER NOT NULL,
-			PRIMARY KEY (task_id, generation)
-		)`,
-		`CREATE TABLE IF NOT EXISTS spool_segments (
-			task_id TEXT NOT NULL,
-			generation TEXT NOT NULL,
-			segment_index INTEGER NOT NULL,
-			start_offset INTEGER NOT NULL,
-			expected_length INTEGER NOT NULL,
-			state TEXT NOT NULL,
-			dirty INTEGER NOT NULL DEFAULT 1,
-			attempts INTEGER NOT NULL DEFAULT 0,
-			next_retry_at INTEGER NOT NULL DEFAULT 0,
-			path TEXT,
-			checksum TEXT,
-			PRIMARY KEY (task_id, generation, segment_index)
-		)`,
-		`CREATE TABLE IF NOT EXISTS target_commits (
-			task_id TEXT NOT NULL,
-			generation TEXT NOT NULL,
-			final_path TEXT NOT NULL,
-			expected_size INTEGER NOT NULL,
-			expected_sha256 TEXT NOT NULL,
-			committed_sha256 TEXT NOT NULL,
-			state TEXT NOT NULL,
-			version INTEGER NOT NULL DEFAULT 1,
-			updated_at INTEGER NOT NULL,
-			PRIMARY KEY (task_id, generation)
-		)`,
-		`CREATE TABLE IF NOT EXISTS spool_cleanup (
-			path TEXT PRIMARY KEY,
-			bytes INTEGER NOT NULL,
-			reason TEXT,
-			attempts INTEGER NOT NULL DEFAULT 0,
-			next_retry_at INTEGER NOT NULL DEFAULT 0
-		)`,
+		// Issue #2: Purge obsolete spool tables permanently
+		`DROP TABLE IF EXISTS spool_attempts`,
+		`DROP TABLE IF EXISTS spool_segments`,
+		`DROP TABLE IF EXISTS target_commits`,
+		`DROP TABLE IF EXISTS spool_cleanup`,
 	}
 
 	for _, q := range queries {
@@ -185,6 +154,8 @@ func (d *Database) initSchema() error {
 
 	// Ensure sha256 column exists on download_records
 	_, _ = d.db.Exec(`ALTER TABLE download_records ADD COLUMN sha256 TEXT`)
+	// Ensure attempt_generation column exists on download_records
+	_, _ = d.db.Exec(`ALTER TABLE download_records ADD COLUMN attempt_generation TEXT NOT NULL DEFAULT ''`)
 
 	// Automatically migrate legacy @username primary keys to canonical numeric IDs
 	d.migrateLegacyUsernameIDs()
@@ -240,6 +211,14 @@ func (d *Database) Execute(query string, args ...any) (sql.Result, error) {
 	d.lock.Lock()
 	defer d.lock.Unlock()
 	return d.db.Exec(query, args...)
+}
+
+func (d *Database) GetTargetTitle(chatID string) string {
+	d.lock.RLock()
+	defer d.lock.RUnlock()
+	var title string
+	_ = d.db.QueryRow(`SELECT title FROM listen_targets WHERE chat_id = ?`, chatID).Scan(&title)
+	return title
 }
 
 func (d *Database) GetListenTargets() ([]ListenTarget, error) {
@@ -544,13 +523,13 @@ func (d *Database) GetDownloadRecord(chatID string, messageID int) (*DownloadRec
 	defer d.lock.RUnlock()
 
 	var rec DownloadRecord
-	var savePath, sha sql.NullString
+	var savePath, sha, attemptGen sql.NullString
 	err := d.db.QueryRow(`
-		SELECT chat_id, message_id, status, file_name, save_path, media_type, file_size, COALESCE(sha256, ''), attempts
+		SELECT chat_id, message_id, status, file_name, save_path, media_type, file_size, COALESCE(sha256, ''), attempts, COALESCE(attempt_generation, '')
 		FROM download_records
 		WHERE chat_id = ? AND message_id = ?
 	`, chatID, messageID).Scan(
-		&rec.ChatID, &rec.MessageID, &rec.Status, &rec.FileName, &savePath, &rec.MediaType, &rec.FileSize, &sha, &rec.Attempts,
+		&rec.ChatID, &rec.MessageID, &rec.Status, &rec.FileName, &savePath, &rec.MediaType, &rec.FileSize, &sha, &rec.Attempts, &attemptGen,
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -563,6 +542,9 @@ func (d *Database) GetDownloadRecord(chatID string, messageID int) (*DownloadRec
 	}
 	if sha.Valid {
 		rec.SHA256 = sha.String
+	}
+	if attemptGen.Valid {
+		rec.AttemptGeneration = attemptGen.String
 	}
 	return &rec, nil
 }
@@ -582,7 +564,7 @@ func (d *Database) UpdateDownloadStatus(chatID string, messageID int, status str
 	var currentAttempts int
 	_ = d.db.QueryRow(`SELECT status, attempts FROM download_records WHERE chat_id = ? AND message_id = ?`, chatID, messageID).Scan(&currentStatus, &currentAttempts)
 
-	if currentStatus == "success" && status == "success" {
+	if currentStatus == "success" {
 		return nil
 	}
 	if currentStatus == "failed" && status == "failed" {
@@ -613,18 +595,28 @@ func (d *Database) UpdateDownloadStatus(chatID string, messageID int, status str
 		}
 	}
 
+	initialAttempts := 0
+	if status == "failed" {
+		initialAttempts = 1
+	}
+
 	_, err := d.db.Exec(`
-		UPDATE download_records
-		SET status = ?, file_name = COALESCE(NULLIF(?, ''), file_name), 
-		    save_path = COALESCE(NULLIF(?, ''), save_path),
-		    media_type = COALESCE(NULLIF(?, ''), media_type),
-		    file_size = CASE WHEN ? > 0 THEN ? ELSE file_size END,
-		    error = ?,
-		    attempts = CASE WHEN ? = 'failed' THEN attempts + 1 ELSE attempts END,
-		    next_retry_at = CASE WHEN ? = 'failed' THEN ? ELSE next_retry_at END,
-		    updated_at = ?, downloaded_at = COALESCE(?, downloaded_at)
-		WHERE chat_id = ? AND message_id = ?
-	`, status, fileName, savePath, mediaType, fileSize, fileSize, errMsg, status, status, nextRetryAt, now, downloadedAt, chatID, messageID)
+		INSERT INTO download_records (
+			chat_id, message_id, status, file_name, save_path, media_type,
+			file_size, error, attempts, next_retry_at, created_at, updated_at, downloaded_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(chat_id, message_id) DO UPDATE SET
+			status = excluded.status,
+			file_name = COALESCE(NULLIF(excluded.file_name, ''), download_records.file_name),
+			save_path = COALESCE(NULLIF(excluded.save_path, ''), download_records.save_path),
+			media_type = COALESCE(NULLIF(excluded.media_type, ''), download_records.media_type),
+			file_size = CASE WHEN excluded.file_size > 0 THEN excluded.file_size ELSE download_records.file_size END,
+			error = excluded.error,
+			attempts = CASE WHEN excluded.status = 'failed' THEN download_records.attempts + 1 ELSE download_records.attempts END,
+			next_retry_at = CASE WHEN excluded.status = 'failed' THEN excluded.next_retry_at ELSE download_records.next_retry_at END,
+			updated_at = excluded.updated_at,
+			downloaded_at = COALESCE(excluded.downloaded_at, download_records.downloaded_at)
+	`, chatID, messageID, status, fileName, savePath, mediaType, fileSize, errMsg, initialAttempts, nextRetryAt, now, now, downloadedAt)
 	return err
 }
 
@@ -922,192 +914,136 @@ func (d *Database) DeleteAccount(namespace string) error {
 	return err
 }
 
-type TargetCommitRecord struct {
-	TaskID          string `json:"task_id"`
-	Generation      string `json:"generation"`
-	FinalPath       string `json:"final_path"`
-	ExpectedSize    int64  `json:"expected_size"`
-	ExpectedSHA256  string `json:"expected_sha256"`
-	CommittedSHA256 string `json:"committed_sha256"`
-	State           string `json:"state"`
-	Version         int    `json:"version"`
-	UpdatedAt       int64  `json:"updated_at"`
-}
-
-type SpoolSegmentRecord struct {
-	TaskID           string `json:"task_id"`
-	Generation       string `json:"generation"`
-	SegmentIndex     int    `json:"segment_index"`
-	StartOffset      int64  `json:"start_offset"`
-	ExpectedLength   int64  `json:"expected_length"`
-	State            string `json:"state"`
-	Dirty            bool   `json:"dirty"`
-	Attempts         int    `json:"attempts"`
-	NextRetryAt      int64  `json:"next_retry_at"`
-	Path             string `json:"path"`
-	Checksum         string `json:"checksum"`
-	FinalRelPath     string `json:"final_rel_path"`
-	ExpectedFileSize int64  `json:"expected_file_size"`
-}
-
-func (d *Database) RecordSpoolAttempt(taskID, generation, finalPath string, expectedSize int64, state string) error {
+// EnsureDownloadRecord guarantees that a row exists in download_records for this task.
+func (d *Database) EnsureDownloadRecord(chatID string, messageID int, finalPath string, expectedSize int64) error {
 	d.lock.Lock()
 	defer d.lock.Unlock()
 
 	now := time.Now().Unix()
 	_, err := d.db.Exec(`
-		INSERT INTO spool_attempts (task_id, generation, final_path, expected_size, state, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(task_id, generation) DO UPDATE SET
-			final_path = excluded.final_path,
-			expected_size = excluded.expected_size,
-			state = excluded.state,
-			updated_at = excluded.updated_at
-	`, taskID, generation, finalPath, expectedSize, state, now, now)
+		INSERT INTO download_records (chat_id, message_id, status, save_path, file_size, created_at, updated_at, attempt_generation)
+		VALUES (?, ?, 'pending', ?, ?, ?, ?, '')
+		ON CONFLICT(chat_id, message_id) DO NOTHING
+	`, chatID, messageID, finalPath, expectedSize, now, now)
 	return err
 }
 
-func (d *Database) RecordSpoolSegment(rec SpoolSegmentRecord) error {
-	d.lock.Lock()
-	defer d.lock.Unlock()
-
-	dirtyInt := 0
-	if rec.Dirty {
-		dirtyInt = 1
-	}
-
-	_, err := d.db.Exec(`
-		INSERT INTO spool_segments (task_id, generation, segment_index, start_offset, expected_length, state, dirty, attempts, next_retry_at, path, checksum)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(task_id, generation, segment_index) DO UPDATE SET
-			start_offset = excluded.start_offset,
-			expected_length = excluded.expected_length,
-			state = excluded.state,
-			dirty = excluded.dirty,
-			attempts = excluded.attempts,
-			next_retry_at = excluded.next_retry_at,
-			path = excluded.path,
-			checksum = excluded.checksum
-	`, rec.TaskID, rec.Generation, rec.SegmentIndex, rec.StartOffset, rec.ExpectedLength, rec.State, dirtyInt, rec.Attempts, rec.NextRetryAt, rec.Path, rec.Checksum)
-	return err
-}
-
-func (d *Database) GetActiveSpoolSegments() ([]SpoolSegmentRecord, error) {
-	d.lock.RLock()
-	defer d.lock.RUnlock()
-
-	rows, err := d.db.Query(`
-		SELECT s.task_id, s.generation, s.segment_index, s.start_offset, s.expected_length, s.state, s.dirty, s.attempts, s.next_retry_at, COALESCE(s.path, ''), COALESCE(s.checksum, ''), COALESCE(a.final_path, ''), COALESCE(a.expected_size, 0)
-		FROM spool_segments s
-		LEFT JOIN spool_attempts a ON s.task_id = a.task_id AND s.generation = a.generation
-		WHERE s.state IN ('ready', 'queued', 'writing_back')
-	`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var records []SpoolSegmentRecord
-	for rows.Next() {
-		var rec SpoolSegmentRecord
-		var dirtyInt int
-		if err := rows.Scan(
-			&rec.TaskID, &rec.Generation, &rec.SegmentIndex, &rec.StartOffset, &rec.ExpectedLength,
-			&rec.State, &dirtyInt, &rec.Attempts, &rec.NextRetryAt, &rec.Path, &rec.Checksum,
-			&rec.FinalRelPath, &rec.ExpectedFileSize,
-		); err != nil {
-			continue
-		}
-		rec.Dirty = (dirtyInt != 0)
-		records = append(records, rec)
-	}
-	return records, nil
-}
-
-func (d *Database) DeleteSpoolSegment(taskID, generation string, segmentIndex int) error {
-	d.lock.Lock()
-	defer d.lock.Unlock()
-
-	_, err := d.db.Exec(`DELETE FROM spool_segments WHERE task_id = ? AND generation = ? AND segment_index = ?`, taskID, generation, segmentIndex)
-	return err
-}
-
-func (d *Database) RecordTargetCommit(rec TargetCommitRecord) error {
+// BeginDownload transitions a record from 'pending' (or eligible retry) to 'downloading'
+// and binds the current attempt generation.
+func (d *Database) BeginDownload(chatID string, messageID int, generation string, fileName, savePath, mediaType string, fileSize int64) error {
 	d.lock.Lock()
 	defer d.lock.Unlock()
 
 	now := time.Now().Unix()
-	if rec.UpdatedAt == 0 {
-		rec.UpdatedAt = now
+	var currentStatus, currentGen string
+	err := d.db.QueryRow(`SELECT status, COALESCE(attempt_generation, '') FROM download_records WHERE chat_id = ? AND message_id = ?`, chatID, messageID).Scan(&currentStatus, &currentGen)
+	if err == sql.ErrNoRows {
+		_, err = d.db.Exec(`
+			INSERT INTO download_records (
+				chat_id, message_id, status, file_name, save_path, media_type,
+				file_size, attempt_generation, created_at, updated_at, processing_started_at
+			) VALUES (?, ?, 'downloading', ?, ?, ?, ?, ?, ?, ?, ?)
+		`, chatID, messageID, fileName, savePath, mediaType, fileSize, generation, now, now, now)
+		return err
+	} else if err != nil {
+		return err
 	}
-	if rec.Version == 0 {
-		rec.Version = 1
+
+	if currentStatus == "success" {
+		return ErrAlreadySuccess
+	}
+	if currentStatus == "committing" && currentGen != generation && currentGen != "" {
+		return ErrStateConflict
 	}
 
-	_, err := d.db.Exec(`
-		INSERT INTO target_commits (task_id, generation, final_path, expected_size, expected_sha256, committed_sha256, state, version, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(task_id, generation) DO UPDATE SET
-			final_path = excluded.final_path,
-			expected_size = excluded.expected_size,
-			expected_sha256 = excluded.expected_sha256,
-			committed_sha256 = excluded.committed_sha256,
-			state = excluded.state,
-			version = excluded.version,
-			updated_at = excluded.updated_at
-	`, rec.TaskID, rec.Generation, rec.FinalPath, rec.ExpectedSize, rec.ExpectedSHA256, rec.CommittedSHA256, rec.State, rec.Version, rec.UpdatedAt)
-	return err
-}
-
-func (d *Database) GetTargetCommit(taskID, generation string) (*TargetCommitRecord, error) {
-	d.lock.RLock()
-	defer d.lock.RUnlock()
-
-	var rec TargetCommitRecord
-	err := d.db.QueryRow(`
-		SELECT task_id, generation, final_path, expected_size, expected_sha256, committed_sha256, state, version, updated_at
-		FROM target_commits
-		WHERE task_id = ? AND (generation = ? OR ? = '')
-		ORDER BY updated_at DESC
-		LIMIT 1
-	`, taskID, generation, generation).Scan(&rec.TaskID, &rec.Generation, &rec.FinalPath, &rec.ExpectedSize, &rec.ExpectedSHA256, &rec.CommittedSHA256, &rec.State, &rec.Version, &rec.UpdatedAt)
+	res, err := d.db.Exec(`
+		UPDATE download_records
+		SET status = 'downloading',
+			file_name = CASE WHEN ? != '' THEN ? ELSE file_name END,
+			save_path = CASE WHEN ? != '' THEN ? ELSE save_path END,
+			media_type = CASE WHEN ? != '' THEN ? ELSE media_type END,
+			file_size = CASE WHEN ? > 0 THEN ? ELSE file_size END,
+			attempt_generation = ?,
+			updated_at = ?,
+			processing_started_at = ?,
+			error = ''
+		WHERE chat_id = ? AND message_id = ? AND status != 'success'
+	`, fileName, fileName, savePath, savePath, mediaType, mediaType, fileSize, fileSize, generation, now, now, chatID, messageID)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	return &rec, nil
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrStateConflict
+	}
+	return nil
 }
 
 // PrepareDownloadCommit records durable intent to commit an SSD download before atomic rename.
-func (d *Database) PrepareDownloadCommit(chatID string, messageID int, relPath string, size int64, sha256Hex string) error {
+// Strictly validates generation and state transitions.
+func (d *Database) PrepareDownloadCommit(chatID string, messageID int, generation string, relPath string, size int64, sha256Hex string) error {
 	d.lock.Lock()
 	defer d.lock.Unlock()
 
 	now := time.Now().Unix()
+	var currentStatus, currentGen, currentSHA string
+	err := d.db.QueryRow(`
+		SELECT status, COALESCE(attempt_generation, ''), COALESCE(sha256, '')
+		FROM download_records
+		WHERE chat_id = ? AND message_id = ?
+	`, chatID, messageID).Scan(&currentStatus, &currentGen, &currentSHA)
+	if err == sql.ErrNoRows {
+		_, err = d.db.Exec(`
+			INSERT INTO download_records (
+				chat_id, message_id, status, save_path, file_size, sha256, attempt_generation, created_at, updated_at
+			) VALUES (?, ?, 'committing', ?, ?, ?, ?, ?, ?)
+		`, chatID, messageID, relPath, size, sha256Hex, generation, now, now)
+		return err
+	} else if err != nil {
+		return err
+	}
+
+	// Idempotency: if already committing with same generation and sha256
+	if currentStatus == "committing" && currentGen == generation && currentSHA == sha256Hex {
+		return nil
+	}
+	// If already success with same sha256
+	if currentStatus == "success" && currentSHA == sha256Hex {
+		return nil
+	}
+	// Generation guard: reject stale attempts
+	if currentGen != "" && generation != "" && currentGen != generation {
+		return fmt.Errorf("%w: record has gen %q, attempt has gen %q", ErrStaleAttempt, currentGen, generation)
+	}
+	// Terminal state guard: cannot transition from failed or unavailable directly to committing
+	if currentStatus == "failed" || currentStatus == "unavailable" {
+		return fmt.Errorf("%w: cannot transition from %q to committing", ErrStateConflict, currentStatus)
+	}
+
 	res, err := d.db.Exec(`
 		UPDATE download_records
 		SET status = 'committing',
-		    save_path = ?,
-		    file_size = ?,
-		    sha256 = ?,
-		    updated_at = ?
-		WHERE chat_id = ? AND message_id = ?
-	`, relPath, size, sha256Hex, now, chatID, messageID)
+			save_path = ?,
+			file_size = ?,
+			sha256 = ?,
+			attempt_generation = ?,
+			updated_at = ?
+		WHERE chat_id = ? AND message_id = ? AND (attempt_generation = ? OR attempt_generation = '')
+	`, relPath, size, sha256Hex, generation, now, chatID, messageID, generation)
 	if err != nil {
 		return err
 	}
-	rows, err := res.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if rows == 0 {
-		return fmt.Errorf("no download record found to commit for chat=%s msg=%d", chatID, messageID)
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("%w: zero rows affected in PrepareDownloadCommit", ErrStateConflict)
 	}
 	return nil
 }
 
 // CompleteDownloadAndQueueArchive atomically marks download_records.status='success'
 // and enqueues an archive_job when archive is enabled.
-func (d *Database) CompleteDownloadAndQueueArchive(chatID string, messageID int, relPath string, size int64, sha256Hex string, queueArchive bool) error {
+// Strictly validates generation and state transitions, and preserves terminal archive states.
+func (d *Database) CompleteDownloadAndQueueArchive(chatID string, messageID int, generation string, relPath string, size int64, sha256Hex string, queueArchive bool) error {
 	d.lock.Lock()
 	defer d.lock.Unlock()
 
@@ -1119,45 +1055,118 @@ func (d *Database) CompleteDownloadAndQueueArchive(chatID string, messageID int,
 	defer tx.Rollback()
 
 	// 1. Mark download_records success
-	res, err := tx.Exec(`
-		UPDATE download_records
-		SET status = 'success',
-		    save_path = ?,
-		    file_size = ?,
-		    sha256 = ?,
-		    downloaded_at = ?,
-		    updated_at = ?,
-		    error = ''
+	var currentStatus, currentGen, currentSHA string
+	err = tx.QueryRow(`
+		SELECT status, COALESCE(attempt_generation, ''), COALESCE(sha256, '')
+		FROM download_records
 		WHERE chat_id = ? AND message_id = ?
-	`, relPath, size, sha256Hex, now, now, chatID, messageID)
-	if err != nil {
-		return fmt.Errorf("update download success: %w", err)
-	}
-	rows, err := res.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("check rows affected: %w", err)
-	}
-	if rows == 0 {
-		return fmt.Errorf("no download record found to complete for chat=%s msg=%d", chatID, messageID)
+	`, chatID, messageID).Scan(&currentStatus, &currentGen, &currentSHA)
+	if err == sql.ErrNoRows {
+		_, err = tx.Exec(`
+			INSERT INTO download_records (
+				chat_id, message_id, status, save_path, file_size, sha256, attempt_generation, downloaded_at, updated_at, error, created_at
+			) VALUES (?, ?, 'success', ?, ?, ?, ?, ?, ?, '', ?)
+		`, chatID, messageID, relPath, size, sha256Hex, generation, now, now, now)
+		if err != nil {
+			return fmt.Errorf("insert download success: %w", err)
+		}
+	} else if err != nil {
+		return err
+	} else {
+		if currentGen != "" && generation != "" && currentGen != generation {
+			return fmt.Errorf("%w: record has gen %q, attempt has gen %q", ErrStaleAttempt, currentGen, generation)
+		}
+		if currentStatus == "success" {
+			if currentSHA != "" && currentSHA != sha256Hex {
+				return fmt.Errorf("%w: already success with different sha %q vs %q", ErrStateConflict, currentSHA, sha256Hex)
+			}
+		} else {
+			if currentStatus != "committing" && currentStatus != "downloading" {
+				return fmt.Errorf("%w: cannot transition from %q to success", ErrStateConflict, currentStatus)
+			}
+
+			res, err := tx.Exec(`
+				UPDATE download_records
+				SET status = 'success',
+					save_path = ?,
+					file_size = ?,
+					sha256 = ?,
+					downloaded_at = ?,
+					updated_at = ?,
+					error = ''
+				WHERE chat_id = ? AND message_id = ? AND status IN ('committing', 'downloading')
+			`, relPath, size, sha256Hex, now, now, chatID, messageID)
+			if err != nil {
+				return fmt.Errorf("update download success: %w", err)
+			}
+			n, _ := res.RowsAffected()
+			if n == 0 {
+				return fmt.Errorf("%w: zero rows affected transitioning to success", ErrStateConflict)
+			}
+		}
 	}
 
-	// 2. If archive enabled, enqueue archive_jobs
+	// 2. Archive handling (Issue #6: preserve terminal archive states across duplicate/late events)
 	if queueArchive {
-		_, err = tx.Exec(`
-			INSERT INTO archive_jobs (
-				chat_id, message_id, relative_path, expected_size, sha256,
-				state, attempts, next_retry_at, created_at, updated_at
-			) VALUES (?, ?, ?, ?, ?, 'pending', 0, 0, ?, ?)
-			ON CONFLICT(chat_id, message_id) DO UPDATE SET
-				relative_path = excluded.relative_path,
-				expected_size = excluded.expected_size,
-				sha256 = excluded.sha256,
-				state = 'pending',
-				next_retry_at = 0,
-				updated_at = excluded.updated_at
-		`, chatID, messageID, relPath, size, sha256Hex, now, now)
-		if err != nil {
-			return fmt.Errorf("insert archive job: %w", err)
+		var arcState, arcSHA string
+		err = tx.QueryRow(`SELECT state, sha256 FROM archive_jobs WHERE chat_id = ? AND message_id = ?`, chatID, messageID).Scan(&arcState, &arcSHA)
+		if err == sql.ErrNoRows {
+			_, err = tx.Exec(`
+				INSERT INTO archive_jobs (
+					chat_id, message_id, relative_path, expected_size, sha256,
+					state, attempts, next_retry_at, created_at, updated_at
+				) VALUES (?, ?, ?, ?, ?, 'pending', 0, 0, ?, ?)
+			`, chatID, messageID, relPath, size, sha256Hex, now, now)
+			if err != nil {
+				return fmt.Errorf("insert archive job: %w", err)
+			}
+		} else if err != nil {
+			return err
+		} else {
+			switch arcState {
+			case "archived":
+				if arcSHA != sha256Hex {
+					_, err = tx.Exec(`
+						UPDATE archive_jobs
+						SET state = 'conflict',
+							last_error = 'archive checksum mismatch on duplicate complete',
+							updated_at = ?
+						WHERE chat_id = ? AND message_id = ?
+					`, now, chatID, messageID)
+					if err != nil {
+						return fmt.Errorf("set archive conflict: %w", err)
+					}
+				}
+				// If sha matches, preserve terminal 'archived' state! Never reset to pending!
+			case "conflict":
+				// Already conflict: do not overwrite
+			case "copying":
+				_, err = tx.Exec(`
+					UPDATE archive_jobs
+					SET relative_path = ?,
+						expected_size = ?,
+						sha256 = ?,
+						updated_at = ?
+					WHERE chat_id = ? AND message_id = ?
+				`, relPath, size, sha256Hex, now, chatID, messageID)
+				if err != nil {
+					return fmt.Errorf("update copying archive job: %w", err)
+				}
+			default:
+				_, err = tx.Exec(`
+					UPDATE archive_jobs
+					SET relative_path = ?,
+						expected_size = ?,
+						sha256 = ?,
+						state = 'pending',
+						next_retry_at = 0,
+						updated_at = ?
+					WHERE chat_id = ? AND message_id = ?
+				`, relPath, size, sha256Hex, now, chatID, messageID)
+				if err != nil {
+					return fmt.Errorf("update pending archive job: %w", err)
+				}
+			}
 		}
 	}
 
@@ -1216,41 +1225,60 @@ func (d *Database) ClaimArchiveJob(chatID string, messageID int) (bool, error) {
 }
 
 // CompleteArchiveJob marks an archive job as 'archived' upon verified durability.
+// Only transitions from 'copying'.
 func (d *Database) CompleteArchiveJob(chatID string, messageID int) error {
 	d.lock.Lock()
 	defer d.lock.Unlock()
 
 	now := time.Now().Unix()
-	_, err := d.db.Exec(`
+	res, err := d.db.Exec(`
 		UPDATE archive_jobs
 		SET state = 'archived', last_error = '', updated_at = ?
-		WHERE chat_id = ? AND message_id = ?
+		WHERE chat_id = ? AND message_id = ? AND state = 'copying'
 	`, now, chatID, messageID)
-	return err
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		var state string
+		_ = d.db.QueryRow(`SELECT state FROM archive_jobs WHERE chat_id = ? AND message_id = ?`, chatID, messageID).Scan(&state)
+		if state == "archived" {
+			return nil
+		}
+		return fmt.Errorf("%w: archive job not in copying state (state=%q)", ErrStateConflict, state)
+	}
+	return nil
 }
 
 // FailArchiveJob returns a failed archive attempt to 'pending' with bounded exponential retry delay (capped at 30 min).
+// Only transitions from 'copying' and never modifies 'archived' or 'conflict'.
 func (d *Database) FailArchiveJob(chatID string, messageID int, errStr string) error {
 	d.lock.Lock()
 	defer d.lock.Unlock()
 
 	now := time.Now().Unix()
-	// Read current attempts
+	var state string
 	var attempts int
-	_ = d.db.QueryRow(`SELECT attempts FROM archive_jobs WHERE chat_id = ? AND message_id = ?`, chatID, messageID).Scan(&attempts)
-	attempts++
+	err := d.db.QueryRow(`SELECT state, attempts FROM archive_jobs WHERE chat_id = ? AND message_id = ?`, chatID, messageID).Scan(&state, &attempts)
+	if err != nil {
+		return err
+	}
+	if state == "archived" || state == "conflict" {
+		return nil
+	}
 
-	// Exponential backoff: 5s * 2^attempts, capped at 1800s (30 minutes)
+	attempts++
 	backoffSec := int64(5 * (1 << (attempts - 1)))
 	if backoffSec > 1800 || backoffSec <= 0 {
 		backoffSec = 1800
 	}
 	nextRetry := now + backoffSec
 
-	_, err := d.db.Exec(`
+	_, err = d.db.Exec(`
 		UPDATE archive_jobs
 		SET state = 'pending', attempts = ?, next_retry_at = ?, last_error = ?, updated_at = ?
-		WHERE chat_id = ? AND message_id = ?
+		WHERE chat_id = ? AND message_id = ? AND state = 'copying'
 	`, attempts, nextRetry, errStr, now, chatID, messageID)
 	return err
 }
@@ -1261,11 +1289,99 @@ func (d *Database) SetArchiveJobConflict(chatID string, messageID int, errStr st
 	defer d.lock.Unlock()
 
 	now := time.Now().Unix()
-	_, err := d.db.Exec(`
+	var state string
+	err := d.db.QueryRow(`SELECT state FROM archive_jobs WHERE chat_id = ? AND message_id = ?`, chatID, messageID).Scan(&state)
+	if err != nil {
+		return err
+	}
+	if state == "archived" {
+		return nil
+	}
+
+	_, err = d.db.Exec(`
 		UPDATE archive_jobs
 		SET state = 'conflict', last_error = ?, updated_at = ?
 		WHERE chat_id = ? AND message_id = ?
 	`, errStr, now, chatID, messageID)
+	return err
+}
+
+// FailDownload records download failure or unavailability, strictly honoring attempt generation
+// and never overwriting terminal 'success'.
+func (d *Database) FailDownload(chatID string, messageID int, generation string, fileName, savePath, mediaType string, fileSize int64, errMsg string, isUnavailable bool) error {
+	d.lock.Lock()
+	defer d.lock.Unlock()
+
+	now := time.Now().Unix()
+	var currentStatus, currentGen string
+	var currentAttempts int
+	err := d.db.QueryRow(`
+		SELECT status, COALESCE(attempt_generation, ''), attempts
+		FROM download_records
+		WHERE chat_id = ? AND message_id = ?
+	`, chatID, messageID).Scan(&currentStatus, &currentGen, &currentAttempts)
+	if err == sql.ErrNoRows {
+		status := "failed"
+		if isUnavailable {
+			status = "unavailable"
+		}
+		_, err = d.db.Exec(`
+			INSERT INTO download_records (
+				chat_id, message_id, status, file_name, save_path, media_type,
+				file_size, error, attempts, next_retry_at, attempt_generation, created_at, updated_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+		`, chatID, messageID, status, fileName, savePath, mediaType, fileSize, errMsg, now+60, generation, now, now)
+		return err
+	} else if err != nil {
+		return err
+	}
+
+	if currentStatus == "success" {
+		return nil
+	}
+	if currentGen != "" && generation != "" && currentGen != generation {
+		return ErrStaleAttempt
+	}
+
+	status := "failed"
+	if isUnavailable {
+		status = "unavailable"
+	}
+
+	lowerErr := strings.ToLower(errMsg)
+	var nextRetryAt int64 = 0
+	if status == "failed" {
+		if strings.Contains(lowerErr, "context canceled") ||
+			strings.Contains(lowerErr, "context deadline exceeded") ||
+			lowerErr == "canceled" || lowerErr == "task canceled" ||
+			strings.Contains(lowerErr, "engine forcibly closed") {
+			status = "pending"
+			errMsg = ""
+		} else {
+			backoff := int64(60 * (1 << currentAttempts))
+			if backoff > 1800 {
+				backoff = 1800
+			}
+			nextRetryAt = now + backoff
+		}
+	} else if status == "unavailable" {
+		nextRetryAt = now + 86400*7
+	}
+
+	_, err = d.db.Exec(`
+		UPDATE download_records
+		SET status = ?,
+			file_name = CASE WHEN ? != '' THEN ? ELSE file_name END,
+			save_path = CASE WHEN ? != '' THEN ? ELSE save_path END,
+			media_type = CASE WHEN ? != '' THEN ? ELSE media_type END,
+			file_size = CASE WHEN ? > 0 THEN ? ELSE file_size END,
+			error = ?,
+			attempts = CASE WHEN ? = 'failed' THEN attempts + 1 ELSE attempts END,
+			next_retry_at = ?,
+			updated_at = ?
+		WHERE chat_id = ? AND message_id = ? AND status != 'success'
+	`, status, fileName, fileName, savePath, savePath, mediaType, mediaType, fileSize, fileSize,
+		errMsg, status, nextRetryAt, now, chatID, messageID)
 	return err
 }
 
@@ -1295,7 +1411,7 @@ func (d *Database) GetPendingCommittingDownloads() ([]DownloadRecord, error) {
 	rows, err := d.db.Query(`
 		SELECT chat_id, message_id, status, COALESCE(file_name, ''), COALESCE(save_path, ''),
 		       COALESCE(media_type, ''), COALESCE(file_size, 0), COALESCE(sha256, ''),
-		       created_at, updated_at, attempts, next_retry_at
+		       created_at, updated_at, attempts, next_retry_at, COALESCE(attempt_generation, '')
 		FROM download_records
 		WHERE status = 'committing'
 	`)
@@ -1310,7 +1426,7 @@ func (d *Database) GetPendingCommittingDownloads() ([]DownloadRecord, error) {
 		if err := rows.Scan(
 			&rec.ChatID, &rec.MessageID, &rec.Status, &rec.FileName, &rec.SavePath,
 			&rec.MediaType, &rec.FileSize, &rec.SHA256,
-			&rec.CreatedAt, &rec.UpdatedAt, &rec.Attempts, &rec.NextRetryAt,
+			&rec.CreatedAt, &rec.UpdatedAt, &rec.Attempts, &rec.NextRetryAt, &rec.AttemptGeneration,
 		); err != nil {
 			return nil, err
 		}
@@ -1327,7 +1443,7 @@ func (d *Database) GetStaleDownloadingRecords() ([]DownloadRecord, error) {
 	rows, err := d.db.Query(`
 		SELECT chat_id, message_id, status, COALESCE(file_name, ''), COALESCE(save_path, ''),
 		       COALESCE(media_type, ''), COALESCE(file_size, 0), COALESCE(sha256, ''),
-		       created_at, updated_at, attempts, next_retry_at
+		       created_at, updated_at, attempts, next_retry_at, COALESCE(attempt_generation, '')
 		FROM download_records
 		WHERE status = 'downloading'
 	`)
@@ -1342,7 +1458,7 @@ func (d *Database) GetStaleDownloadingRecords() ([]DownloadRecord, error) {
 		if err := rows.Scan(
 			&rec.ChatID, &rec.MessageID, &rec.Status, &rec.FileName, &rec.SavePath,
 			&rec.MediaType, &rec.FileSize, &rec.SHA256,
-			&rec.CreatedAt, &rec.UpdatedAt, &rec.Attempts, &rec.NextRetryAt,
+			&rec.CreatedAt, &rec.UpdatedAt, &rec.Attempts, &rec.NextRetryAt, &rec.AttemptGeneration,
 		); err != nil {
 			return nil, err
 		}

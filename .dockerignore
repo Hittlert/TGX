@@ -1,0 +1,41 @@
+.git
+.github
+.codex
+
+# Local configuration and runtime state
+config.yaml
+config.yaml.*
+data.yaml
+data.yaml.*
+*.session
+*.session-journal
+logs/
+downloads/
+state/
+
+# Local build and deployment artifacts
+bin/
+build/
+deployments/
+deploy-staging/
+telegram-downloader-*
+*-linux-amd64*
+tg-downloader
+tgx
+tdl
+*.exe
+
+# Offline evaluation is not part of the production image build.
+scripts/evaluation/
+evaluation/
+
+# Python and editor caches
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.DS_Store
+.idea/
+.vscode/

@@ -18,7 +18,7 @@ const (
 
 // TransferManager manages gotd parallel transport and global RPC rate limits.
 type TransferManager struct {
-	fileCapacity   int
+	fileCapacity   int64
 	activeFiles    int64
 	maxFileThreads int
 	gate           *DataGate
@@ -55,7 +55,7 @@ func NewTransferManager(opts Options) *TransferManager {
 	}
 
 	return &TransferManager{
-		fileCapacity:   opts.FileConcurrency,
+		fileCapacity:   int64(opts.FileConcurrency),
 		maxFileThreads: opts.MaxFileThreads,
 		gate:           gate,
 		downloader:     dl,
@@ -77,12 +77,24 @@ func (m *TransferManager) ActiveFiles() int64 {
 	return atomic.LoadInt64(&m.activeFiles)
 }
 
+// SetFileConcurrency updates the maximum concurrent active files capacity.
+func (m *TransferManager) SetFileConcurrency(n int) error {
+	if m == nil {
+		return fmt.Errorf("transfer manager is nil")
+	}
+	if n < 1 || n > 64 {
+		return fmt.Errorf("file concurrency must be between 1 and 64, got %d", n)
+	}
+	atomic.StoreInt64(&m.fileCapacity, int64(n))
+	return nil
+}
+
 // FileConcurrency returns the maximum concurrent active files capacity.
 func (m *TransferManager) FileConcurrency() int {
 	if m == nil {
 		return 0
 	}
-	return m.fileCapacity
+	return int(atomic.LoadInt64(&m.fileCapacity))
 }
 
 // ComputeFileThreads derives worker goroutines for one file based on logical work.

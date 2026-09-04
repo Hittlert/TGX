@@ -11,7 +11,7 @@ We have reviewed the evaluation protocol and standards defined in `docs/evaluati
 
 **We fully accept and align with the entire TGX Evaluation Protocol v1.0 without reservation.**
 
-The three-layer contract (Evaluation Protocol, RunSpec, Analysis Policy), the 13 immutable raw output files, the strict environment and path isolation, the stratified dataset profiles, and the independent TDL baseline methodology are technically sound, objective, reproducible, and verifiable.
+The four-layer contract (Evaluation Protocol, Baseline Cohort, RunSpec, Analysis Policy), the immutable raw output files, the strict environment and path isolation, the stratified dataset profiles, and the independent TDL baseline methodology are technically sound, objective, reproducible, and verifiable.
 
 ---
 
@@ -25,7 +25,7 @@ The three-layer contract (Evaluation Protocol, RunSpec, Analysis Policy), the 13
 3. **Artifact Identity & Integrity**:
    - Source repository, commit, dirty status, compiler version, and exact binary SHA256 must be fully recorded.
 4. **Physical Environment Isolation**:
-   - Every run must execute against brand-new, empty `OutputDir`, `State DB`, `BufferDir`, and `LogDir`.
+   - Every run must execute against brand-new, empty `OutputDir`, `State DB`, and `LogDir`.
    - Production databases and directories are accessible in read-only mode (`?mode=ro`) strictly for sampling manifest cases.
 5. **Independent TDL Baseline**:
    - Upstream/known-good TDL binary independent of the TGX candidate tree is used to establish physical network ceilings and error floors.
@@ -37,7 +37,7 @@ The three-layer contract (Evaluation Protocol, RunSpec, Analysis Policy), the 13
 ## 3. Operational Implementations & Clarifications
 
 1. **TDL Uninstrumented Field Encoding**:
-   - Since the independent TDL baseline binary does not contain TGX Portable Spool / internal telemetry endpoints, memory and SSD spool fields specific to TGX are recorded as `null` with `error: "unsupported_by_engine"` per Section 8 and Section 9.
+   - Since the independent TDL baseline binary does not contain TGX SSD admission and archive telemetry, unavailable engine-specific fields are recorded as `null` with `error: "unsupported_by_engine"` per Section 8 and Section 9.
 2. **Sequential Execution**:
    - All TDL baseline runs and TGX candidate runs execute sequentially on the same isolated host session and proxy route to eliminate bandwidth contention.
 3. **Golden Manifest Baseline Verification**:
@@ -51,10 +51,10 @@ The following SHA256 hashes are frozen for all Phase B–E executions:
 
 | File | SHA256 Hash |
 |---|---|
-| `docs/evaluation/TGX_EVALUATION_PROTOCOL_V1.md` | `2dad99ee0e37a25178418f727c3e0d80caad67263d700c06b117aa3d27700b33` |
+| `docs/evaluation/TGX_EVALUATION_PROTOCOL_V1.md` | `4dbdf4940f5c751d683c79f3392bbca770832ef258360f57244d69fc3d589c0e` |
 | `docs/evaluation/profiles-v1.json` | `6e0c0f38cde7f51aed3b4828c374611a9cda94d0258240abcd109b7164442438` |
-| `docs/evaluation/run-spec.schema.json` | `72f7a2aa3170b45dc093419f6bb201f705b9a8acfe80c7821f6c306c4780a61c` |
-| `docs/evaluation/analysis-policy/baseline-v1.json` | `8da31c77c7fd43a03e04190f3f70ee8da086e5d962822e7aee2aa584444d5a34` |
+| `docs/evaluation/run-spec.schema.json` | `150209e2e2d7148ae8c39b966058dafdba03d245c4ae9d89c0d5d98f7ae0a8bb` |
+| `docs/evaluation/analysis-policy/baseline-v1.json` | `85d9eca8ddf98650088284e60dde0a3ff1776247ad0033c20c36db743d6ed188` |
 
 ---
 

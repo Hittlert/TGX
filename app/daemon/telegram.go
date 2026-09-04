@@ -97,15 +97,24 @@ func (a *telegramMediaAccess) cleanExpiredCacheLocked(now time.Time) {
 
 func (a *telegramMediaAccess) mediaFromMessage(peer string, messageID int, message *tg.Message) (ResolvedMedia, error) {
 	if message == nil {
-		return ResolvedMedia{}, NewTaskError("unavailable", true, fmt.Errorf("message %s/%d is empty", peer, messageID))
+		return ResolvedMedia{}, NewTaskError("resolve", "get_message", "unavailable", true, false, fmt.Errorf("message %s/%d is empty", peer, messageID))
 	}
 	media, ok := tmedia.GetMedia(message)
 	if !ok || media.Size <= 0 {
-		return ResolvedMedia{}, NewTaskError("unavailable", true, fmt.Errorf("message %s/%d has no downloadable media", peer, messageID))
+		return ResolvedMedia{}, NewTaskError("resolve", "get_media", "unavailable", true, false, fmt.Errorf("message %s/%d has no downloadable media", peer, messageID))
 	}
+	mediaType := "video"
+	if strings.HasSuffix(strings.ToLower(media.Name), ".jpg") || strings.HasSuffix(strings.ToLower(media.Name), ".png") || strings.HasSuffix(strings.ToLower(media.Name), ".jpeg") {
+		mediaType = "photo"
+	} else if strings.HasSuffix(strings.ToLower(media.Name), ".mp3") || strings.HasSuffix(strings.ToLower(media.Name), ".ogg") || strings.HasSuffix(strings.ToLower(media.Name), ".wav") {
+		mediaType = "audio"
+	} else if _, ok := message.Media.(*tg.MessageMediaPhoto); ok {
+		mediaType = "photo"
+	}
+
 	file := telegramFile{media: media}
 	return ResolvedMedia{
-		File: file, Name: media.Name, Size: media.Size, DCID: media.DC, Date: media.Date,
+		File: file, Name: media.Name, Size: media.Size, DCID: media.DC, Date: media.Date, MediaType: mediaType,
 	}, nil
 }
 
@@ -459,7 +468,7 @@ func classifyTelegramError(err error, operation string) error {
 		"FILE_ID_INVALID",
 	) || strings.Contains(errStr, "connection failed")
 	if unavailable {
-		return NewTaskError("unavailable", true, fmt.Errorf("%s: %w", operation, err))
+		return NewTaskError("resolve", operation, "unavailable", true, false, err)
 	}
-	return NewTaskError("telegram", false, fmt.Errorf("%s: %w", operation, err))
+	return NewTaskError("resolve", operation, "telegram", false, true, err)
 }

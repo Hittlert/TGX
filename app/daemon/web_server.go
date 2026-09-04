@@ -1,12 +1,9 @@
 package daemon
 
 import (
-	"crypto/aes"
-	"crypto/cipher"
 	"embed"
-	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"net/http"
@@ -154,14 +151,24 @@ func (s *WebServer) Handler() http.Handler {
 			return
 		}
 		var req TaskRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16*1024)).Decode(&req); err != nil {
 			writeError(w, http.StatusBadRequest, "invalid json")
 			return
 		}
 		snap, created, err := s.registry.Submit(req)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err.Error())
+			switch {
+			case errors.Is(err, ErrQueueFull):
+				writeError(w, http.StatusTooManyRequests, err.Error())
+			case errors.Is(err, ErrIDConflict):
+				writeError(w, http.StatusConflict, err.Error())
+			default:
+				writeError(w, http.StatusBadRequest, err.Error())
+			}
 			return
+		}
+		if s.db != nil {
+			_ = s.db.EnsureDownloadRecord(req.Peer, req.MessageID, req.FinalPath, req.ExpectedSize)
 		}
 		status := http.StatusOK
 		if created {
@@ -170,27 +177,58 @@ func (s *WebServer) Handler() http.Handler {
 		writeJSON(w, status, snap)
 	}).Methods(http.MethodGet, http.MethodPost)
 
-	r.HandleFunc("/api/control", func(w http.ResponseWriter, r *http.Request) {
-		var req struct {
-			Action string `json:"action"`
+	r.HandleFunc("/api/tasks/{id}", func(w http.ResponseWriter, r *http.Request) {
+		task, ok := s.registry.Task(mux.Vars(r)["id"])
+		if !ok {
+			writeError(w, http.StatusNotFound, "task not found")
+			return
 		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusOK, task)
+	}).Methods(http.MethodGet)
+
+	r.HandleFunc("/api/chat/history", func(w http.ResponseWriter, r *http.Request) {
+		if s.access == nil {
+			writeError(w, http.StatusServiceUnavailable, "telegram access not available")
+			return
+		}
+		var req HistoryRequest
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16*1024)).Decode(&req); err != nil {
 			writeError(w, http.StatusBadRequest, "invalid json")
 			return
 		}
-		switch req.Action {
-		case "pause":
-			s.orchestrator.SetRunning(false)
-			s.registry.SetPaused(true)
-		case "resume":
-			s.orchestrator.SetRunning(true)
-			s.registry.SetPaused(false)
-		default:
-			writeError(w, http.StatusBadRequest, "invalid action")
+		messages, err := s.access.GetHistory(r.Context(), req)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		writeJSON(w, http.StatusOK, s.registry.Status())
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":       true,
+			"messages": messages,
+		})
 	}).Methods(http.MethodPost)
+
+	r.HandleFunc("/api/chat/resolve", func(w http.ResponseWriter, r *http.Request) {
+		if s.access == nil {
+			writeError(w, http.StatusServiceUnavailable, "telegram access not available")
+			return
+		}
+		var req ResolveRequest
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16*1024)).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid json")
+			return
+		}
+		dialog, err := s.access.ResolvePeerInfo(r.Context(), req.Query)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":   true,
+			"peer": dialog,
+		})
+	}).Methods(http.MethodPost)
+
+	r.HandleFunc("/api/control", s.handleControl).Methods(http.MethodPost)
 
 	// Login & Auth (Web UI Password)
 	r.HandleFunc("/login", s.handleLogin)
@@ -211,13 +249,13 @@ func (s *WebServer) Handler() http.Handler {
 	// Web Dashboard
 	r.HandleFunc("/", s.requireAuth(s.handleIndex)).Methods(http.MethodGet, http.MethodHead)
 	r.HandleFunc("/get_app_version", s.handleGetAppVersion).Methods(http.MethodGet)
-	r.HandleFunc("/download_state_change", s.requireAuth(s.handleDownloadStateChange)).Methods(http.MethodGet)
 
 	// Download Control & Status
 	r.HandleFunc("/get_download_status", s.requireAuth(s.handleGetDownloadStatus)).Methods(http.MethodGet)
-	r.HandleFunc("/set_download_state", s.requireAuth(s.handleSetDownloadState)).Methods(http.MethodPost)
+	r.HandleFunc("/set_download_state", s.requireAuth(s.handleControl)).Methods(http.MethodPost)
 	r.HandleFunc("/get_download_list", s.requireAuth(s.handleGetDownloadList)).Methods(http.MethodGet)
 	r.HandleFunc("/api/downloaded_records", s.requireAuth(s.handleGetDownloadedRecords)).Methods(http.MethodGet)
+	r.HandleFunc("/api/events", s.requireAuth(s.handleEventsStream)).Methods(http.MethodGet)
 
 	// Targets & Dialogs
 	r.HandleFunc("/api/listen_targets", s.requireAuth(s.handleListenTargets))
@@ -281,7 +319,7 @@ func (s *WebServer) handleIndex(w http.ResponseWriter, r *http.Request) {
 	}
 
 	state := "running"
-	if !s.orchestrator.IsRunning() {
+	if s.orchestrator != nil && !s.orchestrator.IsRunning() {
 		state = "paused"
 	}
 
@@ -305,19 +343,35 @@ func (s *WebServer) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// POST /login
-	var req struct {
-		Password string `json:"password"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"code":"0","msg":"invalid json"}`, http.StatusBadRequest)
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 
-	decryptedPass := s.decryptFrontendPassword(req.Password)
-	if s.password != "" && decryptedPass != s.password && req.Password != s.password {
+	var req struct {
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16*1024)).Decode(&req); err != nil {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"code":"0","msg":"password error"}`))
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"ok":    false,
+			"code":  0,
+			"error": "invalid json",
+			"msg":   "invalid json",
+		})
+		return
+	}
+
+	if s.password != "" && req.Password != s.password {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"ok":    false,
+			"code":  0,
+			"error": "password error",
+			"msg":   "password error",
+		})
 		return
 	}
 
@@ -326,65 +380,38 @@ func (s *WebServer) handleLogin(w http.ResponseWriter, r *http.Request) {
 	s.sessions[token] = time.Now().Add(7 * 24 * time.Hour)
 	s.sessionsMu.Unlock()
 
+	isSecure := r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https"
 	http.SetCookie(w, &http.Cookie{
 		Name:     "tg_downloader_session",
 		Value:    token,
 		Path:     "/",
 		Expires:  time.Now().Add(7 * 24 * time.Hour),
 		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   isSecure,
 	})
 
 	w.Header().Set("Content-Type", "application/json")
-	_, _ = w.Write([]byte(`{"code":"1","msg":"success"}`))
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"ok":   true,
+		"code": 1,
+		"msg":  "success",
+	})
 }
 
 func (s *WebServer) handleLogout(w http.ResponseWriter, r *http.Request) {
+	isSecure := r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https"
 	http.SetCookie(w, &http.Cookie{
-		Name:    "tg_downloader_session",
-		Value:   "",
-		Path:    "/",
-		Expires: time.Unix(0, 0),
+		Name:     "tg_downloader_session",
+		Value:    "",
+		Path:     "/",
+		Expires:  time.Unix(0, 0),
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   isSecure,
 	})
-	http.Redirect(w, r, "/login", http.StatusFound)
-}
-
-func (s *WebServer) decryptFrontendPassword(encryptedB64 string) string {
-	defer func() {
-		_ = recover()
-	}()
-	key := []byte("1234123412ABCDEF")
-	iv := []byte("ABCDEF1234123412")
-
-	b64Decoded, err := base64.StdEncoding.DecodeString(encryptedB64)
-	if err != nil {
-		return encryptedB64
-	}
-
-	rawCipher, err := hex.DecodeString(string(b64Decoded))
-	if err != nil {
-		rawCipher = b64Decoded
-	}
-
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return encryptedB64
-	}
-
-	if len(rawCipher) < aes.BlockSize || len(rawCipher)%aes.BlockSize != 0 {
-		return encryptedB64
-	}
-
-	mode := cipher.NewCBCDecrypter(block, iv)
-	decrypted := make([]byte, len(rawCipher))
-	mode.CryptBlocks(decrypted, rawCipher)
-
-	// Unpad PKCS7
-	length := len(decrypted)
-	unpadding := int(decrypted[length-1])
-	if unpadding < length {
-		decrypted = decrypted[:(length - unpadding)]
-	}
-	return string(decrypted)
+	http.Redirect(w, r, "login", http.StatusFound)
 }
 
 func (s *WebServer) handleGetAppVersion(w http.ResponseWriter, r *http.Request) {
@@ -393,20 +420,173 @@ func (s *WebServer) handleGetAppVersion(w http.ResponseWriter, r *http.Request) 
 	_, _ = w.Write([]byte(ver))
 }
 
-func (s *WebServer) handleDownloadStateChange(w http.ResponseWriter, r *http.Request) {
-	currentState := r.URL.Query().Get("state")
-	newState := "running"
-	if currentState == "running" {
-		newState = "paused"
-		s.orchestrator.SetRunning(false)
-		s.registry.SetPaused(true)
-	} else {
-		s.orchestrator.SetRunning(true)
-		s.registry.SetPaused(false)
+func (s *WebServer) handleControl(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "POST required")
+		return
 	}
 
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	_, _ = w.Write([]byte(newState))
+	var req struct {
+		Action        string `json:"action"`
+		State         string `json:"state"`
+		DownloadState string `json:"download_state"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16*1024)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+
+	desired := strings.ToLower(strings.TrimSpace(req.Action))
+	if desired == "" {
+		st := strings.ToLower(strings.TrimSpace(req.State))
+		if st == "" {
+			st = strings.ToLower(strings.TrimSpace(req.DownloadState))
+		}
+		if st == "paused" {
+			desired = "pause"
+		} else if st == "running" {
+			desired = "resume"
+		}
+	}
+
+	switch desired {
+	case "pause":
+		if s.orchestrator != nil {
+			s.orchestrator.SetRunning(false)
+		}
+		if s.registry != nil {
+			s.registry.SetPaused(true)
+		}
+	case "resume":
+		if s.orchestrator != nil {
+			s.orchestrator.SetRunning(true)
+		}
+		if s.registry != nil {
+			s.registry.SetPaused(false)
+		}
+	default:
+		writeError(w, http.StatusBadRequest, "action must be pause or resume")
+		return
+	}
+
+	state := "running"
+	isPaused := false
+	if (s.orchestrator != nil && !s.orchestrator.IsRunning()) || (s.registry != nil && s.registry.Status().Paused) {
+		state = "paused"
+		isPaused = true
+	}
+
+	resp := map[string]any{
+		"ok":             true,
+		"state":          state,
+		"download_state": state,
+		"paused":         isPaused,
+	}
+	if s.registry != nil {
+		resp["status"] = s.registry.Status()
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *WebServer) collectTelemetrySnapshot() map[string]any {
+	state := "running"
+	isPaused := false
+	if (s.orchestrator != nil && !s.orchestrator.IsRunning()) || (s.registry != nil && s.registry.Status().Paused) {
+		state = "paused"
+		isPaused = true
+	}
+
+	snap := map[string]any{
+		"timestamp":      time.Now().UnixMilli(),
+		"state":          state,
+		"download_state": state,
+		"paused":         isPaused,
+	}
+
+	if s.registry != nil {
+		st := s.registry.Status()
+		snap["speed_bps"] = st.Rolling5sBPS
+		snap["speed_human"] = formatBytes(st.Rolling5sBPS) + "/s"
+		snap["queue_depth"] = st.QueueDepth
+		snap["queue_size"] = st.QueueDepth
+		snap["active_files"] = st.ActiveFiles
+		snap["last_error"] = st.LastError
+	}
+
+	gateInfo := map[string]any{
+		"max_data_in_flight": int64(256 * 1024 * 1024),
+		"data_in_flight":     int64(0),
+		"active_files":       int64(0),
+		"file_concurrency":   5,
+	}
+	if s.transferMgr != nil {
+		gateInfo["active_files"] = s.transferMgr.ActiveFiles()
+		gateInfo["file_concurrency"] = s.transferMgr.FileConcurrency()
+		if g := s.transferMgr.Gate(); g != nil {
+			gateInfo["max_data_in_flight"] = g.Max()
+			gateInfo["data_in_flight"] = g.InFlight()
+		}
+	}
+	snap["gate"] = gateInfo
+
+	ssdInfo := map[string]any{
+		"ssd_reserved_bytes":  int64(0),
+		"ssd_available_bytes": int64(0),
+	}
+	if s.ssdAdmission != nil {
+		ssdInfo["ssd_reserved_bytes"] = s.ssdAdmission.ReservedBytes()
+		ssdInfo["ssd_available_bytes"] = s.ssdAdmission.AvailableBytes()
+	}
+	snap["ssd"] = ssdInfo
+
+	if s.db != nil {
+		if arcStats, err := s.db.GetArchiveStats(); err == nil {
+			snap["archive"] = arcStats
+		}
+	}
+
+	return snap
+}
+
+func (s *WebServer) handleEventsStream(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "streaming unsupported")
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	initial := s.collectTelemetrySnapshot()
+	if data, err := json.Marshal(initial); err == nil {
+		_, _ = fmt.Fprintf(w, "event: snapshot\ndata: %s\n\n", string(data))
+		flusher.Flush()
+	}
+
+	updateTicker := time.NewTicker(1 * time.Second)
+	defer updateTicker.Stop()
+
+	heartbeatTicker := time.NewTicker(15 * time.Second)
+	defer heartbeatTicker.Stop()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-heartbeatTicker.C:
+			_, _ = fmt.Fprintf(w, "event: heartbeat\ndata: {}\n\n")
+			flusher.Flush()
+		case <-updateTicker.C:
+			snap := s.collectTelemetrySnapshot()
+			if data, err := json.Marshal(snap); err == nil {
+				_, _ = fmt.Fprintf(w, "event: update\ndata: %s\n\n", string(data))
+				flusher.Flush()
+			}
+		}
+	}
 }
 
 func (s *WebServer) handleGetDownloadStatus(w http.ResponseWriter, r *http.Request) {
@@ -493,29 +673,6 @@ func (s *WebServer) handleGetDownloadStatus(w http.ResponseWriter, r *http.Reque
 	}
 
 	writeJSON(w, http.StatusOK, resp)
-}
-
-func (s *WebServer) handleSetDownloadState(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		DownloadState string `json:"download_state"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid json")
-		return
-	}
-
-	if req.DownloadState == "running" {
-		s.orchestrator.SetRunning(true)
-		s.registry.SetPaused(false)
-	} else if req.DownloadState == "paused" {
-		s.orchestrator.SetRunning(false)
-		s.registry.SetPaused(true)
-	}
-
-	writeJSON(w, http.StatusOK, map[string]any{
-		"code":           "1",
-		"download_state": req.DownloadState,
-	})
 }
 
 func (s *WebServer) handleGetDownloadList(w http.ResponseWriter, r *http.Request) {
@@ -822,10 +979,14 @@ func (s *WebServer) handleUpdateSingleTarget(w http.ResponseWriter, r *http.Requ
 func (s *WebServer) handleDialogs(w http.ResponseWriter, r *http.Request) {
 	refresh := r.URL.Query().Get("refresh") == "true"
 
-	targets, err := s.db.GetListenTargets()
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
+	var targets []ListenTarget
+	var err error
+	if s.db != nil {
+		targets, err = s.db.GetListenTargets()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
 	}
 
 	targetMap := make(map[string]ListenTarget)
@@ -834,11 +995,15 @@ func (s *WebServer) handleDialogs(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var rawDialogs []DialogDTO
-	if refresh {
+	rawMap := make(map[string]DialogDTO)
+	if s.access != nil && (refresh || len(targets) == 0) {
 		rawDialogs, err = s.access.GetDialogs(r.Context())
-		if err != nil {
+		if err != nil && refresh {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
+		}
+		for _, d := range rawDialogs {
+			rawMap[d.ChatID] = d
 		}
 	}
 
@@ -848,11 +1013,23 @@ func (s *WebServer) handleDialogs(w http.ResponseWriter, r *http.Request) {
 	// 1. First append all configured business targets from database
 	for _, t := range targets {
 		seenIDs[t.ChatID] = true
-		cursor, _, _ := s.db.GetScanCursorWithTime(t.ChatID)
+		var cursor int
+		if s.db != nil {
+			cursor, _, _ = s.db.GetScanCursorWithTime(t.ChatID)
+		}
 		var lastMsgDate int64
-		_ = s.db.DB().QueryRow(`SELECT COALESCE(MAX(date), 0) FROM chat_messages WHERE chat_id = ?`, t.ChatID).Scan(&lastMsgDate)
+		if s.db != nil {
+			_ = s.db.DB().QueryRow(`SELECT COALESCE(MAX(date), 0) FROM chat_messages WHERE chat_id = ?`, t.ChatID).Scan(&lastMsgDate)
+		}
 		if lastMsgDate == 0 {
 			lastMsgDate = t.UpdatedAt
+		}
+
+		topMsgID := 0
+		if d, ok := rawMap[t.ChatID]; ok && d.TopMessageID > 0 {
+			topMsgID = d.TopMessageID
+		} else if s.db != nil {
+			_ = s.db.DB().QueryRow(`SELECT COALESCE(MAX(message_id), 0) FROM chat_messages WHERE chat_id = ?`, t.ChatID).Scan(&topMsgID)
 		}
 
 		decorated = append(decorated, map[string]any{
@@ -863,6 +1040,7 @@ func (s *WebServer) handleDialogs(w http.ResponseWriter, r *http.Request) {
 			"type":                    t.ChatType,
 			"pinned":                  false,
 			"unread_count":            0,
+			"top_message_id":          topMsgID,
 			"last_read_message_id":    cursor,
 			"is_target":               t.Enabled,
 			"enabled":                 t.Enabled,
@@ -891,6 +1069,7 @@ func (s *WebServer) handleDialogs(w http.ResponseWriter, r *http.Request) {
 			"type":                    d.Type,
 			"pinned":                  d.Pinned,
 			"unread_count":            d.UnreadCount,
+			"top_message_id":          d.TopMessageID,
 			"last_read_message_id":    0,
 			"is_target":               false,
 			"enabled":                 false,
@@ -916,7 +1095,7 @@ func (s *WebServer) handleResolveTarget(w http.ResponseWriter, r *http.Request) 
 		Query  string `json:"query"`
 		Target string `json:"target"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16*1024)).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid json")
 		return
 	}
@@ -924,6 +1103,11 @@ func (s *WebServer) handleResolveTarget(w http.ResponseWriter, r *http.Request) 
 	query := req.Query
 	if query == "" {
 		query = req.Target
+	}
+
+	if s.access == nil {
+		writeError(w, http.StatusServiceUnavailable, "telegram access not available")
+		return
 	}
 
 	info, err := s.access.ResolvePeerInfo(r.Context(), query)
@@ -936,11 +1120,12 @@ func (s *WebServer) handleResolveTarget(w http.ResponseWriter, r *http.Request) 
 		"ok":   true,
 		"peer": info,
 		"dialog": map[string]any{
-			"id":       info.ID,
-			"chat_id":  info.ChatID,
-			"title":    info.Title,
-			"username": info.Username,
-			"type":     info.Type,
+			"id":             info.ID,
+			"chat_id":        info.ChatID,
+			"title":          info.Title,
+			"username":       info.Username,
+			"type":           info.Type,
+			"top_message_id": info.TopMessageID,
 		},
 	})
 }
@@ -952,7 +1137,7 @@ func (s *WebServer) handleAddTarget(w http.ResponseWriter, r *http.Request) {
 		ChatID string `json:"chat_id"`
 		Title  string `json:"title"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16*1024)).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid json")
 		return
 	}
@@ -963,6 +1148,11 @@ func (s *WebServer) handleAddTarget(w http.ResponseWriter, r *http.Request) {
 	}
 	if query == "" {
 		query = req.ChatID
+	}
+
+	if s.access == nil {
+		writeError(w, http.StatusServiceUnavailable, "telegram access not available")
+		return
 	}
 
 	info, err := s.access.ResolvePeerInfo(r.Context(), query)
@@ -979,7 +1169,12 @@ func (s *WebServer) handleAddTarget(w http.ResponseWriter, r *http.Request) {
 		Enabled:  true,
 		Priority: 0,
 	}
-	_ = s.db.SaveSingleListenTarget(targetItem)
+	if s.db != nil {
+		if err := s.db.SaveSingleListenTarget(targetItem); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to save listen target: "+err.Error())
+			return
+		}
+	}
 
 	globalUpdatesStreamMu.RLock()
 	stream := globalUpdatesStream
@@ -998,6 +1193,7 @@ func (s *WebServer) handleAddTarget(w http.ResponseWriter, r *http.Request) {
 		"priority":                0,
 		"download_filter":         "",
 		"upload_telegram_chat_id": "",
+		"top_message_id":          info.TopMessageID,
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -1060,6 +1256,12 @@ func (s *WebServer) handleChatContext(w http.ResponseWriter, r *http.Request) {
 
 	limitBefore := 15
 	limitAfter := 15
+	if limitStr := r.URL.Query().Get("limit"); limitStr != "" {
+		if l, err := strconv.Atoi(limitStr); err == nil && l > 0 {
+			limitBefore = l / 2
+			limitAfter = l - limitBefore
+		}
+	}
 	if lb, err := strconv.Atoi(r.URL.Query().Get("limit_before")); err == nil && lb > 0 {
 		limitBefore = lb
 	}
@@ -1068,8 +1270,11 @@ func (s *WebServer) handleChatContext(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 1. First fetch from local SQLite
-	msgs, err := s.db.GetChatMessagesAround(chatID, targetMid, limitBefore, limitAfter)
-	if err != nil || len(msgs) == 0 {
+	var msgs []ChatMessage
+	if s.db != nil {
+		msgs, err = s.db.GetChatMessagesAround(chatID, targetMid, limitBefore, limitAfter)
+	}
+	if (err != nil || len(msgs) == 0) && s.access != nil {
 		// 2. Fallback: fetch from Telegram MTProto
 		req := HistoryRequest{
 			Peer:     chatID,
@@ -1078,22 +1283,24 @@ func (s *WebServer) handleChatContext(w http.ResponseWriter, r *http.Request) {
 			Reverse:  true,
 		}
 		if tgMsgs, tgErr := s.access.GetHistory(r.Context(), req); tgErr == nil && len(tgMsgs) > 0 {
-			for _, tm := range tgMsgs {
-				_ = s.db.IngestMessage(ChatMessage{
-					ChatID:           tm.ChatID,
-					MessageID:        tm.ID,
-					SenderID:         tm.SenderID,
-					SenderName:       tm.SenderName,
-					Text:             tm.Text,
-					MediaType:        tm.MediaType,
-					HasMedia:         tm.HasMedia,
-					ReplyToMessageID: tm.ReplyToMessageID,
-					Date:             tm.Date,
-					FileName:         tm.FileName,
-					FileSize:         tm.FileSize,
-				})
+			if s.db != nil {
+				for _, tm := range tgMsgs {
+					_ = s.db.IngestMessage(ChatMessage{
+						ChatID:           tm.ChatID,
+						MessageID:        tm.ID,
+						SenderID:         tm.SenderID,
+						SenderName:       tm.SenderName,
+						Text:             tm.Text,
+						MediaType:        tm.MediaType,
+						HasMedia:         tm.HasMedia,
+						ReplyToMessageID: tm.ReplyToMessageID,
+						Date:             tm.Date,
+						FileName:         tm.FileName,
+						FileSize:         tm.FileSize,
+					})
+				}
+				msgs, _ = s.db.GetChatMessagesAround(chatID, targetMid, limitBefore, limitAfter)
 			}
-			msgs, _ = s.db.GetChatMessagesAround(chatID, targetMid, limitBefore, limitAfter)
 		}
 	}
 
@@ -1120,25 +1327,61 @@ func (s *WebServer) handleChatContext(w http.ResponseWriter, r *http.Request) {
 
 func (s *WebServer) handleConcurrencySettings(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet {
-		fileConcurrency := 32
+		fileConcurrency := 5
 		if s.transferMgr != nil {
 			fileConcurrency = s.transferMgr.FileConcurrency()
+		}
+		var maxDataInFlight int64 = 256 * 1024 * 1024
+		if s.transferMgr != nil && s.transferMgr.Gate() != nil {
+			maxDataInFlight = s.transferMgr.Gate().Max()
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"ok": true,
 			"settings": map[string]any{
 				"max_active_files":   fileConcurrency,
-				"global_thread_pool": fileConcurrency,
-				"disable_ipv6":       true,
+				"max_data_in_flight": maxDataInFlight,
 			},
 		})
 		return
 	}
 
-	// POST settings
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	var req struct {
+		MaxActiveFiles int `json:"max_active_files"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16*1024)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+
+	if req.MaxActiveFiles < 1 || req.MaxActiveFiles > 64 {
+		writeError(w, http.StatusBadRequest, "max_active_files must be between 1 and 64")
+		return
+	}
+
+	if s.transferMgr != nil {
+		if err := s.transferMgr.SetFileConcurrency(req.MaxActiveFiles); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+
+	var maxDataInFlight int64 = 256 * 1024 * 1024
+	if s.transferMgr != nil && s.transferMgr.Gate() != nil {
+		maxDataInFlight = s.transferMgr.Gate().Max()
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":      true,
 		"message": "Settings saved and applied successfully!",
+		"settings": map[string]any{
+			"max_active_files":   req.MaxActiveFiles,
+			"max_data_in_flight": maxDataInFlight,
+		},
 	})
 }
 

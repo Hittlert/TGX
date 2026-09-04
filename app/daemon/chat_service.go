@@ -16,13 +16,14 @@ import (
 )
 
 type DialogDTO struct {
-	ID          int64  `json:"id"`
-	ChatID      string `json:"chat_id"`
-	Title       string `json:"title"`
-	Username    string `json:"username"`
-	Type        string `json:"type"`
-	Pinned      bool   `json:"pinned"`
-	UnreadCount int    `json:"unread_count"`
+	ID           int64  `json:"id"`
+	ChatID       string `json:"chat_id"`
+	Title        string `json:"title"`
+	Username     string `json:"username"`
+	Type         string `json:"type"`
+	Pinned       bool   `json:"pinned"`
+	UnreadCount  int    `json:"unread_count"`
+	TopMessageID int    `json:"top_message_id"`
 }
 
 type MessageDTO struct {
@@ -157,6 +158,7 @@ func (a *telegramMediaAccess) GetDialogs(ctx context.Context) ([]DialogDTO, erro
 			if d, ok := elem.Dialog.(*tg.Dialog); ok {
 				item.Pinned = d.Pinned
 				item.UnreadCount = d.UnreadCount
+				item.TopMessageID = d.TopMessage
 			}
 		}
 

@@ -85,11 +85,14 @@ func (p PathPlanner) Plan(peer string, channelTitle string, msgID int, rawName s
 	yearMonth := time.Unix(msgDate, 0).Format("2006_01")
 
 	if rawName == "" || strings.HasSuffix(rawName, ".bin") || strings.HasSuffix(rawName, ".unknown") {
-		ext := ".mp4"
-		if mediaType == "photo" {
+		ext := ".bin"
+		switch mediaType {
+		case "photo":
 			ext = ".jpg"
-		} else if mediaType == "audio" {
+		case "audio":
 			ext = ".mp3"
+		case "video":
+			ext = ".mp4"
 		}
 		rawName = fmt.Sprintf("%d%s", msgID, ext)
 	}
@@ -104,11 +107,8 @@ func (p PathPlanner) Plan(peer string, channelTitle string, msgID int, rawName s
 
 // Start launches the background orchestrator loops.
 func (o *Orchestrator) Start(ctx context.Context) {
-	numWorkers := 5
-	if o.transferMgr != nil && o.transferMgr.FileConcurrency() > 0 {
-		numWorkers = o.transferMgr.FileConcurrency()
-	}
-	for i := 0; i < numWorkers; i++ {
+	poolSize := 64
+	for i := 0; i < poolSize; i++ {
 		go o.worker(ctx)
 	}
 
@@ -126,6 +126,11 @@ func (o *Orchestrator) worker(ctx context.Context) {
 
 		if !o.IsRunning() {
 			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+
+		if o.transferMgr != nil && int(o.transferMgr.ActiveFiles()) >= o.transferMgr.FileConcurrency() {
+			time.Sleep(25 * time.Millisecond)
 			continue
 		}
 
@@ -203,6 +208,10 @@ func (o *Orchestrator) SubmitRecord(record DownloadRecord) error {
 		ID:           taskID,
 		Peer:         record.ChatID,
 		MessageID:    record.MessageID,
+		TargetTitle:  record.TargetTitle,
+		MediaType:    record.MediaType,
+		FileName:     record.FileName,
+		Date:         record.CreatedAt,
 		FinalPath:    record.SavePath,
 		ExpectedSize: record.FileSize,
 		Retry:        record.Attempts > 0,
@@ -266,6 +275,7 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 	taskID := req.ID
 	chatID := req.Peer
 	msgID := req.MessageID
+	gen := task.Generation()
 
 	if _, loaded := o.inFlight.LoadOrStore(taskID, struct{}{}); loaded {
 		return
@@ -279,7 +289,11 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 
 	// 1. Media Ingress / Resolution (done first to obtain authoritative size and metadata)
 	if o.db != nil {
-		_ = o.db.UpdateDownloadStatus(chatID, msgID, "resolving", "", req.FinalPath, "", req.ExpectedSize, "")
+		if beginErr := o.db.BeginDownload(chatID, msgID, gen, req.FileName, req.FinalPath, req.MediaType, req.ExpectedSize); errors.Is(beginErr, ErrAlreadySuccess) {
+			o.logger.Info("task already completed successfully in DB", zap.String("task_id", taskID))
+			task.Succeed(req.FinalPath, true)
+			return
+		}
 	}
 
 	normalizedPeer := strings.TrimPrefix(strings.TrimSpace(chatID), "@")
@@ -291,21 +305,19 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 		)
 		errStr := strings.ToLower(err.Error())
 		isUnavailable := strings.Contains(errStr, "deleted") || strings.Contains(errStr, "unavailable") || strings.Contains(errStr, "message_id_invalid")
-		task.Fail("resolve", err.Error(), isUnavailable)
+		taskErr := NewTaskError("resolve", "get_message", "unavailable", isUnavailable, !isUnavailable, err)
+		task.Fail("resolve", taskErr.Error(), isUnavailable)
 		if o.db != nil {
-			st := "failed"
-			if isUnavailable {
-				st = "unavailable"
-			}
-			_ = o.db.UpdateDownloadStatus(chatID, msgID, st, "", req.FinalPath, "", req.ExpectedSize, err.Error())
+			_ = o.db.FailDownload(chatID, msgID, gen, req.FileName, req.FinalPath, req.MediaType, req.ExpectedSize, taskErr.Error(), isUnavailable)
 		}
 		return
 	}
 
 	if resolvedMedia.File == nil || resolvedMedia.Size <= 0 {
-		task.Fail("unavailable", "message has no downloadable media", true)
+		taskErr := NewTaskError("resolve", "validate_media", "unavailable", true, false, errors.New("message has no downloadable media"))
+		task.Fail("unavailable", taskErr.Error(), true)
 		if o.db != nil {
-			_ = o.db.UpdateDownloadStatus(chatID, msgID, "unavailable", "", req.FinalPath, "", 0, "message has no downloadable media")
+			_ = o.db.FailDownload(chatID, msgID, gen, req.FileName, req.FinalPath, req.MediaType, 0, taskErr.Error(), true)
 		}
 		return
 	}
@@ -314,9 +326,25 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 	authoritativeSize := resolvedMedia.Size
 
 	// 2. Canonical Path Planning
+	targetTitle := req.TargetTitle
+	if targetTitle == "" && o.db != nil {
+		targetTitle = o.db.GetTargetTitle(chatID)
+	}
+	mediaType := resolvedMedia.MediaType
+	if mediaType == "" {
+		mediaType = req.MediaType
+	}
+	fileName := resolvedMedia.Name
+	if fileName == "" {
+		fileName = req.FileName
+	}
+	msgDate := resolvedMedia.Date
+	if msgDate <= 0 {
+		msgDate = req.Date
+	}
 	finalRelPath := req.FinalPath
 	if finalRelPath == "" {
-		finalRelPath = PathPlanner{}.Plan(chatID, "", msgID, resolvedMedia.Name, "", resolvedMedia.Date)
+		finalRelPath = PathPlanner{}.Plan(chatID, targetTitle, msgID, fileName, mediaType, msgDate)
 	}
 	finalRelPath = strings.ReplaceAll(finalRelPath, "\\", "/")
 	task.SetFinalPath(finalRelPath)
@@ -326,7 +354,6 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 
 	// 3. Check existing final file (Verified Idempotent success vs Collision)
 	if finInfo, statErr := os.Stat(finalAbsPath); statErr == nil {
-		// Existing file on disk can ONLY be promoted to success if this task has matching commit proof!
 		isVerified := false
 		if o.db != nil {
 			if rec, recErr := o.db.GetDownloadRecord(chatID, msgID); recErr == nil && rec != nil {
@@ -336,7 +363,7 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 					if shaErr == nil && actualSHA == rec.SHA256 {
 						isVerified = true
 						_ = o.db.CompleteDownloadAndQueueArchive(
-							chatID, msgID, finalRelPath,
+							chatID, msgID, gen, finalRelPath,
 							finInfo.Size(), actualSHA,
 							o.archiveWorker != nil && o.archiveWorker.IsEnabled(),
 						)
@@ -355,9 +382,10 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 				zap.String("task_id", taskID),
 				zap.String("final_path", finalAbsPath),
 			)
-			task.Fail("collision", "destination exists with conflicting content or without task commit proof", false)
+			taskErr := NewTaskError("admission", "check_file", "collision", false, false, errors.New("destination exists with conflicting content or without task commit proof"))
+			task.Fail("collision", taskErr.Error(), false)
 			if o.db != nil {
-				_ = o.db.UpdateDownloadStatus(chatID, msgID, "failed", resolvedMedia.Name, finalRelPath, "", authoritativeSize, "collision: destination exists without verified task proof")
+				_ = o.db.FailDownload(chatID, msgID, gen, fileName, finalRelPath, mediaType, authoritativeSize, taskErr.Error(), false)
 			}
 			return
 		}
@@ -379,9 +407,10 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 	// 5. Ensure parent directory exists
 	if err := os.MkdirAll(filepath.Dir(finalAbsPath), 0o755); err != nil {
 		o.logger.Error("failed to create target dir", zap.Error(err))
-		task.Fail("path", err.Error(), false)
+		taskErr := NewTaskError("path", "mkdir", "io", false, false, err)
+		task.Fail("path", taskErr.Error(), false)
 		if o.db != nil {
-			_ = o.db.UpdateDownloadStatus(chatID, msgID, "failed", resolvedMedia.Name, finalRelPath, "", authoritativeSize, err.Error())
+			_ = o.db.FailDownload(chatID, msgID, gen, fileName, finalRelPath, mediaType, authoritativeSize, taskErr.Error(), false)
 		}
 		return
 	}
@@ -393,9 +422,10 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 	partFile, err := os.OpenFile(partAbsPath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
 	if err != nil {
 		o.logger.Error("failed to create part file", zap.Error(err))
-		task.Fail("io", err.Error(), false)
+		taskErr := NewTaskError("download", "open_part", "io", false, false, err)
+		task.Fail("io", taskErr.Error(), false)
 		if o.db != nil {
-			_ = o.db.UpdateDownloadStatus(chatID, msgID, "failed", resolvedMedia.Name, finalRelPath, "", authoritativeSize, err.Error())
+			_ = o.db.FailDownload(chatID, msgID, gen, fileName, finalRelPath, mediaType, authoritativeSize, taskErr.Error(), false)
 		}
 		return
 	}
@@ -403,7 +433,7 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 
 	task.SetDownloading()
 	if o.db != nil {
-		_ = o.db.UpdateDownloadStatus(chatID, msgID, "downloading", resolvedMedia.Name, finalRelPath, "", authoritativeSize, "")
+		_ = o.db.BeginDownload(chatID, msgID, gen, fileName, finalRelPath, mediaType, authoritativeSize)
 	}
 
 	// 6. Build thin gotd client adapter with DataGate & CDN protection
@@ -437,9 +467,10 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 			zap.String("task_id", taskID),
 			zap.Error(dlErr),
 		)
-		task.Fail("transfer", dlErr.Error(), false)
+		taskErr := NewTaskError("transfer", "download_file", "network", false, true, dlErr)
+		task.Fail("transfer", taskErr.Error(), false)
 		if o.db != nil {
-			_ = o.db.UpdateDownloadStatus(chatID, msgID, "failed", resolvedMedia.Name, finalRelPath, "", authoritativeSize, dlErr.Error())
+			_ = o.db.FailDownload(chatID, msgID, gen, fileName, finalRelPath, mediaType, authoritativeSize, taskErr.Error(), false)
 		}
 		return
 	}
@@ -450,9 +481,10 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 		_ = partFile.Close()
 		_ = os.Remove(partAbsPath)
 		errDesc := fmt.Sprintf("short write: got %d, want %d", written, authoritativeSize)
-		task.Fail("corrupt", errDesc, false)
+		taskErr := NewTaskError("transfer", "verify_size", "corrupt", false, false, errors.New(errDesc))
+		task.Fail("corrupt", taskErr.Error(), false)
 		if o.db != nil {
-			_ = o.db.UpdateDownloadStatus(chatID, msgID, "failed", resolvedMedia.Name, finalRelPath, "", authoritativeSize, errDesc)
+			_ = o.db.FailDownload(chatID, msgID, gen, fileName, finalRelPath, mediaType, authoritativeSize, taskErr.Error(), false)
 		}
 		return
 	}
@@ -460,18 +492,20 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 	if syncErr := partFile.Sync(); syncErr != nil {
 		_ = partFile.Close()
 		_ = os.Remove(partAbsPath)
-		task.Fail("io_sync", syncErr.Error(), false)
+		taskErr := NewTaskError("commit", "fsync", "io_sync", false, false, syncErr)
+		task.Fail("io_sync", taskErr.Error(), false)
 		if o.db != nil {
-			_ = o.db.UpdateDownloadStatus(chatID, msgID, "failed", resolvedMedia.Name, finalRelPath, "", authoritativeSize, syncErr.Error())
+			_ = o.db.FailDownload(chatID, msgID, gen, fileName, finalRelPath, mediaType, authoritativeSize, taskErr.Error(), false)
 		}
 		return
 	}
 
 	if closeErr := partFile.Close(); closeErr != nil {
 		_ = os.Remove(partAbsPath)
-		task.Fail("io_close", closeErr.Error(), false)
+		taskErr := NewTaskError("commit", "close", "io_close", false, false, closeErr)
+		task.Fail("io_close", taskErr.Error(), false)
 		if o.db != nil {
-			_ = o.db.UpdateDownloadStatus(chatID, msgID, "failed", resolvedMedia.Name, finalRelPath, "", authoritativeSize, closeErr.Error())
+			_ = o.db.FailDownload(chatID, msgID, gen, fileName, finalRelPath, mediaType, authoritativeSize, taskErr.Error(), false)
 		}
 		return
 	}
@@ -479,18 +513,20 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 	shaHex, shaErr := computeFileSHA256(partAbsPath)
 	if shaErr != nil {
 		_ = os.Remove(partAbsPath)
-		task.Fail("hash", shaErr.Error(), false)
+		taskErr := NewTaskError("hash", "sha256", "hash", false, false, shaErr)
+		task.Fail("hash", taskErr.Error(), false)
 		if o.db != nil {
-			_ = o.db.UpdateDownloadStatus(chatID, msgID, "failed", resolvedMedia.Name, finalRelPath, "", authoritativeSize, shaErr.Error())
+			_ = o.db.FailDownload(chatID, msgID, gen, fileName, finalRelPath, mediaType, authoritativeSize, taskErr.Error(), false)
 		}
 		return
 	}
 
 	// 10. Durable commit intent in DB
 	if o.db != nil {
-		if err := o.db.PrepareDownloadCommit(chatID, msgID, finalRelPath, stat.Size(), shaHex); err != nil {
+		if err := o.db.PrepareDownloadCommit(chatID, msgID, gen, finalRelPath, stat.Size(), shaHex); err != nil {
 			_ = os.Remove(partAbsPath)
-			task.Fail("commit_prepare", err.Error(), false)
+			taskErr := NewTaskError("commit", "prepare", "db_conflict", false, false, err)
+			task.Fail("commit_prepare", taskErr.Error(), false)
 			return
 		}
 	}
@@ -506,9 +542,10 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 	if err := fscommit.CommitSiblingPart(partAbsPath, finalAbsPath); err != nil {
 		_ = os.Remove(partAbsPath)
 		o.logger.Error("atomic commit failed", zap.Error(err))
-		task.Fail("commit", err.Error(), false)
+		taskErr := NewTaskError("commit", "rename", "io", false, false, err)
+		task.Fail("commit", taskErr.Error(), false)
 		if o.db != nil {
-			_ = o.db.UpdateDownloadStatus(chatID, msgID, "failed", resolvedMedia.Name, finalRelPath, "", authoritativeSize, err.Error())
+			_ = o.db.FailDownload(chatID, msgID, gen, fileName, finalRelPath, mediaType, authoritativeSize, taskErr.Error(), false)
 		}
 		return
 	}
@@ -516,9 +553,10 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 	// 13. Complete download and queue archive in single DB transaction
 	queueArchive := o.archiveWorker != nil && o.archiveWorker.IsEnabled()
 	if o.db != nil {
-		if err := o.db.CompleteDownloadAndQueueArchive(chatID, msgID, finalRelPath, stat.Size(), shaHex, queueArchive); err != nil {
+		if err := o.db.CompleteDownloadAndQueueArchive(chatID, msgID, gen, finalRelPath, stat.Size(), shaHex, queueArchive); err != nil {
 			o.logger.Error("failed to complete download in DB", zap.Error(err))
-			task.Fail("db_complete", err.Error(), false)
+			taskErr := NewTaskError("commit", "db_complete", "db_conflict", false, false, err)
+			task.Fail("db_complete", taskErr.Error(), false)
 			return
 		}
 	}

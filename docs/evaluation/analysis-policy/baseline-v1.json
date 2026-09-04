@@ -3,6 +3,32 @@
   "protocol_version": "1.0",
   "missing_required_measurement": "BLOCKED",
   "invalid_artifact_identity": "INVALID",
+  "required_metrics": [
+    "wire_rx_bytes",
+    "rolling_5s_bps",
+    "active_rpc",
+    "queued_jobs",
+    "connection_failures",
+    "process_rss",
+    "ssd_free_bytes",
+    "ssd_reserved_bytes",
+    "archive_backlog_files",
+    "archive_backlog_bytes",
+    "archive_active_workers",
+    "target_write_bytes",
+    "target_read_bytes",
+    "target_backlog_bytes"
+  ],
+  "required_environment_fields": [
+    "host_id",
+    "account_session_id",
+    "proxy_route_id",
+    "network_interface",
+    "target_storage_id",
+    "ssd_storage_id",
+    "filesystem_types",
+    "clock_source"
+  ],
   "correctness": {
     "required_completed_file_match_fraction": 1.0,
     "allow_unexpected_final_files": false,
@@ -12,7 +38,7 @@
   "stability": {
     "allow_unexpected_process_restart": false,
     "maximum_unexplained_zero_throughput_seconds": 10,
-    "require_buffer_drain": true,
+    "require_ssd_admission_recovery": true,
     "require_target_backlog_drain": true
   },
   "performance": {

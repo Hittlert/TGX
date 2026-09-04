@@ -1,27 +1,21 @@
 #!/usr/bin/env python3
-"""
-TGX Evaluation Protocol v1.0 - Reference Test Harness
-Implements exact lifecycle, raw artifact generation, 1s metric recording,
-cryptographic SHA256 sealing, and policy analysis per TGX_EVALUATION_PROTOCOL_V1.md.
-"""
+"""Execute one isolated TGX evaluation run and seal its raw facts."""
 
 import os
-import sys
 import time
 import json
-import uuid
 import shutil
-import sqlite3
 import hashlib
 import argparse
 import threading
 import urllib.request
-import urllib.error
-import posixpath
 import subprocess
+from pathlib import Path, PurePosixPath
+
+from analyze import seal_raw_directory
 
 PROTOCOL_VERSION = "1.0"
-PROTOCOL_SHA256 = "2dad99ee0e37a25178418f727c3e0d80caad67263d700c06b117aa3d27700b33"
+PROTOCOL_SHA256 = "4dbdf4940f5c751d683c79f3392bbca770832ef258360f57244d69fc3d589c0e"
 
 def compute_sha256(filepath):
     if not os.path.isfile(filepath):
@@ -57,105 +51,99 @@ class MetricsSampler(threading.Thread):
         self.api_base = api_base
         self.metrics_file = metrics_file
         self.engine = engine
-        self.running = True
+        self.stop_event = threading.Event()
         self.samples = []
         self.t0 = time.time()
+        self.phase = "setup"
 
     def run(self):
         with open(self.metrics_file, "w", encoding="utf-8") as f:
-            while self.running:
+            while not self.stop_event.is_set():
                 now = time.time()
                 elapsed = round(now - self.t0, 3)
                 
-                # Fixed schema for metrics.jsonl
                 rec = {
                     "timestamp": iso_time(now),
                     "monotonic_elapsed_sec": elapsed,
                     "engine": self.engine,
-                    
-                    # Network
-                    "wire_rx_bytes": None,
-                    "unique_payload_bytes": 0,
-                    "rolling_5s_bps": 0,
-                    "active_rpc": 0,
-                    "queued_jobs": 0,
-                    "connection_count": 0,
-                    "connection_failures": 0,
-                    "retry_count": 0,
-                    "flood_wait_count": 0,
-                    "flood_wait_seconds": 0,
-                    "per_dc_payload_bps": {},
+                    "phase": self.phase,
 
-                    # Memory
+                    "wire_rx_bytes": None,
+                    "unique_payload_bytes": None,
+                    "rolling_5s_bps": None,
+                    "active_rpc": None,
+                    "queued_jobs": None,
+                    "connection_count": None,
+                    "connection_failures": None,
+                    "retry_count": None,
+                    "flood_wait_count": None,
+                    "flood_wait_seconds": None,
+                    "per_dc_payload_bps": None,
                     "process_rss": None,
                     "heap_alloc": None,
                     "heap_inuse": None,
                     "heap_objects": None,
                     "gc_count": None,
                     "gc_pause_total": None,
-                    "buffer_logical_bytes": None,
-                    "buffer_physical_bytes": None,
-
-                    # SSD / Spool
-                    "spool_max_bytes": None,
-                    "spool_used_bytes": None,
-                    "spool_reserved_bytes": None,
-                    "spool_ready_bytes": None,
-                    "spool_writing_bytes": None,
-                    "spool_reclaimed_bytes": None,
-                    "actual_directory_bytes": None,
-                    "active_segments": None,
-                    "writeback_bps": None,
-                    "read_bps": None,
-                    "write_bps": None,
-                    "sync_count": None,
-                    "sync_latency": None,
-                    "backpressured": None,
-
-                    # Target storage
+                    "ssd_free_bytes": None,
+                    "ssd_total_bytes": None,
+                    "ssd_used_bytes": None,
+                    "ssd_reserved_bytes": None,
+                    "ssd_available_bytes": None,
+                    "archive_backlog_files": None,
+                    "archive_backlog_bytes": None,
+                    "archive_active_workers": None,
+                    "archive_archived_files": None,
+                    "archive_conflict_count": None,
                     "target_write_bytes": None,
                     "target_read_bytes": None,
                     "target_durable_bytes": None,
                     "target_writer_concurrency": None,
                     "target_backlog_bytes": None,
-                    "moving_file_count": 0,
                     "fsync_count": None,
                     "fsync_latency": None,
                     "device_util": None,
                     "device_await": None,
-
                     "collection_errors": [],
                 }
 
-                # Poll Daemon /api/status
                 try:
                     st = http_get(f"{self.api_base}/api/status", timeout=1.5)
-                    rec["rolling_5s_bps"] = st.get("rolling_5s_bps", 0)
-                    rec["queued_jobs"] = st.get("queue_depth", 0)
-                    active_files = st.get("active_files") or []
-                    rec["active_rpc"] = len(active_files)
-                    
+                    rec["rolling_5s_bps"] = st.get("rolling_5s_bps")
+                    rec["queued_jobs"] = st.get("queue_depth")
+                    active_files = st.get("active_files")
+                    if isinstance(active_files, list):
+                        rec["active_rpc"] = len(active_files)
                     pool = st.get("pool") or {}
-                    rec["connection_count"] = pool.get("size", 0)
-                    rec["connection_failures"] = pool.get("reconnects", 0)
+                    rec["connection_count"] = pool.get("size")
+                    rec["connection_failures"] = pool.get("reconnects")
                 except Exception as e:
                     rec["collection_errors"].append({"source": "/api/status", "error": str(e)})
 
-                # Poll /api/system/storage
+                try:
+                    gate = http_get(f"{self.api_base}/api/gate", timeout=1.5)
+                    rec["ssd_reserved_bytes"] = gate.get("ssd_reserved_bytes")
+                    rec["ssd_available_bytes"] = gate.get("ssd_available_bytes")
+                except Exception as e:
+                    if self.engine == "tgx":
+                        rec["collection_errors"].append(
+                            {"source": "/api/gate", "error": str(e)}
+                        )
+
                 try:
                     storage = http_get(f"{self.api_base}/api/system/storage", timeout=1.5)
-                    buf = storage.get("buffer")
-                    if buf:
-                        rec["spool_max_bytes"] = buf.get("max_bytes")
-                        rec["spool_used_bytes"] = buf.get("used_bytes")
-                        rec["spool_reserved_bytes"] = buf.get("reserved_bytes")
-                        rec["spool_ready_bytes"] = buf.get("ready_bytes")
-                        rec["spool_writing_bytes"] = buf.get("writing_bytes")
-                        rec["spool_reclaimed_bytes"] = buf.get("reclaimed_bytes")
-                        rec["active_segments"] = buf.get("active_segments")
-                        rec["backpressured"] = buf.get("backpressured")
-                    else:
-                        rec["spool_max_bytes"] = None
+                    rec["ssd_free_bytes"] = storage.get("free_bytes")
+                    rec["ssd_total_bytes"] = storage.get("total_bytes")
+                    rec["ssd_used_bytes"] = storage.get("used_bytes")
+                    archive = storage.get("archive") or {}
+                    for field in (
+                        "archive_backlog_files",
+                        "archive_backlog_bytes",
+                        "archive_active_workers",
+                        "archive_archived_files",
+                        "archive_conflict_count",
+                    ):
+                        rec[field] = archive.get(field)
                 except Exception as e:
                     if self.engine == "tgx":
                         rec["collection_errors"].append({"source": "/api/system/storage", "error": str(e)})
@@ -166,25 +154,41 @@ class MetricsSampler(threading.Thread):
 
                 rem = 1.0 - (time.time() - now)
                 if rem > 0.05:
-                    time.sleep(rem)
+                    self.stop_event.wait(rem)
 
     def stop(self):
-        self.running = False
+        self.stop_event.set()
 
-def extract_artifact_metadata(engine_binary, engine):
+    def set_phase(self, phase):
+        self.phase = phase
+
+def extract_artifact_metadata(
+    engine_binary,
+    engine,
+    docker_command,
+    runner_image,
+    source_repository,
+):
     binary_sha = compute_sha256(engine_binary) or "unknown"
     harness_sha = compute_sha256(__file__) if os.path.exists(__file__) else "unknown"
-    
-    # Get actual docker image digest / ID
-    img_digest = "alpine:latest"
+
+    img_digest = "unknown"
     try:
-        d_cmd = ["sudo", "docker", "inspect", "--format={{range .RepoDigests}}{{.}}{{end}}", "alpine:latest"]
+        d_cmd = docker_command + [
+            "inspect",
+            "--format={{range .RepoDigests}}{{.}}{{end}}",
+            runner_image,
+        ]
         d_res = subprocess.run(d_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5)
         d_str = d_res.stdout.strip()
         if d_str:
             img_digest = d_str
         else:
-            id_cmd = ["sudo", "docker", "inspect", "--format={{.Id}}", "alpine:latest"]
+            id_cmd = docker_command + [
+                "inspect",
+                "--format={{.Id}}",
+                runner_image,
+            ]
             id_res = subprocess.run(id_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5)
             if id_res.stdout.strip():
                 img_digest = id_res.stdout.strip()
@@ -193,21 +197,29 @@ def extract_artifact_metadata(engine_binary, engine):
 
     meta = {
         "engine": engine,
-        "source_repository": "https://github.com/Hittlert/TGX",
+        "source_repository": source_repository,
         "source_commit": "unknown",
-        "source_dirty": False,
+        "source_dirty": None,
         "binary_sha256": binary_sha,
         "harness_sha256": harness_sha,
         "image_digest": img_digest,
         "version": "unknown",
-        "build_time": iso_time(),
+        "build_time": "unknown",
         "go_version": "unknown",
         "os": "linux",
         "arch": "amd64",
     }
-    
+
     try:
-        cmd = ["sudo", "docker", "run", "--rm", "-v", f"{os.path.abspath(engine_binary)}:/app/bin:ro", "alpine:latest", "/app/bin", "version"]
+        cmd = docker_command + [
+            "run",
+            "--rm",
+            "-v",
+            f"{os.path.abspath(engine_binary)}:/app/bin:ro",
+            runner_image,
+            "/app/bin",
+            "version",
+        ]
         res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10)
         output = res.stdout + res.stderr
         for line in output.splitlines():
@@ -232,58 +244,100 @@ def extract_artifact_metadata(engine_binary, engine):
                     meta["source_commit"] = v
                 elif k == "Date":
                     meta["build_time"] = v
+            else:
+                parts = line.split()
+                if len(parts) == 2 and parts[0].startswith("go") and "/" in parts[1]:
+                    meta["go_version"] = parts[0]
+                    meta["os"], meta["arch"] = parts[1].split("/", 1)
         if meta["version"] == "unknown" and meta.get("tdl_revision"):
             meta["version"] = "1.0.0"
     except Exception as e:
         meta["extraction_error"] = str(e)
     return meta
 
-def execute_run(run_spec, engine_binary, eval_dir="/volume2/docker/telegram_downloader_eval/evaluation", host_port=5890):
+def ensure_new_directory(path):
+    path = Path(path)
+    if path.exists():
+        raise FileExistsError(f"refusing to reuse existing evaluation path: {path}")
+    path.mkdir(parents=True)
+    return path
+
+
+def safe_relative_path(value):
+    path = PurePosixPath(str(value).replace("\\", "/"))
+    if path.is_absolute() or not path.parts or ".." in path.parts:
+        raise ValueError(f"unsafe manifest output path: {value!r}")
+    return str(path)
+
+
+def execute_run(run_spec, engine_binary, eval_dir, host_port=5890):
     run_id = run_spec["run_id"]
     engine = run_spec["engine"]
     profile_id = run_spec["profile_id"]
     duration_sec = run_spec["duration_seconds"]
+    warmup_sec = run_spec.get("warmup_seconds", 0)
     drain_timeout_sec = run_spec.get("drain_timeout_seconds", 60)
     net_concurrency = run_spec.get("net_concurrency", 32)
     file_concurrency = run_spec.get("file_concurrency", 5)
     dc_pool_size = run_spec.get("dc_pool_size", 32)
-    manifest_path = run_spec["manifest_path"]
+    manifest_path = Path(run_spec["manifest_path"])
+    manifest_sha256 = compute_sha256(manifest_path)
+    if manifest_sha256 != run_spec.get("manifest_sha256"):
+        raise ValueError("RunSpec manifest_sha256 does not match the selected manifest")
+    if not run_spec.get("baseline_cohort_id"):
+        raise ValueError("RunSpec baseline_cohort_id is required")
 
-    # Target directory structure: baselines/tdl/<run_id>/raw or runs/tgx/<run_id>/raw
+    docker_command = run_spec.get("docker_command")
+    if not isinstance(docker_command, list) or not docker_command:
+        raise ValueError("RunSpec docker_command must be a non-empty argument list")
+    runner_image = run_spec.get("runner_image")
+    if not runner_image:
+        raise ValueError("RunSpec runner_image is required")
+    api_base = run_spec.get("api_base") or f"http://127.0.0.1:{host_port}"
+    artifact_meta = extract_artifact_metadata(
+        engine_binary,
+        engine,
+        docker_command,
+        runner_image,
+        run_spec["source_repository"],
+    )
+    if artifact_meta["binary_sha256"] != run_spec.get("expected_binary_sha256"):
+        raise ValueError("engine binary does not match RunSpec expected SHA-256")
+    if artifact_meta["source_commit"] != run_spec.get("expected_source_commit"):
+        raise ValueError("engine binary does not match RunSpec expected source commit")
+    if artifact_meta.get("source_dirty") is not False:
+        raise ValueError("engine binary reports dirty or unknown source state")
+    if str(artifact_meta.get("version")).lower() in ("", "dev", "unknown"):
+        raise ValueError("engine binary does not report a release identity")
+    for field in ("build_time", "go_version", "os", "arch"):
+        if str(artifact_meta.get(field) or "").lower() in ("", "unknown"):
+            raise ValueError(f"engine binary does not report {field}")
+    if artifact_meta.get("image_digest") == "unknown":
+        raise ValueError("runner image identity could not be resolved")
+
     if engine == "tdl":
-        run_root = os.path.join(eval_dir, "baselines", "tdl", run_id)
+        run_root = Path(eval_dir) / "baselines" / "tdl" / run_id
     else:
-        run_root = os.path.join(eval_dir, "runs", "tgx", run_id)
+        run_root = Path(eval_dir) / "runs" / "tgx" / run_id
+    ensure_new_directory(run_root)
+    raw_dir = run_root / "raw"
+    raw_dir.mkdir()
 
-    raw_dir = os.path.join(run_root, "raw")
-    os.makedirs(raw_dir, exist_ok=True)
+    scratch_root = ensure_new_directory(run_spec["scratch_root"])
+    output_dir = scratch_root / "output"
+    temp_dir = scratch_root / "temp"
+    session_dir = scratch_root / "session"
+    state_dir = scratch_root / "state"
+    log_dir = scratch_root / "logs"
+    for path in (output_dir, temp_dir, session_dir, state_dir, log_dir):
+        path.mkdir()
 
-    # Scratch isolation per run
-    scratch_root = f"/volume2/docker/telegram_downloader_eval/scratch_runs/{run_id}"
-    output_dir = os.path.join(scratch_root, "output")
-    temp_dir = os.path.join(scratch_root, "temp")
-    buffer_dir = os.path.join(scratch_root, "buffer")
-    session_dir = os.path.join(scratch_root, "session")
-    log_dir = os.path.join(scratch_root, "logs")
-
-    # Clean previous run scratch if exists
-    if os.path.exists(scratch_root):
-        shutil.rmtree(scratch_root, ignore_errors=True)
-
-    os.makedirs(output_dir, exist_ok=True)
-    os.makedirs(temp_dir, exist_ok=True)
-    os.makedirs(buffer_dir, exist_ok=True)
-    os.makedirs(session_dir, exist_ok=True)
-    os.makedirs(log_dir, exist_ok=True)
-
-    # Copy session state for independent run
-    src_session = "/volume2/docker/telegram_downloader_eval/tdl-state"
-    if os.path.exists(src_session):
-        for f_name in os.listdir(src_session):
-            s_fp = os.path.join(src_session, f_name)
-            d_fp = os.path.join(session_dir, f_name)
-            if os.path.isfile(s_fp):
-                shutil.copy2(s_fp, d_fp)
+    source_session = Path(run_spec["session_source_dir"])
+    if not source_session.is_dir():
+        raise FileNotFoundError(f"session source does not exist: {source_session}")
+    for source in source_session.iterdir():
+        if source.is_file():
+            shutil.copy2(source, session_dir / source.name)
 
     print(f"\n=======================================================")
     print(f"  TGX Evaluation Protocol v1.0 - RUN: {run_id}")
@@ -294,39 +348,28 @@ def execute_run(run_spec, engine_binary, eval_dir="/volume2/docker/telegram_down
     print(f"=======================================================")
 
     # 1. raw/protocol.json
-    with open(os.path.join(raw_dir, "protocol.json"), "w", encoding="utf-8") as f:
+    with open(raw_dir / "protocol.json", "w", encoding="utf-8") as f:
         json.dump({"protocol_version": PROTOCOL_VERSION, "protocol_sha256": PROTOCOL_SHA256}, f, indent=2)
 
     # 2. raw/run_spec.json
     run_spec_copy = dict(run_spec)
-    run_spec_copy["output_dir"] = output_dir
-    run_spec_copy["buffer_dir"] = buffer_dir
-    run_spec_copy["log_dir"] = log_dir
-    with open(os.path.join(raw_dir, "run_spec.json"), "w", encoding="utf-8") as f:
+    run_spec_copy["output_dir"] = str(output_dir)
+    run_spec_copy["state_db"] = str(state_dir / "records.sqlite3")
+    run_spec_copy["log_dir"] = str(log_dir)
+    with open(raw_dir / "run_spec.json", "w", encoding="utf-8") as f:
         json.dump(run_spec_copy, f, indent=2)
 
     # 3. raw/artifact.json
-    artifact_meta = extract_artifact_metadata(engine_binary, engine)
-    with open(os.path.join(raw_dir, "artifact.json"), "w", encoding="utf-8") as f:
+    with open(raw_dir / "artifact.json", "w", encoding="utf-8") as f:
         json.dump(artifact_meta, f, indent=2)
 
-    # 4. raw/environment.json
-    env_meta = {
-        "host_id": "nas-192.168.79.37",
-        "account_session_id": "production_session_copy",
-        "proxy_route_id": "sing-box-tun-gateway",
-        "network_interface": "tun0",
-        "target_storage_id": "synology-btrfs-volume2",
-        "buffer_storage_id": "synology-nvme-ssd-volume2",
-        "filesystem_types": {"downloads": "btrfs", "buffer": "btrfs"},
-        "container_identity": f"tgx-eval-runner-{run_id}",
-        "clock_source": "synology_system_monotonic",
-    }
-    with open(os.path.join(raw_dir, "environment.json"), "w", encoding="utf-8") as f:
+    env_meta = dict(run_spec.get("environment") or {})
+    env_meta["container_identity"] = f"tgx-eval-runner-{run_id}"
+    with open(raw_dir / "environment.json", "w", encoding="utf-8") as f:
         json.dump(env_meta, f, indent=2)
 
     # 5. raw/manifest.jsonl (byte-identical copy)
-    raw_manifest_path = os.path.join(raw_dir, "manifest.jsonl")
+    raw_manifest_path = raw_dir / "manifest.jsonl"
     shutil.copyfile(manifest_path, raw_manifest_path)
 
     cases = []
@@ -336,10 +379,10 @@ def execute_run(run_spec, engine_binary, eval_dir="/volume2/docker/telegram_down
                 cases.append(json.loads(line))
 
     # Initialize raw facts files
-    events_file = os.path.join(raw_dir, "events.jsonl")
-    errors_file = os.path.join(raw_dir, "errors.jsonl")
-    metrics_file = os.path.join(raw_dir, "metrics.jsonl")
-    process_log_file = os.path.join(raw_dir, "process.log")
+    events_file = raw_dir / "events.jsonl"
+    errors_file = raw_dir / "errors.jsonl"
+    metrics_file = raw_dir / "metrics.jsonl"
+    process_log_file = raw_dir / "process.log"
 
     events_fp = open(events_file, "w", encoding="utf-8")
     errors_fp = open(errors_file, "w", encoding="utf-8")
@@ -355,43 +398,43 @@ def execute_run(run_spec, engine_binary, eval_dir="/volume2/docker/telegram_down
         events_fp.flush()
 
     container_name = f"tgx-eval-runner-{run_id}"
-    subprocess.run(f"sudo docker rm -f {container_name} tgx-eval-daemon $(sudo docker ps -q --filter name=tgx-eval-runner) 2>/dev/null || true", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    time.sleep(2)
 
-    # Launch Runner Container in isolated proxy network namespace
-    print(f"[*] Spawning Runner Container: {container_name} in tgx-eval-proxy network...")
-    serve_args = [
-        "sudo", "docker", "run", "-d",
+    print(f"[*] Spawning Runner Container: {container_name}...")
+    serve_args = docker_command + [
+        "run", "-d",
         "--name", container_name,
-        "--net", "container:tgx-eval-proxy",
         "-v", f"{os.path.abspath(engine_binary)}:/app/telegram-downloader:ro",
         "-v", f"{output_dir}:/app/downloads",
         "-v", f"{session_dir}:/data",
+        "-v", f"{state_dir}:/app/state",
         "-v", f"{log_dir}:/app/logs",
     ]
+    network_container = run_spec.get("network_container")
+    if network_container:
+        serve_args.extend(["--net", f"container:{network_container}"])
+    else:
+        serve_args.extend(["-p", f"127.0.0.1:{host_port}:5000"])
     if engine == "tdl":
         serve_args.extend(["-v", f"{temp_dir}:/app/temp/tdl"])
-    else:
-        serve_args.extend(["-v", f"{buffer_dir}:/app/buffer"])
 
     serve_args.extend([
-        "alpine:latest",
+        runner_image,
         "/app/telegram-downloader", "serve",
         "--dir", "/app/downloads",
         "--storage-path", "/data",
-        "--namespace", "production",
+        "--db-path", "/app/state/records.sqlite3",
+        "--namespace", run_spec.get("namespace", "evaluation"),
         "--listen", "0.0.0.0:5000",
         "--download-threads", str(net_concurrency),
         "--file-concurrency", str(file_concurrency),
         "--dc-pool-size", str(dc_pool_size),
-        "--temp-dir", "/app/temp/tdl",
     ])
+    if engine == "tdl":
+        serve_args.extend(["--temp-dir", "/app/temp/tdl"])
 
     res = subprocess.run(serve_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if res.returncode != 0:
         raise RuntimeError(f"Failed to start container {container_name}: {res.stderr}")
-
-    api_base = "http://127.0.0.1:5885"
 
     # Wait for daemon health
     print(f"[*] Waiting for {container_name} to be ready at {api_base}/healthz...")
@@ -408,11 +451,20 @@ def execute_run(run_spec, engine_binary, eval_dir="/volume2/docker/telegram_down
             pass
 
     if not ready:
-        p_logs = subprocess.run(["sudo", "docker", "logs", container_name], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        subprocess.run(["sudo", "docker", "rm", "-f", container_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        p_logs = subprocess.run(
+            docker_command + ["logs", container_name],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        subprocess.run(
+            docker_command + ["rm", "-f", container_name],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
         raise RuntimeError(f"Engine {engine} failed to start within 90s. Logs:\n{p_logs.stdout}")
 
-    print("[✓] Engine daemon is healthy and ready!")
+    print("[OK] Engine daemon is healthy and ready!")
     log_event("run.started", {"run_id": run_id, "cases_total": len(cases)})
 
     # Start 1s Metrics Sampler
@@ -430,7 +482,9 @@ def execute_run(run_spec, engine_binary, eval_dir="/volume2/docker/telegram_down
     task_submits = {}
     for c in cases:
         case_id = c["case_id"]
-        rel_path = c["expected_tgx_path"] if engine == "tgx" else c["expected_tdl_path"]
+        rel_path = safe_relative_path(
+            c["expected_tgx_path"] if engine == "tgx" else c["expected_tdl_path"]
+        )
         task_id = f"{run_id}_{c['chat_id']}_{c['message_id']}"
         req = {
             "id": task_id,
@@ -445,7 +499,15 @@ def execute_run(run_spec, engine_binary, eval_dir="/volume2/docker/telegram_down
             log_event("item.submitted", {"case_id": case_id, "task_id": task_id})
             task_submits[case_id] = {"task_id": task_id, "submitted_at": t_sub, "submitted": True, "error": None}
         except Exception as e:
-            err_entry = {"case_id": case_id, "stage": "submit", "op": "http_post", "error_code": "SUBMIT_FAILED", "error_cause": str(e), "retryable": False}
+            err_entry = {
+                "case_id": case_id,
+                "attempt_id": "not-admitted",
+                "stage": "submit",
+                "op": "http_post",
+                "error_code": "SUBMIT_FAILED",
+                "error_cause": str(e),
+                "retryable": False,
+            }
             errors_fp.write(json.dumps(err_entry) + "\n")
             task_submits[case_id] = {"task_id": task_id, "submitted_at": t_sub, "submitted": False, "error": str(e)}
 
@@ -456,7 +518,13 @@ def execute_run(run_spec, engine_binary, eval_dir="/volume2/docker/telegram_down
     except Exception:
         pass
 
-    # Execute for duration_seconds
+    if warmup_sec:
+        sampler.set_phase("warmup")
+        log_event("run.warmup.started", {"duration_seconds": warmup_sec})
+        time.sleep(warmup_sec)
+        log_event("run.warmup.finished")
+
+    sampler.set_phase("measurement")
     start_time = time.time()
     print(f"[*] Executing run for {duration_sec}s...")
     
@@ -494,7 +562,7 @@ def execute_run(run_spec, engine_binary, eval_dir="/volume2/docker/telegram_down
             active = len(st.get("active_files") or [])
             q = st.get("queue_depth", 0)
             if active == 0 and q == 0:
-                print("[✓] Queue drained completely!")
+                print("[OK] Queue drained completely!")
                 break
         except Exception:
             pass
@@ -512,20 +580,29 @@ def execute_run(run_spec, engine_binary, eval_dir="/volume2/docker/telegram_down
 
     log_event("run.finished")
     sampler.stop()
-    sampler.join(timeout=3)
+    sampler.join()
     events_fp.close()
 
     # Capture process logs
     with open(process_log_file, "w", encoding="utf-8") as f:
         f.write(f"=== Process Log for Run {run_id} ===\n")
         try:
-            p = subprocess.run(["sudo", "docker", "logs", "--tail", "2000", container_name], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=5)
+            p = subprocess.run(
+                docker_command + ["logs", container_name],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=10,
+            )
             f.write(p.stdout)
         except Exception as e:
             f.write(f"Direct log capture: {e}\n")
 
-    # Teardown Container
-    subprocess.run(["sudo", "docker", "rm", "-f", container_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(
+        docker_command + ["rm", "-f", container_name],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
     time.sleep(2)
 
     # 7. raw/task_results.jsonl, raw/errors.jsonl, and raw/hashes.jsonl
@@ -535,21 +612,21 @@ def execute_run(run_spec, engine_binary, eval_dir="/volume2/docker/telegram_down
 
     for c in cases:
         case_id = c["case_id"]
-        rel_path = c["expected_tgx_path"] if engine == "tgx" else c["expected_tdl_path"]
+        rel_path = safe_relative_path(
+            c["expected_tgx_path"] if engine == "tgx" else c["expected_tdl_path"]
+        )
         expected_size = c["expected_size"]
         baseline_sha = c["baseline_sha256"]
-        target_file = os.path.join(output_dir, rel_path)
+        target_file = output_dir / rel_path
         task_id = f"{run_id}_{c['chat_id']}_{c['message_id']}"
 
-        actual_size = os.path.getsize(target_file) if os.path.isfile(target_file) else 0
-        actual_sha = compute_sha256(target_file) if os.path.isfile(target_file) else ""
+        actual_size = target_file.stat().st_size if target_file.is_file() else 0
+        actual_sha = compute_sha256(target_file) if target_file.is_file() else ""
 
         size_match = (actual_size == expected_size and expected_size > 0)
         sha_match = (actual_sha == baseline_sha and baseline_sha != "") if baseline_sha else size_match
-        file_present = os.path.isfile(target_file)
+        file_present = target_file.is_file()
 
-        terminal_state = "COMPLETED" if (file_present and size_match and sha_match) else "FAILED"
-        
         eng_t = engine_tasks.get(task_id, {})
         eng_state = eng_t.get("state", "unknown")
         admitted = (task_id in engine_tasks or task_submits.get(case_id, {}).get("submitted", False))
@@ -559,7 +636,22 @@ def execute_run(run_spec, engine_binary, eval_dir="/volume2/docker/telegram_down
         err_op = None
         err_cause = None
 
-        if terminal_state != "COMPLETED":
+        if file_present and size_match and sha_match:
+            terminal_state = "COMPLETED"
+        elif eng_state == "canceled" or (eng_t.get("error_class") == "canceled"):
+            terminal_state = "CANCELED"
+            err_code = "CANCELED"
+            err_stage = "lifecycle"
+            err_op = "cancel"
+            err_cause = eng_t.get("error", "task canceled")
+        elif not file_present and (time.time() - start_time >= duration_sec or eng_state in ("queued", "downloading")):
+            terminal_state = "TIMED_OUT"
+            err_code = "TIMED_OUT"
+            err_stage = "lifecycle"
+            err_op = "drain"
+            err_cause = f"task did not complete before run duration ({duration_sec}s)"
+        else:
+            terminal_state = "FAILED"
             if eng_t.get("error_class"):
                 err_code = eng_t.get("error_class")
                 err_cause = eng_t.get("error", "engine error")
@@ -581,9 +673,11 @@ def execute_run(run_spec, engine_binary, eval_dir="/volume2/docker/telegram_down
                 err_op = "verify_sha256"
                 err_cause = f"expected sha {baseline_sha[:12]}, actual sha {actual_sha[:12]}"
             
+        if terminal_state != "COMPLETED":
             err_entry = {
                 "case_id": case_id,
                 "task_id": task_id,
+                "attempt_id": eng_t.get("attempt_generation"),
                 "stage": err_stage or "oracle",
                 "op": err_op or "verification",
                 "error_code": err_code or "FAILED",
@@ -594,6 +688,8 @@ def execute_run(run_spec, engine_binary, eval_dir="/volume2/docker/telegram_down
 
         t_res = {
             "case_id": case_id,
+            "task_id": task_id,
+            "attempt_id": eng_t.get("attempt_generation"),
             "submitted": task_submits.get(case_id, {}).get("submitted", False),
             "admitted": admitted,
             "terminal_state": terminal_state,
@@ -612,7 +708,7 @@ def execute_run(run_spec, engine_binary, eval_dir="/volume2/docker/telegram_down
         h_res = {
             "case_id": case_id,
             "expected_path": rel_path,
-            "actual_path": target_file if file_present else None,
+            "actual_path": str(target_file) if file_present else None,
             "expected_size": expected_size,
             "actual_size": actual_size,
             "baseline_sha256": baseline_sha,
@@ -624,23 +720,40 @@ def execute_run(run_spec, engine_binary, eval_dir="/volume2/docker/telegram_down
 
     errors_fp.close()
 
-    with open(os.path.join(raw_dir, "task_results.jsonl"), "w", encoding="utf-8") as f:
+    with open(raw_dir / "task_results.jsonl", "w", encoding="utf-8") as f:
         for t in task_results:
             f.write(json.dumps(t) + "\n")
 
-    with open(os.path.join(raw_dir, "hashes.jsonl"), "w", encoding="utf-8") as f:
+    with open(raw_dir / "hashes.jsonl", "w", encoding="utf-8") as f:
         for h in hashes_records:
             f.write(json.dumps(h) + "\n")
 
     # 8. raw/file_inventory.jsonl
     inventory = []
+    expected_paths = {
+        safe_relative_path(
+            case["expected_tgx_path"]
+            if engine == "tgx"
+            else case["expected_tdl_path"]
+        )
+        for case in cases
+    }
     for root, _, files in os.walk(output_dir):
         for fl in files:
             full = os.path.join(root, fl)
-            rel = os.path.relpath(full, output_dir)
+            rel = os.path.relpath(full, output_dir).replace(os.sep, "/")
             sz = os.path.getsize(full)
-            residue = "orphan_moving" if fl.endswith(".moving") else ("orphan_segment" if fl.endswith(".seg") else "expected_target")
-            inventory.append({"path": rel, "size_bytes": sz, "classification": residue})
+            if rel in expected_paths:
+                classification = "expected_target"
+            elif fl.endswith(".moving"):
+                classification = "orphan_moving"
+            elif fl.endswith((".seg", ".meta", ".part", ".tmp")) or ".part." in fl:
+                classification = "orphan_temporary"
+            else:
+                classification = "unexpected_file"
+            inventory.append(
+                {"path": rel, "size_bytes": sz, "classification": classification}
+            )
 
     if os.path.exists(temp_dir):
         for root, _, files in os.walk(temp_dir):
@@ -650,122 +763,13 @@ def execute_run(run_spec, engine_binary, eval_dir="/volume2/docker/telegram_down
                 sz = os.path.getsize(full)
                 inventory.append({"path": f"temp/{rel}", "size_bytes": sz, "classification": "temp_residue"})
 
-    if os.path.exists(buffer_dir):
-        for root, _, files in os.walk(buffer_dir):
-            for fl in files:
-                full = os.path.join(root, fl)
-                rel = os.path.relpath(full, buffer_dir)
-                sz = os.path.getsize(full)
-                inventory.append({"path": f"buffer/{rel}", "size_bytes": sz, "classification": "buffer_residue"})
-
-    with open(os.path.join(raw_dir, "file_inventory.jsonl"), "w", encoding="utf-8") as f:
+    with open(raw_dir / "file_inventory.jsonl", "w", encoding="utf-8") as f:
         for inv in inventory:
             f.write(json.dumps(inv) + "\n")
 
-    # 9. raw/checksums.sha256 (Cryptographic Seal)
-    checksums_path = os.path.join(raw_dir, "checksums.sha256")
-    raw_files = [
-        "protocol.json", "run_spec.json", "artifact.json", "environment.json",
-        "manifest.jsonl", "events.jsonl", "metrics.jsonl", "task_results.jsonl",
-        "file_inventory.jsonl", "hashes.jsonl", "errors.jsonl", "process.log"
-    ]
-    with open(checksums_path, "w", encoding="utf-8") as f:
-        for r_file in sorted(raw_files):
-            fp = os.path.join(raw_dir, r_file)
-            if os.path.exists(fp):
-                c_sha = compute_sha256(fp)
-                f.write(f"{c_sha}  {r_file}\n")
-
-    print(f"[✓] Raw evidence sealed with checksums.sha256.")
-
-    # Phase 2: Analysis Policy Evaluation
-    evaluate_policy(run_root, policy_version="baseline-v1")
-    return run_root
-
-def evaluate_policy(run_root, policy_version="baseline-v1"):
-    raw_dir = os.path.join(run_root, "raw")
-    analysis_dir = os.path.join(run_root, "analysis", policy_version)
-    os.makedirs(analysis_dir, exist_ok=True)
-
-    def read_jsonl(filename):
-        fp = os.path.join(raw_dir, filename)
-        if not os.path.exists(fp):
-            return []
-        res = []
-        with open(fp, "r", encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    try:
-                        res.append(json.loads(line))
-                    except Exception:
-                        pass
-        return res
-
-    task_results = read_jsonl("task_results.jsonl")
-    hashes = read_jsonl("hashes.jsonl")
-    inventory = read_jsonl("file_inventory.jsonl")
-    metrics = read_jsonl("metrics.jsonl")
-    errors = read_jsonl("errors.jsonl")
-
-    total_cases = len(task_results)
-    completed_cases = sum(1 for t in task_results if t["terminal_state"] == "COMPLETED")
-    failed_cases = total_cases - completed_cases
-    match_fraction = (completed_cases / total_cases) if total_cases > 0 else 0.0
-
-    orphan_residue = sum(1 for inv in inventory if inv["classification"] != "expected_target")
-    
-    # Calculate throughput metrics
-    all_speeds = [m.get("rolling_5s_bps", 0) for m in metrics]
-    avg_total_bps = sum(all_speeds) / len(all_speeds) if all_speeds else 0
-    avg_total_mbps = round((avg_total_bps * 8) / (1024 * 1024), 2)
-    
-    active_speeds = [s for s in all_speeds if s > 0]
-    avg_active_bps = sum(active_speeds) / len(active_speeds) if active_speeds else 0
-    avg_active_mbps = round((avg_active_bps * 8) / (1024 * 1024), 2)
-
-    zero_speed_samples = sum(1 for s in all_speeds if s == 0)
-    zero_speed_fraction = round(zero_speed_samples / len(all_speeds), 4) if all_speeds else 0.0
-
-    # Gate checks
-    verdict_status = "GO" if (match_fraction == 1.0 and orphan_residue == 0 and len(errors) == 0) else "NO-GO"
-
-    summary = {
-        "policy_version": policy_version,
-        "protocol_version": PROTOCOL_VERSION,
-        "evaluated_at": iso_time(),
-        "total_cases": total_cases,
-        "completed_cases": completed_cases,
-        "failed_cases": failed_cases,
-        "match_fraction": round(match_fraction, 4),
-        "orphan_residue_count": orphan_residue,
-        "average_total_mbps": avg_total_mbps,
-        "average_active_mbps": avg_active_mbps,
-        "zero_speed_fraction": zero_speed_fraction,
-        "error_count": len(errors),
-        "verdict": verdict_status,
-    }
-
-    with open(os.path.join(analysis_dir, "summary.json"), "w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=2)
-
-    with open(os.path.join(analysis_dir, "verdict.json"), "w", encoding="utf-8") as f:
-        json.dump({"verdict": verdict_status, "policy": policy_version, "summary": summary}, f, indent=2)
-
-    with open(os.path.join(analysis_dir, "report.md"), "w", encoding="utf-8") as f:
-        f.write(f"# TGX Evaluation Report - `{policy_version}`\n\n")
-        f.write(f"- **Verdict**: `{verdict_status}`\n")
-        f.write(f"- **Completed Ratio**: {completed_cases}/{total_cases} ({match_fraction * 100:.1f}%)\n")
-        f.write(f"- **Orphan Residue**: {orphan_residue}\n")
-        f.write(f"- **Average Active Speed**: {avg_active_mbps} Mbps (Total Avg: {avg_total_mbps} Mbps, Stalls: {zero_speed_fraction*100:.1f}%)\n\n")
-        f.write("## Hashes & Verification Breakdown\n\n")
-        f.write("| Case ID | Expected Path | Expected Size | Actual Size | SHA Match |\n")
-        f.write("|---|---|---|---|---|\n")
-        for h in hashes:
-            f.write(f"| {h['case_id']} | `{h['expected_path']}` | {h['expected_size']} | {h['actual_size']} | **{h['sha_match']}** |\n")
-
-    print(f"[✓] Policy evaluation `{policy_version}` complete. Verdict: {verdict_status}")
-    print(f"[✓] Report written to: {os.path.join(analysis_dir, 'report.md')}")
+    seal_raw_directory(raw_dir)
+    print("[OK] Raw evidence sealed with checksums.sha256.")
+    return str(run_root)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="TGX Evaluation Protocol v1 Reference Harness")

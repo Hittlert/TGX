@@ -41,13 +41,13 @@ Required harness behavior:
 - analyzer generates policy-versioned verdicts separately;
 - missing files increment failure counts;
 - missing metrics are null + collection_error;
-- OutputDir/DB/Buffer/Log are new and empty per run;
+- OutputDir/DB/Log are new and empty per run;
 - every manifest case appears in task results;
 - artifact identity is complete;
 - collector joins before checksums;
 - protocol self-tests pass before real runs.
 
-Evaluation-only code and read-only observability instrumentation may be changed. Do not fix downloader, scheduling, Spool, commit or recovery behavior during this task.
+Evaluation-only code and read-only observability instrumentation may be changed. Do not fix downloader, scheduling, SSD admission, archive, commit or recovery behavior during this task.
 
 ## Phase C: Freeze Independent TDL Artifact
 

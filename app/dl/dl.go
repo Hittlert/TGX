@@ -10,6 +10,7 @@ import (
 	"github.com/go-faster/errors"
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/telegram/peers"
+	"github.com/gotd/td/tg"
 	"github.com/spf13/viper"
 	"go.uber.org/multierr"
 	"go.uber.org/zap"
@@ -118,7 +119,6 @@ func Run(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Opti
 		MaxFileThreads:  threads,
 		MaxDataInFlight: int64(viper.GetInt(consts.FlagPoolSize)),
 	})
-	clientAdapter := transfer.NewGatedClient(pool.DefaultInvoker(ctx), transferMgr.Gate(), 0, pool.CDN)
 	p := newProgress(dlProgress, it, opts)
 
 	logctx.From(ctx).Info("Start download",
@@ -152,6 +152,7 @@ func Run(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Opti
 	g, gctx := errgroup.WithContext(ctx)
 	sem := make(chan struct{}, limit)
 
+downloadLoop:
 	for it.Next(gctx) {
 		elem := it.Value()
 		p.OnAdd(elem)
@@ -159,15 +160,28 @@ func Run(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Opti
 		select {
 		case sem <- struct{}{}:
 		case <-gctx.Done():
-			break
+			break downloadLoop
 		}
 
 		g.Go(func() error {
 			defer func() { <-sem }()
 
+			var invoker tg.Invoker
+			if elem.AsTakeout() {
+				invoker = pool.TakeoutInvoker(gctx, elem.DC())
+			} else {
+				invoker = pool.Invoker(gctx, elem.DC())
+			}
+			client := transfer.NewGatedClient(
+				invoker,
+				transferMgr.Gate(),
+				elem.DC(),
+				pool.CDN,
+			)
+
 			_, dlErr := transferMgr.DownloadFile(
 				gctx,
-				clientAdapter,
+				client,
 				elem.Location(),
 				elem.Size(),
 				elem.To(),

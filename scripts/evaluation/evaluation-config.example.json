@@ -1,0 +1,40 @@
+{
+  "api_base": "http://127.0.0.1:5890",
+  "artifacts": {
+    "tdl": {
+      "binary": "/evaluation/bin/tdl-baseline",
+      "expected_commit": "replace-with-source-commit",
+      "expected_sha256": "replace-with-binary-sha256",
+      "source_repository": "https://github.com/iyear/tdl"
+    },
+    "tgx": {
+      "binary": "/evaluation/bin/tgx-candidate",
+      "expected_commit": "replace-with-source-commit",
+      "expected_sha256": "replace-with-binary-sha256",
+      "source_repository": "https://github.com/Hittlert/TGX"
+    }
+  },
+  "baseline_root": "/evaluation/golden-files",
+  "docker_command": [
+    "docker"
+  ],
+  "environment": {
+    "account_session_id": "replace-with-non-secret-session-id",
+    "clock_source": "system-monotonic",
+    "filesystem_types": {
+      "archive": "replace-me",
+      "ssd": "replace-me"
+    },
+    "host_id": "replace-me",
+    "network_interface": "replace-me",
+    "proxy_route_id": "replace-me",
+    "ssd_storage_id": "replace-me",
+    "target_storage_id": "replace-me"
+  },
+  "eval_dir": "/evaluation/results",
+  "namespace": "evaluation",
+  "network_container": "",
+  "runner_image": "alpine@sha256:replace-with-pinned-digest",
+  "session_source_dir": "/evaluation/session-source",
+  "source_db": "/evaluation/source/download_records.sqlite3"
+}

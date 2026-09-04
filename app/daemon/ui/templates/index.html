@@ -216,47 +216,31 @@
           <div class="setting-item">
             <div class="setting-label-row">
               <label for="cfg_max_active_files">📁 最大活动文件并发 (Max Active Files)</label>
-              <span class="setting-val-badge" id="val_max_active_files">8</span>
+              <span class="setting-val-badge" id="val_max_active_files">5</span>
             </div>
-            <p class="setting-desc">限制同时打开并写入磁盘的文件数，保护机械硬盘磁头免于过多随机寻道。</p>
+            <p class="setting-desc">限制同时并发下载写入磁盘的文件数，保护系统 I/O 与带宽资源。</p>
             <div class="setting-slider-row">
-              <input type="range" id="cfg_max_active_files" min="1" max="32" step="1" value="8" class="apple-range">
-            </div>
-          </div>
-
-          <div class="setting-item">
-            <div class="setting-label-row">
-              <label for="cfg_global_thread_pool">⚡ 全局线程并发总池 (Global Thread Slots)</label>
-              <span class="setting-val-badge" id="val_global_thread_pool">64</span>
-            </div>
-            <p class="setting-desc">系统全局最大并发线程预算（所有活动文件共享该池），严格控温防风控。</p>
-            <div class="setting-slider-row">
-              <input type="range" id="cfg_global_thread_pool" min="16" max="128" step="8" value="64" class="apple-range">
+              <input type="range" id="cfg_max_active_files" min="1" max="32" step="1" value="5" class="apple-range">
             </div>
           </div>
 
           <div class="setting-item" style="background: rgba(0, 122, 255, 0.04); border-radius: 12px; padding: 14px; border: 1px solid rgba(0, 122, 255, 0.12);">
             <div class="setting-label-row">
-              <label style="color: var(--apple-blue); font-weight: 600;">⚡ 单文件算力自适应规则 (Size-Adaptive)</label>
+              <label style="color: var(--apple-blue); font-weight: 600;">⚡ DataGate 全局在途传输管控 (In-Flight DataGate)</label>
+              <span class="setting-val-badge" id="val_data_gate">256 MB</span>
             </div>
-            <p class="setting-desc" style="margin-bottom: 8px; color: var(--apple-text-secondary);">下载引擎根据 <code>文件体积 / 4MB</code> 自动向总池申请最优槽位数：</p>
-            <div style="font-size: 12px; display: grid; grid-template-columns: 1fr 1fr; gap: 6px; color: var(--apple-text);">
-              <div>• <strong>&lt; 4 MB (图片/语音)</strong>: <code>1 槽位</code> (秒级秒下)</div>
-              <div>• <strong>4 ~ 20 MB (音乐/短片)</strong>: <code>2 ~ 5 槽位</code></div>
-              <div>• <strong>20 ~ 64 MB (短视频)</strong>: <code>6 ~ 16 槽位</code></div>
-              <div>• <strong>&gt; 64 MB (长视频/电影)</strong>: <code>16 槽位</code> (封顶拉满)</div>
-            </div>
+            <p class="setting-desc" style="margin-bottom: 8px; color: var(--apple-text-secondary);">gotd 原生并行下载器自动按文件大小自适应多分片传输，由全局 DataGate 强控在途数据总量，防止内存暴涨与风控。</p>
           </div>
 
           <div class="setting-item" style="padding-top: 4px;">
             <div class="setting-label-row" style="align-items: center;">
-              <label for="cfg_disable_ipv6">Force IPv4 Only (强制纯 IPv4 模式)</label>
+              <label for="cfg_disable_ipv6">Force IPv4 Only (仅使用 IPv4 路由 - 启动配置)</label>
               <label class="apple-switch">
-                <input type="checkbox" id="cfg_disable_ipv6" checked>
+                <input type="checkbox" id="cfg_disable_ipv6" checked disabled>
                 <span class="apple-switch-slider"></span>
               </label>
             </div>
-            <p class="setting-desc">过滤 Telegram 所有 IPv6 端点，防止境外代理回国时连接超时或产生丢包。</p>
+            <p class="setting-desc">启动时固定 Telegram 连接为 IPv4 模式，此项需重启服务生效。</p>
           </div>
 
           <div class="settings-summary-box">
@@ -423,10 +407,8 @@
   <script>
     layui.use(['table', 'layer'], function () {
       var table = layui.table;
-      var layer = layui.layer;
-      var $ = layui.$;
-      var already_download_list_data = [];
-      var download_list_table_data = [];
+  var layer = layui.layer;
+  var $ = layui.$;
 
       // App Version
       $.ajax({
@@ -446,7 +428,6 @@
       // Telegram Web Auth Wizard & Multi-Account Controller
       // ==========================================
       var qr_poll_timer = null;
-      var current_phone_hash = "";
       var current_target_ns = "";
       var saved_accounts_list = [];
 
@@ -766,7 +747,6 @@
           success: function (res) {
             btn.prop("disabled", false).text("重新获取");
             if (res && res.ok) {
-              current_phone_hash = res.phone_code_hash;
               $("#phone_verify_box").slideDown();
               layer.msg("验证码已发送至 Telegram 或短信，请查收", { icon: 1 });
             } else {
@@ -865,13 +845,33 @@
 
       // Pause/Resume state
       window.download_state_change = function (e) {
+        var current = $(e).attr('data-value') || 'running';
+        var targetAction = (current === 'running') ? 'pause' : 'resume';
+        var load_idx = layer.load(2);
         $.ajax({
-          url: "download_state_change?state=" + $(e).attr('data-value'),
-          type: "get",
-          dataType: "text",
+          url: "api/control",
+          type: "post",
+          contentType: "application/json",
+          data: JSON.stringify({ action: targetAction }),
+          dataType: "json",
           success: function (result) {
-            $("#download_state").attr('data-value', result);
-            $("#download_state .status-label").html(result);
+            layer.close(load_idx);
+            if (result && result.ok) {
+              var newState = result.state || result.download_state || (targetAction === 'pause' ? 'paused' : 'running');
+              $("#download_state").attr('data-value', newState);
+              $("#download_state .status-label").html(newState);
+            } else {
+              layer.msg("Failed to change download state: " + ((result && result.error) || 'unknown error'), { icon: 2 });
+            }
+          },
+          error: function (xhr) {
+            layer.close(load_idx);
+            var err = "Request failed";
+            try {
+              var obj = JSON.parse(xhr.responseText);
+              err = obj.error || obj.msg || err;
+            } catch (ex) {}
+            layer.msg("Failed to change download state: " + err, { icon: 2 });
           }
         });
       };
@@ -934,18 +934,6 @@
       function get_scan_status(row) {
         if (!row.scan_status || typeof row.scan_status != 'object') return {};
         return row.scan_status;
-      }
-
-      function scan_status_label(status) {
-        if (status == 'ok') return 'OK';
-        if (status == 'error') return 'Error';
-        if (status == 'scanning') return 'Scanning';
-        return 'Idle';
-      }
-
-      function scan_status_class(status) {
-        if (status == 'ok' || status == 'error' || status == 'scanning') return status;
-        return 'idle';
       }
 
       function target_scan_html(row) {
@@ -1347,6 +1335,8 @@
         var card = $(this).closest('.apple-target-card');
         var row = find_target_row(card.attr('data-chat-key'));
         var is_checked = $(this).prop('checked');
+        var original_checked = !is_checked;
+        var toggle_elem = $(this);
         if (row) {
           row.enabled = is_checked;
         }
@@ -1367,9 +1357,20 @@
             }),
             dataType: "json",
             success: function (res) {
-              if (!res.ok) {
-                layer.msg(res.error || 'Update failed');
+              if (!res || !res.ok) {
+                if (row) row.enabled = original_checked;
+                card.toggleClass('is-enabled', original_checked);
+                toggle_elem.prop('checked', original_checked);
+                update_target_count();
+                layer.msg((res && res.error) || 'Update failed', { icon: 2 });
               }
+            },
+            error: function (xhr) {
+              if (row) row.enabled = original_checked;
+              card.toggleClass('is-enabled', original_checked);
+              toggle_elem.prop('checked', original_checked);
+              update_target_count();
+              layer.msg('Update failed: ' + (xhr.responseText || xhr.statusText), { icon: 2 });
             }
           });
         }
@@ -1395,7 +1396,6 @@
 
       // Tab Switching
       var update_download_list_int = 0;
-      var update_already_download_list_int = 0;
 
       function switch_tab(tab_name) {
         $('.apple-segmented-control .segmented-item').removeClass('is-active');
@@ -1405,7 +1405,6 @@
         $('#pane_' + tab_name).addClass('is-active');
 
         clearInterval(update_download_list_int);
-        clearInterval(update_already_download_list_int);
 
         if (tab_name === 'downloading') {
           update_download_list_int = self.setInterval(update_download_list, 1000);
@@ -1834,11 +1833,12 @@
           dataType: "json",
           success: function (res) {
             if (res.ok && res.settings) {
-              var files = res.settings.max_active_files || 8;
-              var slots = res.settings.global_thread_pool || 64;
+              var files = res.settings.max_active_files || 5;
               $('#cfg_max_active_files').val(files);
-              $('#cfg_global_thread_pool').val(slots);
-              $('#cfg_disable_ipv6').prop('checked', res.settings.disable_ipv6 !== false);
+              $('#val_max_active_files').text(files);
+              if (res.settings.max_data_in_flight) {
+                $('#val_data_gate').text(format_bytes(res.settings.max_data_in_flight));
+              }
               update_settings_ui_summary();
             }
             $('#settings_modal').fadeIn(150);
@@ -1862,12 +1862,9 @@
       });
 
       $('#btn_save_settings').on('click', function () {
-        var files = parseInt($('#cfg_max_active_files').val(), 10) || 8;
-        var slots = parseInt($('#cfg_global_thread_pool').val(), 10) || 64;
+        var files = parseInt($('#cfg_max_active_files').val(), 10) || 5;
         var payload = {
-          max_active_files: files,
-          global_thread_pool: slots,
-          disable_ipv6: $('#cfg_disable_ipv6').is(':checked')
+          max_active_files: files
         };
 
         var load_idx = layer.load(2);
@@ -2051,11 +2048,93 @@
         });
       });
 
-      // Start polling status and downloading queue
-      update_download_status();
-      self.setInterval(update_download_status, 1000);
+      // ==========================================
+      // Telemetry & SSE Stream Controller
+      // ==========================================
+      var sse_active = false;
+      var status_poll_timer = null;
 
-      update_download_list_int = self.setInterval(update_download_list, 1000);
+      function start_fallback_polling() {
+        if (status_poll_timer) return;
+        status_poll_timer = setInterval(function () {
+          if (!sse_active) {
+            update_download_status();
+            var activeTab = $('.apple-segmented-control .segmented-item.is-active').attr('data-tab');
+            if (activeTab === 'downloading') {
+              update_download_list();
+            }
+          }
+        }, 5000);
+      }
+
+      function stop_fallback_polling() {
+        if (status_poll_timer) {
+          clearInterval(status_poll_timer);
+          status_poll_timer = null;
+        }
+      }
+
+      function setup_sse_telemetry() {
+        if (!window.EventSource) {
+          start_fallback_polling();
+          update_download_status();
+          update_download_list();
+          return;
+        }
+
+        var source = new EventSource('api/events');
+
+        function handleSSEData(data) {
+          sse_active = true;
+          stop_fallback_polling();
+
+          if (data.speed_human) {
+            $('#download_speed').html(data.speed_human);
+          }
+          if (data.download_state) {
+            $("#download_state").attr('data-value', data.download_state);
+            $("#download_state .status-label").html(data.download_state);
+          }
+          if (data.gate) {
+            $('#slot_used').html(data.gate.active_files || 0);
+            $('#slot_total').html(data.gate.file_concurrency || 5);
+          }
+          if (data.ssd && data.ssd.reserved_bytes !== undefined) {
+            $('#ssd_reserved_val').html(format_bytes(data.ssd.reserved_bytes));
+          }
+
+          var activeTab = $('.apple-segmented-control .segmented-item.is-active').attr('data-tab');
+          if (activeTab === 'downloading') {
+            update_download_list();
+          }
+        }
+
+        source.addEventListener('snapshot', function (e) {
+          try {
+            var data = JSON.parse(e.data);
+            handleSSEData(data);
+          } catch (err) {}
+        });
+
+        source.addEventListener('update', function (e) {
+          try {
+            var data = JSON.parse(e.data);
+            handleSSEData(data);
+          } catch (err) {}
+        });
+
+        source.addEventListener('heartbeat', function () {
+          sse_active = true;
+        });
+
+        source.onerror = function () {
+          sse_active = false;
+          start_fallback_polling();
+        };
+      }
+
+      setup_sse_telemetry();
+      update_download_status();
       update_download_list();
 
       // Preload dialogs

@@ -50,6 +50,7 @@ type DownloadRecord struct {
 	DownloadedAt        int64  `json:"downloaded_at,omitempty"`
 	ProcessingStartedAt int64  `json:"processing_started_at,omitempty"`
 	Attempts            int    `json:"attempts"`
+	AttemptGeneration   string `json:"attempt_generation,omitempty"`
 	NextRetryAt         int64  `json:"next_retry_at"`
 	TargetTitle         string `json:"target_title,omitempty"`
 }
@@ -80,7 +81,6 @@ type PublishResult struct {
 	Path          string `json:"path"`
 	SHA256        string `json:"sha256,omitempty"`
 	AlreadyExists bool   `json:"already_exists,omitempty"`
-	AsyncMoving   bool   `json:"async_moving,omitempty"`
 	absolutePath  string
 }
 
@@ -95,11 +95,12 @@ type MediaFile interface {
 }
 
 type ResolvedMedia struct {
-	File MediaFile
-	Name string
-	Size int64
-	DCID int
-	Date int64
+	File      MediaFile
+	Name      string
+	Size      int64
+	DCID      int
+	Date      int64
+	MediaType string
 }
 
 

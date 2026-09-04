@@ -81,7 +81,7 @@ func TestHTTPRejectsInvalidRequestsAndFullQueue(t *testing.T) {
 		body   string
 		code   int
 	}{
-		{http.MethodGet, "/api/tasks", "", http.StatusMethodNotAllowed},
+		{http.MethodDelete, "/api/tasks", "", http.StatusMethodNotAllowed},
 		{http.MethodPost, "/api/tasks", "not-json", http.StatusBadRequest},
 		{http.MethodPost, "/api/tasks", `{"id":"bad","peer":"peer","message_id":1,"final_path":"../bad","expected_size":1}`, http.StatusBadRequest},
 		{http.MethodPost, "/api/control", `{"action":"stop"}`, http.StatusBadRequest},

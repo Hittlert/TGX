@@ -28,10 +28,6 @@ type Options struct {
 	OutputDir        string // SSD download root
 	ArchiveDir       string // HDD archive root (optional)
 	MinFreeSpace     uint64 // minimum SSD free space reserve, default 5 GiB
-	TempDir          string // deprecated compatibility
-	BufferType       string // deprecated compatibility
-	BufferDir        string // deprecated compatibility
-	BufferSize       int64  // deprecated compatibility
 	DBPath           string
 	Password         string
 	SingboxURL       string
@@ -61,9 +57,6 @@ func (o Options) withDefaults() Options {
 	}
 	if o.OutputDir == "" {
 		o.OutputDir = "/app/downloads"
-	}
-	if o.TempDir == "" {
-		o.TempDir = "/app/temp/tdl"
 	}
 	if o.FileConcurrency <= 0 {
 		o.FileConcurrency = 5
@@ -96,8 +89,8 @@ func (o Options) validate() error {
 	if _, _, err := net.SplitHostPort(o.Listen); err != nil {
 		return fmt.Errorf("invalid daemon listen address: %w", err)
 	}
-	if !filepath.IsAbs(o.OutputDir) || (o.TempDir != "" && !filepath.IsAbs(o.TempDir)) {
-		return errors.New("daemon output and temp directories must be absolute")
+	if !filepath.IsAbs(o.OutputDir) {
+		return errors.New("daemon output directory must be absolute")
 	}
 	if o.ArchiveDir != "" && !filepath.IsAbs(o.ArchiveDir) {
 		return errors.New("daemon archive directory must be absolute")

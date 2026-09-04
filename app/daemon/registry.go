@@ -35,6 +35,10 @@ type TaskRequest struct {
 	FinalPath    string `json:"final_path"`
 	ExpectedSize int64  `json:"expected_size"`
 	Retry        bool   `json:"retry,omitempty"`
+	TargetTitle  string `json:"target_title,omitempty"`
+	MediaType    string `json:"media_type,omitempty"`
+	FileName     string `json:"file_name,omitempty"`
+	Date         int64  `json:"date,omitempty"`
 }
 
 type TaskSnapshot struct {
@@ -222,37 +226,6 @@ func (r *Registry) Submit(request TaskRequest) (TaskSnapshot, bool, error) {
 	return r.snapshotTaskLocked(state, now), true, nil
 }
 
-// SubmitActive registers and returns an immediately active Task for direct execution.
-func (r *Registry) SubmitActive(request TaskRequest) (*Task, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	pCtx := r.parentCtx
-	if pCtx == nil {
-		pCtx = context.Background()
-	}
-	now := r.now()
-	taskCtx, taskCancel := context.WithCancel(pCtx)
-	gen := "1"
-	if _, ok := r.tasks[request.ID]; ok {
-		gen = fmt.Sprintf("retry_%d", now.UnixNano())
-	}
-	state := &taskState{
-		request:    request,
-		state:      StateResolving,
-		totalSize:  request.ExpectedSize,
-		createdAt:  now,
-		startedAt:  now,
-		attemptGen: gen,
-		ctx:        taskCtx,
-		cancel:     taskCancel,
-	}
-	r.tasks[request.ID] = state
-	r.removeTerminalLocked(request.ID)
-	r.signalLocked()
-	return &Task{registry: r, state: state, attemptGen: gen}, nil
-}
-
 func (r *Registry) removeTerminalLocked(id string) {
 	for index, value := range r.terminalOrder {
 		if value != id {
@@ -397,6 +370,11 @@ func (t *Task) AttemptGen() string {
 		return t.state.attemptGen
 	}
 	return "1"
+}
+
+// Generation is an alias for AttemptGen.
+func (t *Task) Generation() string {
+	return t.AttemptGen()
 }
 
 func (t *Task) Snapshot() TaskSnapshot {

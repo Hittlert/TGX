@@ -28,6 +28,7 @@ func EnableTestMode() {
 type Pool interface {
 	Client(ctx context.Context, dc int) *tg.Client
 	Takeout(ctx context.Context, dc int) *tg.Client
+	TakeoutInvoker(ctx context.Context, dc int) tg.Invoker
 	Default(ctx context.Context) *tg.Client
 	Invoker(ctx context.Context, dc int) tg.Invoker
 	DefaultInvoker(ctx context.Context) tg.Invoker
@@ -205,9 +206,9 @@ func (p *pool) Close() (err error) {
 	return err
 }
 
-func (p *pool) Takeout(ctx context.Context, dc int) *tg.Client {
+func (p *pool) TakeoutInvoker(ctx context.Context, dc int) tg.Invoker {
 	if testMode {
-		return tg.NewClient(p.invoker(ctx, dc))
+		return p.invoker(ctx, dc)
 	}
 
 	p.mu.Lock()
@@ -216,7 +217,7 @@ func (p *pool) Takeout(ctx context.Context, dc int) *tg.Client {
 		if err != nil {
 			logctx.From(ctx).Warn("takeout error", zap.Error(err))
 			p.mu.Unlock()
-			return tg.NewClient(p.invoker(ctx, dc))
+			return p.invoker(ctx, dc)
 		}
 		p.takeout = sid
 		logctx.From(ctx).Info("get takeout id", zap.Int64("id", sid))
@@ -224,7 +225,11 @@ func (p *pool) Takeout(ctx context.Context, dc int) *tg.Client {
 	takeoutID := p.takeout
 	p.mu.Unlock()
 
-	return tg.NewClient(chainMiddlewares(p.invoker(ctx, dc), takeout.Middleware(takeoutID)))
+	return chainMiddlewares(p.invoker(ctx, dc), takeout.Middleware(takeoutID))
+}
+
+func (p *pool) Takeout(ctx context.Context, dc int) *tg.Client {
+	return tg.NewClient(p.TakeoutInvoker(ctx, dc))
 }
 
 func (p *pool) CDN(ctx context.Context, dc int, max int64) (tg.Invoker, io.Closer, error) {

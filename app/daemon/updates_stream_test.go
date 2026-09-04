@@ -223,6 +223,7 @@ type mockE2EPool struct {
 
 func (p *mockE2EPool) Client(ctx context.Context, dc int) *tg.Client { return tg.NewClient(p.invoker) }
 func (p *mockE2EPool) Takeout(ctx context.Context, dc int) *tg.Client { return tg.NewClient(p.invoker) }
+func (p *mockE2EPool) TakeoutInvoker(ctx context.Context, dc int) tg.Invoker { return p.invoker }
 func (p *mockE2EPool) Default(ctx context.Context) *tg.Client { return tg.NewClient(p.invoker) }
 func (p *mockE2EPool) Invoker(ctx context.Context, dc int) tg.Invoker { return p.invoker }
 func (p *mockE2EPool) DefaultInvoker(ctx context.Context) tg.Invoker { return p.invoker }

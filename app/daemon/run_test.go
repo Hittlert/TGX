@@ -11,7 +11,7 @@ import (
 
 func TestOptionsDefaultsAndValidation(t *testing.T) {
 	opts := DefaultOptions()
-	if opts.Listen != "0.0.0.0:18080" || opts.OutputDir != "/app/downloads" || opts.TempDir != "/app/temp/tdl" {
+	if opts.Listen != "0.0.0.0:18080" || opts.OutputDir != "/app/downloads" {
 		t.Fatalf("unexpected path defaults: %#v", opts)
 	}
 	if opts.FileConcurrency != 5 || opts.Threads != 48 || opts.PoolSize != 48 {
@@ -45,7 +45,6 @@ func TestOptionsRejectInvalidRuntimeLimits(t *testing.T) {
 	tests := []Options{
 		func() Options { value := base; value.Listen = "bad"; return value }(),
 		func() Options { value := base; value.OutputDir = "relative"; return value }(),
-		func() Options { value := base; value.TempDir = "relative"; return value }(),
 		func() Options { value := base; value.FileConcurrency = 0; return value }(),
 		func() Options { value := base; value.Threads = 65; return value }(),
 		func() Options { value := base; value.PoolSize = 0; return value }(),

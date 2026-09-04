@@ -10,6 +10,10 @@
   --apple-text-secondary: #6e6e73;
   --apple-text-muted: #86868b;
   --apple-border: rgba(0, 0, 0, 0.08);
+  --apple-border-subtle: rgba(0, 0, 0, 0.06);
+  --apple-text-primary: #1d1d1f;
+  --apple-transition: 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+  --apple-hover-bg: #f2f2f7;
   --apple-border-focus: #0071e3;
   --apple-blue: #0071e3;
   --apple-blue-hover: #0077ed;

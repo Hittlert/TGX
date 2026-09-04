@@ -2,14 +2,15 @@
 
 Status: Candidate for standards alignment. Once frozen for a run, this file and the referenced schemas are immutable for that run.
 
-## 1. Three-Layer Contract
+## 1. Four-Layer Contract
 
-TGX evaluation is split into three independent layers:
+TGX evaluation is split into four independent layers:
 
 ```text
 Evaluation Protocol  fixed: collection semantics, event/metric names, raw artifact schema
-RunSpec              variable: manifest, concurrency, duration, engine, buffer configuration
-Analysis Policy      variable: thresholds, interpretation, Go/No-Go decision
+Baseline Cohort      fixed: case identities, source facts, expected paths and hashes
+RunSpec              variable: cohort reference, concurrency, duration and engine
+Analysis Policy      variable: thresholds, interpretation and Go/No-Go decision
 ```
 
 Raw artifacts MUST NOT contain a built-in Go verdict. A changed interpretation creates a new policy result; it never rewrites raw evidence.
@@ -20,7 +21,7 @@ Raw artifacts MUST NOT contain a built-in Go verdict. A changed interpretation c
 - `SHOULD`: expected unless the run records a justified deviation.
 - Missing measurements MUST be encoded as `null` with `collection_error`; they MUST NOT be encoded as zero.
 - Every run MUST identify the exact source and executable artifact.
-- Every run MUST use a new empty OutputDir, State DB, BufferDir and LogDir.
+- Every run MUST use a new empty OutputDir, State DB and LogDir.
 - A run with missing required artifacts is `INVALID`, not `PASS` or `GO`.
 - A collector records facts only. Analysis and verdict generation are separate steps.
 - Reusing files from a prior run invalidates correctness and throughput results.
@@ -83,7 +84,8 @@ account/session_id
 proxy_route_id
 network_interface
 target_storage_id
-buffer_storage_id
+ssd_storage_id
+archive_storage_id
 filesystem types
 container identity
 clock source
@@ -91,7 +93,7 @@ clock source
 
 TDL and TGX comparison runs MUST use the same account/session copy, proxy route, host and target storage. They run sequentially, never concurrently.
 
-Production DB, OutputDir and BufferDir MUST be read-only sample sources only. Evaluation MUST NOT update production state.
+Production DB and completed-file roots MUST be read-only sample sources only. Evaluation MUST NOT update production state.
 
 ## 6. Manifest Contract
 
@@ -118,6 +120,12 @@ Only Golden cases are used for hard SHA correctness. A Golden case requires two 
 
 The selected manifest MUST be copied into each run's `raw/` directory. TDL and TGX comparison runs use byte-identical manifests.
 
+Manifest creation also writes immutable cohort metadata containing
+`baseline_cohort_id`, `profile_id`, `sample_seed`, `case_count`, and
+`manifest_sha256`. A RunSpec MUST carry the same cohort ID and manifest hash.
+Existing cohort files are never regenerated or overwritten as part of a
+candidate run.
+
 ## 7. Fixed Dataset Profiles
 
 Profile definitions are normative in [profiles-v1.json](profiles-v1.json). The actual messages, concurrency and duration remain RunSpec parameters.
@@ -143,9 +151,11 @@ item.resolved
 rpc.started
 rpc.retry
 rpc.completed
-buffer.ready
 sink.durable
 item.committed
+archive.enqueued
+archive.started
+archive.completed
 item.terminal
 run.draining
 run.finished
@@ -183,38 +193,33 @@ heap_inuse
 heap_objects
 gc_count
 gc_pause_total
-buffer_logical_bytes
-buffer_physical_bytes
 ```
 
-SSD/Spool:
+Direct SSD:
 
 ```text
-max_bytes
-used_bytes
-reserved_bytes
-ready_bytes
-writing_bytes
-reclaimed_bytes
-actual_directory_bytes
-active_segments
-writeback_bps
-read_bps
-write_bps
+ssd_total_bytes
+ssd_free_bytes
+ssd_used_bytes
+ssd_reserved_bytes
+ssd_available_bytes
 sync_count
 sync_latency
-backpressured
 ```
 
-Target storage:
+Archive and target storage:
 
 ```text
+archive_backlog_files
+archive_backlog_bytes
+archive_active_workers
+archive_archived_files
+archive_conflict_count
 target_write_bytes
 target_read_bytes
 target_durable_bytes
 target_writer_concurrency
 target_backlog_bytes
-moving_file_count
 fsync_count
 fsync_latency
 device_util
@@ -277,7 +282,7 @@ TDL baseline purpose:
 3. establish concurrency scaling;
 4. establish direct-download correctness and error floor.
 
-TDL is not used to validate TGX Spool, Recovery or DB terminal semantics.
+TDL is not used to validate TGX SSD admission, Archive, Recovery or DB terminal semantics.
 
 Canonical TDL baseline RunSpec:
 

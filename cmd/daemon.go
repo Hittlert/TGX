@@ -48,10 +48,6 @@ func NewDaemon() *cobra.Command {
 	cmd.Flags().StringVarP(&opts.OutputDir, "dir", "d", opts.OutputDir, "final download root (TargetDir)")
 	cmd.Flags().StringVar(&opts.ArchiveDir, "archive-dir", opts.ArchiveDir, "archive root directory for asynchronous whole-file archiving (empty disables archive)")
 	cmd.Flags().Uint64Var(&opts.MinFreeSpace, "min-free-space", opts.MinFreeSpace, "minimum SSD free space reservation in bytes (default 5 GiB)")
-	cmd.Flags().StringVar(&opts.TempDir, "temp-dir", opts.TempDir, "temporary download root (deprecated)")
-	cmd.Flags().StringVar(&opts.BufferType, "buffer-type", opts.BufferType, "staging buffer type (deprecated)")
-	cmd.Flags().StringVar(&opts.BufferDir, "buffer-dir", opts.BufferDir, "staging buffer directory (deprecated)")
-	cmd.Flags().Int64Var(&opts.BufferSize, "buffer-size", opts.BufferSize, "maximum buffer capacity in bytes (deprecated)")
 	cmd.Flags().StringVar(&opts.DBPath, "db-path", opts.DBPath, "SQLite database path")
 	cmd.Flags().StringVar(&opts.Password, "password", opts.Password, "Web UI login password")
 	cmd.Flags().StringVar(&opts.SingboxURL, "singbox-url", opts.SingboxURL, "sing-box REST API URL")
@@ -65,7 +61,5 @@ func NewDaemon() *cobra.Command {
 	cmd.Flags().DurationVar(&opts.PeerSyncTimeout, "peer-sync-timeout", opts.PeerSyncTimeout, "maximum duration for one dialog cache refresh")
 	_ = cmd.MarkFlagDirname("dir")
 	_ = cmd.MarkFlagDirname("archive-dir")
-	_ = cmd.MarkFlagDirname("temp-dir")
-	_ = cmd.MarkFlagDirname("buffer-dir")
 	return cmd
 }
