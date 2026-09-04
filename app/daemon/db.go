@@ -86,6 +86,7 @@ func (d *Database) initSchema() error {
 			state TEXT NOT NULL DEFAULT 'pending',
 			attempts INTEGER NOT NULL DEFAULT 0,
 			next_retry_at INTEGER NOT NULL DEFAULT 0,
+			claim_id TEXT NOT NULL DEFAULT '',
 			last_error TEXT,
 			created_at INTEGER NOT NULL,
 			updated_at INTEGER NOT NULL,
@@ -139,11 +140,6 @@ func (d *Database) initSchema() error {
 			created_at INTEGER NOT NULL,
 			updated_at INTEGER NOT NULL
 		)`,
-		// Issue #2: Purge obsolete spool tables permanently
-		`DROP TABLE IF EXISTS spool_attempts`,
-		`DROP TABLE IF EXISTS spool_segments`,
-		`DROP TABLE IF EXISTS target_commits`,
-		`DROP TABLE IF EXISTS spool_cleanup`,
 	}
 
 	for _, q := range queries {
@@ -156,6 +152,8 @@ func (d *Database) initSchema() error {
 	_, _ = d.db.Exec(`ALTER TABLE download_records ADD COLUMN sha256 TEXT`)
 	// Ensure attempt_generation column exists on download_records
 	_, _ = d.db.Exec(`ALTER TABLE download_records ADD COLUMN attempt_generation TEXT NOT NULL DEFAULT ''`)
+	// Ensure claim_id column exists on archive_jobs
+	_, _ = d.db.Exec(`ALTER TABLE archive_jobs ADD COLUMN claim_id TEXT NOT NULL DEFAULT ''`)
 
 	// Automatically migrate legacy @username primary keys to canonical numeric IDs
 	d.migrateLegacyUsernameIDs()
@@ -1213,14 +1211,19 @@ func (d *Database) CompleteExistingDownload(chatID string, messageID int, genera
 }
 
 func (d *Database) ensureArchiveJobLocked(tx *sql.Tx, chatID string, messageID int, relPath string, size int64, sha256Hex string, now int64) error {
-	var arcState, arcSHA string
-	err := tx.QueryRow(`SELECT state, sha256 FROM archive_jobs WHERE chat_id = ? AND message_id = ?`, chatID, messageID).Scan(&arcState, &arcSHA)
+	var arcState, arcSHA, arcPath, arcClaimID string
+	var arcSize int64
+	err := tx.QueryRow(`
+		SELECT state, sha256, relative_path, expected_size, COALESCE(claim_id, '')
+		FROM archive_jobs
+		WHERE chat_id = ? AND message_id = ?
+	`, chatID, messageID).Scan(&arcState, &arcSHA, &arcPath, &arcSize, &arcClaimID)
 	if err == sql.ErrNoRows {
 		_, err = tx.Exec(`
 			INSERT INTO archive_jobs (
 				chat_id, message_id, relative_path, expected_size, sha256,
-				state, attempts, next_retry_at, created_at, updated_at
-			) VALUES (?, ?, ?, ?, ?, 'pending', 0, 0, ?, ?)
+				state, attempts, next_retry_at, claim_id, created_at, updated_at
+			) VALUES (?, ?, ?, ?, ?, 'pending', 0, 0, '', ?, ?)
 		`, chatID, messageID, relPath, size, sha256Hex, now, now)
 		if err != nil {
 			return fmt.Errorf("insert archive job: %w", err)
@@ -1232,49 +1235,53 @@ func (d *Database) ensureArchiveJobLocked(tx *sql.Tx, chatID string, messageID i
 
 	switch arcState {
 	case "archived":
-		if arcSHA != sha256Hex {
+		if arcSHA != sha256Hex || arcPath != relPath || arcSize != size {
 			_, err = tx.Exec(`
 				UPDATE archive_jobs
 				SET state = 'conflict',
-					last_error = 'archive checksum mismatch on duplicate complete',
+					last_error = 'archive identity mismatch on duplicate complete',
 					updated_at = ?
 				WHERE chat_id = ? AND message_id = ?
 			`, now, chatID, messageID)
 			if err != nil {
 				return fmt.Errorf("set archive conflict: %w", err)
 			}
+			return fmt.Errorf("%w: duplicate completion identity mismatch with archived job", ErrStateConflict)
 		}
-		// If sha matches, preserve terminal 'archived' state! Never reset to pending!
+		// If sha, path, and size match, preserve terminal 'archived' state!
+		return nil
+
 	case "conflict":
-		// Already conflict: do not overwrite
+		// Already in conflict state: do not overwrite
+		if arcSHA != sha256Hex || arcPath != relPath || arcSize != size {
+			return fmt.Errorf("%w: duplicate completion identity mismatch on conflicted archive job", ErrStateConflict)
+		}
+		return nil
+
 	case "copying":
+		// Strict guard: DO NOT mutate an active copy's identity!
+		if arcSHA != sha256Hex || arcPath != relPath || arcSize != size {
+			return fmt.Errorf("%w: duplicate completion identity mismatch while archive job is actively copying", ErrStateConflict)
+		}
+		// Matching identity: no-op, active copy will complete
+		return nil
+
+	default: // pending
+		if arcSHA == sha256Hex && arcPath == relPath && arcSize == size {
+			return nil
+		}
 		_, err = tx.Exec(`
 			UPDATE archive_jobs
-			SET relative_path = ?,
-				expected_size = ?,
-				sha256 = ?,
+			SET state = 'conflict',
+				last_error = 'archive identity mismatch on duplicate download complete',
 				updated_at = ?
 			WHERE chat_id = ? AND message_id = ?
-		`, relPath, size, sha256Hex, now, chatID, messageID)
+		`, now, chatID, messageID)
 		if err != nil {
-			return fmt.Errorf("update copying archive job: %w", err)
+			return fmt.Errorf("update pending archive job to conflict: %w", err)
 		}
-	default:
-		_, err = tx.Exec(`
-			UPDATE archive_jobs
-			SET relative_path = ?,
-				expected_size = ?,
-				sha256 = ?,
-				state = 'pending',
-				next_retry_at = 0,
-				updated_at = ?
-			WHERE chat_id = ? AND message_id = ?
-		`, relPath, size, sha256Hex, now, chatID, messageID)
-		if err != nil {
-			return fmt.Errorf("update pending archive job: %w", err)
-		}
+		return fmt.Errorf("%w: duplicate completion identity mismatch with pending archive job", ErrStateConflict)
 	}
-	return nil
 }
 
 // GetDueArchiveJobs retrieves pending archive jobs that are ready to run.
@@ -1285,7 +1292,7 @@ func (d *Database) GetDueArchiveJobs(limit int) ([]ArchiveJob, error) {
 	now := time.Now().Unix()
 	rows, err := d.db.Query(`
 		SELECT chat_id, message_id, relative_path, expected_size, sha256,
-		       state, attempts, next_retry_at, COALESCE(last_error, ''), created_at, updated_at
+		       state, attempts, next_retry_at, COALESCE(claim_id, ''), COALESCE(last_error, ''), created_at, updated_at
 		FROM archive_jobs
 		WHERE state = 'pending' AND next_retry_at <= ?
 		ORDER BY created_at ASC
@@ -1301,7 +1308,7 @@ func (d *Database) GetDueArchiveJobs(limit int) ([]ArchiveJob, error) {
 		var j ArchiveJob
 		if err := rows.Scan(
 			&j.ChatID, &j.MessageID, &j.RelativePath, &j.ExpectedSize, &j.SHA256,
-			&j.State, &j.Attempts, &j.NextRetryAt, &j.LastError, &j.CreatedAt, &j.UpdatedAt,
+			&j.State, &j.Attempts, &j.NextRetryAt, &j.ClaimID, &j.LastError, &j.CreatedAt, &j.UpdatedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -1310,17 +1317,17 @@ func (d *Database) GetDueArchiveJobs(limit int) ([]ArchiveJob, error) {
 	return jobs, nil
 }
 
-// ClaimArchiveJob atomically transitions an archive job from 'pending' to 'copying'.
-func (d *Database) ClaimArchiveJob(chatID string, messageID int) (bool, error) {
+// ClaimArchiveJob atomically transitions an archive job from 'pending' to 'copying' with a claim ID.
+func (d *Database) ClaimArchiveJob(chatID string, messageID int, claimID string) (bool, error) {
 	d.lock.Lock()
 	defer d.lock.Unlock()
 
 	now := time.Now().Unix()
 	res, err := d.db.Exec(`
 		UPDATE archive_jobs
-		SET state = 'copying', updated_at = ?
+		SET state = 'copying', claim_id = ?, updated_at = ?
 		WHERE chat_id = ? AND message_id = ? AND state = 'pending'
-	`, now, chatID, messageID)
+	`, claimID, now, chatID, messageID)
 	if err != nil {
 		return false, err
 	}
@@ -1329,26 +1336,42 @@ func (d *Database) ClaimArchiveJob(chatID string, messageID int) (bool, error) {
 }
 
 // CompleteArchiveJob marks an archive job as 'archived' upon verified durability.
-// Only transitions from 'copying'.
-func (d *Database) CompleteArchiveJob(chatID string, messageID int) error {
+// Strict guard: requires matching claimID and expectedSHA, transitions only from 'copying'.
+func (d *Database) CompleteArchiveJob(chatID string, messageID int, claimID string, expectedSHA string) error {
 	d.lock.Lock()
 	defer d.lock.Unlock()
 
 	now := time.Now().Unix()
 	res, err := d.db.Exec(`
 		UPDATE archive_jobs
-		SET state = 'archived', last_error = '', updated_at = ?
+		SET state = 'archived', last_error = '', claim_id = '', updated_at = ?
 		WHERE chat_id = ? AND message_id = ? AND state = 'copying'
-	`, now, chatID, messageID)
+		  AND (claim_id = ? OR claim_id = '')
+		  AND sha256 = ?
+	`, now, chatID, messageID, claimID, expectedSHA)
 	if err != nil {
 		return err
 	}
 	n, _ := res.RowsAffected()
 	if n == 0 {
-		var state string
-		_ = d.db.QueryRow(`SELECT state FROM archive_jobs WHERE chat_id = ? AND message_id = ?`, chatID, messageID).Scan(&state)
+		var state, currentSHA, currentClaim string
+		err := d.db.QueryRow(`SELECT state, sha256, COALESCE(claim_id, '') FROM archive_jobs WHERE chat_id = ? AND message_id = ?`, chatID, messageID).Scan(&state, &currentSHA, &currentClaim)
+		if err == sql.ErrNoRows {
+			return fmt.Errorf("%w: archive job does not exist", ErrStateConflict)
+		} else if err != nil {
+			return err
+		}
 		if state == "archived" {
-			return nil
+			if currentSHA == expectedSHA {
+				return nil // idempotent duplicate complete
+			}
+			return fmt.Errorf("%w: archive job already archived with conflicting sha (%q vs %q)", ErrStateConflict, currentSHA, expectedSHA)
+		}
+		if state == "conflict" {
+			return fmt.Errorf("%w: archive job is in conflict state", ErrStateConflict)
+		}
+		if currentClaim != "" && claimID != "" && currentClaim != claimID {
+			return fmt.Errorf("%w: stale archive claim %q (active is %q)", ErrStaleAttempt, claimID, currentClaim)
 		}
 		return fmt.Errorf("%w: archive job not in copying state (state=%q)", ErrStateConflict, state)
 	}
@@ -1356,20 +1379,29 @@ func (d *Database) CompleteArchiveJob(chatID string, messageID int) error {
 }
 
 // FailArchiveJob returns a failed archive attempt to 'pending' with bounded exponential retry delay (capped at 30 min).
-// Only transitions from 'copying' and never modifies 'archived' or 'conflict'.
-func (d *Database) FailArchiveJob(chatID string, messageID int, errStr string) error {
+// Strict guard: only transitions from 'copying' with matching claimID, NEVER modifies 'archived' or 'conflict'.
+func (d *Database) FailArchiveJob(chatID string, messageID int, claimID string, errStr string) error {
 	d.lock.Lock()
 	defer d.lock.Unlock()
 
 	now := time.Now().Unix()
-	var state string
+	var state, currentClaim string
 	var attempts int
-	err := d.db.QueryRow(`SELECT state, attempts FROM archive_jobs WHERE chat_id = ? AND message_id = ?`, chatID, messageID).Scan(&state, &attempts)
-	if err != nil {
+	err := d.db.QueryRow(`SELECT state, attempts, COALESCE(claim_id, '') FROM archive_jobs WHERE chat_id = ? AND message_id = ?`, chatID, messageID).Scan(&state, &attempts, &currentClaim)
+	if err == sql.ErrNoRows {
+		return fmt.Errorf("%w: archive job does not exist", ErrStateConflict)
+	} else if err != nil {
 		return err
 	}
+
 	if state == "archived" || state == "conflict" {
-		return nil
+		return fmt.Errorf("%w: cannot fail archive job in terminal state %q", ErrStateConflict, state)
+	}
+	if state != "copying" {
+		return fmt.Errorf("%w: cannot fail archive job from state %q", ErrStateConflict, state)
+	}
+	if currentClaim != "" && claimID != "" && currentClaim != claimID {
+		return fmt.Errorf("%w: stale archive attempt %q (active is %q)", ErrStaleAttempt, claimID, currentClaim)
 	}
 
 	attempts++
@@ -1379,35 +1411,61 @@ func (d *Database) FailArchiveJob(chatID string, messageID int, errStr string) e
 	}
 	nextRetry := now + backoffSec
 
-	_, err = d.db.Exec(`
+	res, err := d.db.Exec(`
 		UPDATE archive_jobs
-		SET state = 'pending', attempts = ?, next_retry_at = ?, last_error = ?, updated_at = ?
+		SET state = 'pending', attempts = ?, next_retry_at = ?, last_error = ?, claim_id = '', updated_at = ?
 		WHERE chat_id = ? AND message_id = ? AND state = 'copying'
-	`, attempts, nextRetry, errStr, now, chatID, messageID)
-	return err
+		  AND (claim_id = ? OR claim_id = '')
+	`, attempts, nextRetry, errStr, now, chatID, messageID, claimID)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("%w: zero rows affected in FailArchiveJob", ErrStateConflict)
+	}
+	return nil
 }
 
 // SetArchiveJobConflict marks an archive job as 'conflict' requiring operator intervention without overwrite.
-func (d *Database) SetArchiveJobConflict(chatID string, messageID int, errStr string) error {
+// Strict guard: cannot overwrite 'archived', requires matching claimID if active.
+func (d *Database) SetArchiveJobConflict(chatID string, messageID int, claimID string, errStr string) error {
 	d.lock.Lock()
 	defer d.lock.Unlock()
 
 	now := time.Now().Unix()
-	var state string
-	err := d.db.QueryRow(`SELECT state FROM archive_jobs WHERE chat_id = ? AND message_id = ?`, chatID, messageID).Scan(&state)
+	var state, currentClaim string
+	err := d.db.QueryRow(`SELECT state, COALESCE(claim_id, '') FROM archive_jobs WHERE chat_id = ? AND message_id = ?`, chatID, messageID).Scan(&state, &currentClaim)
+	if err == sql.ErrNoRows {
+		return fmt.Errorf("%w: archive job does not exist", ErrStateConflict)
+	} else if err != nil {
+		return err
+	}
+
+	if state == "archived" {
+		return fmt.Errorf("%w: cannot set conflict on already archived job", ErrStateConflict)
+	}
+	if state == "conflict" {
+		return nil // idempotent conflict
+	}
+	if currentClaim != "" && claimID != "" && currentClaim != claimID {
+		return fmt.Errorf("%w: stale archive claim %q (active is %q)", ErrStaleAttempt, claimID, currentClaim)
+	}
+
+	res, err := d.db.Exec(`
+		UPDATE archive_jobs
+		SET state = 'conflict', last_error = ?, claim_id = '', updated_at = ?
+		WHERE chat_id = ? AND message_id = ? AND state IN ('pending', 'copying')
+		  AND (claim_id = ? OR claim_id = '')
+	`, errStr, now, chatID, messageID, claimID)
 	if err != nil {
 		return err
 	}
-	if state == "archived" {
-		return nil
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("%w: zero rows affected in SetArchiveJobConflict", ErrStateConflict)
 	}
-
-	_, err = d.db.Exec(`
-		UPDATE archive_jobs
-		SET state = 'conflict', last_error = ?, updated_at = ?
-		WHERE chat_id = ? AND message_id = ?
-	`, errStr, now, chatID, messageID)
-	return err
+	return nil
 }
 
 // FailDownloadDisposition records download failure or unavailability using a structured FailureDisposition,
@@ -1626,7 +1684,7 @@ func (d *Database) GetStaleCopyingArchiveJobs() ([]ArchiveJob, error) {
 
 	rows, err := d.db.Query(`
 		SELECT chat_id, message_id, relative_path, expected_size, sha256,
-		       state, attempts, next_retry_at, COALESCE(last_error, ''), created_at, updated_at
+		       state, attempts, next_retry_at, COALESCE(claim_id, ''), COALESCE(last_error, ''), created_at, updated_at
 		FROM archive_jobs
 		WHERE state = 'copying'
 	`)
@@ -1640,11 +1698,65 @@ func (d *Database) GetStaleCopyingArchiveJobs() ([]ArchiveJob, error) {
 		var j ArchiveJob
 		if err := rows.Scan(
 			&j.ChatID, &j.MessageID, &j.RelativePath, &j.ExpectedSize, &j.SHA256,
-			&j.State, &j.Attempts, &j.NextRetryAt, &j.LastError, &j.CreatedAt, &j.UpdatedAt,
+			&j.State, &j.Attempts, &j.NextRetryAt, &j.ClaimID, &j.LastError, &j.CreatedAt, &j.UpdatedAt,
 		); err != nil {
 			return nil, err
 		}
 		jobs = append(jobs, j)
 	}
 	return jobs, nil
+}
+
+// RecoverStaleArchiveJob resets an interrupted 'copying' archive job back to 'pending'.
+// Strict guard: ONLY resets from 'copying' state, NEVER mutates 'archived' or 'conflict'.
+func (d *Database) RecoverStaleArchiveJob(chatID string, messageID int, staleClaimID string) error {
+	d.lock.Lock()
+	defer d.lock.Unlock()
+
+	now := time.Now().Unix()
+	res, err := d.db.Exec(`
+		UPDATE archive_jobs
+		SET state = 'pending', claim_id = '', updated_at = ?
+		WHERE chat_id = ? AND message_id = ? AND state = 'copying'
+		  AND (claim_id = ? OR claim_id = '')
+	`, now, chatID, messageID, staleClaimID)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		var state string
+		_ = d.db.QueryRow(`SELECT state FROM archive_jobs WHERE chat_id = ? AND message_id = ?`, chatID, messageID).Scan(&state)
+		return fmt.Errorf("%w: cannot recover archive job from non-copying state %q", ErrStateConflict, state)
+	}
+	return nil
+}
+
+// RecoverArchiveJobComplete marks an interrupted 'copying' archive job as 'archived'
+// if the final destination file already exists and matches expected SHA.
+func (d *Database) RecoverArchiveJobComplete(chatID string, messageID int, staleClaimID string, expectedSHA string) error {
+	d.lock.Lock()
+	defer d.lock.Unlock()
+
+	now := time.Now().Unix()
+	res, err := d.db.Exec(`
+		UPDATE archive_jobs
+		SET state = 'archived', last_error = '', claim_id = '', updated_at = ?
+		WHERE chat_id = ? AND message_id = ? AND state = 'copying'
+		  AND (claim_id = ? OR claim_id = '')
+		  AND sha256 = ?
+	`, now, chatID, messageID, staleClaimID, expectedSHA)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		var state, currentSHA string
+		_ = d.db.QueryRow(`SELECT state, sha256 FROM archive_jobs WHERE chat_id = ? AND message_id = ?`, chatID, messageID).Scan(&state, &currentSHA)
+		if state == "archived" && currentSHA == expectedSHA {
+			return nil
+		}
+		return fmt.Errorf("%w: cannot complete recovered archive job from state %q", ErrStateConflict, state)
+	}
+	return nil
 }

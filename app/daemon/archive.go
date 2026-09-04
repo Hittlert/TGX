@@ -119,7 +119,8 @@ func (w *ArchiveWorker) runLoop(ctx context.Context) {
 			}
 
 			job := jobs[0]
-			claimed, err := w.db.ClaimArchiveJob(job.ChatID, job.MessageID)
+			claimID := fmt.Sprintf("%d-%d", time.Now().UnixNano(), os.Getpid())
+			claimed, err := w.db.ClaimArchiveJob(job.ChatID, job.MessageID, claimID)
 			if err != nil {
 				w.logger.Error("failed to claim archive job", zap.Error(err), zap.String("chat_id", job.ChatID), zap.Int("message_id", job.MessageID))
 				break
@@ -127,6 +128,7 @@ func (w *ArchiveWorker) runLoop(ctx context.Context) {
 			if !claimed {
 				break
 			}
+			job.ClaimID = claimID
 
 			w.processJob(ctx, job)
 		}
@@ -140,7 +142,7 @@ func (w *ArchiveWorker) processJob(ctx context.Context, job ArchiveJob) {
 			zap.String("chat_id", job.ChatID),
 			zap.Int("message_id", job.MessageID),
 		)
-		if err := w.db.FailArchiveJob(job.ChatID, job.MessageID, "archive job rejected: empty SHA256 proof"); err != nil {
+		if err := w.db.FailArchiveJob(job.ChatID, job.MessageID, job.ClaimID, "archive job rejected: empty SHA256 proof"); err != nil {
 			w.logger.Error("failed to fail archive job with empty SHA", zap.Error(err))
 		}
 		return
@@ -154,7 +156,7 @@ func (w *ArchiveWorker) processJob(ctx context.Context, job ArchiveJob) {
 			zap.Int("message_id", job.MessageID),
 			zap.String("rel_path", job.RelativePath),
 		)
-		if err := w.db.FailArchiveJob(job.ChatID, job.MessageID, "archive job rejected: invalid relative path"); err != nil {
+		if err := w.db.FailArchiveJob(job.ChatID, job.MessageID, job.ClaimID, "archive job rejected: invalid relative path"); err != nil {
 			w.logger.Error("failed to fail archive job with invalid path", zap.Error(err))
 		}
 		return
@@ -166,13 +168,13 @@ func (w *ArchiveWorker) processJob(ctx context.Context, job ArchiveJob) {
 	relSrc, errSrc := filepath.Rel(w.downloadDir, srcPath)
 	if errSrc != nil || strings.HasPrefix(relSrc, "..") {
 		w.logger.Error("archive job rejected: srcPath escapes downloadDir", zap.String("src_path", srcPath))
-		_ = w.db.FailArchiveJob(job.ChatID, job.MessageID, "srcPath escapes downloadDir")
+		_ = w.db.FailArchiveJob(job.ChatID, job.MessageID, job.ClaimID, "srcPath escapes downloadDir")
 		return
 	}
 	relDst, errDst := filepath.Rel(w.archiveDir, dstPath)
 	if errDst != nil || strings.HasPrefix(relDst, "..") {
 		w.logger.Error("archive job rejected: dstPath escapes archiveDir", zap.String("dst_path", dstPath))
-		_ = w.db.FailArchiveJob(job.ChatID, job.MessageID, "dstPath escapes archiveDir")
+		_ = w.db.FailArchiveJob(job.ChatID, job.MessageID, job.ClaimID, "dstPath escapes archiveDir")
 		return
 	}
 
@@ -194,7 +196,7 @@ func (w *ArchiveWorker) processJob(ctx context.Context, job ArchiveJob) {
 					zap.String("chat_id", job.ChatID),
 					zap.Int("message_id", job.MessageID),
 				)
-				if dbErr := w.db.CompleteArchiveJob(job.ChatID, job.MessageID); dbErr != nil {
+				if dbErr := w.db.CompleteArchiveJob(job.ChatID, job.MessageID, job.ClaimID, job.SHA256); dbErr != nil {
 					w.logger.Error("failed to mark archive complete in DB for existing verified target", zap.Error(dbErr))
 					return
 				}
@@ -213,7 +215,7 @@ func (w *ArchiveWorker) processJob(ctx context.Context, job ArchiveJob) {
 			zap.Int("message_id", job.MessageID),
 			zap.String("dst_path", dstPath),
 		)
-		if cErr := w.db.SetArchiveJobConflict(job.ChatID, job.MessageID, "destination file exists with conflicting content"); cErr != nil {
+		if cErr := w.db.SetArchiveJobConflict(job.ChatID, job.MessageID, job.ClaimID, "destination file exists with conflicting content"); cErr != nil {
 			w.logger.Error("failed to set archive job conflict", zap.Error(cErr))
 		}
 		return
@@ -228,12 +230,12 @@ func (w *ArchiveWorker) processJob(ctx context.Context, job ArchiveJob) {
 				zap.Int("message_id", job.MessageID),
 				zap.String("src_path", srcPath),
 			)
-			if fErr := w.db.FailArchiveJob(job.ChatID, job.MessageID, fmt.Sprintf("SSD source missing: %v", err)); fErr != nil {
+			if fErr := w.db.FailArchiveJob(job.ChatID, job.MessageID, job.ClaimID, fmt.Sprintf("SSD source missing: %v", err)); fErr != nil {
 				w.logger.Error("failed to fail archive job for missing source", zap.Error(fErr))
 			}
 			return
 		}
-		if fErr := w.db.FailArchiveJob(job.ChatID, job.MessageID, fmt.Sprintf("stat SSD source: %v", err)); fErr != nil {
+		if fErr := w.db.FailArchiveJob(job.ChatID, job.MessageID, job.ClaimID, fmt.Sprintf("stat SSD source: %v", err)); fErr != nil {
 			w.logger.Error("failed to fail archive job for stat source error", zap.Error(fErr))
 		}
 		return
@@ -246,7 +248,7 @@ func (w *ArchiveWorker) processJob(ctx context.Context, job ArchiveJob) {
 			zap.Int64("actual", srcInfo.Size()),
 			zap.Int64("expected", job.ExpectedSize),
 		)
-		if cErr := w.db.SetArchiveJobConflict(job.ChatID, job.MessageID, fmt.Sprintf("SSD source size mismatch: got %d want %d", srcInfo.Size(), job.ExpectedSize)); cErr != nil {
+		if cErr := w.db.SetArchiveJobConflict(job.ChatID, job.MessageID, job.ClaimID, fmt.Sprintf("SSD source size mismatch: got %d want %d", srcInfo.Size(), job.ExpectedSize)); cErr != nil {
 			w.logger.Error("failed to set archive job conflict for size mismatch", zap.Error(cErr))
 		}
 		return
@@ -256,7 +258,7 @@ func (w *ArchiveWorker) processJob(ctx context.Context, job ArchiveJob) {
 	dstDir := filepath.Dir(dstPath)
 	if err := os.MkdirAll(dstDir, 0o755); err != nil {
 		w.logger.Warn("failed to create archive directory", zap.Error(err))
-		if fErr := w.db.FailArchiveJob(job.ChatID, job.MessageID, fmt.Sprintf("mkdir archive dir: %v", err)); fErr != nil {
+		if fErr := w.db.FailArchiveJob(job.ChatID, job.MessageID, job.ClaimID, fmt.Sprintf("mkdir archive dir: %v", err)); fErr != nil {
 			w.logger.Error("failed to fail archive job for mkdir error", zap.Error(fErr))
 		}
 		return
@@ -268,7 +270,7 @@ func (w *ArchiveWorker) processJob(ctx context.Context, job ArchiveJob) {
 	if copyErr != nil {
 		w.logger.Warn("archive copy failed", zap.Error(copyErr))
 		_ = os.Remove(movingPath)
-		if fErr := w.db.FailArchiveJob(job.ChatID, job.MessageID, fmt.Sprintf("copy file: %v", copyErr)); fErr != nil {
+		if fErr := w.db.FailArchiveJob(job.ChatID, job.MessageID, job.ClaimID, fmt.Sprintf("copy file: %v", copyErr)); fErr != nil {
 			w.logger.Error("failed to fail archive job for copy error", zap.Error(fErr))
 		}
 		return
@@ -283,7 +285,7 @@ func (w *ArchiveWorker) processJob(ctx context.Context, job ArchiveJob) {
 			zap.String("expected_sha", job.SHA256),
 		)
 		_ = os.Remove(movingPath)
-		if fErr := w.db.FailArchiveJob(job.ChatID, job.MessageID, "copied file size or sha mismatch"); fErr != nil {
+		if fErr := w.db.FailArchiveJob(job.ChatID, job.MessageID, job.ClaimID, "copied file size or sha mismatch"); fErr != nil {
 			w.logger.Error("failed to fail archive job for verification mismatch", zap.Error(fErr))
 		}
 		return
@@ -293,11 +295,11 @@ func (w *ArchiveWorker) processJob(ctx context.Context, job ArchiveJob) {
 	if err := fscommit.CommitSiblingPart(movingPath, dstPath); err != nil {
 		w.logger.Error("archive final rename failed", zap.Error(err))
 		if errors.Is(err, fscommit.ErrTargetExists) {
-			if cErr := w.db.SetArchiveJobConflict(job.ChatID, job.MessageID, "archive destination already exists during final commit"); cErr != nil {
+			if cErr := w.db.SetArchiveJobConflict(job.ChatID, job.MessageID, job.ClaimID, "archive destination already exists during final commit"); cErr != nil {
 				w.logger.Error("failed to set archive conflict for existing target", zap.Error(cErr))
 			}
 		} else {
-			if fErr := w.db.FailArchiveJob(job.ChatID, job.MessageID, fmt.Sprintf("archive final commit: %v", err)); fErr != nil {
+			if fErr := w.db.FailArchiveJob(job.ChatID, job.MessageID, job.ClaimID, fmt.Sprintf("archive final commit: %v", err)); fErr != nil {
 				w.logger.Error("failed to fail archive job for commit error", zap.Error(fErr))
 			}
 		}
@@ -305,7 +307,7 @@ func (w *ArchiveWorker) processJob(ctx context.Context, job ArchiveJob) {
 	}
 
 	// 7. Mark archived in DB
-	if err := w.db.CompleteArchiveJob(job.ChatID, job.MessageID); err != nil {
+	if err := w.db.CompleteArchiveJob(job.ChatID, job.MessageID, job.ClaimID, job.SHA256); err != nil {
 		w.logger.Error("failed to mark archive complete in DB", zap.Error(err))
 		return
 	}

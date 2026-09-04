@@ -4,7 +4,6 @@ import (
 	"context"
 	"os"
 	"path/filepath"
-	"time"
 
 	"go.uber.org/zap"
 
@@ -147,7 +146,7 @@ func ReconcileOnStartup(ctx context.Context, db *Database, ssdDir, archiveDir st
 					sha, shaErr := computeFileSHA256(dstFinal)
 					if shaErr == nil && job.SHA256 != "" && sha == job.SHA256 {
 						_ = os.Remove(dstMoving)
-						if completeErr := db.CompleteArchiveJob(job.ChatID, job.MessageID); completeErr != nil {
+						if completeErr := db.RecoverArchiveJobComplete(job.ChatID, job.MessageID, job.ClaimID, job.SHA256); completeErr != nil {
 							logger.Error("failed to complete recovered copying archive job", zap.String("chat_id", job.ChatID), zap.Int("message_id", job.MessageID), zap.Error(completeErr))
 						} else {
 							_ = os.Remove(srcPath) // Clean up SSD duplicate
@@ -160,10 +159,9 @@ func ReconcileOnStartup(ctx context.Context, db *Database, ssdDir, archiveDir st
 					}
 				}
 
-				// Otherwise remove .moving residue and reset state to pending
+				// Otherwise remove .moving residue and reset state to pending (strictly conditional on copying state)
 				_ = os.Remove(dstMoving)
-				if _, execErr := db.Execute(`UPDATE archive_jobs SET state = 'pending', updated_at = ? WHERE chat_id = ? AND message_id = ?`,
-					time.Now().Unix(), job.ChatID, job.MessageID); execErr != nil {
+				if execErr := db.RecoverStaleArchiveJob(job.ChatID, job.MessageID, job.ClaimID); execErr != nil {
 					logger.Error("failed to reset incomplete copying archive job to pending", zap.String("chat_id", job.ChatID), zap.Int("message_id", job.MessageID), zap.Error(execErr))
 				} else {
 					logger.Info("reset incomplete copying archive job to pending",

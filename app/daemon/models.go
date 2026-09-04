@@ -64,6 +64,7 @@ type ArchiveJob struct {
 	State        string `json:"state"` // pending, copying, archived, conflict
 	Attempts     int    `json:"attempts"`
 	NextRetryAt  int64  `json:"next_retry_at"`
+	ClaimID      string `json:"claim_id,omitempty"`
 	LastError    string `json:"last_error,omitempty"`
 	CreatedAt    int64  `json:"created_at"`
 	UpdatedAt    int64  `json:"updated_at"`
