@@ -488,9 +488,11 @@ func (d *Database) GetPendingDownloads(limit int) ([]DownloadRecord, error) {
 	rows, err := d.db.Query(`
 		SELECT r.chat_id, r.message_id, r.status, COALESCE(r.file_name, ''), COALESCE(r.save_path, ''), 
 		       COALESCE(r.media_type, ''), COALESCE(r.file_size, 0), COALESCE(r.error, ''), 
-		       r.created_at, r.updated_at, r.attempts, r.next_retry_at, COALESCE(t.title, '')
+		       r.created_at, r.updated_at, r.attempts, r.next_retry_at, COALESCE(t.title, ''),
+		       COALESCE(m.date, r.created_at)
 		FROM download_records r
 		INNER JOIN listen_targets t ON r.chat_id = t.chat_id
+		LEFT JOIN chat_messages m ON r.chat_id = m.chat_id AND r.message_id = m.message_id
 		WHERE t.enabled = 1 AND (r.status = 'pending' OR (r.status = 'failed' AND r.next_retry_at <= ?))
 		ORDER BY t.priority DESC, r.message_id ASC
 		LIMIT ?
@@ -506,7 +508,7 @@ func (d *Database) GetPendingDownloads(limit int) ([]DownloadRecord, error) {
 		if err := rows.Scan(
 			&rec.ChatID, &rec.MessageID, &rec.Status, &rec.FileName, &rec.SavePath,
 			&rec.MediaType, &rec.FileSize, &rec.Error, &rec.CreatedAt, &rec.UpdatedAt,
-			&rec.Attempts, &rec.NextRetryAt, &rec.TargetTitle,
+			&rec.Attempts, &rec.NextRetryAt, &rec.TargetTitle, &rec.Date,
 		); err != nil {
 			return nil, err
 		}

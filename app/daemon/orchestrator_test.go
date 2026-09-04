@@ -90,6 +90,14 @@ func (m *mockAccessWithPool) Resolve(ctx context.Context, peer string, messageID
 }
 
 func setupTestOrchestrator(t *testing.T, invoker tg.Invoker, resolveErr error) (*Orchestrator, *Registry, *Database, string) {
+	access := &mockAccessWithPool{
+		pool:       &mockPool{invoker: invoker},
+		resolveErr: resolveErr,
+	}
+	return setupTestOrchestratorWithAccess(t, access)
+}
+
+func setupTestOrchestratorWithAccess(t *testing.T, access TelegramAccess) (*Orchestrator, *Registry, *Database, string) {
 	tempDir := t.TempDir()
 	dbPath := filepath.Join(tempDir, "state.db")
 	db, err := NewDatabase(dbPath)
@@ -109,11 +117,6 @@ func setupTestOrchestrator(t *testing.T, invoker tg.Invoker, resolveErr error) (
 		MaxDataInFlight: 10,
 	})
 	ssdAdmission := fscommit.NewSSDAdmission(saveDir, 1<<20)
-
-	access := &mockAccessWithPool{
-		pool:       &mockPool{invoker: invoker},
-		resolveErr: resolveErr,
-	}
 
 	orch := NewOrchestrator(
 		db,
@@ -450,5 +453,95 @@ func TestOrchestrator_Matrix_SuccessWithPhysicalRetries(t *testing.T) {
 	partPath := finalPath + ".part"
 	if _, err := os.Stat(partPath); !os.IsNotExist(err) {
 		t.Fatalf("part file was not cleaned up: %s", partPath)
+	}
+}
+
+func TestOrchestrator_CanonicalPathAssertedInE2E(t *testing.T) {
+	expectedPayload := make([]byte, 1024)
+	for i := range expectedPayload {
+		expectedPayload[i] = byte(i % 251)
+	}
+	h := sha256.Sum256(expectedPayload)
+	expectedHex := hex.EncodeToString(h[:])
+
+	invoker := invokerFunc(func(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
+		setUploadFile(output, expectedPayload)
+		return nil
+	})
+
+	fixedDate := int64(1725148800) // 2024-09-01 -> 2024_09
+	chatID := "-100777888"
+	msgID := 888
+
+	access := &mockAccessWithPool{
+		pool: &mockPool{invoker: invoker},
+		resolveFn: func(ctx context.Context, peer string, messageID int) (ResolvedMedia, error) {
+			return ResolvedMedia{
+				File:      &orchMockMediaFile{loc: &tg.InputDocumentFileLocation{ID: 1001, AccessHash: 2002}, sz: 1024, dc: 2},
+				Name:      "clip.mp4",
+				Size:      1024,
+				DCID:      2,
+				MediaType: "video",
+				Date:      fixedDate,
+			}, nil
+		},
+	}
+
+	orch, registry, db, saveDir := setupTestOrchestratorWithAccess(t, access)
+	defer db.Close()
+
+	// Seed target in DB
+	_, _ = db.Execute(`
+		INSERT INTO listen_targets (chat_id, enabled, title, username, priority, created_at, updated_at)
+		VALUES (?, 1, 'My Special Channel', 'special', 10, ?, ?)
+	`, chatID, fixedDate, fixedDate)
+
+	req := TaskRequest{
+		ID:          "case_canonical_path_e2e",
+		Peer:        chatID,
+		MessageID:   msgID,
+		TargetTitle: "My Special Channel",
+		MediaType:   "video",
+		FileName:    "clip.mp4",
+		Date:        fixedDate,
+		// FinalPath is deliberately EMPTY so PathPlanner plans it!
+	}
+
+	_, _, _ = registry.Submit(req)
+	task, _ := registry.Next(context.Background())
+
+	orch.downloadOne(context.Background(), task)
+
+	snap := task.Snapshot()
+	if snap.State != StateSuccess {
+		t.Fatalf("expected StateSuccess, got: %s (err: %s)", snap.State, snap.Error)
+	}
+	if snap.SHA256 != expectedHex {
+		t.Fatalf("expected sha256 %s, got: %s", expectedHex, snap.SHA256)
+	}
+
+	// Assert the EXACT canonical relative path
+	expectedRelPath := "My Special Channel/2024_09/888 - clip.mp4"
+	if snap.FinalPath != expectedRelPath {
+		t.Fatalf("expected canonical path %q, got: %q", expectedRelPath, snap.FinalPath)
+	}
+
+	// Final destination file must exist at the expected canonical path on disk
+	finalPath := filepath.Join(saveDir, filepath.FromSlash(expectedRelPath))
+	finInfo, err := os.Stat(finalPath)
+	if err != nil {
+		t.Fatalf("final file does not exist at canonical path %q: %v", finalPath, err)
+	}
+	if finInfo.Size() != 1024 {
+		t.Fatalf("expected final file size 1024, got %d", finInfo.Size())
+	}
+
+	// Also verify durable DB record holds the exact canonical path
+	rec, err := db.GetDownloadRecord(chatID, msgID)
+	if err != nil || rec == nil {
+		t.Fatalf("failed to query download record: %v", err)
+	}
+	if rec.SavePath != expectedRelPath {
+		t.Fatalf("expected DB SavePath %q, got %q", expectedRelPath, rec.SavePath)
 	}
 }

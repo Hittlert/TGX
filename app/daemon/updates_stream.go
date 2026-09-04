@@ -358,6 +358,7 @@ func (s *UpdatesStream) handleMessage(ctx context.Context, msgClass tg.MessageCl
 			FileName:    fileName,
 			MediaType:   mediaType,
 			FileSize:    fileSize,
+			Date:        int64(msg.Date),
 			CreatedAt:   int64(msg.Date),
 			TargetTitle: target.Title,
 		}

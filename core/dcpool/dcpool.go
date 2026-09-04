@@ -242,4 +242,3 @@ func (p *pool) CDN(ctx context.Context, dc int, max int64) (tg.Invoker, io.Close
 	}
 	return closeInvoker, closeInvoker, nil
 }
-

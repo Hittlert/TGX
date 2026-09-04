@@ -80,16 +80,18 @@ func (p PathPlanner) Plan(peer string, channelTitle string, msgID int, rawName s
 	if safeFolder == "" {
 		safeFolder, _ = filenamify.Filenamify(peer, filenamify.Options{Replacement: "_"})
 	}
-	if safeFolder == "" {
+	safeFolder = filepath.Clean(strings.TrimSpace(safeFolder))
+	if safeFolder == "" || safeFolder == "." || safeFolder == "/" || strings.HasPrefix(safeFolder, "..") {
 		safeFolder = "default"
 	}
 
 	if msgDate <= 86400 {
 		msgDate = time.Now().Unix()
 	}
-	yearMonth := time.Unix(msgDate, 0).Format("2006_01")
+	yearMonth := time.Unix(msgDate, 0).UTC().Format("2006_01")
 
-	if rawName == "" || strings.HasSuffix(rawName, ".bin") || strings.HasSuffix(rawName, ".unknown") {
+	cleanRaw := strings.TrimSpace(rawName)
+	if cleanRaw == "" || cleanRaw == "." || cleanRaw == fmt.Sprintf("%d.bin", msgID) || cleanRaw == fmt.Sprintf("%d.unknown", msgID) || cleanRaw == "unknown.bin" || strings.HasSuffix(cleanRaw, ".unknown") {
 		ext := ".bin"
 		switch mediaType {
 		case "photo":
@@ -98,16 +100,34 @@ func (p PathPlanner) Plan(peer string, channelTitle string, msgID int, rawName s
 			ext = ".mp3"
 		case "video":
 			ext = ".mp4"
+		default:
+			ext = ".bin"
 		}
-		rawName = fmt.Sprintf("%d%s", msgID, ext)
+		cleanRaw = fmt.Sprintf("%d%s", msgID, ext)
 	}
-	safeFileName, _ := filenamify.Filenamify(rawName, filenamify.Options{Replacement: "_"})
-	if safeFileName == "" {
-		safeFileName = fmt.Sprintf("%d.bin", msgID)
+	safeFileName, _ := filenamify.Filenamify(cleanRaw, filenamify.Options{Replacement: "_"})
+	safeFileName = strings.TrimSpace(safeFileName)
+	if safeFileName == "" || safeFileName == "." || strings.HasPrefix(safeFileName, "..") {
+		ext := ".bin"
+		switch mediaType {
+		case "photo":
+			ext = ".jpg"
+		case "audio":
+			ext = ".mp3"
+		case "video":
+			ext = ".mp4"
+		default:
+			ext = ".bin"
+		}
+		safeFileName = fmt.Sprintf("%d%s", msgID, ext)
 	}
 
-	finalRelPath := filepath.Join(safeFolder, yearMonth, fmt.Sprintf("%d - %s", msgID, safeFileName))
-	return strings.ReplaceAll(finalRelPath, "\\", "/")
+	finalRelPath := filepath.Clean(filepath.Join(safeFolder, yearMonth, fmt.Sprintf("%d - %s", msgID, safeFileName)))
+	finalRelPath = strings.ReplaceAll(finalRelPath, "\\", "/")
+	if strings.HasPrefix(finalRelPath, "..") || strings.HasPrefix(finalRelPath, "/") {
+		finalRelPath = fmt.Sprintf("default/%s/%d - %s", yearMonth, msgID, safeFileName)
+	}
+	return finalRelPath
 }
 
 // Start launches the background orchestrator loops.
@@ -500,7 +520,31 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 	}
 	defer releaseSSD()
 
-	// 5. Ensure parent directory exists
+	// 5. Durably accept planned path in DB and transition to downloading BEFORE filesystem mutation!
+	if o.db != nil {
+		if err := o.db.BeginDownload(chatID, msgID, gen, fileName, finalRelPath, mediaType, authoritativeSize); err != nil {
+			o.logger.Error("failed to begin download in DB with planned path",
+				zap.String("task_id", taskID),
+				zap.String("planned_path", finalRelPath),
+				zap.Error(err),
+			)
+			disp := FailureDisposition{
+				Stage:       "admission",
+				Op:          "db_begin_download",
+				Class:       "db_conflict",
+				Unavailable: false,
+				Retryable:   false,
+				RetryOwner:  "none",
+				Message:     err.Error(),
+				Cause:       err,
+			}
+			task.FailDisposition(disp)
+			return
+		}
+	}
+	task.SetDownloading()
+
+	// 6. Ensure parent directory exists (ONLY after durable DB acceptance)
 	if err := os.MkdirAll(filepath.Dir(finalAbsPath), 0o755); err != nil {
 		o.logger.Error("failed to create target dir", zap.Error(err))
 		disp := FailureDisposition{
@@ -551,11 +595,6 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 		}
 	}()
 	_ = fscommit.Preallocate(partFile, authoritativeSize)
-
-	task.SetDownloading()
-	if o.db != nil {
-		_ = o.db.BeginDownload(chatID, msgID, gen, fileName, finalRelPath, mediaType, authoritativeSize)
-	}
 
 	// 6. Execute parallel chunk download with official gotd downloader
 	onProgress := func(downloaded, total int64) {

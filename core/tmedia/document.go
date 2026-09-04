@@ -62,7 +62,7 @@ func GetDocumentName(doc *tg.Document) string {
 		} else if strings.HasPrefix(doc.MimeType, "audio/") {
 			ext = ".mp3"
 		} else {
-			ext = ".mp4"
+			ext = ".bin"
 		}
 	}
 	return strconv.FormatInt(doc.ID, 10) + ext

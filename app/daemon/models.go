@@ -53,6 +53,7 @@ type DownloadRecord struct {
 	AttemptGeneration   string `json:"attempt_generation,omitempty"`
 	NextRetryAt         int64  `json:"next_retry_at"`
 	TargetTitle         string `json:"target_title,omitempty"`
+	Date                int64  `json:"date,omitempty"`
 }
 
 type ArchiveJob struct {

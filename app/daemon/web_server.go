@@ -707,7 +707,7 @@ func (s *WebServer) handleGetDownloadList(w http.ResponseWriter, r *http.Request
 		}
 
 		fileName := f.FileName
-		if fileName == "" || strings.HasSuffix(fileName, ".bin") || strings.HasSuffix(fileName, ".unknown") {
+		if fileName == "" || strings.HasSuffix(fileName, ".unknown") {
 			base := filepath.Base(f.FinalPath)
 			if idx := strings.Index(base, " - "); idx != -1 && len(base) > idx+3 {
 				fileName = base[idx+3:]
@@ -715,8 +715,8 @@ func (s *WebServer) handleGetDownloadList(w http.ResponseWriter, r *http.Request
 				fileName = base
 			}
 		}
-		if fileName == "" || fileName == "." || strings.HasSuffix(fileName, ".bin") || strings.HasSuffix(fileName, ".unknown") {
-			fileName = fmt.Sprintf("%d.mp4", msgID)
+		if fileName == "" || fileName == "." {
+			fileName = fmt.Sprintf("%d.bin", msgID)
 		}
 
 		speedStr := formatBytes(f.Rolling5sBPS) + "/s"

@@ -11,9 +11,9 @@ import (
 )
 
 var (
-	ErrTargetExists     = os.ErrExist
-	ErrNotSibling       = errors.New("partPath and finalPath must be siblings in the same directory")
-	ErrRenameNotAtomic  = errors.New("atomic non-replacing rename unsupported on target filesystem")
+	ErrTargetExists    = os.ErrExist
+	ErrNotSibling      = errors.New("partPath and finalPath must be siblings in the same directory")
+	ErrRenameNotAtomic = errors.New("atomic non-replacing rename unsupported on target filesystem")
 )
 
 // CommitSiblingPart atomically commits a .part file to finalPath within the same parent directory.
