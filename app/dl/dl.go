@@ -149,13 +149,38 @@ func Run(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Opti
 		}
 	}()
 
+	return runDownloadLoop(ctx, it, pool, transferMgr, limit, p)
+}
+
+type elementIterator interface {
+	Next(ctx context.Context) bool
+	Value() *iterElem
+	Err() error
+}
+
+type progressTracker interface {
+	OnAdd(elem *iterElem)
+	OnDownload(elem *iterElem, downloaded, total int64)
+	OnDone(elem *iterElem, err error)
+}
+
+func runDownloadLoop(
+	ctx context.Context,
+	it elementIterator,
+	pool dcpool.Pool,
+	transferMgr *transfer.TransferManager,
+	limit int,
+	p progressTracker,
+) error {
 	g, gctx := errgroup.WithContext(ctx)
 	sem := make(chan struct{}, limit)
 
 downloadLoop:
 	for it.Next(gctx) {
 		elem := it.Value()
-		p.OnAdd(elem)
+		if p != nil {
+			p.OnAdd(elem)
+		}
 
 		select {
 		case sem <- struct{}{}:
@@ -163,33 +188,38 @@ downloadLoop:
 			break downloadLoop
 		}
 
+		curElem := elem
 		g.Go(func() error {
 			defer func() { <-sem }()
 
 			var invoker tg.Invoker
-			if elem.AsTakeout() {
-				invoker = pool.TakeoutInvoker(gctx, elem.DC())
+			if curElem.AsTakeout() {
+				invoker = pool.TakeoutInvoker(gctx, curElem.DC())
 			} else {
-				invoker = pool.Invoker(gctx, elem.DC())
+				invoker = pool.Invoker(gctx, curElem.DC())
 			}
 			client := transfer.NewGatedClient(
 				invoker,
 				transferMgr.Gate(),
-				elem.DC(),
+				curElem.DC(),
 				pool.CDN,
 			)
 
 			_, dlErr := transferMgr.DownloadFile(
 				gctx,
 				client,
-				elem.Location(),
-				elem.Size(),
-				elem.To(),
+				curElem.Location(),
+				curElem.Size(),
+				curElem.To(),
 				func(downloaded, total int64) {
-					p.OnDownload(elem, downloaded, total)
+					if p != nil {
+						p.OnDownload(curElem, downloaded, total)
+					}
 				},
 			)
-			p.OnDone(elem, dlErr)
+			if p != nil {
+				p.OnDone(curElem, dlErr)
+			}
 			return dlErr
 		})
 	}
