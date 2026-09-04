@@ -24,23 +24,27 @@ const (
 
 // LifecycleEvent represents a structured, correlated event across download and archive lifecycles.
 type LifecycleEvent struct {
-	Event      string         `json:"event"`
-	TaskID     string         `json:"task_id,omitempty"`
-	AttemptID  string         `json:"attempt_id,omitempty"`
-	ChatID     string         `json:"chat_id,omitempty"`
-	MessageID  int            `json:"message_id,omitempty"`
-	Stage      string         `json:"stage,omitempty"`
-	Op         string         `json:"op,omitempty"`
-	Path       string         `json:"path,omitempty"`
-	Size       int64          `json:"size,omitempty"`
-	SHA256     string         `json:"sha256,omitempty"`
-	DC         int            `json:"dc,omitempty"`
-	Error      string         `json:"error,omitempty"`
-	ErrorClass string         `json:"error_class,omitempty"`
-	Retryable  bool           `json:"retryable,omitempty"`
-	RetryOwner string         `json:"retry_owner,omitempty"`
-	Status     string         `json:"status,omitempty"`
-	Extra      map[string]any `json:"extra,omitempty"`
+	Event           string         `json:"event"`
+	TaskID          string         `json:"task_id,omitempty"`
+	AttemptID       string         `json:"attempt_id,omitempty"`
+	ChatID          string         `json:"chat_id,omitempty"`
+	MessageID       int            `json:"message_id,omitempty"`
+	Stage           string         `json:"stage,omitempty"`
+	Op              string         `json:"op,omitempty"`
+	Path            string         `json:"path,omitempty"`
+	Size            int64          `json:"size,omitempty"`
+	SHA256          string         `json:"sha256,omitempty"`
+	DC              int            `json:"dc,omitempty"`
+	Error           string         `json:"error,omitempty"`
+	ErrorClass      string         `json:"error_class,omitempty"`
+	Retryable       bool           `json:"retryable,omitempty"`
+	RetryOwner      string         `json:"retry_owner,omitempty"`
+	Status          string         `json:"status,omitempty"`
+	PhysicalRetries int64          `json:"physical_retries,omitempty"`
+	RequestCount    int64          `json:"request_count,omitempty"`
+	WireBytes       int64          `json:"wire_bytes,omitempty"`
+	ReplayBytes     int64          `json:"replay_bytes,omitempty"`
+	Extra           map[string]any `json:"extra,omitempty"`
 }
 
 // LifecycleObserver observes emitted lifecycle events for testing and telemetry.
@@ -48,25 +52,34 @@ type LifecycleObserver interface {
 	OnLifecycleEvent(evt LifecycleEvent)
 }
 
+// LifecycleObserverFunc implements LifecycleObserver for a simple function callback.
+type LifecycleObserverFunc func(evt LifecycleEvent)
+
+func (f LifecycleObserverFunc) OnLifecycleEvent(evt LifecycleEvent) {
+	f(evt)
+}
+
 var (
 	lifecycleMu        sync.RWMutex
-	lifecycleObservers []LifecycleObserver
+	nextObserverID     uint64
+	lifecycleObservers = make(map[uint64]LifecycleObserver)
 )
 
 // RegisterLifecycleObserver registers an observer and returns an unregister closure.
 func RegisterLifecycleObserver(obs LifecycleObserver) func() {
+	if obs == nil {
+		return func() {}
+	}
 	lifecycleMu.Lock()
-	defer lifecycleMu.Unlock()
-	lifecycleObservers = append(lifecycleObservers, obs)
+	nextObserverID++
+	id := nextObserverID
+	lifecycleObservers[id] = obs
+	lifecycleMu.Unlock()
+
 	return func() {
 		lifecycleMu.Lock()
-		defer lifecycleMu.Unlock()
-		for i, o := range lifecycleObservers {
-			if o == obs {
-				lifecycleObservers = append(lifecycleObservers[:i], lifecycleObservers[i+1:]...)
-				break
-			}
-		}
+		delete(lifecycleObservers, id)
+		lifecycleMu.Unlock()
 	}
 }
 
@@ -118,12 +131,27 @@ func EmitLifecycle(logger *zap.Logger, evt LifecycleEvent) {
 		if evt.Status != "" {
 			fields = append(fields, zap.String("status", evt.Status))
 		}
+		if evt.PhysicalRetries != 0 {
+			fields = append(fields, zap.Int64("physical_retries", evt.PhysicalRetries))
+		}
+		if evt.RequestCount != 0 {
+			fields = append(fields, zap.Int64("request_count", evt.RequestCount))
+		}
+		if evt.WireBytes != 0 {
+			fields = append(fields, zap.Int64("wire_bytes", evt.WireBytes))
+		}
+		if evt.ReplayBytes != 0 {
+			fields = append(fields, zap.Int64("replay_bytes", evt.ReplayBytes))
+		}
 
 		logger.Info("lifecycle_event", fields...)
 	}
 
 	lifecycleMu.RLock()
-	observers := append([]LifecycleObserver(nil), lifecycleObservers...)
+	observers := make([]LifecycleObserver, 0, len(lifecycleObservers))
+	for _, obs := range lifecycleObservers {
+		observers = append(observers, obs)
+	}
 	lifecycleMu.RUnlock()
 
 	for _, obs := range observers {

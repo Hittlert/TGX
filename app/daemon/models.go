@@ -80,10 +80,14 @@ type ArchiveStats struct {
 }
 
 type PublishResult struct {
-	Path          string `json:"path"`
-	SHA256        string `json:"sha256,omitempty"`
-	AlreadyExists bool   `json:"already_exists,omitempty"`
-	absolutePath  string
+	Path            string `json:"path"`
+	SHA256          string `json:"sha256,omitempty"`
+	AlreadyExists   bool   `json:"already_exists,omitempty"`
+	WireBytes       int64  `json:"wire_bytes,omitempty"`
+	ReplayBytes     int64  `json:"replay_bytes,omitempty"`
+	RequestCount    int64  `json:"request_count,omitempty"`
+	PhysicalRetries int64  `json:"physical_retries,omitempty"`
+	absolutePath    string
 }
 
 func normalizePeer(peer string) string {

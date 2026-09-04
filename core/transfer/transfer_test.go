@@ -477,3 +477,70 @@ func TestDownloadFile_CanceledContext_ClassifiedAsCanceled(t *testing.T) {
 		t.Error("expected Retryable to be false for cancellation")
 	}
 }
+
+type invokerFunc func(ctx context.Context, input bin.Encoder, output bin.Decoder) error
+
+func (f invokerFunc) Invoke(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
+	return f(ctx, input, output)
+}
+
+func TestGatedInvoker_RequestAndWireBytesAccounting(t *testing.T) {
+	gate := NewDataGate(10)
+	var reqCount int64
+	var wireBytes int64
+
+	tc := TransferTaskContext{
+		TaskID:       "task-1",
+		AttemptID:    "gen-1",
+		ChatID:       "-1001",
+		MessageID:    42,
+		DCID:         2,
+		RequestCount: &reqCount,
+		WireBytes:    &wireBytes,
+	}
+	ctx := ContextWithTransferTask(context.Background(), tc)
+
+	chunkData := make([]byte, 512)
+	calls := 0
+	mockInv := invokerFunc(func(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
+		calls++
+		if calls == 1 {
+			return errors.New("transient rpc failure")
+		}
+		if box, ok := output.(*tg.UploadFileBox); ok {
+			box.File = &tg.UploadFile{
+				Type:  &tg.StorageFilePartial{},
+				Bytes: chunkData,
+			}
+		}
+		return nil
+	})
+
+	gated := NewGatedInvoker(mockInv, gate, 2)
+
+	// Call 1: fails
+	var out1 tg.UploadFileBox
+	err1 := gated.Invoke(ctx, nil, &out1)
+	if err1 == nil {
+		t.Fatal("expected error on call 1")
+	}
+
+	// Call 2: succeeds
+	var out2 tg.UploadFileBox
+	err2 := gated.Invoke(ctx, nil, &out2)
+	if err2 != nil {
+		t.Fatalf("unexpected error on call 2: %v", err2)
+	}
+
+	if reqCount != 2 {
+		t.Fatalf("expected 2 requests tracked, got %d", reqCount)
+	}
+	if wireBytes != 512 {
+		t.Fatalf("expected 512 wire bytes, got %d", wireBytes)
+	}
+
+	budget := ComputeRequestBudget(1024, 20)
+	if budget != 21 {
+		t.Fatalf("expected budget 21 for 1024 bytes (1 chunk + 20 retries), got %d", budget)
+	}
+}

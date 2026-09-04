@@ -682,12 +682,20 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 		Size:      authoritativeSize,
 	})
 
+	var reqCount int64
+	var wireBytes int64
+	var physicalRetries int64
+
 	taskCtx = transfer.ContextWithTransferTask(taskCtx, transfer.TransferTaskContext{
-		TaskID:    taskID,
-		AttemptID: gen,
-		ChatID:    chatID,
-		MessageID: msgID,
-		DCID:      resolvedMedia.DCID,
+		TaskID:          taskID,
+		AttemptID:       gen,
+		ChatID:          chatID,
+		MessageID:       msgID,
+		DCID:            resolvedMedia.DCID,
+		MaxRetries:      transfer.DefaultMaxRetryAttempts,
+		RequestCount:    &reqCount,
+		WireBytes:       &wireBytes,
+		PhysicalRetries: &physicalRetries,
 	})
 
 	dlResult, dlErr := o.transferMgr.DownloadFileWithResult(
@@ -699,7 +707,13 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 		onProgress,
 	)
 	written := dlResult.Written
-	physicalRetries := dlResult.PhysicalRetries
+	retries := dlResult.PhysicalRetries
+	wireTotal := dlResult.WireBytes
+	replayBytes := dlResult.ReplayBytes
+	reqTotal := dlResult.RequestCount
+	budget := dlResult.RequestBudget
+
+	task.RecordTransferTelemetry(written, wireTotal, replayBytes, reqTotal, retries)
 
 	if dlErr != nil {
 		_ = partFile.Close()
@@ -721,7 +735,11 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 			o.logger.Warn("download transfer failed",
 				zap.String("task_id", taskID),
 				zap.String("logical_generation", gen),
-				zap.Int64("physical_retries", physicalRetries),
+				zap.Int64("physical_retries", retries),
+				zap.Int64("request_count", reqTotal),
+				zap.Int64("wire_bytes", wireTotal),
+				zap.Int64("replay_bytes", replayBytes),
+				zap.Int64("request_budget", budget),
 				zap.String("operation", tErr.Op),
 				zap.String("typed_cause", tErr.Class),
 				zap.String("retry_owner", tErr.RetryOwner),
@@ -741,7 +759,11 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 			o.logger.Warn("gotd download failed",
 				zap.String("task_id", taskID),
 				zap.String("logical_generation", gen),
-				zap.Int64("physical_retries", physicalRetries),
+				zap.Int64("physical_retries", retries),
+				zap.Int64("request_count", reqTotal),
+				zap.Int64("wire_bytes", wireTotal),
+				zap.Int64("replay_bytes", replayBytes),
+				zap.Int64("request_budget", budget),
 				zap.String("operation", "download_file"),
 				zap.String("typed_cause", "unknown"),
 				zap.String("retry_owner", "gotd"),
@@ -854,14 +876,26 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 			return
 		}
 		EmitLifecycle(o.logger, LifecycleEvent{
-			Event:     EventSSDCommitPrepared,
-			TaskID:    taskID,
-			AttemptID: gen,
-			ChatID:    chatID,
-			MessageID: msgID,
-			Path:      finalRelPath,
-			Size:      stat.Size(),
-			SHA256:    shaHex,
+			Event:           EventSSDCommitPrepared,
+			TaskID:          taskID,
+			AttemptID:       gen,
+			ChatID:          chatID,
+			MessageID:       msgID,
+			Path:            finalRelPath,
+			Size:            stat.Size(),
+			SHA256:          shaHex,
+			PhysicalRetries: retries,
+			RequestCount:    reqTotal,
+			WireBytes:       wireTotal,
+			ReplayBytes:     replayBytes,
+			Extra: map[string]any{
+				"request_count":    reqTotal,
+				"request_budget":   budget,
+				"physical_retries": retries,
+				"wire_bytes":       wireTotal,
+				"committed_bytes":  stat.Size(),
+				"replay_bytes":     replayBytes,
+			},
 		})
 	}
 
@@ -894,13 +928,26 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 	}
 	committed = true
 	EmitLifecycle(o.logger, LifecycleEvent{
-		Event:     EventSSDCommitted,
-		TaskID:    taskID,
-		AttemptID: gen,
-		ChatID:    chatID,
-		MessageID: msgID,
-		Path:      finalRelPath,
-		Size:      stat.Size(),
+		Event:           EventSSDCommitted,
+		TaskID:          taskID,
+		AttemptID:       gen,
+		ChatID:          chatID,
+		MessageID:       msgID,
+		Path:            finalRelPath,
+		Size:            stat.Size(),
+		SHA256:          shaHex,
+		PhysicalRetries: retries,
+		RequestCount:    reqTotal,
+		WireBytes:       wireTotal,
+		ReplayBytes:     replayBytes,
+		Extra: map[string]any{
+			"request_count":    reqTotal,
+			"request_budget":   budget,
+			"physical_retries": retries,
+			"wire_bytes":       wireTotal,
+			"committed_bytes":  stat.Size(),
+			"replay_bytes":     replayBytes,
+		},
 	})
 
 	// 13. Complete download and queue archive in single DB transaction
@@ -942,20 +989,36 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 
 	// 15. Complete task in Registry ONLY after both SSD commit and DB transaction succeed!
 	task.SucceedResult(PublishResult{
-		Path:         finalRelPath,
-		SHA256:       shaHex,
-		absolutePath: finalAbsPath,
+		Path:            finalRelPath,
+		SHA256:          shaHex,
+		WireBytes:       wireTotal,
+		ReplayBytes:     replayBytes,
+		RequestCount:    reqTotal,
+		PhysicalRetries: retries,
+		absolutePath:    finalAbsPath,
 	})
 	EmitLifecycle(o.logger, LifecycleEvent{
-		Event:     EventItemTerminal,
-		TaskID:    taskID,
-		AttemptID: gen,
-		ChatID:    chatID,
-		MessageID: msgID,
-		Path:      finalRelPath,
-		Size:      stat.Size(),
-		SHA256:    shaHex,
-		Status:    "success",
+		Event:           EventItemTerminal,
+		TaskID:          taskID,
+		AttemptID:       gen,
+		ChatID:          chatID,
+		MessageID:       msgID,
+		Path:            finalRelPath,
+		Size:            stat.Size(),
+		SHA256:          shaHex,
+		Status:          "success",
+		PhysicalRetries: retries,
+		RequestCount:    reqTotal,
+		WireBytes:       wireTotal,
+		ReplayBytes:     replayBytes,
+		Extra: map[string]any{
+			"request_count":    reqTotal,
+			"request_budget":   budget,
+			"physical_retries": retries,
+			"wire_bytes":       wireTotal,
+			"committed_bytes":  stat.Size(),
+			"replay_bytes":     replayBytes,
+		},
 	})
 
 	o.logger.Info("download completed successfully",
@@ -963,6 +1026,10 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 		zap.String("rel_path", finalRelPath),
 		zap.Int64("size", stat.Size()),
 		zap.String("sha256", shaHex),
-		zap.Int64("physical_retries", physicalRetries),
+		zap.Int64("physical_retries", retries),
+		zap.Int64("request_count", reqTotal),
+		zap.Int64("wire_bytes", wireTotal),
+		zap.Int64("replay_bytes", replayBytes),
+		zap.Int64("request_budget", budget),
 	)
 }

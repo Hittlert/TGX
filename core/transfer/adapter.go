@@ -3,6 +3,7 @@ package transfer
 import (
 	"context"
 	"io"
+	"sync/atomic"
 
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/telegram/downloader"
@@ -29,8 +30,14 @@ func NewGatedInvoker(invoker tg.Invoker, gate *DataGate, dcID int) *GatedInvoker
 	}
 }
 
-// Invoke implements tg.Invoker, enforcing the global in-flight limit and FloodWait cooldowns.
+// Invoke implements tg.Invoker, enforcing the global in-flight limit, FloodWait cooldowns,
+// request counts, and wire byte accounting.
 func (g *GatedInvoker) Invoke(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
+	tc, hasTask := TransferTaskFromContext(ctx)
+	if hasTask && tc.RequestCount != nil {
+		atomic.AddInt64(tc.RequestCount, 1)
+	}
+
 	if g.gate != nil {
 		release, err := g.gate.Acquire(ctx, g.dcID)
 		if err != nil {
@@ -43,7 +50,32 @@ func (g *GatedInvoker) Invoke(ctx context.Context, input bin.Encoder, output bin
 	if d, isFlood := tgerr.AsFloodWait(err); isFlood && g.gate != nil {
 		g.gate.TriggerFloodWait(g.dcID, d)
 	}
+	if hasTask && tc.WireBytes != nil {
+		if b := extractWireBytes(output); b > 0 {
+			atomic.AddInt64(tc.WireBytes, b)
+		}
+	}
 	return err
+}
+
+// extractWireBytes returns the payload size in bytes delivered in an RPC response.
+func extractWireBytes(output bin.Decoder) int64 {
+	if output == nil {
+		return 0
+	}
+	switch v := output.(type) {
+	case *tg.UploadFile:
+		return int64(len(v.Bytes))
+	case *tg.UploadFileBox:
+		if v != nil && v.File != nil {
+			if f, ok := v.File.(*tg.UploadFile); ok && f != nil {
+				return int64(len(f.Bytes))
+			}
+		}
+	case interface{ GetBytes() []byte }:
+		return int64(len(v.GetBytes()))
+	}
+	return 0
 }
 
 // GatedClient wraps a *tg.Client with gotd downloader.CDNProvider support.

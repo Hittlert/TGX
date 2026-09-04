@@ -12,10 +12,32 @@ import (
 )
 
 const (
-	DefaultFileConcurrency = 5
-	DefaultMaxFileThreads  = 8
-	GotdPartSize           = 512 * 1024 // 512 KiB gotd protocol chunk size
+	DefaultFileConcurrency  = 5
+	DefaultMaxFileThreads   = 8
+	GotdPartSize            = 512 * 1024 // 512 KiB gotd protocol chunk size
+	DefaultMaxRetryAttempts = 20         // Maximum gotd chunk retries per operation
 )
+
+// ComputeChunkCount calculates the expected number of 512 KiB chunks for a given file size.
+func ComputeChunkCount(size int64) int {
+	if size <= 0 {
+		return 1
+	}
+	chunks := int((size + GotdPartSize - 1) / GotdPartSize)
+	if chunks <= 0 {
+		return 1
+	}
+	return chunks
+}
+
+// ComputeRequestBudget derives the declared bounded RPC request budget for a given expected file size.
+func ComputeRequestBudget(expectedSize int64, maxRetriesPerChunk int) int64 {
+	if maxRetriesPerChunk <= 0 {
+		maxRetriesPerChunk = DefaultMaxRetryAttempts
+	}
+	chunks := int64(ComputeChunkCount(expectedSize))
+	return chunks * int64(1+maxRetriesPerChunk)
+}
 
 // TransferError preserves classified failure semantics across the transfer boundary.
 type TransferError struct {
@@ -46,11 +68,15 @@ type taskCtxKey struct{}
 
 // TransferTaskContext preserves task, attempt generation, and DC correlation for transfer-level retries.
 type TransferTaskContext struct {
-	TaskID    string
-	AttemptID string
-	ChatID    string
-	MessageID int
-	DCID      int
+	TaskID          string
+	AttemptID       string
+	ChatID          string
+	MessageID       int
+	DCID            int
+	MaxRetries      int
+	RequestCount    *int64
+	WireBytes       *int64
+	PhysicalRetries *int64
 }
 
 // ContextWithTransferTask wraps ctx with TransferTaskContext.
@@ -184,8 +210,12 @@ func (m *TransferManager) ComputeFileThreads(expectedSize int64) int {
 
 // DownloadResult contains physical transport telemetry for one download execution.
 type DownloadResult struct {
-	Written         int64
-	PhysicalRetries int64
+	Written         int64 // Unique committed payload bytes
+	WireBytes       int64 // Total bytes received across all RPC requests and retries
+	ReplayBytes     int64 // Physical replay bytes (WireBytes - Written, >= 0)
+	RequestCount    int64 // Total Telegram RPC requests executed
+	PhysicalRetries int64 // Physical retry attempts handled inside gotd
+	RequestBudget   int64 // Declared bounded request budget
 }
 
 // DownloadFileWithResult downloads a Telegram file directly into dest and returns execution telemetry.
@@ -204,11 +234,16 @@ func (m *TransferManager) DownloadFileWithResult(
 	writer := NewCountingWriterAt(dest, expectedSize, onProgress)
 
 	var fileRetries int64
+	tc, hasTask := TransferTaskFromContext(ctx)
+
 	builder := m.downloader.Download(client, location).
 		WithThreads(fileThreads).
 		WithRetryHandler(func(event downloader.RetryEvent) {
 			atomic.AddInt64(&m.physicalRetries, 1)
 			atomic.AddInt64(&fileRetries, 1)
+			if hasTask && tc.PhysicalRetries != nil {
+				atomic.AddInt64(tc.PhysicalRetries, 1)
+			}
 			if m.userRetry != nil {
 				m.userRetry(event)
 			}
@@ -219,9 +254,37 @@ func (m *TransferManager) DownloadFileWithResult(
 
 	_, err := builder.Parallel(ctx, writer)
 	downloaded := writer.Downloaded()
+
+	var wireBytes, reqCount int64
+	if hasTask {
+		if tc.WireBytes != nil {
+			wireBytes = atomic.LoadInt64(tc.WireBytes)
+		}
+		if tc.RequestCount != nil {
+			reqCount = atomic.LoadInt64(tc.RequestCount)
+		}
+	}
+	if wireBytes < downloaded {
+		wireBytes = downloaded
+	}
+	var replayBytes int64
+	if wireBytes > downloaded {
+		replayBytes = wireBytes - downloaded
+	}
+
+	maxRetries := DefaultMaxRetryAttempts
+	if hasTask && tc.MaxRetries > 0 {
+		maxRetries = tc.MaxRetries
+	}
+	budget := ComputeRequestBudget(expectedSize, maxRetries)
+
 	res := DownloadResult{
 		Written:         downloaded,
+		WireBytes:       wireBytes,
+		ReplayBytes:     replayBytes,
+		RequestCount:    reqCount,
 		PhysicalRetries: atomic.LoadInt64(&fileRetries),
+		RequestBudget:   budget,
 	}
 	if err != nil {
 		if writeErr := writer.WriteErr(); writeErr != nil {

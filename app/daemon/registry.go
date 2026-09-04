@@ -49,6 +49,10 @@ type TaskSnapshot struct {
 	TotalSize         int64     `json:"total_size"`
 	Downloaded        int64     `json:"downloaded"`
 	NetDownloaded     int64     `json:"net_downloaded,omitempty"`
+	WireBytes         int64     `json:"wire_bytes,omitempty"`
+	ReplayBytes       int64     `json:"replay_bytes,omitempty"`
+	RequestCount      int64     `json:"request_count,omitempty"`
+	PhysicalRetries   int64     `json:"physical_retries,omitempty"`
 	Progress          float64   `json:"progress"`
 	Rolling5sBPS      int64     `json:"rolling_5s_bps"`
 	DCID              int       `json:"dc_id,omitempty"`
@@ -111,6 +115,10 @@ type taskState struct {
 	fileName           string
 	totalSize          int64
 	downloaded         int64
+	wireBytes          int64
+	replayBytes        int64
+	requestCount       int64
+	physicalRetries    int64
 	dcID               int
 	alreadyExists      bool
 	sha256             string
@@ -444,11 +452,42 @@ func (t *Task) SetPublishing() bool {
 	return ok
 }
 
+func (t *Task) RecordTransferTelemetry(written, wireBytes, replayBytes, reqCount, physicalRetries int64) {
+	if t == nil || t.state == nil {
+		return
+	}
+	t.registry.mu.Lock()
+	defer t.registry.mu.Unlock()
+	if written > 0 {
+		t.state.downloaded = written
+	}
+	t.state.wireBytes = wireBytes
+	t.state.replayBytes = replayBytes
+	t.state.requestCount = reqCount
+	t.state.physicalRetries = physicalRetries
+}
+
 func (t *Task) Succeed(finalPath string, alreadyExists bool) {
 	t.SucceedResult(PublishResult{Path: finalPath, AlreadyExists: alreadyExists})
 }
 
 func (t *Task) SucceedResult(result PublishResult) {
+	if t != nil && t.state != nil {
+		t.registry.mu.Lock()
+		if result.WireBytes > 0 {
+			t.state.wireBytes = result.WireBytes
+		}
+		if result.ReplayBytes > 0 {
+			t.state.replayBytes = result.ReplayBytes
+		}
+		if result.RequestCount > 0 {
+			t.state.requestCount = result.RequestCount
+		}
+		if result.PhysicalRetries > 0 {
+			t.state.physicalRetries = result.PhysicalRetries
+		}
+		t.registry.mu.Unlock()
+	}
 	t.registry.finishWithGen(t.state, t.attemptGen, StateSuccess, "", "", "", "", false, "", result.Path, result.AlreadyExists, result.SHA256)
 }
 
@@ -825,6 +864,8 @@ func (r *Registry) snapshotTaskLocked(state *taskState, now time.Time) TaskSnaps
 	return TaskSnapshot{
 		TaskRequest: state.request, State: state.state, FileName: state.fileName,
 		TotalSize: state.totalSize, Downloaded: state.downloaded, NetDownloaded: netDownloaded,
+		WireBytes: state.wireBytes, ReplayBytes: state.replayBytes,
+		RequestCount: state.requestCount, PhysicalRetries: state.physicalRetries,
 		Progress:     progress,
 		Rolling5sBPS: int64(state.smoothedSpeed),
 		DCID:         state.dcID, AlreadyExists: state.alreadyExists, SHA256: state.sha256,

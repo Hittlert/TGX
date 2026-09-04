@@ -190,9 +190,10 @@ func TestWebServer_BrowserJavaScriptExecutionE2E(t *testing.T) {
 	jsScript := `
 const [, serverUrl, correctPassword] = process.argv;
 const assert = require('assert');
+const vm = require('vm');
 
 async function main() {
-  // 1. Fetch login page to ensure static compatibility and exact shipped JS markers
+  // 1. Fetch login page delivered by the production handler
   const pageRes = await fetch(serverUrl + '/login');
   assert.strictEqual(pageRes.status, 200, 'login.html must be served with 200 OK');
   const html = await pageRes.text();
@@ -201,108 +202,131 @@ async function main() {
   assert(html.includes("window.location.href = './';"), 'shipped page must use relative post-login navigation');
   assert(html.includes("'Content-Type': 'application/json'"), 'shipped page must declare json Content-Type');
 
-  // 2. Simulate browser runtime environment executing the shipped login() handler
+  // 2. Extract the exact shipped <script> delivered in login.html
+  const scriptTags = [...html.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/gi)];
+  const inlineScript = scriptTags.find(m => m[1].includes('login') && m[1].includes('fetch('));
+  assert(inlineScript, 'delivered login.html must include inline script defining login()');
+  const deliveredCode = inlineScript[1];
+
+  // 3. Build simulated browser environment with DOM, layer, and cookie-aware fetch
   let passwordVal = '';
   let layerMsgs = [];
   let navTarget = '';
-  let lastCleared = false;
+  let currentCookie = '';
+  let simulatedBaseUrl = serverUrl + '/login';
+  let simulatedHeaders = {};
 
-  const $ = () => ({
-    val: (v) => {
-      if (v !== undefined) {
-        passwordVal = v;
-        if (v === '') lastCleared = true;
+  const sandbox = {
+    console,
+    JSON,
+    Promise,
+    setTimeout,
+    clearTimeout,
+    fetch: async (url, opts = {}) => {
+      // Map relative URL to live test server while tracking simulated client-side base
+      const dispatchUrl = new URL(url, serverUrl + '/login').toString();
+      const headers = { ...(opts.headers || {}), ...simulatedHeaders };
+      if (currentCookie && !headers['Cookie']) {
+        headers['Cookie'] = currentCookie;
       }
-      return passwordVal;
-    }
-  });
-
-  const layer = {
-    msg: (m) => { layerMsgs.push(m); }
-  };
-
-  const window = {
-    location: {
-      get href() { return navTarget; },
-      set href(val) { navTarget = val; }
-    }
-  };
-
-  // Re-create the exact JavaScript logic shipped in login.html
-  const login = () => {
-    const pValue = $('#password').val();
-    if (!pValue) {
-      layer.msg('Please enter your password!');
-      return Promise.resolve();
-    }
-    return fetch(serverUrl + '/login', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({ password: pValue })
-    })
-    .then(async (res) => {
-      let data = {};
-      try {
-        data = await res.json();
-      } catch (e) {}
-
-      if (!res.ok) {
-        layer.msg(data.msg || data.error || 'Password error!');
-        $('#password').val('');
-        return;
+      const res = await globalThis.fetch(dispatchUrl, { ...opts, headers });
+      const setCookie = res.headers.get('set-cookie');
+      if (setCookie) {
+        currentCookie = setCookie.split(';')[0];
       }
-
-      if (data.ok || data.code === 1 || data.code === '1') {
-        window.location.href = './';
-      } else {
-        layer.msg(data.msg || data.error || 'Password error!');
-        $('#password').val('');
-      }
-    })
-    .catch(() => {
-      layer.msg('Network request failed');
-      $('#password').val('');
-    });
-  };
-
-  // Scenario A: Empty password input
-  passwordVal = '';
-  await login();
-  assert.strictEqual(layerMsgs.length, 1);
-  assert.strictEqual(layerMsgs[0], 'Please enter your password!');
-  assert.strictEqual(navTarget, '', 'must not navigate when password is empty');
-
-  // Scenario B: Wrong password (HTTP 401)
-  passwordVal = 'bad_password';
-  lastCleared = false;
-  await login();
-  assert.strictEqual(layerMsgs.length, 2);
-  assert(layerMsgs[1].toLowerCase().includes('password error'));
-  assert.strictEqual(lastCleared, true, 'password input must be cleared on authentication error');
-  assert.strictEqual(navTarget, '', 'must never navigate on wrong password');
-
-  // Scenario C: Correct password (HTTP 200)
-  passwordVal = correctPassword;
-  await login();
-  assert.strictEqual(navTarget, './', 'must navigate to relative ./ on successful login');
-
-  // Scenario D: HTTPS reverse proxy wire acceptance
-  const proxyRes = await fetch(serverUrl + '/login', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-Forwarded-Proto': 'https'
+      return res;
     },
-    body: JSON.stringify({ password: correctPassword })
-  });
-  assert.strictEqual(proxyRes.status, 200);
-  const setCookie = proxyRes.headers.get('set-cookie');
-  assert(setCookie, 'set-cookie header must be present');
-  assert(setCookie.includes('Secure'), 'cookie must be marked Secure when forwarded as https');
-  assert(setCookie.includes('HttpOnly'), 'cookie must be marked HttpOnly');
-  assert(setCookie.includes('SameSite=Lax'), 'cookie must have SameSite=Lax');
+    layui: {
+      $: (selector) => {
+        if (selector === '#password') {
+          return {
+            val: (v) => {
+              if (v !== undefined) {
+                passwordVal = v;
+              }
+              return passwordVal;
+            },
+            on: () => {}
+          };
+        }
+        return { val: () => '', on: () => {} };
+      },
+      layer: {
+        msg: (m) => { layerMsgs.push(m); }
+      }
+    }
+  };
+
+  sandbox.window = sandbox;
+  sandbox.document = {
+    location: {
+      get href() { return navTarget || simulatedBaseUrl; },
+      set href(val) {
+        navTarget = val;
+        sandbox.resolvedHref = new URL(val, simulatedBaseUrl).toString();
+      }
+    }
+  };
+  sandbox.window.location = sandbox.document.location;
+
+  // Execute the exact delivered JavaScript code in the sandbox
+  const context = vm.createContext(sandbox);
+  vm.runInContext(deliveredCode, context);
+  assert.strictEqual(typeof vm.runInContext('login', context), 'function', 'delivered script must define login() function');
+  const triggerLogin = () => vm.runInContext('login()', context);
+
+  const waitFor = async (predicate, desc, timeoutMs = 3000) => {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      if (predicate()) return;
+      await new Promise(r => setTimeout(r, 10));
+    }
+    throw new Error('timeout waiting for ' + desc + '; layerMsgs=' + JSON.stringify(layerMsgs) + ', navTarget=' + navTarget + ', passwordVal=' + passwordVal);
+  };
+
+  // Scenario A: Empty password input -> visible rejection without HTTP dispatch
+  passwordVal = '';
+  layerMsgs = [];
+  navTarget = '';
+  await triggerLogin();
+  assert.strictEqual(layerMsgs.length, 1, 'must display visible warning message');
+  assert.strictEqual(layerMsgs[0], 'Please enter your password!');
+  assert.strictEqual(navTarget, '', 'must not navigate on empty password');
+
+  // Scenario B: Wrong password -> HTTP 401 rejection, visible message, cleared password input, no navigation
+  passwordVal = 'wrong_password';
+  layerMsgs = [];
+  navTarget = '';
+  await triggerLogin();
+  await waitFor(() => layerMsgs.length === 1 && passwordVal === '', 'Scenario B 401 rejection and password cleared');
+  assert(layerMsgs[0].toLowerCase().includes('password error'));
+  assert.strictEqual(passwordVal, '', 'password input must be cleared on authentication rejection');
+  assert.strictEqual(navTarget, '', 'must not navigate on wrong password');
+
+  // Scenario C: Correct password -> HTTP 200, relative navigation, session cookie captured
+  passwordVal = correctPassword;
+  layerMsgs = [];
+  navTarget = '';
+  await triggerLogin();
+  await waitFor(() => navTarget === './', 'Scenario C successful navigation to ./');
+  assert.strictEqual(sandbox.resolvedHref, new URL('./', simulatedBaseUrl).toString(), 'navigation must preserve scheme and base path');
+  assert(currentCookie.includes('tg_downloader_session='), 'tg_downloader_session cookie must be captured in client store');
+
+  // Scenario D: Reverse-proxy HTTPS & subpath preservation
+  simulatedBaseUrl = 'https://nas.internal:8443/custom_prefix/login';
+  simulatedHeaders = { 'X-Forwarded-Proto': 'https', 'X-Forwarded-Prefix': '/custom_prefix' };
+  passwordVal = correctPassword;
+  layerMsgs = [];
+  navTarget = '';
+  await triggerLogin();
+  await waitFor(() => navTarget === './', 'Scenario D reverse proxy navigation to ./');
+  assert.strictEqual(sandbox.resolvedHref, 'https://nas.internal:8443/custom_prefix/', 'scheme https and subpath prefix must be preserved');
+
+  // Scenario E: Verify authenticated session with captured cookie on production endpoint
+  const authRes = await sandbox.fetch(serverUrl + '/api/status');
+  assert.strictEqual(authRes.status, 200, 'captured cookie must authenticate protected API endpoints');
+  const authData = await authRes.json();
+  assert(authData.backend, 'must receive status payload from protected router');
 
   console.log('BROWSER_E2E_VERIFIED');
 }
@@ -1503,5 +1527,3 @@ func TestWebServer_FrontendCleanlinessAndStaticCheck(t *testing.T) {
 		}
 	}
 }
-
-

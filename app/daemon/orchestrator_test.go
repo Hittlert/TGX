@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -396,7 +397,9 @@ func TestOrchestrator_Matrix_GotdExhaustion(t *testing.T) {
 }
 
 // 6. Success with physical retries: gotd recovers after 2 transient retries.
-// Assert: StateSuccess, SHA-256 match, final file exists, .part cleaned up, physicalRetries recorded.
+// Assert: StateSuccess, SHA-256 match, final file exists, .part cleaned up,
+// physicalRetries recorded, exact request count, bounded request budget, wire bytes,
+// and physical attempt correlation in lifecycle observer.
 func TestOrchestrator_Matrix_SuccessWithPhysicalRetries(t *testing.T) {
 	data := make([]byte, 1024)
 	for i := range data {
@@ -414,6 +417,15 @@ func TestOrchestrator_Matrix_SuccessWithPhysicalRetries(t *testing.T) {
 		setUploadFile(output, data)
 		return nil
 	})
+
+	var observedEvents []LifecycleEvent
+	var obsMu sync.Mutex
+	unreg := RegisterLifecycleObserver(LifecycleObserverFunc(func(evt LifecycleEvent) {
+		obsMu.Lock()
+		defer obsMu.Unlock()
+		observedEvents = append(observedEvents, evt)
+	}))
+	defer unreg()
 
 	orch, registry, db, saveDir := setupTestOrchestrator(t, invoker, nil)
 	defer db.Close()
@@ -439,6 +451,30 @@ func TestOrchestrator_Matrix_SuccessWithPhysicalRetries(t *testing.T) {
 		t.Fatalf("expected sha256 %s, got: %s", expectedHex, snap.SHA256)
 	}
 
+	// 1. Physical retries recorded on task snapshot
+	if snap.PhysicalRetries != 2 {
+		t.Fatalf("expected physical_retries 2, got %d", snap.PhysicalRetries)
+	}
+	// 2. Exact request count: 2 timeouts + 1 success = 3 requests
+	if snap.RequestCount != 3 {
+		t.Fatalf("expected request_count 3, got %d", snap.RequestCount)
+	}
+	// 3. Request budget: bounded within 21 (1 chunk * 21 max attempts)
+	expectedBudget := transfer.ComputeRequestBudget(1024, transfer.DefaultMaxRetryAttempts)
+	if snap.RequestCount > expectedBudget {
+		t.Fatalf("request_count %d exceeded bounded budget %d", snap.RequestCount, expectedBudget)
+	}
+	// 4. Wire bytes vs committed payload bytes
+	if snap.Downloaded != 1024 {
+		t.Fatalf("expected downloaded payload 1024, got %d", snap.Downloaded)
+	}
+	if snap.WireBytes != 1024 {
+		t.Fatalf("expected wire bytes 1024, got %d", snap.WireBytes)
+	}
+	if snap.ReplayBytes != 0 {
+		t.Fatalf("expected replay bytes 0 (timeouts failed before payload arrival), got %d", snap.ReplayBytes)
+	}
+
 	// Final destination file must exist
 	finalPath := filepath.Join(saveDir, filepath.FromSlash(req.FinalPath))
 	finInfo, err := os.Stat(finalPath)
@@ -453,6 +489,204 @@ func TestOrchestrator_Matrix_SuccessWithPhysicalRetries(t *testing.T) {
 	partPath := finalPath + ".part"
 	if _, err := os.Stat(partPath); !os.IsNotExist(err) {
 		t.Fatalf("part file was not cleaned up: %s", partPath)
+	}
+
+	// Verify lifecycle events carry physical-attempt identity and wire metrics
+	obsMu.Lock()
+	defer obsMu.Unlock()
+	var terminalEvt *LifecycleEvent
+	for _, e := range observedEvents {
+		if e.Event == EventItemTerminal && e.TaskID == req.ID {
+			terminalEvt = &e
+			break
+		}
+	}
+	if terminalEvt == nil {
+		t.Fatal("expected EventItemTerminal lifecycle event")
+	}
+	if terminalEvt.PhysicalRetries != 2 {
+		t.Fatalf("expected lifecycle physical_retries 2, got %d", terminalEvt.PhysicalRetries)
+	}
+	if terminalEvt.RequestCount != 3 {
+		t.Fatalf("expected lifecycle request_count 3, got %d", terminalEvt.RequestCount)
+	}
+	if terminalEvt.WireBytes != 1024 {
+		t.Fatalf("expected lifecycle wire_bytes 1024, got %d", terminalEvt.WireBytes)
+	}
+}
+
+// 7. Production-path Wire and Replay Bytes Accounting test:
+// Proves:
+// - Physical replay bytes are distinguishable from unique committed payload bytes;
+// - Total wire bytes equals committed payload bytes + physical replay bytes;
+// - Exact accounting is captured on TaskSnapshot and Lifecycle telemetry.
+func TestOrchestrator_ProductionPath_WireAndReplayBytesAccounting(t *testing.T) {
+	data := make([]byte, 1024)
+	for i := range data {
+		data[i] = byte((i * 19) % 256)
+	}
+	hash := sha256.Sum256(data)
+	expectedHex := hex.EncodeToString(hash[:])
+
+	var callCount int64
+	// In this test, the invoker delivers 1024 bytes over the wire on call 1, but then gotd triggers
+	// a retry because call 1 returns a transient error after payload delivery.
+	// Call 2 delivers 1024 bytes over the wire and succeeds.
+	invoker := invokerFunc(func(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
+		count := atomic.AddInt64(&callCount, 1)
+		setUploadFile(output, data)
+		if count == 1 {
+			return tgerr.New(500, tg.ErrTimeout)
+		}
+		return nil
+	})
+
+	orch, registry, db, saveDir := setupTestOrchestrator(t, invoker, nil)
+	defer db.Close()
+
+	req := TaskRequest{
+		ID:           "case_wire_replay_bytes",
+		Peer:         "-1001234567",
+		MessageID:    107,
+		FinalPath:    "Replay/test_replay.mp4",
+		ExpectedSize: 1024,
+	}
+
+	_, _, _ = registry.Submit(req)
+	task, _ := registry.Next(context.Background())
+
+	orch.downloadOne(context.Background(), task)
+
+	snap := task.Snapshot()
+	if snap.State != StateSuccess {
+		t.Fatalf("expected StateSuccess, got: %s (err: %s)", snap.State, snap.Error)
+	}
+	if snap.SHA256 != expectedHex {
+		t.Fatalf("expected sha256 %s, got: %s", expectedHex, snap.SHA256)
+	}
+
+	// Unique committed payload bytes
+	if snap.Downloaded != 1024 {
+		t.Fatalf("expected downloaded payload 1024, got %d", snap.Downloaded)
+	}
+	// Wire bytes delivered across 2 RPC attempts: 1024 + 1024 = 2048 bytes
+	if snap.WireBytes != 2048 {
+		t.Fatalf("expected wire bytes 2048, got %d", snap.WireBytes)
+	}
+	// Physical replay bytes: 2048 - 1024 = 1024 bytes
+	if snap.ReplayBytes != 1024 {
+		t.Fatalf("expected replay bytes 1024, got %d", snap.ReplayBytes)
+	}
+	if snap.WireBytes != snap.Downloaded+snap.ReplayBytes {
+		t.Fatalf("invariant violation: wire_bytes (%d) != downloaded (%d) + replay_bytes (%d)",
+			snap.WireBytes, snap.Downloaded, snap.ReplayBytes)
+	}
+	if snap.PhysicalRetries != 1 {
+		t.Fatalf("expected physical retries 1, got %d", snap.PhysicalRetries)
+	}
+	if snap.RequestCount != 2 {
+		t.Fatalf("expected request count 2, got %d", snap.RequestCount)
+	}
+
+	finalPath := filepath.Join(saveDir, filepath.FromSlash(req.FinalPath))
+	finInfo, err := os.Stat(finalPath)
+	if err != nil || finInfo.Size() != 1024 {
+		t.Fatalf("final destination file invalid: %v", err)
+	}
+}
+
+// 8. FloodWait ownership and shared-cooldown test:
+// Proves:
+// - gotd handles FloodWait retry internally;
+// - DataGate enforces shared cooldown across tasks targeting the same DC;
+// - Outer layer (Orchestrator) does NOT multiply requests or replay whole files;
+// - Exactly 2 requests for Task 1 (1 FloodWait + 1 success retry), exactly 1 request for Task 2.
+func TestOrchestrator_ProductionPath_FloodWaitSharedCooldownNoMultiplication(t *testing.T) {
+	data := make([]byte, 1024)
+	for i := range data {
+		data[i] = byte((i * 13) % 256)
+	}
+
+	var task1Calls, task2Calls int64
+	invoker := invokerFunc(func(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
+		tc, _ := transfer.TransferTaskFromContext(ctx)
+		if tc.TaskID == "flood_task_1" {
+			c := atomic.AddInt64(&task1Calls, 1)
+			if c == 1 {
+				// Server responds with 1-second FloodWait
+				return tgerr.New(420, "FLOOD_WAIT_1")
+			}
+			setUploadFile(output, data)
+			return nil
+		}
+		// Task 2
+		atomic.AddInt64(&task2Calls, 1)
+		setUploadFile(output, data)
+		return nil
+	})
+
+	orch, registry, db, _ := setupTestOrchestrator(t, invoker, nil)
+	defer db.Close()
+
+	req1 := TaskRequest{
+		ID:           "flood_task_1",
+		Peer:         "-1001234567",
+		MessageID:    201,
+		FinalPath:    "Flood/test1.mp4",
+		ExpectedSize: 1024,
+	}
+	req2 := TaskRequest{
+		ID:           "flood_task_2",
+		Peer:         "-1001234567",
+		MessageID:    202,
+		FinalPath:    "Flood/test2.mp4",
+		ExpectedSize: 1024,
+	}
+
+	_, _, _ = registry.Submit(req1)
+	_, _, _ = registry.Submit(req2)
+	task1, _ := registry.Next(context.Background())
+	task2, _ := registry.Next(context.Background())
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		orch.downloadOne(context.Background(), task1)
+	}()
+	// Start task2 concurrently shortly after task1 triggers FloodWait
+	time.Sleep(50 * time.Millisecond)
+	go func() {
+		defer wg.Done()
+		orch.downloadOne(context.Background(), task2)
+	}()
+	wg.Wait()
+
+	snap1 := task1.Snapshot()
+	snap2 := task2.Snapshot()
+
+	if snap1.State != StateSuccess {
+		t.Fatalf("task1 failed: state=%s, err=%s", snap1.State, snap1.Error)
+	}
+	if snap2.State != StateSuccess {
+		t.Fatalf("task2 failed: state=%s, err=%s", snap2.State, snap2.Error)
+	}
+
+	// Task 1: exactly 2 requests (1 initial FloodWait + 1 internal gotd retry).
+	// Crucially: NOT multiplied by the outer layer!
+	if snap1.RequestCount != 2 {
+		t.Fatalf("expected task1 request count 2 (1 flood + 1 retry), got %d (outer layer multiplied requests!)", snap1.RequestCount)
+	}
+	if snap1.PhysicalRetries != 1 {
+		t.Fatalf("expected task1 physical retries 1, got %d", snap1.PhysicalRetries)
+	}
+
+	// Task 2: exactly 1 request because DataGate waited out the shared cooldown on DC 2 before dispatching
+	if snap2.RequestCount != 1 {
+		t.Fatalf("expected task2 request count 1, got %d", snap2.RequestCount)
+	}
+	if snap2.PhysicalRetries != 0 {
+		t.Fatalf("expected task2 physical retries 0, got %d", snap2.PhysicalRetries)
 	}
 }
 
