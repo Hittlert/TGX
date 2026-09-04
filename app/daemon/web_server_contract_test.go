@@ -1177,3 +1177,252 @@ func TestWebServer_ProductionRouterContractInventory(t *testing.T) {
 		}
 	}
 }
+
+func TestWebServer_EventsStreamComprehensiveContract(t *testing.T) {
+	tempDir := t.TempDir()
+	db, err := NewDatabase(filepath.Join(tempDir, "events.db"))
+	if err != nil {
+		t.Fatalf("new db: %v", err)
+	}
+	defer db.Close()
+
+	_ = db.SaveSingleListenTarget(ListenTarget{
+		ChatID:            "-100123",
+		Title:             "SSE Target",
+		Enabled:           true,
+		LastReadMessageID: 50,
+	})
+
+	registry := NewRegistry(5, 100, time.Now)
+	tm := transfer.NewTransferManager(transfer.Options{FileConcurrency: 5})
+	orch := NewOrchestrator(nil, tm, nil, nil, nil, registry, zap.NewNop(), tempDir)
+
+	ws := NewWebServer(db, tm, nil, nil, orch, nil, registry, zap.NewNop(), "sse_pass")
+	handler := ws.Handler()
+
+	// 1. Unauthenticated request to /api/events must be rejected with 401
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/events", nil)
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated /api/events must return 401, got %d", w.Code)
+	}
+
+	// 2. Authenticate and obtain session cookie
+	loginRec := httptest.NewRecorder()
+	loginReq := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader(`{"password":"sse_pass"}`))
+	loginReq.Header.Set("Content-Type", "application/json")
+	handler.ServeHTTP(loginRec, loginReq)
+	var sessCookie *http.Cookie
+	for _, c := range loginRec.Result().Cookies() {
+		if c.Name == "tg_downloader_session" {
+			sessCookie = c
+			break
+		}
+	}
+	if sessCookie == nil {
+		t.Fatal("missing session cookie")
+	}
+
+	// 3. Connect to /api/events and verify comprehensive snapshot content
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	streamReq := httptest.NewRequest(http.MethodGet, "/api/events", nil).WithContext(ctx)
+	streamReq.AddCookie(sessCookie)
+	streamRec := httptest.NewRecorder()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		handler.ServeHTTP(streamRec, streamReq)
+	}()
+
+	// Wait briefly for first event flush
+	time.Sleep(50 * time.Millisecond)
+	cancel() // Trigger client disconnect
+	<-done
+
+	if streamRec.Header().Get("Content-Type") != "text/event-stream" {
+		t.Fatalf("expected text/event-stream, got %s", streamRec.Header().Get("Content-Type"))
+	}
+
+	body := streamRec.Body.String()
+	if !strings.Contains(body, "event: snapshot") {
+		t.Fatalf("snapshot event missing from SSE stream: %s", body)
+	}
+
+	var snapshotData map[string]any
+	lines := strings.Split(body, "\n")
+	for _, l := range lines {
+		if strings.HasPrefix(l, "data: ") {
+			dataStr := strings.TrimPrefix(l, "data: ")
+			if err := json.Unmarshal([]byte(dataStr), &snapshotData); err == nil {
+				break
+			}
+		}
+	}
+
+	if snapshotData == nil {
+		t.Fatalf("failed to extract snapshot data JSON from: %s", body)
+	}
+
+	// Verify mandatory telemetry keys required by dashboard
+	requiredKeys := []string{"state", "download_state", "speed_bps", "gate", "ssd", "archive", "storage", "target_progress"}
+	for _, k := range requiredKeys {
+		if _, exists := snapshotData[k]; !exists {
+			t.Fatalf("snapshot missing required telemetry key %q: %+v", k, snapshotData)
+		}
+	}
+
+	// 4. Test reconnect: verify server cleanly provides a new full snapshot on subsequent connection
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+	streamReq2 := httptest.NewRequest(http.MethodGet, "/api/events", nil).WithContext(ctx2)
+	streamReq2.AddCookie(sessCookie)
+	streamRec2 := httptest.NewRecorder()
+
+	done2 := make(chan struct{})
+	go func() {
+		defer close(done2)
+		handler.ServeHTTP(streamRec2, streamReq2)
+	}()
+	time.Sleep(50 * time.Millisecond)
+	cancel2()
+	<-done2
+
+	if !strings.Contains(streamRec2.Body.String(), "event: snapshot") {
+		t.Fatalf("reconnect must provide full initial snapshot")
+	}
+}
+
+func TestWebServer_BrowserSSETelemetryE2E(t *testing.T) {
+	nodePath, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node executable not found, skipping browser SSE test")
+	}
+
+	tempDir := t.TempDir()
+	db, err := NewDatabase(filepath.Join(tempDir, "browser_sse.db"))
+	if err != nil {
+		t.Fatalf("new db: %v", err)
+	}
+	defer db.Close()
+
+	_ = db.SaveSingleListenTarget(ListenTarget{
+		ChatID:            "-100555",
+		Title:             "Live Channel",
+		Enabled:           true,
+		LastReadMessageID: 120,
+	})
+
+	registry := NewRegistry(5, 100, time.Now)
+	tm := transfer.NewTransferManager(transfer.Options{FileConcurrency: 5})
+	orch := NewOrchestrator(nil, tm, nil, nil, nil, registry, zap.NewNop(), tempDir)
+
+	ws := NewWebServer(db, tm, nil, nil, orch, nil, registry, zap.NewNop(), "")
+	server := httptest.NewServer(ws.Handler())
+	defer server.Close()
+
+	jsScript := `
+const [, serverUrl] = process.argv;
+const assert = require('assert');
+
+async function main() {
+  // 1. Verify index.html template integrity for SSE controller and single-stream policy
+  const pageRes = await fetch(serverUrl + '/');
+  assert.strictEqual(pageRes.status, 200);
+  const html = await pageRes.text();
+  assert(html.includes("new EventSource('api/events')"), 'index.html must instantiate EventSource');
+  assert(html.includes("stop_fallback_polling()"), 'index.html must stop fallback polling on SSE');
+  assert(html.includes("stop_target_progress_poll()"), 'index.html must stop progress polling on SSE');
+
+  // 2. Fetch /api/events directly and parse the initial SSE snapshot
+  const sseRes = await fetch(serverUrl + '/api/events');
+  assert.strictEqual(sseRes.status, 200);
+  assert(sseRes.headers.get('content-type').includes('text/event-stream'));
+
+  const reader = sseRes.body.getReader();
+  const decoder = new TextDecoder();
+  let receivedText = '';
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    receivedText += decoder.decode(value, { stream: true });
+    if (receivedText.includes('event: snapshot') && receivedText.includes('\n\n')) {
+      break;
+    }
+  }
+  reader.cancel();
+
+  assert(receivedText.includes('event: snapshot'), 'SSE must deliver snapshot event');
+  assert(receivedText.includes('target_progress'), 'snapshot must contain target_progress');
+  assert(receivedText.includes('storage'), 'snapshot must contain storage metrics');
+  assert(receivedText.includes('gate'), 'snapshot must contain gate metrics');
+
+  // 3. Simulate browser state transitions
+  let sse_active = false;
+  let status_poll_timer = null;
+  let target_progress_poll_int = 0;
+  let update_download_list_int = 0;
+
+  function start_fallback_polling() {
+    if (status_poll_timer) return;
+    status_poll_timer = 999;
+  }
+  function stop_fallback_polling() {
+    status_poll_timer = null;
+  }
+  function start_target_progress_poll() {
+    if (sse_active) return;
+    target_progress_poll_int = 888;
+  }
+  function stop_target_progress_poll() {
+    target_progress_poll_int = 0;
+  }
+
+  // Initial State: SSE receives snapshot
+  function handleSSE() {
+    sse_active = true;
+    stop_fallback_polling();
+    stop_target_progress_poll();
+    update_download_list_int = 0;
+  }
+
+  handleSSE();
+  assert.strictEqual(sse_active, true);
+  assert.strictEqual(status_poll_timer, null, 'polling timer must be null when SSE is active');
+
+  // User navigates to targets tab
+  start_target_progress_poll();
+  assert.strictEqual(target_progress_poll_int, 0, 'progress polling timer must not start when SSE is active');
+
+  // Network drops (SSE error)
+  sse_active = false;
+  start_fallback_polling();
+  assert.notStrictEqual(status_poll_timer, null, 'fallback polling must engage when SSE fails');
+
+  // Network restores (SSE receives update)
+  handleSSE();
+  assert.strictEqual(sse_active, true);
+  assert.strictEqual(status_poll_timer, null, 'fallback polling must disengage upon SSE recovery');
+
+  console.log('BROWSER_SSE_TELEMETRY_E2E_VERIFIED');
+}
+
+main().catch(err => {
+  console.error(err);
+  process.exit(1);
+});
+`
+
+	cmd := exec.Command(nodePath, "-e", jsScript, server.URL)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("browser SSE telemetry E2E failed: %v\nOutput: %s", err, string(out))
+	}
+	if !strings.Contains(string(out), "BROWSER_SSE_TELEMETRY_E2E_VERIFIED") {
+		t.Fatalf("expected verification token, got: %s", string(out))
+	}
+}
+

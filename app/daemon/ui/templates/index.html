@@ -1089,15 +1089,18 @@
       }
 
       function stop_target_progress_poll() {
-        clearInterval(target_progress_poll_int);
-        target_progress_poll_int = 0;
+        if (target_progress_poll_int) {
+          clearInterval(target_progress_poll_int);
+          target_progress_poll_int = 0;
+        }
       }
 
       function start_target_progress_poll() {
         stop_target_progress_poll();
+        if (sse_active) return;
         load_target_progress();
         target_progress_poll_int = self.setInterval(function () {
-          if ($('#pane_targets').hasClass('is-active')) {
+          if ($('#pane_targets').hasClass('is-active') && !sse_active) {
             load_target_progress();
           }
         }, TARGET_PROGRESS_POLL_INTERVAL);
@@ -1418,13 +1421,17 @@
         clearInterval(update_download_list_int);
 
         if (tab_name === 'downloading') {
-          update_download_list_int = self.setInterval(update_download_list, 1000);
+          if (!sse_active) {
+            update_download_list_int = self.setInterval(update_download_list, 2000);
+          }
           update_download_list();
         } else if (tab_name === 'downloaded') {
           reload_downloaded_data();
         } else if (tab_name === 'targets') {
           if (!target_loaded) load_dialogs(false);
-          start_target_progress_poll();
+          if (!sse_active) {
+            start_target_progress_poll();
+          }
         } else if (tab_name === 'proxy') {
           load_proxies();
         } else {
@@ -2069,9 +2076,12 @@
         status_poll_timer = setInterval(function () {
           if (!sse_active) {
             update_download_status();
+            update_system_storage();
             var activeTab = $('.apple-segmented-control .segmented-item.is-active').attr('data-tab');
             if (activeTab === 'downloading') {
               update_download_list();
+            } else if (activeTab === 'targets') {
+              load_target_progress();
             }
           }
         }, 5000);
@@ -2089,6 +2099,7 @@
           start_fallback_polling();
           update_download_status();
           update_download_list();
+          update_system_storage();
           return;
         }
 
@@ -2097,21 +2108,64 @@
         function handleSSEData(data) {
           sse_active = true;
           stop_fallback_polling();
+          stop_target_progress_poll();
+          if (update_download_list_int) {
+            clearInterval(update_download_list_int);
+            update_download_list_int = 0;
+          }
 
+          // 1. Download speed & sparkline
           if (data.speed_human) {
             $('#download_speed').html(data.speed_human);
+            $('#download_speed_title').html(data.speed_human);
           }
+          if (data.speed_bps !== undefined) {
+            draw_speed_sparkline(data.speed_bps);
+          }
+
+          // 2. Download state
           if (data.download_state) {
             sync_download_state_ui(data.download_state);
           }
+
+          // 3. Gate & Slots
+          var activeFilesCount = 0;
           if (data.gate) {
+            activeFilesCount = data.gate.active_files || 0;
             $('#slot_used').html(data.gate.active_files || 0);
             $('#slot_total').html(data.gate.file_concurrency || 5);
           }
+          var poolText = '⚡ 槽位待命 (0/64)';
+          if (activeFilesCount > 0) {
+            poolText = '⚡ ' + activeFilesCount + ' 个文件下载中';
+          }
+          $('#media_pool_status').html(poolText);
+
+          // 4. SSD admission
           if (data.ssd && data.ssd.reserved_bytes !== undefined) {
             $('#ssd_reserved_val').html(format_bytes(data.ssd.reserved_bytes));
           }
 
+          // 5. Storage metrics
+          if (data.storage) {
+            $('#storage_free_label').text(data.storage.free_human + ' 可用 / ' + data.storage.total_human);
+            $('#storage_pill').attr('title', '存储分区: ' + data.storage.path + ' (已用 ' + data.storage.percent_used + ')');
+          }
+
+          // 6. Target progress
+          if (Array.isArray(data.target_progress)) {
+            var next_progress = {};
+            for (var i = 0; i < data.target_progress.length; i++) {
+              var p = normalize_target_progress(data.target_progress[i]);
+              if (p.chat_id) next_progress[p.chat_id] = p;
+            }
+            target_progress_by_chat = next_progress;
+            target_progress_has_snapshot = true;
+            target_progress_unavailable = false;
+            update_target_progress_nodes();
+          }
+
+          // 7. Active files list on downloading tab
           var activeTab = $('.apple-segmented-control .segmented-item.is-active').attr('data-tab');
           if (activeTab === 'downloading') {
             update_download_list();
@@ -2143,8 +2197,6 @@
       }
 
       setup_sse_telemetry();
-      update_download_status();
-      update_download_list();
 
       // Preload dialogs
       setTimeout(function () {

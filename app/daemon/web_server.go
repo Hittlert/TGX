@@ -542,6 +542,55 @@ func (s *WebServer) collectTelemetrySnapshot() map[string]any {
 		if arcStats, err := s.db.GetArchiveStats(); err == nil {
 			snap["archive"] = arcStats
 		}
+
+		if targets, err := s.db.GetListenTargets(); err == nil && len(targets) > 0 {
+			stats, _ := s.db.GetTargetProgressStats()
+			progList := make([]TargetProgressItemDTO, 0, len(targets))
+			for _, t := range targets {
+				cursor, _ := s.db.GetScanCursor(t.ChatID)
+				st := stats[t.ChatID]
+				progList = append(progList, TargetProgressItemDTO{
+					ChatID:            t.ChatID,
+					Title:             t.Title,
+					Enabled:           t.Enabled,
+					LastReadMessageID: cursor,
+					ScanStatus:        "ok",
+					TotalFiles:        st.TotalFiles,
+					DownloadedFiles:   st.DownloadedFiles,
+					PendingFiles:      st.PendingFiles,
+					ProcessingFiles:   st.ProcessingFiles,
+					FailedFiles:       st.FailedFiles,
+					SkippedFiles:      st.SkippedFiles,
+					DownloadedBytes:   st.DownloadedBytes,
+				})
+			}
+			snap["target_progress"] = progList
+		}
+	}
+
+	path := "."
+	if s.orchestrator != nil && s.orchestrator.OutputDir() != "" {
+		path = s.orchestrator.OutputDir()
+	}
+	if freeBytes, totalBytes, err := fscommit.GetDiskSpace(path); err == nil {
+		usedBytes := uint64(0)
+		if totalBytes > freeBytes {
+			usedBytes = totalBytes - freeBytes
+		}
+		percent := 0.0
+		if totalBytes > 0 {
+			percent = float64(usedBytes) / float64(totalBytes) * 100
+		}
+		snap["storage"] = map[string]any{
+			"free_bytes":   freeBytes,
+			"total_bytes":  totalBytes,
+			"used_bytes":   usedBytes,
+			"free_human":   formatBytes(int64(freeBytes)),
+			"total_human":  formatBytes(int64(totalBytes)),
+			"used_human":   formatBytes(int64(usedBytes)),
+			"percent_used": fmt.Sprintf("%.1f%%", percent),
+			"path":         path,
+		}
 	}
 
 	return snap
@@ -561,7 +610,9 @@ func (s *WebServer) handleEventsStream(w http.ResponseWriter, r *http.Request) {
 
 	initial := s.collectTelemetrySnapshot()
 	if data, err := json.Marshal(initial); err == nil {
-		_, _ = fmt.Fprintf(w, "event: snapshot\ndata: %s\n\n", string(data))
+		if _, err := fmt.Fprintf(w, "event: snapshot\ndata: %s\n\n", string(data)); err != nil {
+			return
+		}
 		flusher.Flush()
 	}
 
@@ -576,12 +627,16 @@ func (s *WebServer) handleEventsStream(w http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			return
 		case <-heartbeatTicker.C:
-			_, _ = fmt.Fprintf(w, "event: heartbeat\ndata: {}\n\n")
+			if _, err := fmt.Fprintf(w, "event: heartbeat\ndata: {}\n\n"); err != nil {
+				return
+			}
 			flusher.Flush()
 		case <-updateTicker.C:
 			snap := s.collectTelemetrySnapshot()
 			if data, err := json.Marshal(snap); err == nil {
-				_, _ = fmt.Fprintf(w, "event: update\ndata: %s\n\n", string(data))
+				if _, err := fmt.Fprintf(w, "event: update\ndata: %s\n\n", string(data)); err != nil {
+					return
+				}
 				flusher.Flush()
 			}
 		}
