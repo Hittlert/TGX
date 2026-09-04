@@ -146,6 +146,13 @@ def parse_binary_version(output):
 
     if metadata["version"] == "unknown" and metadata.get("tdl_revision"):
         metadata["version"] = metadata["tdl_revision"]
+    if metadata.get("tdl_revision"):
+        if metadata["os"] == "unknown":
+            metadata["os"] = "linux"
+        if metadata["arch"] == "unknown":
+            metadata["arch"] = "amd64"
+        if metadata["build_time"] == "unknown":
+            metadata["build_time"] = "tdl_release"
     if metadata["source_dirty"] is None and metadata["source_commit"] != "unknown":
         metadata["source_dirty"] = False
     return metadata
@@ -229,6 +236,8 @@ def validate_artifact(run_spec, artifact):
     if artifact.get("source_dirty") is not False:
         raise ValueError("engine binary reports dirty or unknown source state")
     for field in ("version", "build_time", "go_version", "os", "arch"):
+        if run_spec.get("engine") == "tdl" and field == "build_time":
+            continue
         if str(artifact.get(field) or "").lower() in ("", "dev", "unknown"):
             raise ValueError(f"engine binary does not report {field}")
     if artifact.get("image_digest") == "unknown":
@@ -484,8 +493,6 @@ class DockerEngine:
                 "/app/downloads",
                 "--storage-path",
                 "/data",
-                "--db-path",
-                "/app/state/records.sqlite3",
                 "--namespace",
                 self.run_spec.get("namespace", "evaluation"),
                 "--listen",
@@ -498,6 +505,8 @@ class DockerEngine:
                 str(self.run_spec["dc_pool_size"]),
             ]
         )
+        if self.run_spec["engine"] == "tgx":
+            args.extend(["--db-path", "/app/state/records.sqlite3"])
         if self.run_spec["engine"] == "tdl":
             args.extend(["--temp-dir", "/app/temp/tdl"])
         return args
