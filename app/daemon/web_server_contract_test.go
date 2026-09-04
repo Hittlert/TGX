@@ -415,6 +415,84 @@ func TestWebServer_SettingsAndControlContract(t *testing.T) {
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for max_active_files=0, got %d", w.Code)
 	}
+
+	// 6. Control Authentication Protection
+	authWS := NewWebServer(nil, tm, nil, nil, orch, nil, registry, zap.NewNop(), "strong_pass")
+	authHandler := authWS.Handler()
+
+	w = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/api/control", strings.NewReader(`{"action":"pause"}`))
+	req.Header.Set("Content-Type", "application/json")
+	authHandler.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated /api/control must return 401, got %d", w.Code)
+	}
+
+	// 7. Deprecated /set_download_state route must be 404
+	w = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/set_download_state", strings.NewReader(`{"action":"pause"}`))
+	req.Header.Set("Content-Type", "application/json")
+	authHandler.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("deprecated /set_download_state route must return 404, got %d", w.Code)
+	}
+
+	// 8. Idempotent Repeated & Stale Control Requests
+	for i := 0; i < 3; i++ {
+		w = httptest.NewRecorder()
+		req = httptest.NewRequest(http.MethodPost, "/api/control", strings.NewReader(`{"action":"pause"}`))
+		req.Header.Set("Content-Type", "application/json")
+		handler.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("idempotent pause #%d failed with code %d", i, w.Code)
+		}
+		var r map[string]any
+		_ = json.Unmarshal(w.Body.Bytes(), &r)
+		if r["state"] != "paused" || r["paused"] != true {
+			t.Fatalf("idempotent pause #%d expected paused state, got %v", i, r)
+		}
+	}
+
+	// 9. Concurrent Control Requests Safety
+	concurrency := 20
+	doneCh := make(chan bool, concurrency)
+	for i := 0; i < concurrency; i++ {
+		go func(idx int) {
+			action := "pause"
+			if idx%2 == 1 {
+				action = "resume"
+			}
+			rec := httptest.NewRecorder()
+			r := httptest.NewRequest(http.MethodPost, "/api/control", strings.NewReader(`{"action":"`+action+`"}`))
+			r.Header.Set("Content-Type", "application/json")
+			handler.ServeHTTP(rec, r)
+			doneCh <- (rec.Code == http.StatusOK)
+		}(i)
+	}
+	for i := 0; i < concurrency; i++ {
+		if !<-doneCh {
+			t.Fatalf("concurrent control request failed")
+		}
+	}
+
+	// 10. Verify index.html template does not reference obsolete 64 Slots or nonexistent cfg_global_thread_pool
+	indexData, err := uiFS.ReadFile("ui/templates/index.html")
+	if err != nil {
+		t.Fatalf("failed to read embedded index.html: %v", err)
+	}
+	indexHTML := string(indexData)
+	if strings.Contains(indexHTML, "64 Slots") {
+		t.Fatal("index.html must not contain obsolete '64 Slots' reference")
+	}
+	if strings.Contains(indexHTML, "16 Threads") {
+		t.Fatal("index.html must not contain obsolete '16 Threads' reference")
+	}
+	if strings.Contains(indexHTML, "cfg_global_thread_pool") {
+		t.Fatal("index.html must not reference nonexistent 'cfg_global_thread_pool'")
+	}
+	if !strings.Contains(indexHTML, "sync_download_state_ui") {
+		t.Fatal("index.html must use sync_download_state_ui for authoritative state synchronization")
+	}
 }
 
 type mockContractAccess struct {

@@ -228,7 +228,7 @@ func (s *WebServer) Handler() http.Handler {
 		})
 	}).Methods(http.MethodPost)
 
-	r.HandleFunc("/api/control", s.handleControl).Methods(http.MethodPost)
+	r.HandleFunc("/api/control", s.requireAuth(s.handleControl)).Methods(http.MethodPost)
 
 	// Login & Auth (Web UI Password)
 	r.HandleFunc("/login", s.handleLogin)
@@ -252,7 +252,6 @@ func (s *WebServer) Handler() http.Handler {
 
 	// Download Control & Status
 	r.HandleFunc("/get_download_status", s.requireAuth(s.handleGetDownloadStatus)).Methods(http.MethodGet)
-	r.HandleFunc("/set_download_state", s.requireAuth(s.handleControl)).Methods(http.MethodPost)
 	r.HandleFunc("/get_download_list", s.requireAuth(s.handleGetDownloadList)).Methods(http.MethodGet)
 	r.HandleFunc("/api/downloaded_records", s.requireAuth(s.handleGetDownloadedRecords)).Methods(http.MethodGet)
 	r.HandleFunc("/api/events", s.requireAuth(s.handleEventsStream)).Methods(http.MethodGet)
@@ -286,7 +285,7 @@ func (s *WebServer) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 
 		cookie, err := r.Cookie("tg_downloader_session")
 		if err != nil || cookie.Value == "" {
-			if strings.HasPrefix(r.URL.Path, "/api/") || strings.HasPrefix(r.URL.Path, "/get_") || strings.HasPrefix(r.URL.Path, "/set_") || strings.HasPrefix(r.URL.Path, "/download_") {
+			if strings.HasPrefix(r.URL.Path, "/api/") || strings.HasPrefix(r.URL.Path, "/get_") || strings.HasPrefix(r.URL.Path, "/download_") {
 				http.Error(w, `{"ok":false,"error":"unauthorized"}`, http.StatusUnauthorized)
 				return
 			}

@@ -246,19 +246,15 @@
           <div class="settings-summary-box">
             <div class="summary-item">
               <span class="summary-label">最大活动文件:</span>
-              <span class="summary-value" id="summary_max_files">8 Files (硬盘保护)</span>
+              <span class="summary-value" id="summary_max_files">5 Files</span>
             </div>
             <div class="summary-item">
-              <span class="summary-label">全局线程池容量:</span>
-              <span class="summary-value" id="summary_total_threads">64 Slots (自适应)</span>
+              <span class="summary-label">在途数据管控:</span>
+              <span class="summary-value" id="summary_data_gate">256 MB (DataGate)</span>
             </div>
             <div class="summary-item">
-              <span class="summary-label">单文件最大分配:</span>
-              <span class="summary-value">16 Threads (4MB/Slot)</span>
-            </div>
-            <div class="summary-item">
-              <span class="summary-label">内存安全预算:</span>
-              <span class="summary-value">~128 MB (极轻量)</span>
+              <span class="summary-label">分片传输规格:</span>
+              <span class="summary-value">512 KB/Part (gotd)</span>
             </div>
             <div class="summary-item">
               <span class="summary-label">下载引擎:</span>
@@ -843,23 +839,30 @@
       // Initial check
       check_tg_auth_status(false);
 
-      // Pause/Resume state
+      // Authoritative Pause/Resume state
+      window.current_download_state = $("#download_state").attr('data-value') || 'running';
+
+      function sync_download_state_ui(state) {
+        if (!state) return;
+        window.current_download_state = state;
+        $("#download_state").attr('data-value', state);
+        $("#download_state .status-label").text(state);
+      }
+
       window.download_state_change = function (e) {
-        var current = $(e).attr('data-value') || 'running';
-        var targetAction = (current === 'running') ? 'pause' : 'resume';
+        var desiredAction = (window.current_download_state === 'paused') ? 'resume' : 'pause';
         var load_idx = layer.load(2);
         $.ajax({
           url: "api/control",
           type: "post",
           contentType: "application/json",
-          data: JSON.stringify({ action: targetAction }),
+          data: JSON.stringify({ action: desiredAction }),
           dataType: "json",
           success: function (result) {
             layer.close(load_idx);
             if (result && result.ok) {
-              var newState = result.state || result.download_state || (targetAction === 'pause' ? 'paused' : 'running');
-              $("#download_state").attr('data-value', newState);
-              $("#download_state .status-label").html(newState);
+              var authoritativeState = result.state || result.download_state || (desiredAction === 'pause' ? 'paused' : 'running');
+              sync_download_state_ui(authoritativeState);
             } else {
               layer.msg("Failed to change download state: " + ((result && result.error) || 'unknown error'), { icon: 2 });
             }
@@ -1816,12 +1819,9 @@
 
       // Settings Modal Logic
       function update_settings_ui_summary() {
-        var files = parseInt($('#cfg_max_active_files').val(), 10) || 8;
-        var pool_slots = parseInt($('#cfg_global_thread_pool').val(), 10) || 64;
+        var files = parseInt($('#cfg_max_active_files').val(), 10) || 5;
         $('#val_max_active_files').text(files);
-        $('#val_global_thread_pool').text(pool_slots);
-        $('#summary_max_files').text(files + ' Files (硬盘保护)');
-        $('#summary_total_threads').text(pool_slots + ' Slots (自适应)');
+        $('#summary_max_files').text(files + ' Files');
       }
 
       $('.apple-range').on('input change', update_settings_ui_summary);
@@ -1837,7 +1837,9 @@
               $('#cfg_max_active_files').val(files);
               $('#val_max_active_files').text(files);
               if (res.settings.max_data_in_flight) {
-                $('#val_data_gate').text(format_bytes(res.settings.max_data_in_flight));
+                var gateFormatted = format_bytes(res.settings.max_data_in_flight);
+                $('#val_data_gate').text(gateFormatted);
+                $('#summary_data_gate').text(gateFormatted + ' (DataGate)');
               }
               update_settings_ui_summary();
             }
@@ -2092,8 +2094,7 @@
             $('#download_speed').html(data.speed_human);
           }
           if (data.download_state) {
-            $("#download_state").attr('data-value', data.download_state);
-            $("#download_state .status-label").html(data.download_state);
+            sync_download_state_ui(data.download_state);
           }
           if (data.gate) {
             $('#slot_used').html(data.gate.active_files || 0);
