@@ -1,5 +1,9 @@
-# TGX 系统架构与技术实现规范 (Master Specification)
+# TGX 系统架构与技术实现规范 (Master Specification) [SUPERSEDED]
 ## TGX Architecture & Production Technical Specification: Dual-Lane Streaming Engine & Network Subsystem
+
+> [!IMPORTANT]
+> **SUPERSEDED**: This document specifies historical designs (Segment-Buffer / Dual-Lane Streaming Engine) that have been retired.
+> Refer to [DIRECT_SSD_DOWNLOAD_ARCHIVE_REFACTOR_PLAN.md](../DIRECT_SSD_DOWNLOAD_ARCHIVE_REFACTOR_PLAN.md) for the active Direct SSD Download + Async Archive production architecture.
 
 ---
 

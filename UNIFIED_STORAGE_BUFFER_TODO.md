@@ -1,10 +1,14 @@
-# Unified Storage Buffer TODO
+# Unified Storage Buffer TODO [SUPERSEDED]
 
-> 状态：已全部按本文架构要求完成重构，并通过全仓 Race 单测与 NAS 线上生产热更验证（v4.4.0）。
+> [!IMPORTANT]
+> **SUPERSEDED**: This document specifies historical designs (Unified Storage Buffer / Segment Mover) that have been retired.
+> Refer to [DIRECT_SSD_DOWNLOAD_ARCHIVE_REFACTOR_PLAN.md](DIRECT_SSD_DOWNLOAD_ARCHIVE_REFACTOR_PLAN.md) for the active Direct SSD Download + Async Archive production architecture.
+
+> 状态：SUPERSEDED / RETIRED。已被 Direct SSD Download + Async Archive 架构替代。
 >
-> 基线：`f89a174`。本文描述的是下一阶段目标架构，不代表当前 whole-file Mover 已满足这些要求。
+> 基线：`f89a174`。本文描述的是已退役的历史架构，全量数据面已重构为 Direct SSD Download + Async Archive。
 >
-> 核心结论：把 memory/SSD Buffer 统一视为本地对象存储桶；一个 Telegram 网络分片就是一个对象，不在 Buffer 层预聚合。目标盘由单 Writer 消费对象：能续写当前文件就续写，续不上立即选择其他 Ready 对象。低负载下允许零散搬运，高负载下依靠 Ready 队列自然形成连续写，不设置 200 Mbps 模式开关。
+> 核心结论：把 memory/SSD Buffer 统一视为本地对象存储桶；一个 Telegram 网络分片就是一个对象，不在 Buffer 层预聚合。目标盘由单 Writer 消费对象。
 
 ## 1. 要解决的问题
 

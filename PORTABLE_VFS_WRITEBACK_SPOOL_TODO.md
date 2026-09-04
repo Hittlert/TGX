@@ -1,8 +1,12 @@
-# Portable VFS Write-Back Spool TODO
+# Portable VFS Write-Back Spool TODO [SUPERSEDED]
 
-> 状态：Architecture Direction GO / Implementation NO-GO。Gemini首轮评审已完成并合并；Phase 0原型、benchmark和剩余决策完成前，不得接入生产。
+> [!IMPORTANT]
+> **SUPERSEDED**: This document specifies historical designs (Portable VFS Write-Back Spool) that have been retired.
+> Refer to [DIRECT_SSD_DOWNLOAD_ARCHIVE_REFACTOR_PLAN.md](DIRECT_SSD_DOWNLOAD_ARCHIVE_REFACTOR_PLAN.md) for the active Direct SSD Download + Async Archive production architecture.
+
+> 状态：SUPERSEDED / RETIRED。已被 Direct SSD Download + Async Archive 架构替代。
 >
-> 评审对象：以 rclone `vfs/vfscache` 的写缓存模型为参考，重构 TGX 当前 memory/SSD Bucket + TargetWriter。本文不是在现有对象管线旁边追加第三套路径，而是定义一个最终替代方案。
+> 评审对象：以 rclone `vfs/vfscache` 的写缓存模型为参考，重构 TGX 当前 memory/SSD Bucket + TargetWriter。
 >
 > 产品边界：TGX 运行在 Docker 中，宿主机可能是 Linux、NAS、macOS 或 Windows。核心实现只能依赖普通目录、普通文件 API、SQLite 和 Go 并发原语；不得依赖 RAID、LVM、Btrfs、APFS、NTFS、FUSE、块设备或特定内核能力。
 

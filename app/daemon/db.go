@@ -525,7 +525,7 @@ func (d *Database) GetDownloadRecord(chatID string, messageID int) (*DownloadRec
 	var rec DownloadRecord
 	var savePath, sha, attemptGen sql.NullString
 	err := d.db.QueryRow(`
-		SELECT chat_id, message_id, status, file_name, save_path, media_type, file_size, COALESCE(sha256, ''), attempts, COALESCE(attempt_generation, '')
+		SELECT chat_id, message_id, status, COALESCE(file_name, ''), save_path, COALESCE(media_type, ''), file_size, COALESCE(sha256, ''), attempts, COALESCE(attempt_generation, '')
 		FROM download_records
 		WHERE chat_id = ? AND message_id = ?
 	`, chatID, messageID).Scan(
