@@ -146,6 +146,8 @@ def parse_binary_version(output):
                 metadata["source_commit"] = value
             elif key == "Date":
                 metadata["build_time"] = value
+            elif key in ("Dirty", "dirty"):
+                metadata["source_dirty"] = value.lower() == "true"
             continue
         parts = line.split()
         if len(parts) == 2 and parts[0].startswith("go") and "/" in parts[1]:

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	_ "embed"
 	"runtime"
+	"runtime/debug"
 	"text/template"
 
 	"github.com/fatih/color"
@@ -15,6 +16,19 @@ import (
 //go:embed version.tmpl
 var version string
 
+func isSourceDirty() bool {
+	bi, ok := debug.ReadBuildInfo()
+	if !ok {
+		return false
+	}
+	for _, s := range bi.Settings {
+		if s.Key == "vcs.modified" {
+			return s.Value == "true"
+		}
+	}
+	return false
+}
+
 func NewVersion() *cobra.Command {
 	return &cobra.Command{
 		Use:   "version",
@@ -25,6 +39,7 @@ func NewVersion() *cobra.Command {
 				"Version":   consts.Version,
 				"Commit":    consts.Commit,
 				"Date":      consts.CommitDate,
+				"Dirty":     isSourceDirty(),
 				"GoVersion": runtime.Version(),
 				"GOOS":      runtime.GOOS,
 				"GOARCH":    runtime.GOARCH,
