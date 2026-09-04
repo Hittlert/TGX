@@ -143,6 +143,11 @@ func EmitLifecycle(logger *zap.Logger, evt LifecycleEvent) {
 		if evt.ReplayBytes != 0 {
 			fields = append(fields, zap.Int64("replay_bytes", evt.ReplayBytes))
 		}
+		if evt.Extra != nil {
+			for k, v := range evt.Extra {
+				fields = append(fields, zap.Any(k, v))
+			}
+		}
 
 		logger.Info("lifecycle_event", fields...)
 	}

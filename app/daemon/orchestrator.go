@@ -355,6 +355,16 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 		defer stop()
 	}
 
+	EmitLifecycle(o.logger, LifecycleEvent{
+		Event:     EventItemAdmitted,
+		TaskID:    taskID,
+		AttemptID: gen,
+		ChatID:    chatID,
+		MessageID: msgID,
+		Path:      req.FinalPath,
+		Size:      req.ExpectedSize,
+	})
+
 	// 1. Media Ingress / Resolution (done first to obtain authoritative size and metadata)
 	if o.db != nil {
 		if beginErr := o.db.BeginDownload(chatID, msgID, gen, req.FileName, req.FinalPath, req.MediaType, req.ExpectedSize); errors.Is(beginErr, ErrAlreadySuccess) {
@@ -595,15 +605,6 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 		}
 	}
 	task.SetDownloading()
-	EmitLifecycle(o.logger, LifecycleEvent{
-		Event:     EventItemAdmitted,
-		TaskID:    taskID,
-		AttemptID: gen,
-		ChatID:    chatID,
-		MessageID: msgID,
-		Path:      finalRelPath,
-		Size:      authoritativeSize,
-	})
 
 	// 6. Ensure parent directory exists (ONLY after durable DB acceptance)
 	if err := os.MkdirAll(filepath.Dir(finalAbsPath), 0o755); err != nil {
