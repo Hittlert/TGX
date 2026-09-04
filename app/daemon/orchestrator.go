@@ -487,29 +487,67 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 		_ = o.db.BeginDownload(chatID, msgID, gen, fileName, finalRelPath, mediaType, authoritativeSize)
 	}
 
-	// 6. Build thin gotd client adapter with DataGate & CDN protection
-	pool := o.access.Pool()
-	invoker := pool.Invoker(taskCtx, resolvedMedia.DCID)
-	client := transfer.NewGatedClient(
-		invoker,
-		o.transferMgr.Gate(),
-		resolvedMedia.DCID,
-		pool.CDN,
-	)
-
-	// 7. Execute parallel chunk download with official gotd downloader
+	// 6. Execute parallel chunk download with official gotd downloader (with retry on transient errors)
 	onProgress := func(downloaded, total int64) {
 		task.RecordProgress(downloaded)
 	}
 
-	written, dlErr := o.transferMgr.DownloadFile(
-		taskCtx,
-		client,
-		resolvedMedia.File.Location(),
-		authoritativeSize,
-		partFile,
-		onProgress,
+	var (
+		written int64
+		dlErr   error
 	)
+	const maxDownloadAttempts = 3
+	for attempt := 1; attempt <= maxDownloadAttempts; attempt++ {
+		if _, seekErr := partFile.Seek(0, 0); seekErr != nil {
+			dlErr = seekErr
+			break
+		}
+		if truncErr := partFile.Truncate(0); truncErr != nil {
+			dlErr = truncErr
+			break
+		}
+
+		pool := o.access.Pool()
+		invoker := pool.Invoker(taskCtx, resolvedMedia.DCID)
+		client := transfer.NewGatedClient(
+			invoker,
+			o.transferMgr.Gate(),
+			resolvedMedia.DCID,
+			pool.CDN,
+		)
+
+		written, dlErr = o.transferMgr.DownloadFile(
+			taskCtx,
+			client,
+			resolvedMedia.File.Location(),
+			authoritativeSize,
+			partFile,
+			onProgress,
+		)
+		if dlErr == nil {
+			break
+		}
+
+		if taskCtx.Err() != nil {
+			break
+		}
+
+		if attempt < maxDownloadAttempts {
+			o.logger.Warn("transient download error, retrying",
+				zap.String("task_id", taskID),
+				zap.Int("attempt", attempt),
+				zap.Error(dlErr),
+			)
+			select {
+			case <-taskCtx.Done():
+				dlErr = taskCtx.Err()
+			case <-time.After(time.Duration(attempt) * 500 * time.Millisecond):
+			}
+			if taskCtx.Err() != nil {
+				break
+			}
+		}
+	}
 
 	if dlErr != nil {
 		_ = partFile.Close()

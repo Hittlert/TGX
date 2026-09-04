@@ -637,9 +637,23 @@ def wait_for_measurement(engine, cases, duration, events):
                 flush=True,
             )
             if active == 0 and queued == 0:
-                tasks = http_json(f"{engine.api_base}/api/tasks")
                 terminal = {"success", "failed", "unavailable", "canceled"}
-                if sum(task.get("state") in terminal for task in tasks) >= len(cases):
+                tasks = []
+                try:
+                    res = http_json(f"{engine.api_base}/api/tasks")
+                    if isinstance(res, list):
+                        tasks = res
+                except Exception:
+                    pass
+                if engine.run_spec.get("engine") == "tdl" or (
+                    tasks
+                    and sum(
+                        task.get("state") in terminal
+                        for task in tasks
+                        if isinstance(task, dict)
+                    )
+                    >= len(cases)
+                ):
                     events.write({"timestamp": iso_time(), "event": "run.completed_early"})
                     return False
         except Exception:

@@ -53,9 +53,11 @@ type TaskSnapshot struct {
 	DCID          int       `json:"dc_id,omitempty"`
 	AlreadyExists bool      `json:"already_exists,omitempty"`
 	SHA256        string    `json:"sha256,omitempty"`
-	ErrorClass    string    `json:"error_class,omitempty"`
-	Error         string    `json:"error,omitempty"`
-	CreatedAt     int64     `json:"created_at"`
+	ErrorClass        string    `json:"error_class,omitempty"`
+	Error             string    `json:"error,omitempty"`
+	AttemptGeneration string    `json:"attempt_generation,omitempty"`
+	AttemptCount      int       `json:"attempt_count,omitempty"`
+	CreatedAt         int64     `json:"created_at"`
 	StartedAt     int64     `json:"started_at,omitempty"`
 	FinishedAt    int64     `json:"finished_at,omitempty"`
 }
@@ -91,6 +93,7 @@ type taskState struct {
 	request            TaskRequest
 	state              TaskState
 	attemptGen         string // generation ID for this attempt, set once at Submit time
+	attemptCount       int
 	fileName           string
 	totalSize          int64
 	downloaded         int64
@@ -199,8 +202,9 @@ func (r *Registry) Submit(request TaskRequest) (TaskSnapshot, bool, error) {
 			// Old Task instances continue to hold their original, canceled taskState pointer.
 			newState := &taskState{
 				request: request, state: StateQueued, totalSize: request.ExpectedSize, createdAt: now,
-				attemptGen: fmt.Sprintf("retry_%d", now.UnixNano()),
-				ctx:        taskCtx, cancel: taskCancel,
+				attemptGen:   fmt.Sprintf("retry_%d", now.UnixNano()),
+				attemptCount: existing.attemptCount + 1,
+				ctx:          taskCtx, cancel: taskCancel,
 			}
 			r.tasks[request.ID] = newState
 			r.removeTerminalLocked(request.ID)
@@ -217,8 +221,9 @@ func (r *Registry) Submit(request TaskRequest) (TaskSnapshot, bool, error) {
 	taskCtx, taskCancel := context.WithCancel(pCtx)
 	state := &taskState{
 		request: request, state: StateQueued, totalSize: request.ExpectedSize, createdAt: now,
-		attemptGen: "1", // First attempt always uses generation "1"
-		ctx:        taskCtx, cancel: taskCancel,
+		attemptGen:   "1", // First attempt always uses generation "1"
+		attemptCount: 1,
+		ctx:          taskCtx, cancel: taskCancel,
 	}
 	r.tasks[request.ID] = state
 	r.queue = append(r.queue, state)
@@ -747,6 +752,15 @@ func (r *Registry) snapshotTaskLocked(state *taskState, now time.Time) TaskSnaps
 		netDownloaded = state.downloaded
 	}
 
+	attemptGen := state.attemptGen
+	if attemptGen == "" {
+		attemptGen = "1"
+	}
+	attemptCount := state.attemptCount
+	if attemptCount <= 0 {
+		attemptCount = 1
+	}
+
 	return TaskSnapshot{
 		TaskRequest: state.request, State: state.state, FileName: state.fileName,
 		TotalSize: state.totalSize, Downloaded: state.downloaded, NetDownloaded: netDownloaded,
@@ -754,6 +768,7 @@ func (r *Registry) snapshotTaskLocked(state *taskState, now time.Time) TaskSnaps
 		Rolling5sBPS: int64(state.smoothedSpeed),
 		DCID:         state.dcID, AlreadyExists: state.alreadyExists, SHA256: state.sha256,
 		ErrorClass: state.errorClass, Error: state.errorText,
+		AttemptGeneration: attemptGen, AttemptCount: attemptCount,
 		CreatedAt: state.createdAt.Unix(), StartedAt: unixOrZero(state.startedAt),
 		FinishedAt: unixOrZero(state.finishedAt),
 	}

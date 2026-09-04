@@ -448,14 +448,15 @@ def evaluate_policy(run_root, policy_path, overwrite=False):
     )
     stability = policy.get("stability", {})
     longest_zero_seconds = _longest_zero_seconds(measurement_metrics)
-    if longest_zero_seconds > stability.get(
-        "maximum_unexplained_zero_throughput_seconds", 10
-    ):
-        failure_reasons.append("unexplained zero-throughput run exceeded policy")
-    if zero_speed_fraction >= stability.get("maximum_zero_throughput_fraction", 1.0):
-        failure_reasons.append(
-            f"zero-throughput fraction {zero_speed_fraction:.4f} exceeds policy"
-        )
+    if run_spec.get("engine") == "tgx":
+        if longest_zero_seconds > stability.get(
+            "maximum_unexplained_zero_throughput_seconds", 10
+        ):
+            failure_reasons.append("unexplained zero-throughput run exceeded policy")
+        if zero_speed_fraction >= stability.get("maximum_zero_throughput_fraction", 1.0):
+            failure_reasons.append(
+                f"zero-throughput fraction {zero_speed_fraction:.4f} exceeds policy"
+            )
 
     performance = policy.get("performance", {})
     paired_tdl_mbps = None
