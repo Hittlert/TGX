@@ -834,7 +834,7 @@ func trimEvents(events []byteEvent, cutoff time.Time) []byteEvent {
 }
 
 func rollingRate(events []byteEvent, firstByte, lastByte, now time.Time) int64 {
-	if len(events) == 0 || lastByte.IsZero() || now.Sub(lastByte) >= 3*time.Second {
+	if len(events) == 0 || lastByte.IsZero() || now.Sub(lastByte) >= 5*time.Second {
 		return 0
 	}
 	var total int64
