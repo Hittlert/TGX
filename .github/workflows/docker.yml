@@ -58,5 +58,6 @@ jobs:
             VERSION=${{ steps.meta.outputs.version }}
             COMMIT=${{ github.sha }}
             COMMIT_DATE=${{ github.event.head_commit.timestamp }}
+            DIRTY=false
           cache-from: type=gha
           cache-to: type=gha,mode=max

@@ -17,13 +17,13 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: 'stable'
+          go-version: '1.25.0'
           check-latest: true
           cache: true
 
       - name: Run Tests
         run: |
-          go test -v -race ./pkg/... ./app/... ./test/chaos/...
+          go test -v -race ./pkg/... ./core/... ./app/... ./test/chaos/...
 
       - name: Validate Evaluation Tools
         run: |
