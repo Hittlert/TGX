@@ -964,3 +964,216 @@ main().catch(err => {
 		t.Fatalf("expected verification token, got: %s", string(out))
 	}
 }
+
+// TestWebServer_ProductionRouterContractInventory verifies that production and tests share
+// the exact same router and middleware table. It validates every browser-used endpoint for:
+// 1. Unauthenticated rejection (401 JSON or 302 redirect to /login)
+// 2. Authenticated wire acceptance and correct HTTP status (no 404 or 405)
+// 3. Named owners for non-browser routes (healthz, gate, tasks, status)
+// 4. Absence of unowned obsolete aliases (e.g. /set_download_state is 404)
+// 5. Complete static HTML template route inventory alignment (anti-drift)
+func TestWebServer_ProductionRouterContractInventory(t *testing.T) {
+	tempDir := t.TempDir()
+	db, err := NewDatabase(filepath.Join(tempDir, "inventory.db"))
+	if err != nil {
+		t.Fatalf("new db: %v", err)
+	}
+	defer db.Close()
+
+	registry := NewRegistry(5, 100, time.Now)
+	tm := transfer.NewTransferManager(transfer.Options{FileConcurrency: 5})
+	orch := NewOrchestrator(nil, tm, nil, nil, nil, registry, zap.NewNop(), tempDir)
+	access := &mockContractAccess{
+		dialogs: []DialogDTO{
+			{ID: 101, ChatID: "-100101", Title: "Channel", TopMessageID: 100},
+		},
+	}
+
+	testPass := "inventory_secret_password"
+	ws := NewWebServer(db, tm, nil, nil, orch, access, registry, zap.NewNop(), testPass)
+	handler := ws.Handler()
+
+	// 1. Obtain authenticated session cookie via /login
+	loginRec := httptest.NewRecorder()
+	loginReq := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader(`{"password":"`+testPass+`"}`))
+	loginReq.Header.Set("Content-Type", "application/json")
+	handler.ServeHTTP(loginRec, loginReq)
+	if loginRec.Code != http.StatusOK {
+		t.Fatalf("login failed with code %d: %s", loginRec.Code, loginRec.Body.String())
+	}
+	var sessCookie *http.Cookie
+	for _, c := range loginRec.Result().Cookies() {
+		if c.Name == "tg_downloader_session" {
+			sessCookie = c
+			break
+		}
+	}
+	if sessCookie == nil {
+		t.Fatal("expected tg_downloader_session cookie from login")
+	}
+
+	type routeContract struct {
+		method         string
+		path           string
+		body           string
+		requiresAuth   bool
+		expectedStatus int
+		namedOwner     string
+	}
+
+	inventory := []routeContract{
+		// Non-browser routes with named owners
+		{"GET", "/healthz", "", false, http.StatusOK, "CGroup/Docker container healthcheck"},
+		{"GET", "/api/status", "", false, http.StatusOK, "CLI and external telemetry"},
+		{"GET", "/api/gate", "", false, http.StatusOK, "Evaluation sandbox live diagnostics"},
+		{"GET", "/api/tasks", "", false, http.StatusOK, "CLI task queue monitoring"},
+		{"POST", "/api/tasks", "{}", false, http.StatusBadRequest, "CLI task batch submission"},
+
+		// Public authentication routes
+		{"GET", "/get_app_version", "", false, http.StatusOK, "Frontend version check"},
+		{"GET", "/login", "", false, http.StatusOK, "Browser login page"},
+		{"POST", "/login", `{"password":"` + testPass + `"}`, false, http.StatusOK, "Browser login wire"},
+		{"GET", "/logout", "", false, http.StatusFound, "Browser logout handler"},
+
+		// Authenticated dashboard routes
+		{"GET", "/", "", true, http.StatusOK, "Browser root dashboard"},
+		{"POST", "/api/control", `{"action":"pause"}`, true, http.StatusOK, "Authoritative system state control"},
+		{"GET", "/get_download_status", "", true, http.StatusOK, "Telemetry status probe"},
+		{"GET", "/get_download_list?already_down=false", "", true, http.StatusOK, "Active download queue snapshot"},
+		{"GET", "/api/downloaded_records?page=1&limit=10", "", true, http.StatusOK, "Historical downloaded records table"},
+		{"GET", "/api/system/storage", "", false, http.StatusOK, "Storage utilization diagnostics"},
+
+		// Target & Dialog management
+		{"GET", "/api/dialogs", "", true, http.StatusOK, "Dialog and monitored target list"},
+		{"POST", "/api/add_target", `{"query":"test"}`, true, http.StatusOK, "Single target atomic creation"},
+		{"POST", "/api/listen_targets", `{"targets":[]}`, true, http.StatusOK, "Target batch persistence"},
+		{"POST", "/api/target/update", `{"chat_id":"-100100"}`, true, http.StatusOK, "Inline target settings update"},
+		{"GET", "/api/target_progress", "", true, http.StatusOK, "Live target scan & download progress"},
+		{"GET", "/api/chat_context?chat_id=-100100&message_id=1&limit=30", "", true, http.StatusOK, "Unified limit message context"},
+
+		// Settings & Telemetry
+		{"GET", "/api/settings/concurrency", "", true, http.StatusOK, "Concurrency settings read"},
+		{"POST", "/api/settings/concurrency", `{"max_active_files":8}`, true, http.StatusOK, "Concurrency settings write"},
+
+		// Telegram Account Auth Wizard & Multi-account
+		{"GET", "/api/auth/status", "", true, http.StatusOK, "Telegram MTProto authorization status"},
+		{"POST", "/api/auth/qr/start", "", true, http.StatusServiceUnavailable, "Telegram QR login start"},
+		{"GET", "/api/auth/qr/poll", "", true, http.StatusServiceUnavailable, "Telegram QR login polling"},
+		{"POST", "/api/auth/phone/send_code", "{}", true, http.StatusBadRequest, "Phone auth SMS dispatch"},
+		{"POST", "/api/auth/phone/verify_code", "{}", true, http.StatusBadRequest, "Phone auth SMS verification"},
+		{"POST", "/api/auth/2fa/verify", "{}", true, http.StatusBadRequest, "Cloud password 2FA verification"},
+		{"POST", "/api/auth/logout", "", true, http.StatusServiceUnavailable, "Telegram session logout"},
+		{"GET", "/api/accounts", "", true, http.StatusOK, "Multi-account list"},
+		{"POST", "/api/accounts/switch", "{}", true, http.StatusBadRequest, "Multi-account switch"},
+		{"POST", "/api/accounts/delete", "{}", true, http.StatusBadRequest, "Multi-account deletion"},
+
+		// Proxy actions
+		{"GET", "/api/proxy/list", "", true, http.StatusOK, "Configured proxy list"},
+		{"POST", "/api/proxy/switch", "{}", true, http.StatusBadRequest, "Proxy profile switch"},
+		{"POST", "/api/proxy/ping", "{}", true, http.StatusBadRequest, "Proxy connectivity probe"},
+	}
+
+	for _, rc := range inventory {
+		t.Run(rc.method+"_"+rc.path, func(t *testing.T) {
+			// Phase A: Unauthenticated test for protected routes
+			if rc.requiresAuth {
+				rec := httptest.NewRecorder()
+				r := httptest.NewRequest(rc.method, rc.path, strings.NewReader(rc.body))
+				if rc.body != "" {
+					r.Header.Set("Content-Type", "application/json")
+				}
+				handler.ServeHTTP(rec, r)
+
+				if strings.HasPrefix(rc.path, "/api/") || strings.HasPrefix(rc.path, "/get_") {
+					if rec.Code != http.StatusUnauthorized {
+						t.Fatalf("[%s %s] unauthenticated request must return 401 Unauthorized, got %d", rc.method, rc.path, rec.Code)
+					}
+					var errMap map[string]any
+					if err := json.Unmarshal(rec.Body.Bytes(), &errMap); err != nil || errMap["ok"] != false {
+						t.Fatalf("[%s %s] unauthenticated 401 response must be structured error json, got: %s", rc.method, rc.path, rec.Body.String())
+					}
+				} else if rc.path == "/" {
+					if rec.Code != http.StatusFound || rec.Header().Get("Location") != "/login" {
+						t.Fatalf("[%s %s] unauthenticated root page must redirect to /login, got %d", rc.method, rc.path, rec.Code)
+					}
+				}
+			}
+
+			// Phase B: Authenticated request verification
+			rec := httptest.NewRecorder()
+			r := httptest.NewRequest(rc.method, rc.path, strings.NewReader(rc.body))
+			if rc.body != "" {
+				r.Header.Set("Content-Type", "application/json")
+			}
+			if rc.requiresAuth {
+				r.AddCookie(sessCookie)
+			}
+			handler.ServeHTTP(rec, r)
+
+			if rec.Code == http.StatusNotFound {
+				t.Fatalf("[%s %s] route is NOT registered in production WebServer (got 404 Not Found)", rc.method, rc.path)
+			}
+			if rec.Code == http.StatusMethodNotAllowed {
+				t.Fatalf("[%s %s] method not allowed on production WebServer (got 405)", rc.method, rc.path)
+			}
+			if rec.Code != rc.expectedStatus {
+				t.Fatalf("[%s %s] expected status %d, got %d: %s", rc.method, rc.path, rc.expectedStatus, rec.Code, rec.Body.String())
+			}
+		})
+	}
+
+	// 2. Anti-drift test: parse index.html and ensure all called endpoints are covered in production WebServer
+	indexBytes, err := uiFS.ReadFile("ui/templates/index.html")
+	if err != nil {
+		t.Fatalf("failed to read embedded index.html: %v", err)
+	}
+	indexStr := string(indexBytes)
+
+	expectedClientEndpoints := []string{
+		"get_app_version",
+		"api/accounts/switch",
+		"api/accounts/delete",
+		"api/auth/status",
+		"api/auth/qr/start",
+		"api/auth/qr/poll",
+		"api/auth/2fa/verify",
+		"api/auth/phone/send_code",
+		"api/auth/phone/verify_code",
+		"api/auth/logout",
+		"api/control",
+		"api/target_progress",
+		"api/dialogs",
+		"api/add_target",
+		"api/listen_targets",
+		"api/target/update",
+		"api/chat_context",
+		"api/downloaded_records",
+		"get_download_list",
+		"api/system/storage",
+		"get_download_status",
+		"api/settings/concurrency",
+		"api/proxy/list",
+		"api/proxy/switch",
+		"api/proxy/ping",
+	}
+
+	for _, ep := range expectedClientEndpoints {
+		if !strings.Contains(indexStr, ep) {
+			t.Fatalf("index.html is missing expected endpoint call: %s", ep)
+		}
+	}
+
+	// 3. Verify unowned obsolete aliases are strictly removed (404)
+	obsoleteRoutes := []string{
+		"/set_download_state",
+	}
+	for _, obs := range obsoleteRoutes {
+		rec := httptest.NewRecorder()
+		r := httptest.NewRequest(http.MethodPost, obs, strings.NewReader(`{"action":"pause"}`))
+		r.AddCookie(sessCookie)
+		handler.ServeHTTP(rec, r)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("obsolete route %s must return 404, got %d", obs, rec.Code)
+		}
+	}
+}

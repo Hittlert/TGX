@@ -1412,6 +1412,20 @@ func (s *WebServer) handleConcurrencySettings(w http.ResponseWriter, r *http.Req
 }
 
 func (s *WebServer) handleProxyList(w http.ResponseWriter, r *http.Request) {
+	if s.proxyManager == nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":      true,
+			"active":  "direct",
+			"nodes":   []any{},
+			"proxies": []any{},
+			"watchdog": map[string]any{
+				"interval_seconds": 60,
+				"failover_count":   0,
+			},
+		})
+		return
+	}
+
 	nodes, current, err := s.proxyManager.GetProxyList(r.Context())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -1466,6 +1480,16 @@ func (s *WebServer) handleProxySwitch(w http.ResponseWriter, r *http.Request) {
 		targetNode = req.NodeTag
 	}
 
+	if targetNode == "" {
+		writeError(w, http.StatusBadRequest, "node name or tag is required")
+		return
+	}
+
+	if s.proxyManager == nil {
+		writeError(w, http.StatusServiceUnavailable, "proxy manager not initialized")
+		return
+	}
+
 	if err := s.proxyManager.SwitchProxy(r.Context(), req.Group, targetNode); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -1500,6 +1524,16 @@ func (s *WebServer) handleProxyPing(w http.ResponseWriter, r *http.Request) {
 	}
 	if targetNode == "" {
 		targetNode = req.NodeTag
+	}
+
+	if targetNode == "" {
+		writeError(w, http.StatusBadRequest, "node name or tag is required")
+		return
+	}
+
+	if s.proxyManager == nil {
+		writeError(w, http.StatusServiceUnavailable, "proxy manager not initialized")
+		return
 	}
 
 	delay, err := s.proxyManager.PingProxy(r.Context(), targetNode)
@@ -1542,7 +1576,7 @@ func (s *WebServer) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
 
 func (s *WebServer) handleAuthQRStart(w http.ResponseWriter, r *http.Request) {
 	if s.authWizard == nil {
-		writeError(w, http.StatusInternalServerError, "auth wizard not initialized")
+		writeError(w, http.StatusServiceUnavailable, "auth wizard not initialized")
 		return
 	}
 	var req struct {
@@ -1562,7 +1596,7 @@ func (s *WebServer) handleAuthQRStart(w http.ResponseWriter, r *http.Request) {
 
 func (s *WebServer) handleAuthQRPoll(w http.ResponseWriter, r *http.Request) {
 	if s.authWizard == nil {
-		writeError(w, http.StatusInternalServerError, "auth wizard not initialized")
+		writeError(w, http.StatusServiceUnavailable, "auth wizard not initialized")
 		return
 	}
 	resp, err := s.authWizard.PollQR(r.Context())
@@ -1574,16 +1608,16 @@ func (s *WebServer) handleAuthQRPoll(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *WebServer) handleAuthSendPhoneCode(w http.ResponseWriter, r *http.Request) {
-	if s.authWizard == nil {
-		writeError(w, http.StatusInternalServerError, "auth wizard not initialized")
-		return
-	}
 	var req struct {
 		Phone     string `json:"phone"`
 		Namespace string `json:"namespace"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Phone == "" {
 		writeError(w, http.StatusBadRequest, "invalid phone number")
+		return
+	}
+	if s.authWizard == nil {
+		writeError(w, http.StatusServiceUnavailable, "auth wizard not initialized")
 		return
 	}
 	resp, err := s.authWizard.SendPhoneCode(r.Context(), req.Phone, req.Namespace)
@@ -1595,15 +1629,15 @@ func (s *WebServer) handleAuthSendPhoneCode(w http.ResponseWriter, r *http.Reque
 }
 
 func (s *WebServer) handleAuthVerifyPhoneCode(w http.ResponseWriter, r *http.Request) {
-	if s.authWizard == nil {
-		writeError(w, http.StatusInternalServerError, "auth wizard not initialized")
-		return
-	}
 	var req struct {
 		Code string `json:"code"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Code == "" {
 		writeError(w, http.StatusBadRequest, "invalid verification code")
+		return
+	}
+	if s.authWizard == nil {
+		writeError(w, http.StatusServiceUnavailable, "auth wizard not initialized")
 		return
 	}
 	resp, err := s.authWizard.VerifyPhoneCode(r.Context(), req.Code)
@@ -1615,15 +1649,15 @@ func (s *WebServer) handleAuthVerifyPhoneCode(w http.ResponseWriter, r *http.Req
 }
 
 func (s *WebServer) handleAuthVerify2FA(w http.ResponseWriter, r *http.Request) {
-	if s.authWizard == nil {
-		writeError(w, http.StatusInternalServerError, "auth wizard not initialized")
-		return
-	}
 	var req struct {
 		Password string `json:"password"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Password == "" {
 		writeError(w, http.StatusBadRequest, "invalid password")
+		return
+	}
+	if s.authWizard == nil {
+		writeError(w, http.StatusServiceUnavailable, "auth wizard not initialized")
 		return
 	}
 	resp, err := s.authWizard.Verify2FA(r.Context(), req.Password)
@@ -1636,7 +1670,7 @@ func (s *WebServer) handleAuthVerify2FA(w http.ResponseWriter, r *http.Request) 
 
 func (s *WebServer) handleAuthLogoutTelegram(w http.ResponseWriter, r *http.Request) {
 	if s.authWizard == nil {
-		writeError(w, http.StatusInternalServerError, "auth wizard not initialized")
+		writeError(w, http.StatusServiceUnavailable, "auth wizard not initialized")
 		return
 	}
 	if err := s.authWizard.Logout(r.Context()); err != nil {
@@ -1648,7 +1682,7 @@ func (s *WebServer) handleAuthLogoutTelegram(w http.ResponseWriter, r *http.Requ
 
 func (s *WebServer) handleGetAccounts(w http.ResponseWriter, r *http.Request) {
 	if s.db == nil {
-		writeError(w, http.StatusInternalServerError, "database not initialized")
+		writeError(w, http.StatusServiceUnavailable, "database not initialized")
 		return
 	}
 	accounts, err := s.db.GetAccounts()
@@ -1663,15 +1697,15 @@ func (s *WebServer) handleGetAccounts(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *WebServer) handleSwitchAccount(w http.ResponseWriter, r *http.Request) {
-	if s.authWizard == nil {
-		writeError(w, http.StatusInternalServerError, "auth wizard not initialized")
-		return
-	}
 	var req struct {
 		Namespace string `json:"namespace"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Namespace == "" {
 		writeError(w, http.StatusBadRequest, "invalid namespace")
+		return
+	}
+	if s.authWizard == nil {
+		writeError(w, http.StatusServiceUnavailable, "auth wizard not initialized")
 		return
 	}
 	if err := s.authWizard.SwitchAccount(r.Context(), req.Namespace); err != nil {
@@ -1686,15 +1720,15 @@ func (s *WebServer) handleSwitchAccount(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *WebServer) handleDeleteAccount(w http.ResponseWriter, r *http.Request) {
-	if s.authWizard == nil {
-		writeError(w, http.StatusInternalServerError, "auth wizard not initialized")
-		return
-	}
 	var req struct {
 		Namespace string `json:"namespace"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Namespace == "" {
 		writeError(w, http.StatusBadRequest, "invalid namespace")
+		return
+	}
+	if s.authWizard == nil {
+		writeError(w, http.StatusServiceUnavailable, "auth wizard not initialized")
 		return
 	}
 	if err := s.authWizard.DeleteAccount(r.Context(), req.Namespace); err != nil {
