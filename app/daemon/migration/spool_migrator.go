@@ -411,12 +411,38 @@ func Run(ctx context.Context, opts MigrationOptions) (*MigrationReport, error) {
 		}
 	}
 
-	// 12. Clean orphaned buffer files on disk BEFORE dropping legacy tables and committing
-	for _, p := range report.PlannedCleanFiles {
-		if err := os.Remove(p); err != nil {
-			return report, fmt.Errorf("clean buffer file %s: %w", p, err)
+	// 12. Stage buffer files to recoverable quarantine before database mutation
+	type stagedFile struct {
+		origPath   string
+		stagedPath string
+	}
+	var staged []stagedFile
+	var quarantineDir string
+
+	if len(report.PlannedCleanFiles) > 0 && opts.BufferDir != "" {
+		quarantineDir = filepath.Join(opts.BufferDir, fmt.Sprintf(".migrator_quarantine_%d", now))
+		if err := os.MkdirAll(quarantineDir, 0o755); err != nil {
+			return report, fmt.Errorf("create quarantine directory: %w", err)
 		}
-		report.CleanedFiles = append(report.CleanedFiles, p)
+		// In case of error during staging or database operations, restore staged files
+		defer func() {
+			if quarantineDir != "" {
+				for _, sf := range staged {
+					if _, err := os.Stat(sf.stagedPath); err == nil {
+						_ = os.Rename(sf.stagedPath, sf.origPath)
+					}
+				}
+				_ = os.RemoveAll(quarantineDir)
+			}
+		}()
+
+		for idx, p := range report.PlannedCleanFiles {
+			stagedPath := filepath.Join(quarantineDir, fmt.Sprintf("staged_%d_%s", idx, filepath.Base(p)))
+			if err := os.Rename(p, stagedPath); err != nil {
+				return report, fmt.Errorf("stage buffer file %s to quarantine: %w", p, err)
+			}
+			staged = append(staged, stagedFile{origPath: p, stagedPath: stagedPath})
+		}
 	}
 
 	// 13. Drop legacy tables if requested
@@ -432,6 +458,18 @@ func Run(ctx context.Context, opts MigrationOptions) (*MigrationReport, error) {
 
 	if err := tx.Commit(); err != nil {
 		return report, fmt.Errorf("commit migration transaction: %w", err)
+	}
+
+	// 14. Finalize deletion: ONLY after database transaction is durably committed!
+	if quarantineDir != "" {
+		for _, sf := range staged {
+			if err := os.Remove(sf.stagedPath); err != nil {
+				return report, fmt.Errorf("finalize removal of staged file %s: %w", sf.stagedPath, err)
+			}
+			report.CleanedFiles = append(report.CleanedFiles, sf.origPath)
+		}
+		_ = os.RemoveAll(quarantineDir)
+		quarantineDir = "" // prevent defer from running
 	}
 
 	return report, nil

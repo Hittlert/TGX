@@ -608,3 +608,98 @@ func TestMigration_RemovalFailureAbortsWithoutDroppingEvidence(t *testing.T) {
 		t.Fatalf("legacy evidence was dropped! target_commits count: %d, err: %v", tblCount, err)
 	}
 }
+
+// 11. Acceptance Test: Database DROP/commit failure after staging restores buffer files and preserves evidence.
+func TestMigration_DropOrCommitFailureAfterStagingPreservesFilesystemEvidence(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "drop_fail.sqlite3")
+	bufferDir := filepath.Join(tempDir, "buffer")
+	if err := os.MkdirAll(bufferDir, 0o755); err != nil {
+		t.Fatalf("failed to create buffer dir: %v", err)
+	}
+
+	spoolFile := filepath.Join(bufferDir, "critical_evidence.spool")
+	evidenceContent := []byte("irreplaceable buffer chunk evidence")
+	if err := os.WriteFile(spoolFile, evidenceContent, 0o644); err != nil {
+		t.Fatalf("failed to write spool file: %v", err)
+	}
+
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("failed to open sqlite: %v", err)
+	}
+	_, err = db.Exec(`
+		CREATE TABLE target_commits (
+			chat_id TEXT NOT NULL,
+			message_id INTEGER NOT NULL,
+			save_path TEXT,
+			file_size INTEGER,
+			sha256 TEXT,
+			committed_at INTEGER,
+			PRIMARY KEY (chat_id, message_id)
+		);
+		INSERT INTO target_commits VALUES ('-10099', 1, 'vid.mp4', 100, 'hash', 1000);
+	`)
+	if err != nil {
+		t.Fatalf("failed to setup legacy table: %v", err)
+	}
+
+	// Lock table target_commits by holding an active read query in an explicit transaction
+	lockingDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("failed to open locking db: %v", err)
+	}
+	defer lockingDB.Close()
+
+	lockTx, err := lockingDB.Begin()
+	if err != nil {
+		t.Fatalf("failed to begin lock transaction: %v", err)
+	}
+	rows, err := lockTx.Query("SELECT * FROM target_commits")
+	if err != nil {
+		t.Fatalf("failed to query for lock: %v", err)
+	}
+	// Do not close rows or commit lockTx until migration run finishes
+
+	opts := migration.MigrationOptions{
+		DBPath:           dbPath,
+		BufferDir:        bufferDir,
+		DropLegacyTables: true,
+	}
+
+	// Running migration should stage files, but DROP TABLE target_commits will fail due to table lock!
+	report, runErr := migration.Run(context.Background(), opts)
+	_ = report
+
+	// Release lock now so we can verify DB
+	_ = rows.Close()
+	_ = lockTx.Rollback()
+	db.Close()
+
+	if runErr == nil {
+		t.Fatal("expected migration to fail when DROP TABLE is locked, got nil")
+	}
+
+	// Assert cross-resource failure atomicity:
+	// 1. Filesystem: The critical buffer file MUST still exist at its original path with matching content!
+	content, err := os.ReadFile(spoolFile)
+	if err != nil {
+		t.Fatalf("critical filesystem evidence was destroyed or missing after DB failure: %v", err)
+	}
+	if string(content) != string(evidenceContent) {
+		t.Fatalf("filesystem evidence corrupted! expected %q, got %q", string(evidenceContent), string(content))
+	}
+
+	// 2. Database: The legacy table MUST still exist!
+	verifyDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("failed to open sqlite for verification: %v", err)
+	}
+	defer verifyDB.Close()
+
+	var tblCount int
+	err = verifyDB.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='target_commits'").Scan(&tblCount)
+	if err != nil || tblCount != 1 {
+		t.Fatalf("legacy evidence was dropped! target_commits count: %d, err: %v", tblCount, err)
+	}
+}
