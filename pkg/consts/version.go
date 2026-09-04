@@ -5,6 +5,7 @@ var (
 	Version    = "dev"
 	Commit     = "unknown"
 	CommitDate = "unknown"
+	Dirty      = "false"
 )
 
 const FallbackVersion = "v4.4.20"

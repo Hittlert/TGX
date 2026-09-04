@@ -347,3 +347,24 @@ func TestWebServer_AddTargetPersistenceFailure(t *testing.T) {
 	}
 }
 
+func TestWebServer_StatusActiveFilesNeverNull(t *testing.T) {
+	registry := NewRegistry(5, 100, time.Now)
+	ws := NewWebServer(nil, nil, nil, nil, nil, nil, registry, zap.NewNop(), "")
+	handler := ws.Handler()
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/status", nil)
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", w.Code)
+	}
+	body := w.Body.String()
+	if strings.Contains(body, `"active_files":null`) {
+		t.Fatalf("active_files must not serialize as null, got: %s", body)
+	}
+	if !strings.Contains(body, `"active_files":[]`) {
+		t.Fatalf("active_files should serialize as empty slice [], got: %s", body)
+	}
+}
+

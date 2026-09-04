@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path"
@@ -77,6 +78,15 @@ type StatusSnapshot struct {
 	Pool         PoolSnapshot   `json:"pool"`
 	LastError    string         `json:"last_error"`
 	UpdatedAt    int64          `json:"updated_at"`
+}
+
+func (s StatusSnapshot) MarshalJSON() ([]byte, error) {
+	type Alias StatusSnapshot
+	aux := Alias(s)
+	if aux.ActiveFiles == nil {
+		aux.ActiveFiles = make([]TaskSnapshot, 0)
+	}
+	return json.Marshal(aux)
 }
 
 type byteRange struct {

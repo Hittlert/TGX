@@ -17,6 +17,9 @@ import (
 var version string
 
 func isSourceDirty() bool {
+	if consts.Dirty != "" {
+		return consts.Dirty == "true"
+	}
 	bi, ok := debug.ReadBuildInfo()
 	if !ok {
 		return false
