@@ -436,11 +436,25 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 					actualSHA, shaErr := computeFileSHA256(finalAbsPath)
 					if shaErr == nil && actualSHA == rec.SHA256 {
 						isVerified = true
-						_ = o.db.CompleteDownloadAndQueueArchive(
+						if err := o.db.CompleteExistingDownload(
 							chatID, msgID, gen, finalRelPath,
 							finInfo.Size(), actualSHA,
 							o.archiveWorker != nil && o.archiveWorker.IsEnabled(),
-						)
+						); err != nil {
+							o.logger.Error("failed to complete existing download in DB", zap.Error(err))
+							disp := FailureDisposition{
+								Stage:       "admission",
+								Op:          "db_complete_existing",
+								Class:       "db_conflict",
+								Unavailable: false,
+								Retryable:   false,
+								RetryOwner:  "none",
+								Message:     err.Error(),
+								Cause:       err,
+							}
+							task.FailDisposition(disp)
+							return
+						}
 						if o.archiveWorker != nil {
 							o.archiveWorker.Wake()
 						}

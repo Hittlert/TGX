@@ -952,8 +952,17 @@ func (d *Database) BeginDownload(chatID string, messageID int, generation string
 	if currentStatus == "success" {
 		return ErrAlreadySuccess
 	}
-	if currentStatus == "committing" && currentGen != generation && currentGen != "" {
-		return ErrStateConflict
+	if currentStatus == "unavailable" {
+		return fmt.Errorf("%w: cannot download unavailable message", ErrStateConflict)
+	}
+	if currentStatus == "committing" {
+		return fmt.Errorf("%w: message is currently committing", ErrStateConflict)
+	}
+	if currentStatus == "downloading" {
+		if currentGen == generation {
+			return nil // idempotent for same active attempt
+		}
+		return fmt.Errorf("%w: concurrent download active with gen %q vs %q", ErrStateConflict, currentGen, generation)
 	}
 
 	res, err := d.db.Exec(`
@@ -967,44 +976,41 @@ func (d *Database) BeginDownload(chatID string, messageID int, generation string
 			updated_at = ?,
 			processing_started_at = ?,
 			error = ''
-		WHERE chat_id = ? AND message_id = ? AND status != 'success'
+		WHERE chat_id = ? AND message_id = ?
+		  AND status IN ('pending', 'failed')
 	`, fileName, fileName, savePath, savePath, mediaType, mediaType, fileSize, fileSize, generation, now, now, chatID, messageID)
 	if err != nil {
 		return err
 	}
 	n, _ := res.RowsAffected()
 	if n == 0 {
-		return ErrStateConflict
+		return fmt.Errorf("%w: zero rows affected in BeginDownload", ErrStateConflict)
 	}
 	return nil
 }
 
 // PrepareDownloadCommit records durable intent to commit an SSD download before atomic rename.
-// Strictly validates generation and state transitions.
+// Strictly validates generation and state transitions: only 'downloading' + matching generation -> 'committing'.
 func (d *Database) PrepareDownloadCommit(chatID string, messageID int, generation string, relPath string, size int64, sha256Hex string) error {
 	d.lock.Lock()
 	defer d.lock.Unlock()
 
 	now := time.Now().Unix()
-	var currentStatus, currentGen, currentSHA string
+	var currentStatus, currentGen, currentSHA, currentPath string
+	var currentSize int64
 	err := d.db.QueryRow(`
-		SELECT status, COALESCE(attempt_generation, ''), COALESCE(sha256, '')
+		SELECT status, COALESCE(attempt_generation, ''), COALESCE(sha256, ''), COALESCE(save_path, ''), COALESCE(file_size, 0)
 		FROM download_records
 		WHERE chat_id = ? AND message_id = ?
-	`, chatID, messageID).Scan(&currentStatus, &currentGen, &currentSHA)
+	`, chatID, messageID).Scan(&currentStatus, &currentGen, &currentSHA, &currentPath, &currentSize)
 	if err == sql.ErrNoRows {
-		_, err = d.db.Exec(`
-			INSERT INTO download_records (
-				chat_id, message_id, status, save_path, file_size, sha256, attempt_generation, created_at, updated_at
-			) VALUES (?, ?, 'committing', ?, ?, ?, ?, ?, ?)
-		`, chatID, messageID, relPath, size, sha256Hex, generation, now, now)
-		return err
+		return fmt.Errorf("%w: record does not exist for PrepareDownloadCommit", ErrStateConflict)
 	} else if err != nil {
 		return err
 	}
 
-	// Idempotency: if already committing with same generation and sha256
-	if currentStatus == "committing" && currentGen == generation && currentSHA == sha256Hex {
+	// Idempotency: if already committing with same generation, path, size, and sha256
+	if currentStatus == "committing" && currentGen == generation && currentSHA == sha256Hex && currentPath == relPath && currentSize == size {
 		return nil
 	}
 	// If already success with same sha256
@@ -1012,11 +1018,11 @@ func (d *Database) PrepareDownloadCommit(chatID string, messageID int, generatio
 		return nil
 	}
 	// Generation guard: reject stale attempts
-	if currentGen != "" && generation != "" && currentGen != generation {
+	if currentGen != generation {
 		return fmt.Errorf("%w: record has gen %q, attempt has gen %q", ErrStaleAttempt, currentGen, generation)
 	}
-	// Terminal state guard: cannot transition from failed or unavailable directly to committing
-	if currentStatus == "failed" || currentStatus == "unavailable" {
+	// State guard: only downloading can transition to committing
+	if currentStatus != "downloading" {
 		return fmt.Errorf("%w: cannot transition from %q to committing", ErrStateConflict, currentStatus)
 	}
 
@@ -1026,10 +1032,11 @@ func (d *Database) PrepareDownloadCommit(chatID string, messageID int, generatio
 			save_path = ?,
 			file_size = ?,
 			sha256 = ?,
-			attempt_generation = ?,
 			updated_at = ?
-		WHERE chat_id = ? AND message_id = ? AND (attempt_generation = ? OR attempt_generation = '')
-	`, relPath, size, sha256Hex, generation, now, chatID, messageID, generation)
+		WHERE chat_id = ? AND message_id = ?
+		  AND status = 'downloading'
+		  AND attempt_generation = ?
+	`, relPath, size, sha256Hex, now, chatID, messageID, generation)
 	if err != nil {
 		return err
 	}
@@ -1042,7 +1049,7 @@ func (d *Database) PrepareDownloadCommit(chatID string, messageID int, generatio
 
 // CompleteDownloadAndQueueArchive atomically marks download_records.status='success'
 // and enqueues an archive_job when archive is enabled.
-// Strictly validates generation and state transitions, and preserves terminal archive states.
+// Strictly validates generation and state transitions: only 'committing' + current generation + matching proof -> 'success'.
 func (d *Database) CompleteDownloadAndQueueArchive(chatID string, messageID int, generation string, relPath string, size int64, sha256Hex string, queueArchive bool) error {
 	d.lock.Lock()
 	defer d.lock.Unlock()
@@ -1054,37 +1061,123 @@ func (d *Database) CompleteDownloadAndQueueArchive(chatID string, messageID int,
 	}
 	defer tx.Rollback()
 
-	// 1. Mark download_records success
-	var currentStatus, currentGen, currentSHA string
+	var currentStatus, currentGen, currentSHA, currentPath string
+	var currentSize int64
 	err = tx.QueryRow(`
-		SELECT status, COALESCE(attempt_generation, ''), COALESCE(sha256, '')
+		SELECT status, COALESCE(attempt_generation, ''), COALESCE(sha256, ''), COALESCE(save_path, ''), COALESCE(file_size, 0)
 		FROM download_records
 		WHERE chat_id = ? AND message_id = ?
-	`, chatID, messageID).Scan(&currentStatus, &currentGen, &currentSHA)
+	`, chatID, messageID).Scan(&currentStatus, &currentGen, &currentSHA, &currentPath, &currentSize)
+	if err == sql.ErrNoRows {
+		return fmt.Errorf("%w: record does not exist for CompleteDownload", ErrStateConflict)
+	} else if err != nil {
+		return err
+	}
+
+	if currentStatus == "success" {
+		if currentSHA != sha256Hex || currentPath != relPath || currentSize != size {
+			return fmt.Errorf("%w: already success with conflicting proof (sha: %q vs %q, size: %d vs %d, path: %q vs %q)",
+				ErrStateConflict, currentSHA, sha256Hex, currentSize, size, currentPath, relPath)
+		}
+		if queueArchive {
+			if queueErr := d.ensureArchiveJobLocked(tx, chatID, messageID, relPath, size, sha256Hex, now); queueErr != nil {
+				return queueErr
+			}
+		}
+		return tx.Commit()
+	}
+
+	// Generation guard
+	if currentGen != generation {
+		return fmt.Errorf("%w: record has gen %q, attempt has gen %q", ErrStaleAttempt, currentGen, generation)
+	}
+
+	// State guard: ONLY committing can transition to success!
+	if currentStatus != "committing" {
+		return fmt.Errorf("%w: cannot transition from %q to success (must be committing)", ErrStateConflict, currentStatus)
+	}
+
+	// Verify committed proof matches
+	if currentSHA != "" && currentSHA != sha256Hex {
+		return fmt.Errorf("%w: prepared sha %q does not match completion sha %q", ErrStateConflict, currentSHA, sha256Hex)
+	}
+	if currentPath != "" && currentPath != relPath {
+		return fmt.Errorf("%w: prepared path %q does not match completion path %q", ErrStateConflict, currentPath, relPath)
+	}
+	if currentSize > 0 && currentSize != size {
+		return fmt.Errorf("%w: prepared size %d does not match completion size %d", ErrStateConflict, currentSize, size)
+	}
+
+	res, err := tx.Exec(`
+		UPDATE download_records
+		SET status = 'success',
+			save_path = ?,
+			file_size = ?,
+			sha256 = ?,
+			downloaded_at = ?,
+			updated_at = ?,
+			error = ''
+		WHERE chat_id = ? AND message_id = ?
+		  AND status = 'committing'
+		  AND attempt_generation = ?
+	`, relPath, size, sha256Hex, now, now, chatID, messageID, generation)
+	if err != nil {
+		return fmt.Errorf("update download success: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("%w: zero rows affected in CompleteDownload", ErrStateConflict)
+	}
+
+	if queueArchive {
+		if queueErr := d.ensureArchiveJobLocked(tx, chatID, messageID, relPath, size, sha256Hex, now); queueErr != nil {
+			return queueErr
+		}
+	}
+
+	return tx.Commit()
+}
+
+// CompleteExistingDownload handles idempotent completion for pre-existing files on disk with verified SHA proof.
+func (d *Database) CompleteExistingDownload(chatID string, messageID int, generation string, relPath string, size int64, sha256Hex string, queueArchive bool) error {
+	d.lock.Lock()
+	defer d.lock.Unlock()
+
+	now := time.Now().Unix()
+	tx, err := d.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin complete existing tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	var currentStatus, currentGen, currentSHA, currentPath string
+	var currentSize int64
+	err = tx.QueryRow(`
+		SELECT status, COALESCE(attempt_generation, ''), COALESCE(sha256, ''), COALESCE(save_path, ''), COALESCE(file_size, 0)
+		FROM download_records
+		WHERE chat_id = ? AND message_id = ?
+	`, chatID, messageID).Scan(&currentStatus, &currentGen, &currentSHA, &currentPath, &currentSize)
 	if err == sql.ErrNoRows {
 		_, err = tx.Exec(`
 			INSERT INTO download_records (
-				chat_id, message_id, status, save_path, file_size, sha256, attempt_generation, downloaded_at, updated_at, error, created_at
+				chat_id, message_id, status, save_path, file_size, sha256,
+				attempt_generation, downloaded_at, updated_at, error, created_at
 			) VALUES (?, ?, 'success', ?, ?, ?, ?, ?, ?, '', ?)
 		`, chatID, messageID, relPath, size, sha256Hex, generation, now, now, now)
 		if err != nil {
-			return fmt.Errorf("insert download success: %w", err)
+			return fmt.Errorf("insert existing download success: %w", err)
 		}
 	} else if err != nil {
 		return err
 	} else {
-		if currentGen != "" && generation != "" && currentGen != generation {
-			return fmt.Errorf("%w: record has gen %q, attempt has gen %q", ErrStaleAttempt, currentGen, generation)
-		}
 		if currentStatus == "success" {
 			if currentSHA != "" && currentSHA != sha256Hex {
 				return fmt.Errorf("%w: already success with different sha %q vs %q", ErrStateConflict, currentSHA, sha256Hex)
 			}
-		} else {
-			if currentStatus != "committing" && currentStatus != "downloading" {
-				return fmt.Errorf("%w: cannot transition from %q to success", ErrStateConflict, currentStatus)
+		} else if currentStatus == "committing" || currentStatus == "downloading" {
+			if currentGen != "" && generation != "" && currentGen != generation {
+				return fmt.Errorf("%w: record has gen %q, attempt has gen %q", ErrStaleAttempt, currentGen, generation)
 			}
-
 			res, err := tx.Exec(`
 				UPDATE download_records
 				SET status = 'success',
@@ -1094,83 +1187,94 @@ func (d *Database) CompleteDownloadAndQueueArchive(chatID string, messageID int,
 					downloaded_at = ?,
 					updated_at = ?,
 					error = ''
-				WHERE chat_id = ? AND message_id = ? AND status IN ('committing', 'downloading')
-			`, relPath, size, sha256Hex, now, now, chatID, messageID)
+				WHERE chat_id = ? AND message_id = ?
+				  AND status IN ('committing', 'downloading')
+				  AND (attempt_generation = ? OR attempt_generation = '')
+			`, relPath, size, sha256Hex, now, now, chatID, messageID, generation)
 			if err != nil {
-				return fmt.Errorf("update download success: %w", err)
+				return fmt.Errorf("update existing download success: %w", err)
 			}
 			n, _ := res.RowsAffected()
 			if n == 0 {
-				return fmt.Errorf("%w: zero rows affected transitioning to success", ErrStateConflict)
+				return fmt.Errorf("%w: zero rows affected in CompleteExistingDownload", ErrStateConflict)
 			}
+		} else {
+			return fmt.Errorf("%w: cannot complete existing download from status %q", ErrStateConflict, currentStatus)
 		}
 	}
 
-	// 2. Archive handling (Issue #6: preserve terminal archive states across duplicate/late events)
 	if queueArchive {
-		var arcState, arcSHA string
-		err = tx.QueryRow(`SELECT state, sha256 FROM archive_jobs WHERE chat_id = ? AND message_id = ?`, chatID, messageID).Scan(&arcState, &arcSHA)
-		if err == sql.ErrNoRows {
-			_, err = tx.Exec(`
-				INSERT INTO archive_jobs (
-					chat_id, message_id, relative_path, expected_size, sha256,
-					state, attempts, next_retry_at, created_at, updated_at
-				) VALUES (?, ?, ?, ?, ?, 'pending', 0, 0, ?, ?)
-			`, chatID, messageID, relPath, size, sha256Hex, now, now)
-			if err != nil {
-				return fmt.Errorf("insert archive job: %w", err)
-			}
-		} else if err != nil {
-			return err
-		} else {
-			switch arcState {
-			case "archived":
-				if arcSHA != sha256Hex {
-					_, err = tx.Exec(`
-						UPDATE archive_jobs
-						SET state = 'conflict',
-							last_error = 'archive checksum mismatch on duplicate complete',
-							updated_at = ?
-						WHERE chat_id = ? AND message_id = ?
-					`, now, chatID, messageID)
-					if err != nil {
-						return fmt.Errorf("set archive conflict: %w", err)
-					}
-				}
-				// If sha matches, preserve terminal 'archived' state! Never reset to pending!
-			case "conflict":
-				// Already conflict: do not overwrite
-			case "copying":
-				_, err = tx.Exec(`
-					UPDATE archive_jobs
-					SET relative_path = ?,
-						expected_size = ?,
-						sha256 = ?,
-						updated_at = ?
-					WHERE chat_id = ? AND message_id = ?
-				`, relPath, size, sha256Hex, now, chatID, messageID)
-				if err != nil {
-					return fmt.Errorf("update copying archive job: %w", err)
-				}
-			default:
-				_, err = tx.Exec(`
-					UPDATE archive_jobs
-					SET relative_path = ?,
-						expected_size = ?,
-						sha256 = ?,
-						state = 'pending',
-						next_retry_at = 0,
-						updated_at = ?
-					WHERE chat_id = ? AND message_id = ?
-				`, relPath, size, sha256Hex, now, chatID, messageID)
-				if err != nil {
-					return fmt.Errorf("update pending archive job: %w", err)
-				}
-			}
+		if queueErr := d.ensureArchiveJobLocked(tx, chatID, messageID, relPath, size, sha256Hex, now); queueErr != nil {
+			return queueErr
 		}
 	}
 
 	return tx.Commit()
+}
+
+func (d *Database) ensureArchiveJobLocked(tx *sql.Tx, chatID string, messageID int, relPath string, size int64, sha256Hex string, now int64) error {
+	var arcState, arcSHA string
+	err := tx.QueryRow(`SELECT state, sha256 FROM archive_jobs WHERE chat_id = ? AND message_id = ?`, chatID, messageID).Scan(&arcState, &arcSHA)
+	if err == sql.ErrNoRows {
+		_, err = tx.Exec(`
+			INSERT INTO archive_jobs (
+				chat_id, message_id, relative_path, expected_size, sha256,
+				state, attempts, next_retry_at, created_at, updated_at
+			) VALUES (?, ?, ?, ?, ?, 'pending', 0, 0, ?, ?)
+		`, chatID, messageID, relPath, size, sha256Hex, now, now)
+		if err != nil {
+			return fmt.Errorf("insert archive job: %w", err)
+		}
+		return nil
+	} else if err != nil {
+		return err
+	}
+
+	switch arcState {
+	case "archived":
+		if arcSHA != sha256Hex {
+			_, err = tx.Exec(`
+				UPDATE archive_jobs
+				SET state = 'conflict',
+					last_error = 'archive checksum mismatch on duplicate complete',
+					updated_at = ?
+				WHERE chat_id = ? AND message_id = ?
+			`, now, chatID, messageID)
+			if err != nil {
+				return fmt.Errorf("set archive conflict: %w", err)
+			}
+		}
+		// If sha matches, preserve terminal 'archived' state! Never reset to pending!
+	case "conflict":
+		// Already conflict: do not overwrite
+	case "copying":
+		_, err = tx.Exec(`
+			UPDATE archive_jobs
+			SET relative_path = ?,
+				expected_size = ?,
+				sha256 = ?,
+				updated_at = ?
+			WHERE chat_id = ? AND message_id = ?
+		`, relPath, size, sha256Hex, now, chatID, messageID)
+		if err != nil {
+			return fmt.Errorf("update copying archive job: %w", err)
+		}
+	default:
+		_, err = tx.Exec(`
+			UPDATE archive_jobs
+			SET relative_path = ?,
+				expected_size = ?,
+				sha256 = ?,
+				state = 'pending',
+				next_retry_at = 0,
+				updated_at = ?
+			WHERE chat_id = ? AND message_id = ?
+		`, relPath, size, sha256Hex, now, chatID, messageID)
+		if err != nil {
+			return fmt.Errorf("update pending archive job: %w", err)
+		}
+	}
+	return nil
 }
 
 // GetDueArchiveJobs retrieves pending archive jobs that are ready to run.
@@ -1378,7 +1482,7 @@ func (d *Database) FailDownload(chatID string, messageID int, generation string,
 		nextRetryAt = now + 86400*7
 	}
 
-	_, err = d.db.Exec(`
+	res, err := d.db.Exec(`
 		UPDATE download_records
 		SET status = ?,
 			file_name = CASE WHEN ? != '' THEN ? ELSE file_name END,
@@ -1389,10 +1493,48 @@ func (d *Database) FailDownload(chatID string, messageID int, generation string,
 			attempts = CASE WHEN ? = 'failed' THEN attempts + 1 ELSE attempts END,
 			next_retry_at = ?,
 			updated_at = ?
-		WHERE chat_id = ? AND message_id = ? AND status != 'success'
+		WHERE chat_id = ? AND message_id = ?
+		  AND status != 'success'
+		  AND (attempt_generation = ? OR attempt_generation = '')
 	`, status, fileName, fileName, savePath, savePath, mediaType, mediaType, fileSize, fileSize,
-		errMsg, status, nextRetryAt, now, chatID, messageID)
-	return err
+		errMsg, status, nextRetryAt, now, chatID, messageID, generation)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("%w: zero rows affected in FailDownload", ErrStaleAttempt)
+	}
+	return nil
+}
+
+// CancelDownload transitions an active download to 'failed' due to cancellation,
+// conditional on the matching attempt generation and current non-terminal state.
+func (d *Database) CancelDownload(chatID string, messageID int, generation string, reason string) error {
+	d.lock.Lock()
+	defer d.lock.Unlock()
+
+	now := time.Now().Unix()
+	if reason == "" {
+		reason = "task canceled"
+	}
+	res, err := d.db.Exec(`
+		UPDATE download_records
+		SET status = 'failed',
+			error = ?,
+			updated_at = ?
+		WHERE chat_id = ? AND message_id = ?
+		  AND status IN ('pending', 'downloading', 'committing')
+		  AND (attempt_generation = ? OR attempt_generation = '')
+	`, reason, now, chatID, messageID, generation)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("%w: zero rows affected in CancelDownload", ErrStateConflict)
+	}
+	return nil
 }
 
 // GetArchiveStats returns the aggregate archive queue status.
