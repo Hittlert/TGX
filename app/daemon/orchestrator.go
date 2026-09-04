@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/flytam/filenamify"
@@ -30,9 +31,11 @@ type Orchestrator struct {
 	logger        *zap.Logger
 	saveDir       string
 
-	runningMu sync.Mutex
-	running   bool
-	inFlight  sync.Map
+	runningMu     sync.Mutex
+	running       bool
+	inFlight      sync.Map
+	activeTasks   int64
+	taskSlotFreed chan struct{}
 }
 
 // NewOrchestrator creates a new direct-SSD download orchestrator.
@@ -47,15 +50,16 @@ func NewOrchestrator(
 	saveDir string,
 ) *Orchestrator {
 	return &Orchestrator{
-		db:           db,
-		transferMgr:  transferMgr,
-		ssdAdmission: ssdAdmission,
-		proxyManager: proxyManager,
-		access:       access,
-		registry:     registry,
-		logger:       logger,
-		saveDir:      saveDir,
-		running:      true,
+		db:            db,
+		transferMgr:   transferMgr,
+		ssdAdmission:  ssdAdmission,
+		proxyManager:  proxyManager,
+		access:        access,
+		registry:      registry,
+		logger:        logger,
+		saveDir:       saveDir,
+		running:       true,
+		taskSlotFreed: make(chan struct{}, 64),
 	}
 }
 
@@ -108,16 +112,15 @@ func (p PathPlanner) Plan(peer string, channelTitle string, msgID int, rawName s
 
 // Start launches the background orchestrator loops.
 func (o *Orchestrator) Start(ctx context.Context) {
-	poolSize := 64
-	for i := 0; i < poolSize; i++ {
-		go o.worker(ctx)
+	if o.taskSlotFreed == nil {
+		o.taskSlotFreed = make(chan struct{}, 64)
 	}
-
+	go o.dispatchLoop(ctx)
 	go o.scanLoop(ctx)
 	go o.metricsLoop(ctx)
 }
 
-func (o *Orchestrator) worker(ctx context.Context) {
+func (o *Orchestrator) dispatchLoop(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -130,9 +133,20 @@ func (o *Orchestrator) worker(ctx context.Context) {
 			continue
 		}
 
-		if o.transferMgr != nil && int(o.transferMgr.ActiveFiles()) >= o.transferMgr.FileConcurrency() {
-			time.Sleep(25 * time.Millisecond)
-			continue
+		maxConc := 5
+		if o.transferMgr != nil && o.transferMgr.FileConcurrency() > 0 {
+			maxConc = o.transferMgr.FileConcurrency()
+		}
+
+		if int(atomic.LoadInt64(&o.activeTasks)) >= maxConc {
+			select {
+			case <-ctx.Done():
+				return
+			case <-o.taskSlotFreed:
+				continue
+			case <-time.After(25 * time.Millisecond):
+				continue
+			}
 		}
 
 		task, err := o.registry.Next(ctx)
@@ -144,8 +158,25 @@ func (o *Orchestrator) worker(ctx context.Context) {
 			continue
 		}
 
-		o.downloadOne(ctx, task)
+		atomic.AddInt64(&o.activeTasks, 1)
+		go func(t *Task) {
+			defer func() {
+				atomic.AddInt64(&o.activeTasks, -1)
+				if o.taskSlotFreed != nil {
+					select {
+					case o.taskSlotFreed <- struct{}{}:
+					default:
+					}
+				}
+			}()
+			o.downloadOne(ctx, t)
+		}(task)
 	}
+}
+
+// ActiveTasks returns the number of tasks currently in-flight in the orchestrator pipeline.
+func (o *Orchestrator) ActiveTasks() int64 {
+	return atomic.LoadInt64(&o.activeTasks)
 }
 
 func (o *Orchestrator) metricsLoop(ctx context.Context) {

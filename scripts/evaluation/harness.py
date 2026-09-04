@@ -68,7 +68,7 @@ def write_jsonl(path, records):
             stream.write(json.dumps(record, sort_keys=True) + "\n")
 
 
-def http_json(url, method="GET", data=None, timeout=5):
+def http_json(url, method="GET", data=None, timeout=5, retries=1):
     body = None if data is None else json.dumps(data).encode("utf-8")
     request = urllib.request.Request(
         url,
@@ -79,8 +79,16 @@ def http_json(url, method="GET", data=None, timeout=5):
             "User-Agent": "TGX-Protocol-Harness/1.0",
         },
     )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return json.loads(response.read().decode("utf-8"))
+    last_err = None
+    for attempt in range(retries + 1):
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except Exception as err:
+            last_err = err
+            if attempt < retries:
+                time.sleep(0.1)
+    raise last_err
 
 
 def http_ok(url, timeout=5):
@@ -324,7 +332,7 @@ class MetricsSampler(threading.Thread):
             "collection_errors": [],
         }
         try:
-            status = http_json(f"{self.api_base}/api/status", timeout=1.5)
+            status = http_json(f"{self.api_base}/api/status", timeout=3.0, retries=1)
             record["rolling_5s_bps"] = status.get("rolling_5s_bps") or 0
             record["queued_jobs"] = status.get("queue_depth") or 0
             active_files = status.get("active_files")
@@ -344,7 +352,7 @@ class MetricsSampler(threading.Thread):
 
         if self.engine == "tgx":
             try:
-                gate = http_json(f"{self.api_base}/api/gate", timeout=1.5)
+                gate = http_json(f"{self.api_base}/api/gate", timeout=3.0, retries=1)
                 val = gate.get("data_in_flight")
                 record["active_rpc"] = val if val is not None else 0
                 val = gate.get("ssd_reserved_bytes")
@@ -357,7 +365,7 @@ class MetricsSampler(threading.Thread):
                 )
             try:
                 storage = http_json(
-                    f"{self.api_base}/api/system/storage", timeout=1.5
+                    f"{self.api_base}/api/system/storage", timeout=3.0, retries=1
                 )
                 val = storage.get("free_bytes")
                 record["ssd_free_bytes"] = val if val is not None else 0
