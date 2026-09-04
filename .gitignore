@@ -98,3 +98,4 @@ htmlcov/
 *.swp
 *.swo
 bin/
+telegram-downloader
