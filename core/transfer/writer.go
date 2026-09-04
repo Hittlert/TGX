@@ -100,6 +100,7 @@ type CountingWriterAt struct {
 	mu         sync.Mutex
 	maxWritten int64
 	downloaded int64
+	writeErr   error
 }
 
 // NewCountingWriterAt creates a thread-safe progress reporter and range tracker wrapping w.
@@ -115,6 +116,13 @@ func NewCountingWriterAt(w io.WriterAt, totalSize int64, onProgress func(downloa
 // WriteAt delegates to the underlying io.WriterAt and records written bytes.
 func (c *CountingWriterAt) WriteAt(p []byte, off int64) (n int, err error) {
 	n, err = c.w.WriteAt(p, off)
+	if err != nil {
+		c.mu.Lock()
+		if c.writeErr == nil {
+			c.writeErr = err
+		}
+		c.mu.Unlock()
+	}
 	if n > 0 {
 		c.tracker.AddRange(off, off+int64(n))
 		curr := atomic.AddInt64(&c.downloaded, int64(n))
@@ -128,6 +136,13 @@ func (c *CountingWriterAt) WriteAt(p []byte, off int64) (n int, err error) {
 		}
 	}
 	return n, err
+}
+
+// WriteErr returns the first error returned by the underlying WriterAt, if any.
+func (c *CountingWriterAt) WriteErr() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.writeErr
 }
 
 // Downloaded returns total bytes written so far.

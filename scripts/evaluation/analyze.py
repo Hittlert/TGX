@@ -161,12 +161,8 @@ def _longest_zero_seconds(metrics):
         busy = (record.get("active_files") or 0) > 0 or (
             record.get("queued_jobs") or 0
         ) > 0
-        unexplained = (
-            busy
-            and record.get("rolling_5s_bps") == 0
-            and (record.get("active_rpc") or 0) == 0
-        )
-        if unexplained:
+        stall = busy and (record.get("rolling_5s_bps") or 0) == 0
+        if stall:
             current += delta
             longest = max(longest, current)
         else:
@@ -448,10 +444,15 @@ def evaluate_policy(run_root, policy_path, overwrite=False):
     zero_speed_samples = sum(
         1
         for record in busy_metrics
-        if record.get("rolling_5s_bps") == 0 and (record.get("active_rpc") or 0) == 0
+        if (record.get("rolling_5s_bps") or 0) == 0
     )
     zero_speed_fraction = (
         zero_speed_samples / len(busy_metrics) if busy_metrics else 0.0
+    )
+    zero_speed_with_active_rpc_samples = sum(
+        1
+        for record in busy_metrics
+        if (record.get("rolling_5s_bps") or 0) == 0 and (record.get("active_rpc") or 0) > 0
     )
     stability = policy.get("stability", {})
     longest_zero_seconds = _longest_zero_seconds(measurement_metrics)
@@ -563,6 +564,7 @@ def evaluate_policy(run_root, policy_path, overwrite=False):
         "golden_attested_case_ids": golden_attested_case_ids,
         "maximum_zero_speed_seconds": round(longest_zero_seconds, 3),
         "zero_speed_fraction": round(zero_speed_fraction, 4),
+        "zero_speed_with_active_rpc_samples": zero_speed_with_active_rpc_samples,
         "error_count": len(errors),
         "invalid_reasons": invalid_reasons,
         "blocked_reasons": blocked_reasons,

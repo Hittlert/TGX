@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"io"
 	"sync"
 	"testing"
@@ -334,5 +335,148 @@ func TestGatedClient_InvokerAndCDN(t *testing.T) {
 	}
 	_ = closer.Close()
 }
+
+type failingWriterAt struct {
+	mu         sync.Mutex
+	writeCalls int
+	err        error
+}
+
+func (f *failingWriterAt) WriteAt(p []byte, off int64) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.writeCalls++
+	return 0, f.err
+}
+
+func TestDownloadFile_PermanentWriterError_ClassifiedAsIO(t *testing.T) {
+	mgr := NewTransferManager(Options{
+		MaxFileThreads: 1,
+	})
+
+	fake := &fakeClient{
+		data:     make([]byte, GotdPartSize),
+		partSize: GotdPartSize,
+	}
+	location := &tg.InputDocumentFileLocation{ID: 1, AccessHash: 2}
+
+	expectedErr := io.ErrUnexpectedEOF
+	failWriter := &failingWriterAt{err: expectedErr}
+
+	_, err := mgr.DownloadFile(
+		context.Background(),
+		fake,
+		location,
+		int64(len(fake.data)),
+		failWriter,
+		nil,
+	)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+
+	var tErr *TransferError
+	if !errors.As(err, &tErr) {
+		t.Fatalf("expected TransferError, got %T: %v", err, err)
+	}
+
+	if tErr.Class != "io" {
+		t.Errorf("expected Class 'io', got %q", tErr.Class)
+	}
+	if tErr.Op != "write_chunk" {
+		t.Errorf("expected Op 'write_chunk', got %q", tErr.Op)
+	}
+	if tErr.Retryable {
+		t.Error("expected Retryable to be false for permanent I/O error")
+	}
+	if tErr.RetryOwner != "none" {
+		t.Errorf("expected RetryOwner 'none', got %q", tErr.RetryOwner)
+	}
+	if !errors.Is(tErr.Cause, expectedErr) {
+		t.Errorf("expected Cause %v, got %v", expectedErr, tErr.Cause)
+	}
+}
+
+func TestDownloadFile_IncompleteCoverage_ClassifiedAsCorrupt(t *testing.T) {
+	mgr := NewTransferManager(Options{
+		MaxFileThreads: 2,
+	})
+
+	// fake client with less data than expectedSize
+	fake := &fakeClient{
+		data:     []byte("short"),
+		partSize: GotdPartSize,
+	}
+	location := &tg.InputDocumentFileLocation{ID: 1, AccessHash: 2}
+	mem := &MemoryWriterAt{buf: make([]byte, 1024)}
+
+	_, err := mgr.DownloadFile(
+		context.Background(),
+		fake,
+		location,
+		1024,
+		mem,
+		nil,
+	)
+	if err == nil {
+		t.Fatal("expected error for incomplete coverage, got nil")
+	}
+
+	var tErr *TransferError
+	if !errors.As(err, &tErr) {
+		t.Fatalf("expected TransferError, got %T: %v", err, err)
+	}
+
+	if tErr.Class != "corrupt" {
+		t.Errorf("expected Class 'corrupt', got %q", tErr.Class)
+	}
+	if tErr.Op != "verify_coverage" {
+		t.Errorf("expected Op 'verify_coverage', got %q", tErr.Op)
+	}
+	if tErr.Retryable {
+		t.Error("expected Retryable to be false for corrupt coverage")
+	}
+}
+
+func TestDownloadFile_CanceledContext_ClassifiedAsCanceled(t *testing.T) {
+	mgr := NewTransferManager(Options{
+		MaxFileThreads: 1,
+	})
+
+	fake := &fakeClient{
+		data:     make([]byte, GotdPartSize),
+		partSize: GotdPartSize,
+	}
+	location := &tg.InputDocumentFileLocation{ID: 1, AccessHash: 2}
+	mem := &MemoryWriterAt{buf: make([]byte, GotdPartSize)}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // canceled immediately
+
+	_, err := mgr.DownloadFile(
+		ctx,
+		fake,
+		location,
+		GotdPartSize,
+		mem,
+		nil,
+	)
+	if err == nil {
+		t.Fatal("expected error for canceled context, got nil")
+	}
+
+	var tErr *TransferError
+	if !errors.As(err, &tErr) {
+		t.Fatalf("expected TransferError, got %T: %v", err, err)
+	}
+
+	if tErr.Class != "canceled" {
+		t.Errorf("expected Class 'canceled', got %q", tErr.Class)
+	}
+	if tErr.Retryable {
+		t.Error("expected Retryable to be false for cancellation")
+	}
+}
+
 
 

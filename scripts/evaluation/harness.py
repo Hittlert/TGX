@@ -154,15 +154,6 @@ def parse_binary_version(output):
 
     if metadata["version"] == "unknown" and metadata.get("tdl_revision"):
         metadata["version"] = metadata["tdl_revision"]
-    if metadata.get("tdl_revision"):
-        if metadata["os"] == "unknown":
-            metadata["os"] = "linux"
-        if metadata["arch"] == "unknown":
-            metadata["arch"] = "amd64"
-        if metadata["build_time"] == "unknown":
-            metadata["build_time"] = "tdl_release"
-    if metadata["source_dirty"] is None and metadata["source_commit"] != "unknown":
-        metadata["source_dirty"] = False
     return metadata
 
 
@@ -333,18 +324,22 @@ class MetricsSampler(threading.Thread):
         }
         try:
             status = http_json(f"{self.api_base}/api/status", timeout=3.0, retries=1)
-            record["rolling_5s_bps"] = status.get("rolling_5s_bps") or 0
-            record["queued_jobs"] = status.get("queue_depth") or 0
+            record["rolling_5s_bps"] = status.get("rolling_5s_bps")
+            record["queued_jobs"] = status.get("queue_depth")
             active_files = status.get("active_files")
             if isinstance(active_files, list):
                 record["active_files"] = len(active_files)
             elif isinstance(active_files, (int, float)):
                 record["active_files"] = int(active_files)
             else:
-                record["active_files"] = 0
-            pool = status.get("pool") or {}
-            record["connection_count"] = pool.get("size") or 0
-            record["connection_failures"] = pool.get("reconnects") or 0
+                record["active_files"] = None
+            pool = status.get("pool")
+            if isinstance(pool, dict):
+                record["connection_count"] = pool.get("size")
+                record["connection_failures"] = pool.get("reconnects")
+            else:
+                record["connection_count"] = None
+                record["connection_failures"] = None
         except Exception as error:
             record["collection_errors"].append(
                 {"source": "/api/status", "error": str(error)}
@@ -353,12 +348,9 @@ class MetricsSampler(threading.Thread):
         if self.engine == "tgx":
             try:
                 gate = http_json(f"{self.api_base}/api/gate", timeout=3.0, retries=1)
-                val = gate.get("data_in_flight")
-                record["active_rpc"] = val if val is not None else 0
-                val = gate.get("ssd_reserved_bytes")
-                record["ssd_reserved_bytes"] = val if val is not None else 0
-                val = gate.get("ssd_available_bytes")
-                record["ssd_available_bytes"] = val if val is not None else 0
+                record["active_rpc"] = gate.get("data_in_flight")
+                record["ssd_reserved_bytes"] = gate.get("ssd_reserved_bytes")
+                record["ssd_available_bytes"] = gate.get("ssd_available_bytes")
             except Exception as error:
                 record["collection_errors"].append(
                     {"source": "/api/gate", "error": str(error)}
@@ -367,22 +359,28 @@ class MetricsSampler(threading.Thread):
                 storage = http_json(
                     f"{self.api_base}/api/system/storage", timeout=3.0, retries=1
                 )
-                val = storage.get("free_bytes")
-                record["ssd_free_bytes"] = val if val is not None else 0
-                val = storage.get("total_bytes")
-                record["ssd_total_bytes"] = val if val is not None else 0
-                val = storage.get("used_bytes")
-                record["ssd_used_bytes"] = val if val is not None else 0
-                archive = storage.get("archive") or {}
-                for field in (
-                    "archive_backlog_files",
-                    "archive_backlog_bytes",
-                    "archive_active_workers",
-                    "archive_archived_files",
-                    "archive_conflict_count",
-                ):
-                    fval = archive.get(field)
-                    record[field] = fval if fval is not None else 0
+                record["ssd_free_bytes"] = storage.get("free_bytes")
+                record["ssd_total_bytes"] = storage.get("total_bytes")
+                record["ssd_used_bytes"] = storage.get("used_bytes")
+                archive = storage.get("archive")
+                if isinstance(archive, dict):
+                    for field in (
+                        "archive_backlog_files",
+                        "archive_backlog_bytes",
+                        "archive_active_workers",
+                        "archive_archived_files",
+                        "archive_conflict_count",
+                    ):
+                        record[field] = archive.get(field)
+                else:
+                    for field in (
+                        "archive_backlog_files",
+                        "archive_backlog_bytes",
+                        "archive_active_workers",
+                        "archive_archived_files",
+                        "archive_conflict_count",
+                    ):
+                        record[field] = None
             except Exception as error:
                 record["collection_errors"].append(
                     {"source": "/api/system/storage", "error": str(error)}
@@ -623,7 +621,7 @@ def append_run_error(writer, error_code, cause, op):
     )
 
 
-def wait_for_measurement(engine, cases, duration, events):
+def wait_for_measurement(engine, cases, duration, events, task_submits=None):
     deadline = time.monotonic() + duration
     while time.monotonic() < deadline:
         time.sleep(min(2, max(0, deadline - time.monotonic())))
@@ -631,7 +629,7 @@ def wait_for_measurement(engine, cases, duration, events):
             status = http_json(f"{engine.api_base}/api/status")
             active = len(status.get("active_files") or [])
             queued = status.get("queue_depth", 0)
-            speed = status.get("rolling_5s_bps", 0) * 8 / (1024 * 1024)
+            speed = (status.get("rolling_5s_bps") or 0) * 8 / (1024 * 1024)
             print(
                 f"Active={active} Queue={queued} Speed={speed:.2f} Mbps",
                 flush=True,
@@ -643,9 +641,21 @@ def wait_for_measurement(engine, cases, duration, events):
                     res = http_json(f"{engine.api_base}/api/tasks")
                     if isinstance(res, list):
                         tasks = res
+                    elif isinstance(res, dict) and "tasks" in res and isinstance(res["tasks"], list):
+                        tasks = res["tasks"]
                 except Exception:
                     pass
-                if engine.run_spec.get("engine") == "tdl" or (
+                if not tasks and task_submits:
+                    for task_info in task_submits.values():
+                        tid = task_info.get("task_id")
+                        if tid:
+                            try:
+                                snap = http_json(f"{engine.api_base}/api/tasks/{tid}")
+                                if isinstance(snap, dict) and snap.get("id"):
+                                    tasks.append(snap)
+                            except Exception:
+                                pass
+                if (
                     tasks
                     and sum(
                         task.get("state") in terminal
@@ -721,7 +731,7 @@ def classify_results(cases, engine_name, paths, task_submits, engine_tasks, time
             error_cause = snapshot.get("error") or "task canceled"
         elif timed_out and (
             state in ("queued", "resolving", "downloading")
-            or run_spec.get("engine") == "tdl"
+            or engine_name == "tdl"
         ):
             terminal_state = "TIMED_OUT"
             error_code = "TIMED_OUT"
@@ -960,6 +970,7 @@ def execute_run(run_spec, engine_binary, eval_dir, host_port=5890):
                     cases,
                     run_spec["duration_seconds"],
                     events,
+                    task_submits=task_submits,
                 )
                 try:
                     http_json(

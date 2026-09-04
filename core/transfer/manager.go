@@ -8,6 +8,7 @@ import (
 
 	"github.com/gotd/td/telegram/downloader"
 	"github.com/gotd/td/tg"
+	"github.com/gotd/td/tgerr"
 )
 
 const (
@@ -16,6 +17,31 @@ const (
 	GotdPartSize           = 512 * 1024 // 512 KiB gotd protocol chunk size
 )
 
+// TransferError preserves classified failure semantics across the transfer boundary.
+type TransferError struct {
+	Stage       string `json:"stage"`
+	Op          string `json:"op"`
+	Class       string `json:"class"`
+	Unavailable bool   `json:"unavailable"`
+	Retryable   bool   `json:"retryable"`
+	RetryOwner  string `json:"retry_owner"`
+	Cause       error  `json:"-"`
+}
+
+func (e *TransferError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return fmt.Sprintf("[%s:%s] %s (owner: %s): %v", e.Stage, e.Op, e.Class, e.RetryOwner, e.Cause)
+}
+
+func (e *TransferError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Cause
+}
+
 // TransferManager manages gotd parallel transport and global RPC rate limits.
 type TransferManager struct {
 	fileCapacity   int64
@@ -23,6 +49,7 @@ type TransferManager struct {
 	maxFileThreads int
 	gate           *DataGate
 	downloader     *downloader.Downloader
+	physicalRetries int64
 }
 
 // Options configures the TransferManager.
@@ -46,20 +73,34 @@ func NewTransferManager(opts Options) *TransferManager {
 	}
 
 	gate := NewDataGate(opts.MaxDataInFlight)
+	mgr := &TransferManager{
+		fileCapacity:   int64(opts.FileConcurrency),
+		maxFileThreads: opts.MaxFileThreads,
+		gate:           gate,
+	}
+
 	dl := downloader.NewDownloader().
 		WithPartSize(GotdPartSize).
 		WithAllowCDN(true)
 
-	if opts.RetryHandler != nil {
-		dl = dl.WithRetryHandler(opts.RetryHandler)
-	}
+	userRetry := opts.RetryHandler
+	dl = dl.WithRetryHandler(func(event downloader.RetryEvent) {
+		atomic.AddInt64(&mgr.physicalRetries, 1)
+		if userRetry != nil {
+			userRetry(event)
+		}
+	})
+	mgr.downloader = dl
 
-	return &TransferManager{
-		fileCapacity:   int64(opts.FileConcurrency),
-		maxFileThreads: opts.MaxFileThreads,
-		gate:           gate,
-		downloader:     dl,
+	return mgr
+}
+
+// PhysicalRetries returns the total number of transient retries executed by gotd.
+func (m *TransferManager) PhysicalRetries() int64 {
+	if m == nil {
+		return 0
 	}
+	return atomic.LoadInt64(&m.physicalRetries)
 }
 
 // Gate returns the underlying DataGate.
@@ -135,12 +176,62 @@ func (m *TransferManager) DownloadFile(
 	_, err := builder.Parallel(ctx, writer)
 	downloaded := writer.Downloaded()
 	if err != nil {
-		return downloaded, fmt.Errorf("gotd parallel download: %w", err)
+		if writeErr := writer.WriteErr(); writeErr != nil {
+			return downloaded, &TransferError{
+				Stage:       "transfer",
+				Op:          "write_chunk",
+				Class:       "io",
+				Unavailable: false,
+				Retryable:   false,
+				RetryOwner:  "none",
+				Cause:       writeErr,
+			}
+		}
+		if ctx.Err() != nil {
+			return downloaded, &TransferError{
+				Stage:       "transfer",
+				Op:          "download",
+				Class:       "canceled",
+				Unavailable: false,
+				Retryable:   false,
+				RetryOwner:  "none",
+				Cause:       ctx.Err(),
+			}
+		}
+		if tgerr.Is(err, "FILE_REFERENCE_EXPIRED", "FILEREF_INVALID", "FILE_ID_INVALID", "LOCATION_INVALID") {
+			return downloaded, &TransferError{
+				Stage:       "transfer",
+				Op:          "download",
+				Class:       "unavailable",
+				Unavailable: true,
+				Retryable:   false,
+				RetryOwner:  "none",
+				Cause:       err,
+			}
+		}
+		return downloaded, &TransferError{
+			Stage:       "transfer",
+			Op:          "download",
+			Class:       "network",
+			Unavailable: false,
+			Retryable:   false,
+			RetryOwner:  "gotd",
+			Cause:       err,
+		}
 	}
 
 	if expectedSize > 0 && !writer.IsComplete(expectedSize) {
 		covered := writer.CoveredBytes()
-		return downloaded, fmt.Errorf("incomplete download coverage: covered %d of %d expected bytes", covered, expectedSize)
+		covErr := fmt.Errorf("incomplete download coverage: covered %d of %d expected bytes", covered, expectedSize)
+		return downloaded, &TransferError{
+			Stage:       "transfer",
+			Op:          "verify_coverage",
+			Class:       "corrupt",
+			Unavailable: false,
+			Retryable:   false,
+			RetryOwner:  "none",
+			Cause:       covErr,
+		}
 	}
 
 	return downloaded, nil

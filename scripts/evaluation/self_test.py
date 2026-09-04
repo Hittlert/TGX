@@ -8,8 +8,20 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from analyze import RAW_ARTIFACTS, compute_sha256, evaluate_policy, seal_raw_directory
-from harness import MetricsSampler, ensure_new_directory
+from analyze import (
+    RAW_ARTIFACTS,
+    _longest_zero_seconds,
+    compute_sha256,
+    evaluate_policy,
+    seal_raw_directory,
+)
+from harness import (
+    MetricsSampler,
+    classify_results,
+    ensure_new_directory,
+    validate_artifact,
+    wait_for_measurement,
+)
 from manifest_generator import generate_profile_manifest
 from run_protocol_v1 import build_run_spec, validate_run_spec_shape
 
@@ -498,6 +510,140 @@ class EvaluationSelfTest(unittest.TestCase):
             seal_raw_directory(raw)
             summary = evaluate_policy(run_root, POLICY_PATH)
             self.assertEqual("NO-GO", summary["verdict"])
+
+    def test_tdl_timeout_classification_without_exception(self):
+        class MockPaths:
+            def __init__(self, temp_dir):
+                self.output = Path(temp_dir)
+
+        with tempfile.TemporaryDirectory() as temp:
+            paths = MockPaths(temp)
+            cases = [
+                {
+                    "case_id": "P-S-0001",
+                    "expected_tgx_path": "tgx/P-S-0001.bin",
+                    "expected_tdl_path": "tdl/P-S-0001.bin",
+                    "expected_size": 1024,
+                    "baseline_sha256": "a" * 64,
+                }
+            ]
+            task_submits = {
+                "P-S-0001": {"task_id": "task-1", "submitted": True, "error": None}
+            }
+            engine_tasks = {}
+            results, hashes, errors = classify_results(
+                cases=cases,
+                engine_name="tdl",
+                paths=paths,
+                task_submits=task_submits,
+                engine_tasks=engine_tasks,
+                timed_out=True,
+            )
+            self.assertEqual(1, len(results))
+            self.assertEqual("TIMED_OUT", results[0]["terminal_state"])
+            self.assertEqual("TIMED_OUT", results[0]["error_code"])
+
+    def test_measurement_continues_on_nonterminal_idle_sample(self):
+        class MockEngine:
+            api_base = "http://mock-engine"
+            run_spec = {"engine": "tdl"}
+
+        class MockEvents:
+            def __init__(self):
+                self.events = []
+
+            def write(self, ev):
+                self.events.append(ev)
+
+        cases = [{"case_id": "case_1"}]
+        task_submits = {"case_1": {"task_id": "t1", "submitted": True}}
+        events = MockEvents()
+
+        # Status says active=0, queued=0, but tasks endpoint returns task in "downloading" (nonterminal)
+        def mock_http_json(url, timeout=None, retries=None):
+            if "/api/status" in url:
+                return {"active_files": [], "queue_depth": 0, "rolling_5s_bps": 0}
+            if "/api/tasks" in url:
+                return [{"id": "t1", "state": "downloading"}]
+            return {}
+
+        with patch("harness.http_json", side_effect=mock_http_json):
+            timed_out = wait_for_measurement(
+                MockEngine(), cases, duration=0.05, events=events, task_submits=task_submits
+            )
+            self.assertTrue(timed_out)
+            self.assertNotIn("run.completed_early", [e.get("event") for e in events.events])
+
+    def test_active_rpc_zero_throughput_counts_as_stall(self):
+        metrics = [
+            {
+                "monotonic_elapsed_sec": 0.0,
+                "active_files": 1,
+                "queued_jobs": 0,
+                "rolling_5s_bps": 0,
+                "active_rpc": 5,
+            },
+            {
+                "monotonic_elapsed_sec": 5.0,
+                "active_files": 1,
+                "queued_jobs": 0,
+                "rolling_5s_bps": 0,
+                "active_rpc": 5,
+            },
+            {
+                "monotonic_elapsed_sec": 12.0,
+                "active_files": 1,
+                "queued_jobs": 0,
+                "rolling_5s_bps": 0,
+                "active_rpc": 5,
+            },
+        ]
+        longest = _longest_zero_seconds(metrics)
+        self.assertEqual(12.0, longest)
+
+    def test_partial_http_metrics_payload_blocks_run(self):
+        with tempfile.TemporaryDirectory() as temp:
+            run_root = Path(temp) / "run"
+            raw = create_raw_fixture(run_root)
+            (raw / "checksums.sha256").unlink()
+            bad_sample = required_metric_sample()
+            bad_sample["active_files"] = None
+            write_jsonl(raw / "metrics.jsonl", [bad_sample])
+            seal_raw_directory(raw)
+            summary = evaluate_policy(run_root, POLICY_PATH)
+            self.assertEqual("BLOCKED", summary["verdict"])
+            self.assertTrue(
+                any("missing required field active_files" in r for r in summary["blocked_reasons"])
+            )
+
+    def test_absent_dirty_and_build_metadata_rejected(self):
+        run_spec = {
+            "engine": "tgx",
+            "expected_binary_sha256": "1" * 64,
+            "expected_source_commit": "abcdef",
+        }
+        artifact_missing_dirty = {
+            "binary_sha256": "1" * 64,
+            "source_commit": "abcdef",
+            "source_dirty": None,
+            "version": "v1.0.0",
+            "build_time": "2026-09-04T00:00:00Z",
+            "go_version": "go1.22",
+            "os": "linux",
+            "arch": "amd64",
+            "image_digest": "sha256:abcd",
+        }
+        with self.assertRaises(ValueError) as cm:
+            validate_artifact(run_spec, artifact_missing_dirty)
+        self.assertIn("dirty or unknown source state", str(cm.exception))
+
+        artifact_missing_build = dict(artifact_missing_dirty)
+        artifact_missing_build["source_dirty"] = False
+        artifact_missing_build["build_time"] = "unknown"
+        with self.assertRaises(ValueError) as cm:
+            validate_artifact(run_spec, artifact_missing_build)
+        self.assertIn("does not report build_time", str(cm.exception))
+
 
 
 def run_self_tests():

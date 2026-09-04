@@ -494,79 +494,62 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 		_ = o.db.BeginDownload(chatID, msgID, gen, fileName, finalRelPath, mediaType, authoritativeSize)
 	}
 
-	// 6. Execute parallel chunk download with official gotd downloader (with retry on transient errors)
+	// 6. Execute parallel chunk download with official gotd downloader
 	onProgress := func(downloaded, total int64) {
 		task.RecordProgress(downloaded)
 	}
 
-	var (
-		written int64
-		dlErr   error
+	pool := o.access.Pool()
+	invoker := pool.Invoker(taskCtx, resolvedMedia.DCID)
+	client := transfer.NewGatedClient(
+		invoker,
+		o.transferMgr.Gate(),
+		resolvedMedia.DCID,
+		pool.CDN,
 	)
-	const maxDownloadAttempts = 3
-	for attempt := 1; attempt <= maxDownloadAttempts; attempt++ {
-		if _, seekErr := partFile.Seek(0, 0); seekErr != nil {
-			dlErr = seekErr
-			break
-		}
-		if truncErr := partFile.Truncate(0); truncErr != nil {
-			dlErr = truncErr
-			break
-		}
 
-		pool := o.access.Pool()
-		invoker := pool.Invoker(taskCtx, resolvedMedia.DCID)
-		client := transfer.NewGatedClient(
-			invoker,
-			o.transferMgr.Gate(),
-			resolvedMedia.DCID,
-			pool.CDN,
-		)
-
-		written, dlErr = o.transferMgr.DownloadFile(
-			taskCtx,
-			client,
-			resolvedMedia.File.Location(),
-			authoritativeSize,
-			partFile,
-			onProgress,
-		)
-		if dlErr == nil {
-			break
-		}
-
-		if taskCtx.Err() != nil {
-			break
-		}
-
-		if attempt < maxDownloadAttempts {
-			o.logger.Warn("transient download error, retrying",
-				zap.String("task_id", taskID),
-				zap.Int("attempt", attempt),
-				zap.Error(dlErr),
-			)
-			select {
-			case <-taskCtx.Done():
-				dlErr = taskCtx.Err()
-			case <-time.After(time.Duration(attempt) * 500 * time.Millisecond):
-			}
-			if taskCtx.Err() != nil {
-				break
-			}
-		}
-	}
+	written, dlErr := o.transferMgr.DownloadFile(
+		taskCtx,
+		client,
+		resolvedMedia.File.Location(),
+		authoritativeSize,
+		partFile,
+		onProgress,
+	)
 
 	if dlErr != nil {
 		_ = partFile.Close()
 		_ = os.Remove(partAbsPath)
-		o.logger.Warn("gotd download failed",
-			zap.String("task_id", taskID),
-			zap.Error(dlErr),
-		)
-		taskErr := NewTaskError("transfer", "download_file", "network", false, true, dlErr)
-		task.Fail("transfer", taskErr.Error(), false)
+
+		var tErr *transfer.TransferError
+		var taskErr *TaskError
+		if errors.As(dlErr, &tErr) {
+			taskErr = NewTaskError(tErr.Stage, tErr.Op, tErr.Class, tErr.Unavailable, tErr.Retryable, tErr.Cause)
+			o.logger.Warn("download transfer failed",
+				zap.String("task_id", taskID),
+				zap.String("logical_generation", gen),
+				zap.Int("physical_attempt", 1),
+				zap.String("operation", tErr.Op),
+				zap.String("typed_cause", tErr.Class),
+				zap.String("retry_owner", tErr.RetryOwner),
+				zap.Error(tErr.Cause),
+			)
+		} else {
+			taskErr = NewTaskError("transfer", "download_file", "network", false, false, dlErr)
+			o.logger.Warn("gotd download failed",
+				zap.String("task_id", taskID),
+				zap.String("logical_generation", gen),
+				zap.Int("physical_attempt", 1),
+				zap.String("operation", "download_file"),
+				zap.String("typed_cause", "unknown"),
+				zap.String("retry_owner", "gotd"),
+				zap.Error(dlErr),
+			)
+		}
+
+		task.Fail("transfer", taskErr.Error(), taskErr.Retryable)
 		if o.db != nil {
-			_ = o.db.FailDownload(chatID, msgID, gen, fileName, finalRelPath, mediaType, authoritativeSize, taskErr.Error(), false)
+			_ = o.db.FailDownload(chatID, msgID, gen, fileName, finalRelPath, mediaType, authoritativeSize, taskErr.Error(), taskErr.Retryable)
 		}
 		return
 	}
