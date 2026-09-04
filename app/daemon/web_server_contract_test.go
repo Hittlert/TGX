@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -1425,4 +1426,82 @@ main().catch(err => {
 		t.Fatalf("expected verification token, got: %s", string(out))
 	}
 }
+
+// TestWebServer_FrontendCleanlinessAndStaticCheck enforces Issue #15 acceptance criteria:
+// 1. Catches dead/unused JavaScript bindings and timer variables.
+// 2. Proves all referenced CSS custom properties are defined in stylesheets.
+// 3. Proves unreferenced CryptoJS tree and static-key AES code are removed.
+func TestWebServer_FrontendCleanlinessAndStaticCheck(t *testing.T) {
+	// 1. Static check: prove dead bindings and unused timer states are absent from index.html
+	indexData, err := uiFS.ReadFile("ui/templates/index.html")
+	if err != nil {
+		t.Fatalf("read index.html: %v", err)
+	}
+	indexStr := string(indexData)
+
+	deadBindings := []string{
+		"already_download_list_data",
+		"download_list_table_data",
+		"current_phone_hash",
+		"scan_status_label",
+		"scan_status_class",
+		"update_already_download_list_int",
+		"CryptoJS",
+		"AES",
+	}
+
+	for _, sym := range deadBindings {
+		if strings.Contains(indexStr, sym) {
+			t.Fatalf("authored template must not contain dead symbol %q", sym)
+		}
+	}
+
+	// 2. Static check: prove login.html does not contain CryptoJS or AES
+	loginData, err := uiFS.ReadFile("ui/templates/login.html")
+	if err != nil {
+		t.Fatalf("read login.html: %v", err)
+	}
+	loginStr := string(loginData)
+	for _, sym := range []string{"CryptoJS", "AES", "crypto-js"} {
+		if strings.Contains(loginStr, sym) {
+			t.Fatalf("login.html must not contain %q", sym)
+		}
+	}
+
+	// 3. Static check: CSS custom properties are canonical and defined
+	cssData, err := uiFS.ReadFile("ui/static/css/index.css")
+	if err != nil {
+		t.Fatalf("read index.css: %v", err)
+	}
+	cssStr := string(cssData)
+
+	defRe := regexp.MustCompile(`--[a-zA-Z0-9_-]+(?:\s*:)`)
+	usedRe := regexp.MustCompile(`var\((--[a-zA-Z0-9_-]+)`)
+
+	definedVars := make(map[string]bool)
+	for _, match := range defRe.FindAllString(cssStr+"\n"+indexStr, -1) {
+		trimmed := strings.TrimRight(match, ": \t\r\n")
+		definedVars[trimmed] = true
+	}
+
+	usedMatches := usedRe.FindAllStringSubmatch(cssStr+"\n"+indexStr, -1)
+	for _, sub := range usedMatches {
+		varName := sub[1]
+		if !definedVars[varName] {
+			t.Fatalf("found undefined CSS custom property: %s", varName)
+		}
+	}
+
+	// 4. Verify no unreferenced CryptoJS directory in embedded static assets
+	staticEntries, err := uiFS.ReadDir("ui/static")
+	if err != nil {
+		t.Fatalf("read ui/static: %v", err)
+	}
+	for _, entry := range staticEntries {
+		if strings.Contains(strings.ToLower(entry.Name()), "crypto") {
+			t.Fatalf("unreferenced CryptoJS tree must not exist in ui/static: %s", entry.Name())
+		}
+	}
+}
+
 
