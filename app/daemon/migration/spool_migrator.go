@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -38,6 +39,31 @@ type MigrationOptions struct {
 	DropLegacyTables bool
 }
 
+// QuarantineFileEntry records metadata of a file placed in quarantine staging.
+type QuarantineFileEntry struct {
+	OriginalPath string `json:"original_path"`
+	StagedName   string `json:"staged_name"`
+	StagedPath   string `json:"staged_path"`
+	Size         int64  `json:"size"`
+	SHA256       string `json:"sha256"`
+}
+
+// QuarantineManifest is the durable on-disk record created before database transaction mutation.
+type QuarantineManifest struct {
+	MigrationID   string                `json:"migration_id"`
+	QuarantineDir string                `json:"quarantine_dir"`
+	CreatedAt     int64                 `json:"created_at"`
+	Files         []QuarantineFileEntry `json:"files"`
+}
+
+// ReconcileReport records the results of reconciling interrupted quarantines across restarts.
+type ReconcileReport struct {
+	QuarantineDirsScanned int      `json:"quarantine_dirs_scanned"`
+	RestoredFiles         []string `json:"restored_files"`
+	CleanedFiles          []string `json:"cleaned_files"`
+	CleanedDirs           []string `json:"cleaned_dirs"`
+}
+
 // ItemReport details the disposition decision for an individual legacy row or artifact.
 type ItemReport struct {
 	SourceTable string            `json:"source_table"`
@@ -54,19 +80,20 @@ type ItemReport struct {
 
 // MigrationReport summarizes the entire migration inventory and applied actions.
 type MigrationReport struct {
-	DBPath            string       `json:"db_path"`
-	BackupPath        string       `json:"backup_path,omitempty"`
-	DryRun            bool         `json:"dry_run"`
-	LegacyTablesFound []string     `json:"legacy_tables_found"`
-	TotalLegacyRows   int          `json:"total_legacy_rows"`
-	ImportedSuccess   int          `json:"imported_success"`
-	ResetPending      int          `json:"reset_pending"`
-	Quarantined       int          `json:"quarantined"`
-	AlreadyMigrated   int          `json:"already_migrated"`
-	DroppedTables     []string     `json:"dropped_tables,omitempty"`
-	PlannedCleanFiles []string     `json:"planned_clean_files,omitempty"`
-	CleanedFiles      []string     `json:"cleaned_files,omitempty"`
-	Items             []ItemReport `json:"items"`
+	DBPath            string           `json:"db_path"`
+	BackupPath        string           `json:"backup_path,omitempty"`
+	DryRun            bool             `json:"dry_run"`
+	LegacyTablesFound []string         `json:"legacy_tables_found"`
+	TotalLegacyRows   int              `json:"total_legacy_rows"`
+	ImportedSuccess   int              `json:"imported_success"`
+	ResetPending      int              `json:"reset_pending"`
+	Quarantined       int              `json:"quarantined"`
+	AlreadyMigrated   int              `json:"already_migrated"`
+	DroppedTables     []string         `json:"dropped_tables,omitempty"`
+	PlannedCleanFiles []string         `json:"planned_clean_files,omitempty"`
+	CleanedFiles      []string         `json:"cleaned_files,omitempty"`
+	ReconcileReport   *ReconcileReport `json:"reconcile_report,omitempty"`
+	Items             []ItemReport     `json:"items"`
 }
 
 // Run executes the migration evaluation and optional mutation.
@@ -86,6 +113,17 @@ func Run(ctx context.Context, opts MigrationOptions) (*MigrationReport, error) {
 	// 1. Check SQLite database existence
 	if _, err := os.Stat(opts.DBPath); os.IsNotExist(err) {
 		return nil, fmt.Errorf("database file does not exist: %s", opts.DBPath)
+	}
+
+	// 1.1 Reconcile any interrupted quarantines from prior crashes
+	if opts.BufferDir != "" && !opts.DryRun {
+		reconciled, err := ReconcilePendingQuarantines(ctx, opts.DBPath, opts.BufferDir)
+		if err != nil {
+			return nil, fmt.Errorf("reconcile pending quarantines: %w", err)
+		}
+		if reconciled != nil && (len(reconciled.RestoredFiles) > 0 || len(reconciled.CleanedFiles) > 0) {
+			report.ReconcileReport = reconciled
+		}
 	}
 
 	db, err := sql.Open("sqlite", opts.DBPath)
@@ -412,12 +450,9 @@ func Run(ctx context.Context, opts MigrationOptions) (*MigrationReport, error) {
 	}
 
 	// 12. Stage buffer files to recoverable quarantine before database mutation
-	type stagedFile struct {
-		origPath   string
-		stagedPath string
-	}
-	var staged []stagedFile
+	var staged []QuarantineFileEntry
 	var quarantineDir string
+	migrationID := fmt.Sprintf("mig_%d_%d", now, os.Getpid())
 
 	if len(report.PlannedCleanFiles) > 0 && opts.BufferDir != "" {
 		quarantineDir = filepath.Join(opts.BufferDir, fmt.Sprintf(".migrator_quarantine_%d", now))
@@ -428,21 +463,61 @@ func Run(ctx context.Context, opts MigrationOptions) (*MigrationReport, error) {
 		defer func() {
 			if quarantineDir != "" {
 				for _, sf := range staged {
-					if _, err := os.Stat(sf.stagedPath); err == nil {
-						_ = os.Rename(sf.stagedPath, sf.origPath)
+					if _, err := os.Stat(sf.StagedPath); err == nil {
+						_ = os.MkdirAll(filepath.Dir(sf.OriginalPath), 0o755)
+						_ = os.Rename(sf.StagedPath, sf.OriginalPath)
 					}
 				}
+				_ = os.Remove(filepath.Join(quarantineDir, "quarantine_manifest.json"))
 				_ = os.RemoveAll(quarantineDir)
 			}
 		}()
 
 		for idx, p := range report.PlannedCleanFiles {
-			stagedPath := filepath.Join(quarantineDir, fmt.Sprintf("staged_%d_%s", idx, filepath.Base(p)))
+			stagedName := fmt.Sprintf("staged_%d_%s", idx, filepath.Base(p))
+			stagedPath := filepath.Join(quarantineDir, stagedName)
+
+			var size int64
+			var hashStr string
+			if fi, err := os.Stat(p); err == nil {
+				size = fi.Size()
+				hashStr, _ = computeFileSHA256(p)
+			}
+
 			if err := os.Rename(p, stagedPath); err != nil {
 				return report, fmt.Errorf("stage buffer file %s to quarantine: %w", p, err)
 			}
-			staged = append(staged, stagedFile{origPath: p, stagedPath: stagedPath})
+			staged = append(staged, QuarantineFileEntry{
+				OriginalPath: p,
+				StagedName:   stagedName,
+				StagedPath:   stagedPath,
+				Size:         size,
+				SHA256:       hashStr,
+			})
 		}
+
+		// Persist quarantine manifest to disk before any DB commit
+		manifest := QuarantineManifest{
+			MigrationID:   migrationID,
+			QuarantineDir: quarantineDir,
+			CreatedAt:     now,
+			Files:         staged,
+		}
+		manifestData, err := json.MarshalIndent(manifest, "", "  ")
+		if err != nil {
+			return report, fmt.Errorf("marshal quarantine manifest: %w", err)
+		}
+		manifestPath := filepath.Join(quarantineDir, "quarantine_manifest.json")
+		mf, err := os.OpenFile(manifestPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+		if err != nil {
+			return report, fmt.Errorf("create quarantine manifest: %w", err)
+		}
+		if _, err := mf.Write(manifestData); err != nil {
+			_ = mf.Close()
+			return report, fmt.Errorf("write quarantine manifest: %w", err)
+		}
+		_ = mf.Sync()
+		_ = mf.Close()
 	}
 
 	// 13. Drop legacy tables if requested
@@ -456,6 +531,28 @@ func Run(ctx context.Context, opts MigrationOptions) (*MigrationReport, error) {
 		}
 	}
 
+	// Ensure migration verdicts table and record verdict inside transaction
+	_, err = tx.ExecContext(ctx, `
+		CREATE TABLE IF NOT EXISTS _tgx_migration_verdicts (
+			migration_id TEXT PRIMARY KEY,
+			committed_at INTEGER NOT NULL,
+			status TEXT NOT NULL
+		)
+	`)
+	if err != nil {
+		return report, fmt.Errorf("ensure migration verdicts table: %w", err)
+	}
+
+	if quarantineDir != "" {
+		_, err = tx.ExecContext(ctx, `
+			INSERT INTO _tgx_migration_verdicts (migration_id, committed_at, status)
+			VALUES (?, ?, 'COMMITTED')
+		`, migrationID, now)
+		if err != nil {
+			return report, fmt.Errorf("insert migration verdict: %w", err)
+		}
+	}
+
 	if err := tx.Commit(); err != nil {
 		return report, fmt.Errorf("commit migration transaction: %w", err)
 	}
@@ -463,11 +560,12 @@ func Run(ctx context.Context, opts MigrationOptions) (*MigrationReport, error) {
 	// 14. Finalize deletion: ONLY after database transaction is durably committed!
 	if quarantineDir != "" {
 		for _, sf := range staged {
-			if err := os.Remove(sf.stagedPath); err != nil {
-				return report, fmt.Errorf("finalize removal of staged file %s: %w", sf.stagedPath, err)
+			if err := os.Remove(sf.StagedPath); err != nil {
+				return report, fmt.Errorf("finalize removal of staged file %s: %w", sf.StagedPath, err)
 			}
-			report.CleanedFiles = append(report.CleanedFiles, sf.origPath)
+			report.CleanedFiles = append(report.CleanedFiles, sf.OriginalPath)
 		}
+		_ = os.Remove(filepath.Join(quarantineDir, "quarantine_manifest.json"))
 		_ = os.RemoveAll(quarantineDir)
 		quarantineDir = "" // prevent defer from running
 	}
@@ -567,4 +665,101 @@ func contains(slice []string, s string) bool {
 		}
 	}
 	return false
+}
+
+// ReconcilePendingQuarantines scans for interrupted quarantine staging directories from previous crashes.
+// If the migration transaction committed durably (_tgx_migration_verdicts has COMMITTED), it finalizes the purge.
+// If the migration transaction did not commit (crashed before/during commit), it durably restores original files.
+func ReconcilePendingQuarantines(ctx context.Context, dbPath string, bufferDir string) (*ReconcileReport, error) {
+	report := &ReconcileReport{
+		RestoredFiles: make([]string, 0),
+		CleanedFiles:  make([]string, 0),
+		CleanedDirs:   make([]string, 0),
+	}
+	if bufferDir == "" {
+		return report, nil
+	}
+
+	matches, err := filepath.Glob(filepath.Join(bufferDir, ".migrator_quarantine_*"))
+	if err != nil {
+		return nil, fmt.Errorf("glob quarantine dirs: %w", err)
+	}
+	if len(matches) == 0 {
+		return report, nil
+	}
+
+	report.QuarantineDirsScanned = len(matches)
+
+	var db *sql.DB
+	if dbPath != "" {
+		if _, err := os.Stat(dbPath); err == nil {
+			var openErr error
+			db, openErr = sql.Open("sqlite", dbPath)
+			if openErr != nil {
+				return nil, fmt.Errorf("open db for quarantine reconcile: %w", openErr)
+			}
+			defer db.Close()
+		}
+	}
+
+	for _, qDir := range matches {
+		manifestPath := filepath.Join(qDir, "quarantine_manifest.json")
+		manifestBytes, err := os.ReadFile(manifestPath)
+		if err != nil {
+			// No manifest found: if directory is empty, clean it up
+			entries, readErr := os.ReadDir(qDir)
+			if readErr == nil && len(entries) == 0 {
+				_ = os.Remove(qDir)
+				report.CleanedDirs = append(report.CleanedDirs, qDir)
+			}
+			continue
+		}
+
+		var manifest QuarantineManifest
+		if err := json.Unmarshal(manifestBytes, &manifest); err != nil {
+			// Corrupted manifest
+			continue
+		}
+
+		// Check verdict in DB
+		var isCommitted bool
+		if db != nil {
+			var tblExists int
+			_ = db.QueryRowContext(ctx, "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='_tgx_migration_verdicts'").Scan(&tblExists)
+			if tblExists > 0 {
+				var verdictStatus string
+				err := db.QueryRowContext(ctx, "SELECT status FROM _tgx_migration_verdicts WHERE migration_id = ?", manifest.MigrationID).Scan(&verdictStatus)
+				if err == nil && verdictStatus == "COMMITTED" {
+					isCommitted = true
+				}
+			}
+		}
+
+		if isCommitted {
+			// Crash occurred AFTER DB commit: finalize deletion of staged files
+			for _, f := range manifest.Files {
+				if err := os.Remove(f.StagedPath); err == nil || os.IsNotExist(err) {
+					report.CleanedFiles = append(report.CleanedFiles, f.OriginalPath)
+				}
+			}
+			_ = os.Remove(manifestPath)
+			_ = os.RemoveAll(qDir)
+			report.CleanedDirs = append(report.CleanedDirs, qDir)
+		} else {
+			// Crash occurred BEFORE or DURING DB commit: restore original files
+			for _, f := range manifest.Files {
+				if _, err := os.Stat(f.StagedPath); err == nil {
+					_ = os.MkdirAll(filepath.Dir(f.OriginalPath), 0o755)
+					if err := os.Rename(f.StagedPath, f.OriginalPath); err == nil {
+						report.RestoredFiles = append(report.RestoredFiles, f.OriginalPath)
+					}
+				}
+			}
+			_ = os.Remove(manifestPath)
+			_ = os.RemoveAll(qDir)
+			report.CleanedDirs = append(report.CleanedDirs, qDir)
+		}
+	}
+
+	return report, nil
 }

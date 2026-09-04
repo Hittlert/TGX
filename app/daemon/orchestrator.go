@@ -699,6 +699,10 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 	var wireBytes int64
 	var physicalRetries int64
 
+	var rangeAttempts sync.Map
+	var failedAttempts sync.Map
+	var lastPhysID atomic.Pointer[string]
+
 	taskCtx = transfer.ContextWithTransferTask(taskCtx, transfer.TransferTaskContext{
 		TaskID:          taskID,
 		AttemptID:       gen,
@@ -710,6 +714,9 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 		RequestCount:    &reqCount,
 		WireBytes:       &wireBytes,
 		PhysicalRetries: &physicalRetries,
+		RangeAttempts:   &rangeAttempts,
+		FailedAttempts:  &failedAttempts,
+		LastPhysicalID:  &lastPhysID,
 	})
 
 	dlResult, dlErr := o.transferMgr.DownloadFileWithResult(
@@ -726,7 +733,10 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 	replayBytes := dlResult.ReplayBytes
 	reqTotal := dlResult.RequestCount
 	budget = dlResult.RequestBudget
-	physAttemptID := fmt.Sprintf("%s-p%d", gen, retries)
+	physAttemptID := dlResult.PhysicalAttemptID
+	if physAttemptID == "" {
+		physAttemptID = fmt.Sprintf("%s-p%d", gen, retries)
+	}
 
 	task.RecordTransferTelemetry(written, wireTotal, replayBytes, reqTotal, retries, physAttemptID)
 

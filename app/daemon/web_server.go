@@ -32,15 +32,64 @@ type WebServer struct {
 	orchestrator *Orchestrator
 	access       TelegramAccess
 	registry     *Registry
-	logger       *zap.Logger
-	password     string
-	sessionsMu   sync.RWMutex
-	sessions     map[string]time.Time
-	authWizard   *AuthWizard
+	logger               *zap.Logger
+	password             string
+	sessionsMu           sync.RWMutex
+	sessions             map[string]time.Time
+	authWizard           *AuthWizard
+	sseUpdateInterval    time.Duration
+	sseHeartbeatInterval time.Duration
+	sseWriteTimeout      time.Duration
 }
 
 func (s *WebServer) SetAuthWizard(w *AuthWizard) {
 	s.authWizard = w
+}
+
+func (s *WebServer) SetSSEIntervals(update, heartbeat, writeTimeout time.Duration) {
+	s.sessionsMu.Lock()
+	defer s.sessionsMu.Unlock()
+	if update > 0 {
+		s.sseUpdateInterval = update
+	}
+	if heartbeat > 0 {
+		s.sseHeartbeatInterval = heartbeat
+	}
+	if writeTimeout > 0 {
+		s.sseWriteTimeout = writeTimeout
+	}
+}
+
+func (s *WebServer) getSSEIntervals() (time.Duration, time.Duration, time.Duration) {
+	s.sessionsMu.RLock()
+	defer s.sessionsMu.RUnlock()
+	up := s.sseUpdateInterval
+	if up <= 0 {
+		up = 1 * time.Second
+	}
+	hb := s.sseHeartbeatInterval
+	if hb <= 0 {
+		hb = 15 * time.Second
+	}
+	wt := s.sseWriteTimeout
+	if wt <= 0 {
+		wt = 5 * time.Second
+	}
+	return up, hb, wt
+}
+
+func (s *WebServer) isSessionValid(r *http.Request) bool {
+	if s.password == "" {
+		return true
+	}
+	cookie, err := r.Cookie("tg_downloader_session")
+	if err != nil || cookie.Value == "" {
+		return false
+	}
+	s.sessionsMu.RLock()
+	expireAt, ok := s.sessions[cookie.Value]
+	s.sessionsMu.RUnlock()
+	return ok && time.Now().Before(expireAt)
 }
 
 func NewWebServer(
@@ -55,16 +104,19 @@ func NewWebServer(
 	password string,
 ) *WebServer {
 	return &WebServer{
-		db:           db,
-		transferMgr:  transferMgr,
-		ssdAdmission: ssdAdmission,
-		proxyManager: proxyManager,
-		orchestrator: orchestrator,
-		access:       access,
-		registry:     registry,
-		logger:       logger,
-		password:     password,
-		sessions:     make(map[string]time.Time),
+		db:                   db,
+		transferMgr:          transferMgr,
+		ssdAdmission:         ssdAdmission,
+		proxyManager:         proxyManager,
+		orchestrator:         orchestrator,
+		access:               access,
+		registry:             registry,
+		logger:               logger,
+		password:             password,
+		sessions:             make(map[string]time.Time),
+		sseUpdateInterval:    1 * time.Second,
+		sseHeartbeatInterval: 15 * time.Second,
+		sseWriteTimeout:      5 * time.Second,
 	}
 }
 
@@ -607,23 +659,34 @@ func (s *WebServer) handleEventsStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	rc := http.NewResponseController(w)
+	updateInt, heartbeatInt, writeTimeout := s.getSSEIntervals()
+
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
 
+	if !s.isSessionValid(r) {
+		_ = rc.SetWriteDeadline(time.Now().Add(writeTimeout))
+		fmt.Fprintf(w, "event: error\ndata: {\"error\":\"session expired\"}\n\n")
+		flusher.Flush()
+		return
+	}
+
 	initial := s.collectTelemetrySnapshot()
 	if data, err := json.Marshal(initial); err == nil {
+		_ = rc.SetWriteDeadline(time.Now().Add(writeTimeout))
 		if _, err := fmt.Fprintf(w, "event: snapshot\ndata: %s\n\n", string(data)); err != nil {
 			return
 		}
 		flusher.Flush()
 	}
 
-	updateTicker := time.NewTicker(1 * time.Second)
+	updateTicker := time.NewTicker(updateInt)
 	defer updateTicker.Stop()
 
-	heartbeatTicker := time.NewTicker(15 * time.Second)
+	heartbeatTicker := time.NewTicker(heartbeatInt)
 	defer heartbeatTicker.Stop()
 
 	for {
@@ -631,13 +694,27 @@ func (s *WebServer) handleEventsStream(w http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			return
 		case <-heartbeatTicker.C:
+			if !s.isSessionValid(r) {
+				_ = rc.SetWriteDeadline(time.Now().Add(writeTimeout))
+				fmt.Fprintf(w, "event: error\ndata: {\"error\":\"session expired\"}\n\n")
+				flusher.Flush()
+				return
+			}
+			_ = rc.SetWriteDeadline(time.Now().Add(writeTimeout))
 			if _, err := fmt.Fprintf(w, "event: heartbeat\ndata: {}\n\n"); err != nil {
 				return
 			}
 			flusher.Flush()
 		case <-updateTicker.C:
+			if !s.isSessionValid(r) {
+				_ = rc.SetWriteDeadline(time.Now().Add(writeTimeout))
+				fmt.Fprintf(w, "event: error\ndata: {\"error\":\"session expired\"}\n\n")
+				flusher.Flush()
+				return
+			}
 			snap := s.collectTelemetrySnapshot()
 			if data, err := json.Marshal(snap); err == nil {
+				_ = rc.SetWriteDeadline(time.Now().Add(writeTimeout))
 				if _, err := fmt.Fprintf(w, "event: update\ndata: %s\n\n", string(data)); err != nil {
 					return
 				}

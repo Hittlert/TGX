@@ -2,6 +2,7 @@ package transfer
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"sync/atomic"
 
@@ -30,14 +31,54 @@ func NewGatedInvoker(invoker tg.Invoker, gate *DataGate, dcID int) *GatedInvoker
 	}
 }
 
+type physAttemptCtxKey struct{}
+
+// ContextWithPhysicalAttemptID wraps ctx with the authoritative physical attempt ID.
+func ContextWithPhysicalAttemptID(ctx context.Context, id string) context.Context {
+	return context.WithValue(ctx, physAttemptCtxKey{}, id)
+}
+
+// PhysicalAttemptIDFromContext extracts the authoritative physical attempt ID from ctx.
+func PhysicalAttemptIDFromContext(ctx context.Context) string {
+	if v, ok := ctx.Value(physAttemptCtxKey{}).(string); ok {
+		return v
+	}
+	return ""
+}
+
+// extractRequestRange extracts the canonical range identifier and range bounds from an RPC input encoder.
+func extractRequestRange(input bin.Encoder) (string, int64, int) {
+	if input == nil {
+		return "rpc", 0, 0
+	}
+	switch req := input.(type) {
+	case *tg.UploadGetFileRequest:
+		return fmt.Sprintf("chunk-%d", req.Offset), req.Offset, req.Limit
+	case *tg.UploadGetCDNFileRequest:
+		return fmt.Sprintf("cdn-%d", req.Offset), req.Offset, req.Limit
+	default:
+		return "rpc", 0, 0
+	}
+}
+
 // Invoke implements tg.Invoker, enforcing the global in-flight limit, FloodWait cooldowns,
 // request counts, and wire byte accounting.
 func (g *GatedInvoker) Invoke(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
 	tc, hasTask := TransferTaskFromContext(ctx)
+	var physID string
+	var rangeLabel string
+	if hasTask {
+		rangeLabel, _, _ = extractRequestRange(input)
+		physID, _ = tc.NextInvocationID(rangeLabel)
+	}
+
 	if hasTask && tc.RequestCount != nil {
 		for {
 			cur := atomic.LoadInt64(tc.RequestCount)
 			if tc.RequestBudget > 0 && cur >= tc.RequestBudget {
+				if hasTask {
+					tc.RecordFailedAttempt(rangeLabel, physID, ErrRequestBudgetExhausted)
+				}
 				return ErrRequestBudgetExhausted
 			}
 			if atomic.CompareAndSwapInt64(tc.RequestCount, cur, cur+1) {
@@ -49,12 +90,28 @@ func (g *GatedInvoker) Invoke(ctx context.Context, input bin.Encoder, output bin
 	if g.gate != nil {
 		release, err := g.gate.Acquire(ctx, g.dcID)
 		if err != nil {
+			if hasTask {
+				tc.RecordFailedAttempt(rangeLabel, physID, err)
+			}
 			return err
 		}
 		defer release()
 	}
 
-	err := g.raw.Invoke(ctx, input, output)
+	invokeCtx := ctx
+	if hasTask && physID != "" {
+		invokeCtx = ContextWithPhysicalAttemptID(ctx, physID)
+	}
+
+	err := g.raw.Invoke(invokeCtx, input, output)
+	if hasTask {
+		if err != nil {
+			tc.RecordFailedAttempt(rangeLabel, physID, err)
+		}
+		if tc.OnInvocation != nil {
+			tc.OnInvocation(physID, err)
+		}
+	}
 	if d, isFlood := tgerr.AsFloodWait(err); isFlood && g.gate != nil {
 		g.gate.TriggerFloodWait(g.dcID, d)
 	}

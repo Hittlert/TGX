@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"strings"
+	"sync"
 	"sync/atomic"
 
 	"github.com/gotd/td/telegram/downloader"
@@ -85,6 +85,65 @@ type TransferTaskContext struct {
 	RequestCount    *int64
 	WireBytes       *int64
 	PhysicalRetries *int64
+	RangeAttempts   *sync.Map
+	FailedAttempts  *sync.Map
+	LastPhysicalID  *atomic.Pointer[string]
+	OnInvocation    func(invID string, err error)
+}
+
+// NextInvocationID assigns a unique physical attempt ID tied to this task/generation, request range, and attempt count.
+func (tc TransferTaskContext) NextInvocationID(rangeLabel string) (string, int64) {
+	var counter *atomic.Int64
+	if tc.RangeAttempts != nil {
+		actual, _ := tc.RangeAttempts.LoadOrStore(rangeLabel, new(atomic.Int64))
+		counter = actual.(*atomic.Int64)
+	} else {
+		counter = new(atomic.Int64)
+	}
+	attempt := counter.Add(1)
+	gen := tc.AttemptID
+	if gen == "" {
+		gen = "1"
+	}
+	id := fmt.Sprintf("%s-%s-a%d", gen, rangeLabel, attempt)
+	if tc.LastPhysicalID != nil {
+		tc.LastPhysicalID.Store(&id)
+	}
+	return id, attempt
+}
+
+// RecordFailedAttempt records the exact physical attempt that experienced an error for a given range.
+func (tc TransferTaskContext) RecordFailedAttempt(rangeLabel, invID string, err error) {
+	if tc.FailedAttempts != nil {
+		tc.FailedAttempts.Store(rangeLabel, invID)
+	}
+	if tc.LastPhysicalID != nil {
+		tc.LastPhysicalID.Store(&invID)
+	}
+}
+
+// GetFailedAttempt retrieves the physical attempt ID that failed for a given range/operation.
+func (tc TransferTaskContext) GetFailedAttempt(rangeLabel string) string {
+	if tc.FailedAttempts != nil {
+		if val, ok := tc.FailedAttempts.Load(rangeLabel); ok {
+			return val.(string)
+		}
+	}
+	return tc.GetLatestPhysicalAttemptID()
+}
+
+// GetLatestPhysicalAttemptID returns the most recent physical invocation ID.
+func (tc TransferTaskContext) GetLatestPhysicalAttemptID() string {
+	if tc.LastPhysicalID != nil {
+		ptr := tc.LastPhysicalID.Load()
+		if ptr != nil && *ptr != "" {
+			return *ptr
+		}
+	}
+	if tc.AttemptID != "" {
+		return tc.AttemptID + "-p0"
+	}
+	return "p0"
 }
 
 // PhysicalAttemptID formats a unique identity for a physical attempt within this logical attempt.
@@ -226,12 +285,13 @@ func (m *TransferManager) ComputeFileThreads(expectedSize int64) int {
 
 // DownloadResult contains physical transport telemetry for one download execution.
 type DownloadResult struct {
-	Written         int64 // Unique committed payload bytes
-	WireBytes       int64 // Total bytes received across all RPC requests and retries
-	ReplayBytes     int64 // Physical replay bytes (WireBytes - Written, >= 0)
-	RequestCount    int64 // Total Telegram RPC requests executed
-	PhysicalRetries int64 // Physical retry attempts handled inside gotd
-	RequestBudget   int64 // Declared bounded request budget
+	Written           int64  // Unique committed payload bytes
+	WireBytes         int64  // Total bytes received across all RPC requests and retries
+	ReplayBytes       int64  // Physical replay bytes (WireBytes - Written, >= 0)
+	RequestCount      int64  // Total Telegram RPC requests executed
+	PhysicalRetries   int64  // Physical retry attempts handled inside gotd
+	RequestBudget     int64  // Declared bounded request budget
+	PhysicalAttemptID string // Authoritative physical attempt ID
 }
 
 // DownloadFileWithResult downloads a Telegram file directly into dest and returns execution telemetry.
@@ -302,15 +362,16 @@ func (m *TransferManager) DownloadFileWithResult(
 	}
 
 	res := DownloadResult{
-		Written:         downloaded,
-		WireBytes:       wireBytes,
-		ReplayBytes:     replayBytes,
-		RequestCount:    reqCount,
-		PhysicalRetries: atomic.LoadInt64(&fileRetries),
-		RequestBudget:   budget,
+		Written:           downloaded,
+		WireBytes:         wireBytes,
+		ReplayBytes:       replayBytes,
+		RequestCount:      reqCount,
+		PhysicalRetries:   atomic.LoadInt64(&fileRetries),
+		RequestBudget:     budget,
+		PhysicalAttemptID: tc.GetLatestPhysicalAttemptID(),
 	}
 	if err != nil {
-		if errors.Is(err, ErrRequestBudgetExhausted) || strings.Contains(err.Error(), ErrRequestBudgetExhausted.Error()) {
+		if errors.Is(err, ErrRequestBudgetExhausted) {
 			return res, &TransferError{
 				Stage:       "transfer",
 				Op:          "invoke",

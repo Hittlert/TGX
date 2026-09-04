@@ -304,7 +304,10 @@ func TestLifecycle_RPCRetryHandler(t *testing.T) {
 		TaskRetryHandler: func(taskCtx context.Context, event downloader.RetryEvent) {
 			retryEventFired = true
 			tc, _ := transfer.TransferTaskFromContext(taskCtx)
-			physAttemptID := fmt.Sprintf("%s-p%d", tc.AttemptID, event.Attempt)
+			physAttemptID := tc.GetFailedAttempt(event.Operation)
+			if physAttemptID == "" {
+				physAttemptID = fmt.Sprintf("%s-p%d", tc.AttemptID, event.Attempt)
+			}
 			EmitLifecycle(logger, LifecycleEvent{
 				Event:             EventRPCRetry,
 				TaskID:            tc.TaskID,
@@ -411,9 +414,9 @@ func TestLifecycle_RPCRetryHandler(t *testing.T) {
 	require.Equal(t, "reader.chunk", rpcRetryEvent.Op)
 	require.Equal(t, int64(1), rpcRetryEvent.PhysicalRetries)
 	require.Equal(t, "reader.chunk", rpcRetryEvent.Extra["operation"])
-	require.Equal(t, 1, rpcRetryEvent.Extra["attempt"])
-	require.Equal(t, fmt.Sprintf("%s-p1", task.Generation()), rpcRetryEvent.PhysicalAttemptID)
-	require.Equal(t, fmt.Sprintf("%s-p1", task.Generation()), rpcRetryEvent.Extra["physical_attempt_id"])
+	expectedPhysID := fmt.Sprintf("%s-chunk-0-a1", task.Generation())
+	require.Equal(t, expectedPhysID, rpcRetryEvent.PhysicalAttemptID)
+	require.Equal(t, expectedPhysID, rpcRetryEvent.Extra["physical_attempt_id"])
 
 	// 2. Assert zap logger actually emitted all fields including Extra (operation, attempt)
 	var loggedRetryEntry *observer.LoggedEntry
@@ -429,7 +432,7 @@ func TestLifecycle_RPCRetryHandler(t *testing.T) {
 	logCtx := loggedRetryEntry.ContextMap()
 	require.Equal(t, task.Request().ID, logCtx["task_id"])
 	require.Equal(t, task.Generation(), logCtx["attempt_id"])
-	require.Equal(t, fmt.Sprintf("%s-p1", task.Generation()), logCtx["physical_attempt_id"])
+	require.Equal(t, expectedPhysID, logCtx["physical_attempt_id"])
 	require.Equal(t, "-100888", logCtx["chat_id"])
 	require.Equal(t, int64(888), logCtx["message_id"])
 	require.Equal(t, int64(targetDC), logCtx["dc"])

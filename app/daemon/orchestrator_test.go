@@ -121,7 +121,10 @@ func setupTestOrchestratorWithAccess(t *testing.T, access TelegramAccess) (*Orch
 		MaxDataInFlight: 10,
 		TaskRetryHandler: func(taskCtx context.Context, event downloader.RetryEvent) {
 			tc, _ := transfer.TransferTaskFromContext(taskCtx)
-			physAttemptID := fmt.Sprintf("%s-p%d", tc.AttemptID, event.Attempt)
+			physAttemptID := tc.GetFailedAttempt(event.Operation)
+			if physAttemptID == "" {
+				physAttemptID = fmt.Sprintf("%s-p%d", tc.AttemptID, event.Attempt)
+			}
 			EmitLifecycle(zap.NewNop(), LifecycleEvent{
 				Event:             EventRPCRetry,
 				TaskID:            tc.TaskID,
@@ -538,7 +541,7 @@ func TestOrchestrator_Matrix_SuccessWithPhysicalRetries(t *testing.T) {
 		t.Fatalf("expected lifecycle wire_bytes 1024, got %d", terminalEvt.WireBytes)
 	}
 
-	expectedPhysID := fmt.Sprintf("%s-p2", task.Generation())
+	expectedPhysID := fmt.Sprintf("%s-chunk-0-a3", task.Generation())
 	if snap.PhysicalAttemptID != expectedPhysID {
 		t.Fatalf("expected task physical_attempt_id %s, got %s", expectedPhysID, snap.PhysicalAttemptID)
 	}
@@ -559,11 +562,11 @@ func TestOrchestrator_Matrix_SuccessWithPhysicalRetries(t *testing.T) {
 	if len(rpcRetries) != 2 {
 		t.Fatalf("expected 2 EventRPCRetry events, got %d", len(rpcRetries))
 	}
-	if rpcRetries[0].PhysicalAttemptID != fmt.Sprintf("%s-p1", task.Generation()) {
-		t.Fatalf("expected retry 1 physical attempt ID %s-p1, got %s", task.Generation(), rpcRetries[0].PhysicalAttemptID)
+	if rpcRetries[0].PhysicalAttemptID != fmt.Sprintf("%s-chunk-0-a1", task.Generation()) {
+		t.Fatalf("expected retry 1 physical attempt ID %s-chunk-0-a1, got %s", task.Generation(), rpcRetries[0].PhysicalAttemptID)
 	}
-	if rpcRetries[1].PhysicalAttemptID != fmt.Sprintf("%s-p2", task.Generation()) {
-		t.Fatalf("expected retry 2 physical attempt ID %s-p2, got %s", task.Generation(), rpcRetries[1].PhysicalAttemptID)
+	if rpcRetries[1].PhysicalAttemptID != fmt.Sprintf("%s-chunk-0-a2", task.Generation()) {
+		t.Fatalf("expected retry 2 physical attempt ID %s-chunk-0-a2, got %s", task.Generation(), rpcRetries[1].PhysicalAttemptID)
 	}
 }
 
@@ -896,7 +899,7 @@ func TestOrchestrator_ExactBudgetExhaustionAtBoundary(t *testing.T) {
 		t.Fatalf("expected snap.RequestCount == 3, got %d", snap.RequestCount)
 	}
 
-	expectedPhysID := fmt.Sprintf("%s-p3", task.Generation())
+	expectedPhysID := fmt.Sprintf("%s-chunk-0-a4", task.Generation())
 	if snap.PhysicalAttemptID != expectedPhysID {
 		t.Fatalf("expected task physical attempt ID %s, got %s", expectedPhysID, snap.PhysicalAttemptID)
 	}
@@ -954,17 +957,180 @@ func TestOrchestrator_ExactBudgetExhaustionAtBoundary(t *testing.T) {
 		t.Fatalf("expected request_budget 3 in terminal extra, got %v", terminalEvt.Extra["request_budget"])
 	}
 
-	// Check that physical attempt IDs across retries are distinct and ordered
+	// Check that physical attempt IDs across retries are distinct and tied to chunk-0
 	if len(rpcRetries) != 3 {
 		t.Fatalf("expected 3 EventRPCRetry events, got %d", len(rpcRetries))
 	}
-	if rpcRetries[0].PhysicalAttemptID != fmt.Sprintf("%s-p1", task.Generation()) {
-		t.Fatalf("expected retry 1 physical attempt ID %s-p1, got %s", task.Generation(), rpcRetries[0].PhysicalAttemptID)
+	if rpcRetries[0].PhysicalAttemptID != fmt.Sprintf("%s-chunk-0-a1", task.Generation()) {
+		t.Fatalf("expected retry 1 physical attempt ID %s-chunk-0-a1, got %s", task.Generation(), rpcRetries[0].PhysicalAttemptID)
 	}
-	if rpcRetries[1].PhysicalAttemptID != fmt.Sprintf("%s-p2", task.Generation()) {
-		t.Fatalf("expected retry 2 physical attempt ID %s-p2, got %s", task.Generation(), rpcRetries[1].PhysicalAttemptID)
+	if rpcRetries[1].PhysicalAttemptID != fmt.Sprintf("%s-chunk-0-a2", task.Generation()) {
+		t.Fatalf("expected retry 2 physical attempt ID %s-chunk-0-a2, got %s", task.Generation(), rpcRetries[1].PhysicalAttemptID)
 	}
-	if rpcRetries[2].PhysicalAttemptID != fmt.Sprintf("%s-p3", task.Generation()) {
-		t.Fatalf("expected retry 3 physical attempt ID %s-p3, got %s", task.Generation(), rpcRetries[2].PhysicalAttemptID)
+	if rpcRetries[2].PhysicalAttemptID != fmt.Sprintf("%s-chunk-0-a3", task.Generation()) {
+		t.Fatalf("expected retry 3 physical attempt ID %s-chunk-0-a3, got %s", task.Generation(), rpcRetries[2].PhysicalAttemptID)
+	}
+}
+
+// 10. Multi-part concurrent retry fixture proving uniqueness and causality:
+// Proves:
+// - Parallel chunk requests do NOT share a physical attempt ID (no collision, no shared p0);
+// - Concurrently executing retries receive unique identities bound to the chunk range being attempted;
+// - Retry events carry physical attempt IDs causally linked to the specific failing range;
+// - All physical attempt IDs across concurrent chunks are strictly unique.
+func TestOrchestrator_MultiPartConcurrentRetry_UniquenessAndCausality(t *testing.T) {
+	var (
+		invocationsMu sync.Mutex
+		allPhysIDs    []string
+		chunk1Calls   int64
+	)
+
+	// File size: 2 * 512 KiB = 1048576 bytes (2 chunks: offset 0 and offset 524288)
+	chunkSize := 512 * 1024
+	totalSize := int64(chunkSize * 2)
+
+	invoker := invokerFunc(func(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
+		req, ok := input.(*tg.UploadGetFileRequest)
+		if !ok {
+			return errors.New("unsupported request type")
+		}
+
+		physID := transfer.PhysicalAttemptIDFromContext(ctx)
+		invocationsMu.Lock()
+		allPhysIDs = append(allPhysIDs, physID)
+		invocationsMu.Unlock()
+
+		if req.Offset == int64(chunkSize) {
+			call := atomic.AddInt64(&chunk1Calls, 1)
+			if call == 1 {
+				// Inject transient timeout on attempt 1 of chunk 1 to trigger gotd retry
+				return tgerr.New(500, tg.ErrTimeout)
+			}
+		}
+
+		remaining := totalSize - req.Offset
+		if remaining <= 0 {
+			setUploadFile(output, []byte{})
+			return nil
+		}
+		limit := req.Limit
+		if remaining < int64(limit) {
+			limit = int(remaining)
+		}
+		data := make([]byte, limit)
+		for i := range data {
+			data[i] = byte((int(req.Offset) + i) % 256)
+		}
+		setUploadFile(output, data)
+		return nil
+	})
+
+	var observedEvents []LifecycleEvent
+	var obsMu sync.Mutex
+	unreg := RegisterLifecycleObserver(LifecycleObserverFunc(func(evt LifecycleEvent) {
+		obsMu.Lock()
+		defer obsMu.Unlock()
+		observedEvents = append(observedEvents, evt)
+	}))
+	defer unreg()
+
+	access := &mockAccessWithPool{
+		pool: &mockPool{invoker: invoker},
+		resolveFn: func(ctx context.Context, peer string, messageID int) (ResolvedMedia, error) {
+			return ResolvedMedia{
+				File:      &orchMockMediaFile{loc: &tg.InputDocumentFileLocation{ID: 9999, AccessHash: 8888}, sz: totalSize, dc: 2},
+				Name:      "multipart_test.bin",
+				Size:      totalSize,
+				DCID:      2,
+				MediaType: "document",
+				Date:      time.Now().Unix(),
+			}, nil
+		},
+	}
+	orch, registry, db, saveDir := setupTestOrchestratorWithAccess(t, access)
+	defer db.Close()
+
+	req := TaskRequest{
+		ID:           "case_multipart_concurrent_retry",
+		Peer:         "-1009999",
+		MessageID:    555,
+		FinalPath:    "Concurrent/multipart_test.bin",
+		ExpectedSize: totalSize,
+		MaxRetries:   3,
+	}
+
+	_, _, _ = registry.Submit(req)
+	task, _ := registry.Next(context.Background())
+
+	orch.downloadOne(context.Background(), task)
+
+	snap := task.Snapshot()
+	if snap.State != StateSuccess {
+		t.Fatalf("expected StateSuccess, got: %s (err: %s)", snap.State, snap.Error)
+	}
+
+	// Verify file was written to disk
+	finalPath := filepath.Join(saveDir, filepath.FromSlash(req.FinalPath))
+	info, err := os.Stat(finalPath)
+	if err != nil {
+		t.Fatalf("final file does not exist: %v", err)
+	}
+	if info.Size() != totalSize {
+		t.Fatalf("expected size %d, got %d", totalSize, info.Size())
+	}
+
+	// Verify that physical attempt IDs are strictly unique across all invocations
+	invocationsMu.Lock()
+	defer invocationsMu.Unlock()
+	seen := make(map[string]bool)
+	for _, id := range allPhysIDs {
+		if seen[id] {
+			t.Fatalf("detected COLLISION in physical attempt ID: %s (all: %v)", id, allPhysIDs)
+		}
+		seen[id] = true
+	}
+
+	// Verify Chunk 0 and Chunk 1 have distinct range labels in their attempt IDs
+	hasChunk0 := false
+	hasChunk1A1 := false
+	hasChunk1A2 := false
+	gen := task.Generation()
+	for _, id := range allPhysIDs {
+		if strings.Contains(id, fmt.Sprintf("%s-chunk-0-a1", gen)) {
+			hasChunk0 = true
+		}
+		if strings.Contains(id, fmt.Sprintf("%s-chunk-%d-a1", gen, chunkSize)) {
+			hasChunk1A1 = true
+		}
+		if strings.Contains(id, fmt.Sprintf("%s-chunk-%d-a2", gen, chunkSize)) {
+			hasChunk1A2 = true
+		}
+	}
+	if !hasChunk0 {
+		t.Fatalf("missing physical invocation for chunk 0: all = %v", allPhysIDs)
+	}
+	if !hasChunk1A1 {
+		t.Fatalf("missing physical invocation for chunk 1 attempt 1: all = %v", allPhysIDs)
+	}
+	if !hasChunk1A2 {
+		t.Fatalf("missing physical invocation for chunk 1 attempt 2 (retry): all = %v", allPhysIDs)
+	}
+
+	// Verify Lifecycle EventRPCRetry captured the exact chunk 1 attempt 1 that failed
+	obsMu.Lock()
+	defer obsMu.Unlock()
+	var retryEvt *LifecycleEvent
+	for i := range observedEvents {
+		if observedEvents[i].TaskID == req.ID && observedEvents[i].Event == EventRPCRetry {
+			retryEvt = &observedEvents[i]
+			break
+		}
+	}
+	if retryEvt == nil {
+		t.Fatal("expected EventRPCRetry to be emitted for chunk 1 failure")
+	}
+	expectedRetryPhysID := fmt.Sprintf("%s-chunk-%d-a1", gen, chunkSize)
+	if retryEvt.PhysicalAttemptID != expectedRetryPhysID {
+		t.Fatalf("expected retry event to carry causally linked physical attempt %s, got %s", expectedRetryPhysID, retryEvt.PhysicalAttemptID)
 	}
 }

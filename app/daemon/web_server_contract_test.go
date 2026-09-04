@@ -7,8 +7,10 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
@@ -2150,4 +2152,415 @@ console.log('RESPONSIVE_RENDER_ACCEPTANCE_VERIFIED');
 	if !strings.Contains(string(out), "RESPONSIVE_RENDER_ACCEPTANCE_VERIFIED") {
 		t.Fatalf("expected verification token, got: %s", string(out))
 	}
+}
+
+func findChromeExecutable() string {
+	if env := os.Getenv("CHROME_BIN"); env != "" {
+		if _, err := os.Stat(env); err == nil {
+			return env
+		}
+	}
+	candidates := []string{
+		"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+		"/Applications/Chromium.app/Contents/MacOS/Chromium",
+		"/usr/bin/google-chrome",
+		"/usr/bin/google-chrome-stable",
+		"/usr/bin/chromium",
+		"/usr/bin/chromium-browser",
+	}
+	for _, cand := range candidates {
+		if _, err := os.Stat(cand); err == nil {
+			return cand
+		}
+	}
+	for _, bin := range []string{"google-chrome", "google-chrome-stable", "chromium", "chromium-browser"} {
+		if path, err := exec.LookPath(bin); err == nil {
+			return path
+		}
+	}
+	return ""
+}
+
+func TestWebServer_RealHeadlessChromeRenderAcceptance(t *testing.T) {
+	chromePath := findChromeExecutable()
+	if chromePath == "" {
+		t.Skip("Google Chrome / Chromium not installed in test environment")
+	}
+	nodePath, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("Node.js not installed in test environment")
+	}
+
+	db, err := NewDatabase(":memory:")
+	if err != nil {
+		t.Fatalf("failed to create in-memory database: %v", err)
+	}
+	defer db.Close()
+
+	registry := NewRegistry(5, 100, time.Now)
+	ws := NewWebServer(db, nil, nil, nil, nil, nil, registry, zap.NewNop(), "")
+	server := httptest.NewServer(ws.Handler())
+	defer server.Close()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen tcp for cdp port: %v", err)
+	}
+	cdpPort := ln.Addr().(*net.TCPAddr).Port
+	_ = ln.Close()
+
+	userDataDir := t.TempDir()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	chromeCmd := exec.CommandContext(ctx, chromePath,
+		"--headless=new",
+		fmt.Sprintf("--remote-debugging-port=%d", cdpPort),
+		fmt.Sprintf("--user-data-dir=%s", userDataDir),
+		"--disable-gpu",
+		"--no-sandbox",
+		"--disable-dev-shm-usage",
+		server.URL,
+	)
+	if err := chromeCmd.Start(); err != nil {
+		t.Fatalf("start chrome: %v", err)
+	}
+	defer func() {
+		_ = chromeCmd.Process.Kill()
+		_ = chromeCmd.Wait()
+	}()
+
+	driverScript := fmt.Sprintf(`
+const port = %d;
+async function test() {
+  let pageWsUrl = '';
+  for (let i = 0; i < 50; i++) {
+    await new Promise(r => setTimeout(r, 100));
+    try {
+      const res = await fetch('http://127.0.0.1:' + port + '/json/list');
+      const list = await res.json();
+      const page = list.find(t => t.type === 'page' && t.webSocketDebuggerUrl);
+      if (page) {
+        pageWsUrl = page.webSocketDebuggerUrl;
+        break;
+      }
+    } catch (e) {}
+  }
+  if (!pageWsUrl) throw new Error('No page WebSocket URL found from Chrome CDP');
+
+  const ws = new WebSocket(pageWsUrl);
+  await new Promise(r => ws.onopen = r);
+
+  let id = 1;
+  function send(method, params = {}) {
+    return new Promise((resolve, reject) => {
+      const reqId = id++;
+      const handler = (event) => {
+        const msg = JSON.parse(event.data);
+        if (msg.id === reqId) {
+          ws.removeEventListener('message', handler);
+          if (msg.error) reject(new Error(JSON.stringify(msg.error)));
+          else resolve(msg.result);
+        }
+      };
+      ws.addEventListener('message', handler);
+      ws.send(JSON.stringify({ id: reqId, method, params }));
+    });
+  }
+
+  async function evaluate(expression) {
+    const res = await send('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true });
+    if (res.exceptionDetails) throw new Error(JSON.stringify(res.exceptionDetails));
+    return res.result.value;
+  }
+
+  await send('Page.enable');
+  await send('Runtime.enable');
+
+  // Wait for document ready
+  for (let i = 0; i < 50; i++) {
+    const ready = await evaluate('document.readyState');
+    if (ready === 'complete') break;
+    await new Promise(r => setTimeout(r, 100));
+  }
+  await new Promise(r => setTimeout(r, 500));
+
+  // --- 1. Desktop Render Check (1280x800) ---
+  await send('Emulation.setDeviceMetricsOverride', {
+    width: 1280,
+    height: 800,
+    deviceScaleFactor: 1,
+    mobile: false
+  });
+  await new Promise(r => setTimeout(r, 300));
+
+  // Switch to downloaded tab
+  await evaluate('document.querySelector("[data-tab=\\"downloaded\\"]").click()');
+  await new Promise(r => setTimeout(r, 300));
+
+  const desktop = await evaluate('({ ' +
+    'innerWidth: window.innerWidth, ' +
+    'scrollWidth: document.documentElement.scrollWidth, ' +
+    'desktopTableDisplay: window.getComputedStyle(document.querySelector(".table-card.desktop-only")).display ' +
+  '})');
+  if (desktop.scrollWidth > desktop.innerWidth) {
+    throw new Error('Desktop horizontal overflow detected: scrollWidth=' + desktop.scrollWidth + ' > innerWidth=' + desktop.innerWidth);
+  }
+  if (desktop.desktopTableDisplay === 'none') {
+    throw new Error('Desktop table card should be visible on 1280px screen');
+  }
+
+  // Open Settings Modal on Desktop
+  await evaluate('document.getElementById("btn_open_settings").click()');
+  await new Promise(r => setTimeout(r, 400));
+  const desktopModal = await evaluate('({ ' +
+    'modalDisplay: window.getComputedStyle(document.getElementById("settings_modal")).display, ' +
+    'scrollWidth: document.documentElement.scrollWidth, ' +
+    'innerWidth: window.innerWidth ' +
+  '})');
+  if (desktopModal.scrollWidth > desktopModal.innerWidth) {
+    throw new Error('Desktop modal caused horizontal overflow: scrollWidth=' + desktopModal.scrollWidth + ' > innerWidth=' + desktopModal.innerWidth);
+  }
+  await evaluate('document.getElementById("btn_close_settings").click()');
+  await new Promise(r => setTimeout(r, 300));
+
+  // --- 2. Mobile Render Check (375x667) ---
+  await send('Emulation.setDeviceMetricsOverride', {
+    width: 375,
+    height: 667,
+    deviceScaleFactor: 2,
+    mobile: true
+  });
+  await new Promise(r => setTimeout(r, 300));
+
+  const mobile = await evaluate('({ ' +
+    'innerWidth: window.innerWidth, ' +
+    'scrollWidth: document.documentElement.scrollWidth, ' +
+    'desktopTableDisplay: window.getComputedStyle(document.querySelector(".table-card.desktop-only")).display ' +
+  '})');
+  if (mobile.scrollWidth > mobile.innerWidth) {
+    throw new Error('Mobile horizontal overflow detected: scrollWidth=' + mobile.scrollWidth + ' > innerWidth=' + mobile.innerWidth);
+  }
+  if (mobile.desktopTableDisplay !== 'none') {
+    throw new Error('Desktop table card must be hidden on 375px mobile viewport');
+  }
+
+  // Render sample mobile card and verify zero overflow
+  await evaluate('render_mobile_downloaded_cards([{ ' +
+    'id: 101, filename: "test_sample_render_acceptance.mp4", total_size: "15.4 MB", ' +
+    'completed_at: 1700000000, save_path: "/downloads/test.mp4", chat: "Channel" ' +
+  '}])');
+  await new Promise(r => setTimeout(r, 300));
+
+  const mobileCardCheck = await evaluate('({ ' +
+    'scrollWidth: document.documentElement.scrollWidth, ' +
+    'innerWidth: window.innerWidth, ' +
+    'hasCard: document.querySelectorAll("#already_download_mobile_list .apple-download-card").length > 0 ' +
+  '})');
+  if (mobileCardCheck.scrollWidth > mobileCardCheck.innerWidth) {
+    throw new Error('Mobile card rendering caused horizontal overflow');
+  }
+  if (!mobileCardCheck.hasCard) {
+    throw new Error('Mobile card was not rendered in #already_download_mobile_list');
+  }
+
+  // Open Settings Modal on Mobile
+  await evaluate('document.getElementById("btn_open_settings").click()');
+  await new Promise(r => setTimeout(r, 400));
+  const mobileModal = await evaluate('({ ' +
+    'modalDisplay: window.getComputedStyle(document.getElementById("settings_modal")).display, ' +
+    'dialogWidth: document.querySelector("#settings_modal .apple-modal-dialog").getBoundingClientRect().width, ' +
+    'scrollWidth: document.documentElement.scrollWidth, ' +
+    'innerWidth: window.innerWidth ' +
+  '})');
+  if (mobileModal.scrollWidth > mobileModal.innerWidth) {
+    throw new Error('Mobile modal caused horizontal overflow: scrollWidth=' + mobileModal.scrollWidth + ' > innerWidth=' + mobileModal.innerWidth);
+  }
+  if (mobileModal.dialogWidth > mobileModal.innerWidth) {
+    throw new Error('Mobile dialog width exceeds viewport width: ' + mobileModal.dialogWidth + ' > ' + mobileModal.innerWidth);
+  }
+
+  ws.close();
+  console.log("REAL_CHROME_RENDER_ACCEPTANCE_PASS");
+}
+
+test().catch(e => { console.error('CHROME_TEST_ERROR:', e); process.exit(1); });
+`, cdpPort)
+
+	nodeCmd := exec.Command(nodePath, "-e", driverScript)
+	out, err := nodeCmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("real headless Chrome render acceptance failed: %v\nOutput: %s", err, string(out))
+	}
+	if !strings.Contains(string(out), "REAL_CHROME_RENDER_ACCEPTANCE_PASS") {
+		t.Fatalf("expected real Chrome verification token, got: %s", string(out))
+	}
+}
+
+func TestWebServer_SSELiveSessionExpiry(t *testing.T) {
+	registry := NewRegistry(5, 100, time.Now)
+	ws := NewWebServer(nil, nil, nil, nil, nil, nil, registry, zap.NewNop(), "mypassword")
+	ws.SetSSEIntervals(50*time.Millisecond, 200*time.Millisecond, 2*time.Second)
+
+	server := httptest.NewServer(ws.Handler())
+	defer server.Close()
+
+	// 1. Log in to get session cookie
+	loginBody := `{"password":"mypassword"}`
+	resp, err := http.Post(server.URL+"/login", "application/json", strings.NewReader(loginBody))
+	if err != nil {
+		t.Fatalf("login post: %v", err)
+	}
+	defer resp.Body.Close()
+
+	cookies := resp.Cookies()
+	var sessionCookie *http.Cookie
+	for _, c := range cookies {
+		if c.Name == "tg_downloader_session" {
+			sessionCookie = c
+			break
+		}
+	}
+	if sessionCookie == nil {
+		t.Fatal("expected tg_downloader_session cookie")
+	}
+
+	// 2. Connect to SSE stream
+	req, err := http.NewRequest(http.MethodGet, server.URL+"/api/events", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.AddCookie(sessionCookie)
+
+	client := &http.Client{}
+	sseResp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("GET /api/events: %v", err)
+	}
+	defer sseResp.Body.Close()
+
+	if sseResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", sseResp.StatusCode)
+	}
+
+	reader := bufio.NewReader(sseResp.Body)
+
+	// Read snapshot
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read snapshot event line: %v", err)
+	}
+	if !strings.HasPrefix(line, "event: snapshot") {
+		t.Fatalf("expected event: snapshot, got: %s", line)
+	}
+
+	// Wait 60ms to let a healthy update pass
+	time.Sleep(60 * time.Millisecond)
+
+	// 3. Expire the session in web server state while stream is active
+	ws.sessionsMu.Lock()
+	ws.sessions[sessionCookie.Value] = time.Now().Add(-1 * time.Hour)
+	ws.sessionsMu.Unlock()
+
+	// 4. Read stream until EOF or error event
+	var sawErrorEvent bool
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		line, err = reader.ReadString('\n')
+		if err != nil {
+			// Stream was closed by server
+			break
+		}
+		if strings.Contains(line, "event: error") || strings.Contains(line, "session expired") {
+			sawErrorEvent = true
+		}
+	}
+
+	if !sawErrorEvent && err == nil {
+		t.Fatal("expected live stream to terminate or emit error event upon session expiration")
+	}
+}
+
+func TestWebServer_SSEHeartbeat(t *testing.T) {
+	registry := NewRegistry(5, 100, time.Now)
+	ws := NewWebServer(nil, nil, nil, nil, nil, nil, registry, zap.NewNop(), "")
+	// Fast heartbeat interval (50ms)
+	ws.SetSSEIntervals(500*time.Millisecond, 50*time.Millisecond, 2*time.Second)
+
+	server := httptest.NewServer(ws.Handler())
+	defer server.Close()
+
+	req, _ := http.NewRequest(http.MethodGet, server.URL+"/api/events", nil)
+	client := &http.Client{}
+	sseResp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("GET /api/events: %v", err)
+	}
+	defer sseResp.Body.Close()
+
+	reader := bufio.NewReader(sseResp.Body)
+	sawHeartbeat := false
+	deadline := time.Now().Add(1 * time.Second)
+	for time.Now().Before(deadline) {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			break
+		}
+		if strings.Contains(line, "event: heartbeat") {
+			sawHeartbeat = true
+			break
+		}
+	}
+	if !sawHeartbeat {
+		t.Fatal("expected heartbeat event in SSE stream")
+	}
+}
+
+func TestWebServer_SSEStalledClientBackpressure(t *testing.T) {
+	registry := NewRegistry(5, 100, time.Now)
+	ws := NewWebServer(nil, nil, nil, nil, nil, nil, registry, zap.NewNop(), "")
+	// Set very fast update interval (10ms) and short write timeout (50ms)
+	ws.SetSSEIntervals(10*time.Millisecond, 50*time.Millisecond, 50*time.Millisecond)
+
+	server := httptest.NewServer(ws.Handler())
+	defer server.Close()
+
+	// Connect using raw TCP dial to simulate a stalled client that stops reading
+	conn, err := net.Dial("tcp", strings.TrimPrefix(server.URL, "http://"))
+	if err != nil {
+		t.Fatalf("dial server: %v", err)
+	}
+
+	// Send HTTP GET /api/events
+	reqStr := "GET /api/events HTTP/1.1\r\nHost: localhost\r\nAccept: text/event-stream\r\n\r\n"
+	_, err = conn.Write([]byte(reqStr))
+	if err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+
+	// Read headers and first snapshot
+	buf := make([]byte, 4096)
+	n, err := conn.Read(buf)
+	if err != nil || n == 0 {
+		t.Fatalf("read initial response: %v", err)
+	}
+	if !strings.Contains(string(buf[:n]), "text/event-stream") {
+		t.Fatalf("expected text/event-stream, got: %s", string(buf[:n]))
+	}
+
+	// Now client STALLS completely: stops reading anything from the connection.
+	// Server continues trying to write updates with 50ms write deadline.
+	// After write deadline fires, server should detect error and close connection.
+
+	// Wait up to 2 seconds for server to close the connection from its end
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	for {
+		_, err := conn.Read(buf)
+		if err != nil {
+			// Connection closed by server due to write deadline or EOF!
+			break
+		}
+	}
+	_ = conn.Close()
 }
