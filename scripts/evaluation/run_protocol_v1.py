@@ -6,7 +6,7 @@ import json
 import time
 from pathlib import Path
 
-from analyze import evaluate_policy
+from analyze import evaluate_policy, verify_raw_directory
 from harness import PROTOCOL_SHA256, PROTOCOL_VERSION, execute_run
 from manifest_generator import (
     DEFAULT_CASE_COUNTS,
@@ -14,14 +14,10 @@ from manifest_generator import (
     compute_sha256,
     generate_profile_manifest,
 )
-from self_test import run_self_tests
 
 
 PROFILES = tuple(DEFAULT_CASE_COUNTS)
-REQUIRED_CONFIG = (
-    "eval_dir",
-    "source_db",
-    "baseline_root",
+RUNTIME_CONFIG = (
     "session_source_dir",
     "runner_image",
     "docker_command",
@@ -31,13 +27,19 @@ REQUIRED_CONFIG = (
 )
 
 
-def load_config(path):
+def load_config(path, mode):
     with open(path, "r", encoding="utf-8") as stream:
         config = json.load(stream)
-    missing = [key for key in REQUIRED_CONFIG if not config.get(key)]
+    required = ["eval_dir"]
+    if mode == "manifests":
+        required.extend(("source_db", "baseline_root"))
+    elif mode in ("baseline", "candidate"):
+        required.extend(RUNTIME_CONFIG)
+    missing = [key for key in required if not config.get(key)]
     if missing:
         raise ValueError(f"evaluation config is missing: {', '.join(missing)}")
-    for engine in ("tdl", "tgx"):
+    engines = {"baseline": ("tdl",), "candidate": ("tgx",)}.get(mode, ())
+    for engine in engines:
         artifact = config["artifacts"].get(engine) or {}
         missing_artifact = [
             key
@@ -57,7 +59,14 @@ def load_config(path):
         expected_sha = artifact["expected_sha256"]
         if len(expected_sha) != 64 or any(c not in "0123456789abcdef" for c in expected_sha):
             raise ValueError(f"artifacts.{engine}.expected_sha256 is not SHA-256")
-    if not isinstance(config["docker_command"], list):
+        expected_commit = artifact["expected_commit"].lower()
+        if len(expected_commit) < 7 or any(
+            character not in "0123456789abcdef" for character in expected_commit
+        ):
+            raise ValueError(f"artifacts.{engine}.expected_commit is not a Git commit")
+    if mode in ("baseline", "candidate") and not isinstance(
+        config["docker_command"], list
+    ):
         raise ValueError("evaluation config docker_command must be a JSON array")
     return config
 
@@ -75,12 +84,32 @@ def validate_environment(config, policy_path):
         raise ValueError(f"evaluation environment is missing: {', '.join(missing)}")
 
 
+def find_project_root():
+    p = Path(__file__).resolve()
+    for parent in [p.parent, p.parent.parent, p.parent.parent.parent]:
+        if (parent / "docs/evaluation/TGX_EVALUATION_PROTOCOL_V1.md").exists():
+            return parent
+    return p.parent.parent
+
+
 def validate_protocol_hash():
-    protocol_path = Path(__file__).resolve().parents[2] / "docs/evaluation/TGX_EVALUATION_PROTOCOL_V1.md"
+    protocol_path = find_project_root() / "docs/evaluation/TGX_EVALUATION_PROTOCOL_V1.md"
     actual = compute_sha256(protocol_path)
     if actual != PROTOCOL_SHA256:
         raise ValueError(
             f"protocol hash drift: harness={PROTOCOL_SHA256}, document={actual}"
+        )
+
+
+def validate_run_spec_shape(run_spec):
+    schema_path = find_project_root() / "docs/evaluation/run-spec.schema.json"
+    with schema_path.open("r", encoding="utf-8") as stream:
+        schema = json.load(stream)
+    missing = [key for key in schema["required"] if key not in run_spec]
+    unknown = sorted(set(run_spec) - set(schema["properties"]))
+    if missing or unknown:
+        raise ValueError(
+            f"RunSpec schema mismatch: missing={missing}, unknown={unknown}"
         )
 
 
@@ -163,35 +192,62 @@ def build_run_spec(
     }
 
 
-def matching_baseline_exists(eval_dir, spec):
+def find_matching_baseline(eval_dir, spec, include_artifact, policy_version):
     baseline_root = Path(eval_dir) / "baselines" / "tdl"
     if not baseline_root.is_dir():
-        return False
-    identity_fields = (
-        "baseline_cohort_id",
-        "expected_binary_sha256",
-        "expected_source_commit",
+        return None
+    identity_fields = [
         "profile_id",
         "net_concurrency",
         "file_concurrency",
         "dc_pool_size",
         "duration_seconds",
         "warmup_seconds",
-    )
+    ]
+    if include_artifact:
+        identity_fields.extend(("expected_binary_sha256", "expected_source_commit"))
     for path in baseline_root.glob("*/raw/run_spec.json"):
+        run_root = path.parents[1]
+        if verify_raw_directory(path.parent):
+            continue
+        summary_path = run_root / "analysis" / policy_version / "summary.json"
+        if not summary_path.is_file():
+            continue
+        try:
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            if summary.get("verdict") != "GO":
+                continue
+        except (OSError, json.JSONDecodeError):
+            continue
         try:
             with path.open("r", encoding="utf-8") as stream:
                 existing = json.load(stream)
         except (OSError, json.JSONDecodeError):
             continue
+        existing_cohort_id = existing.get("baseline_cohort_id")
+        if not existing_cohort_id:
+            raw_manifest = path.parent / "manifest.jsonl"
+            if raw_manifest.is_file():
+                existing_cohort_id = (
+                    f"{spec['profile_id'].lower()}-"
+                    f"{compute_sha256(raw_manifest)[:16]}"
+                )
+        if existing_cohort_id != spec.get("baseline_cohort_id"):
+            continue
         if all(existing.get(field) == spec.get(field) for field in identity_fields):
-            return True
-    return False
+            return {
+                "run_root": str(run_root),
+                "summary": summary,
+                "summary_path": str(summary_path),
+            }
+    return None
 
 
 def run_engine(config, args, engine):
     eval_dir = Path(config["eval_dir"])
     policy_path = Path(args.policy)
+    with policy_path.open("r", encoding="utf-8") as stream:
+        policy_version = json.load(stream)["policy_version"]
     binary = Path(config["artifacts"][engine]["binary"])
     if not binary.is_file():
         raise FileNotFoundError(f"{engine} artifact does not exist: {binary}")
@@ -219,13 +275,41 @@ def run_engine(config, args, engine):
                     file_concurrency=args.file_concurrency,
                     dc_pool_size=args.dc_pool_size,
                 )
-                if engine == "tdl" and not args.force and matching_baseline_exists(
-                    eval_dir, spec
-                ):
+                matching_baseline = find_matching_baseline(
+                    eval_dir,
+                    spec,
+                    include_artifact=engine == "tdl",
+                    policy_version=policy_version,
+                )
+                if engine == "tdl" and not args.force and matching_baseline:
                     raise FileExistsError(
                         "matching TDL baseline already exists; reuse it or pass --force "
                         "to run an intentional new repetition"
                     )
+                if engine == "tgx" and not matching_baseline:
+                    raise FileNotFoundError(
+                        "no matching sealed TDL baseline exists for this cohort and RunSpec"
+                    )
+                if engine == "tgx" and matching_baseline:
+                    baseline_summary = matching_baseline["summary"]
+                    spec.update(
+                        {
+                            "paired_tdl_run_id": baseline_summary["run_id"],
+                            "paired_tdl_summary_sha256": compute_sha256(
+                                matching_baseline["summary_path"]
+                            ),
+                            "paired_tdl_artifact_sha256": baseline_summary[
+                                "artifact_sha256"
+                            ],
+                            "paired_tdl_average_active_mbps": baseline_summary[
+                                "average_active_mbps"
+                            ],
+                            "paired_tdl_attested_case_ids": baseline_summary[
+                                "golden_attested_case_ids"
+                            ],
+                        }
+                    )
+                validate_run_spec_shape(spec)
                 run_root = execute_run(
                     spec,
                     str(binary),
@@ -257,20 +341,37 @@ def generate_report(config, policy_version, force):
     mode = "w" if force else "x"
     with output.open(mode, encoding="utf-8", newline="\n") as stream:
         stream.write(f"# TGX Evaluation Comparison: {policy_version}\n\n")
-        stream.write("| Engine | Run | Cases | Match | Active Mbps | Verdict |\n")
-        stream.write("|---|---|---:|---:|---:|---|\n")
+        grouped = {}
         for engine, run_id, summary in rows:
-            stream.write(
-                f"| {engine} | `{run_id}` | {summary['total_cases']} | "
-                f"{summary['match_fraction']:.1%} | "
-                f"{summary['average_active_mbps']:.2f} | "
-                f"**{summary['verdict']}** |\n"
+            identity = (
+                summary.get("profile_id") or "invalid",
+                summary.get("baseline_cohort_id") or "unidentified",
             )
+            grouped.setdefault(identity, []).append((engine, run_id, summary))
+        for (profile, cohort), group_rows in sorted(grouped.items()):
+            stream.write(f"## {profile}: `{cohort}`\n\n")
+            stream.write(
+                "| Engine | Run | Artifact | Net/File/DC | Cases | Match | "
+                "Active Mbps | Verdict |\n"
+            )
+            stream.write("|---|---|---|---|---:|---:|---:|---|\n")
+            for engine, run_id, summary in group_rows:
+                stream.write(
+                    f"| {engine} | `{run_id}` | "
+                    f"`{str(summary.get('artifact_sha256') or '')[:12]}` | "
+                    f"{summary.get('net_concurrency')}/"
+                    f"{summary.get('file_concurrency')}/"
+                    f"{summary.get('dc_pool_size')} | {summary['total_cases']} | "
+                    f"{summary['match_fraction']:.1%} | "
+                    f"{summary['average_active_mbps']:.2f} | "
+                    f"**{summary['verdict']}** |\n"
+                )
+            stream.write("\n")
     return output
 
 
 def parse_args():
-    project_root = Path(__file__).resolve().parents[2]
+    project_root = find_project_root()
     default_policy = project_root / "docs/evaluation/analysis-policy/baseline-v1.json"
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -298,14 +399,17 @@ def main():
     args = parse_args()
     validate_protocol_hash()
     if args.mode == "self-test":
+        from self_test import run_self_tests
+
         if not run_self_tests():
             raise SystemExit(1)
         return
     if not args.config:
         raise SystemExit("--config is required for this mode")
 
-    config = load_config(args.config)
-    validate_environment(config, args.policy)
+    config = load_config(args.config, args.mode)
+    if args.mode in ("baseline", "candidate"):
+        validate_environment(config, args.policy)
     if args.mode == "manifests":
         ensure_manifests(config, args.profiles, args.seed, args.force)
     elif args.mode == "baseline":

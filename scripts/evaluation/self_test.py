@@ -6,10 +6,12 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from analyze import RAW_ARTIFACTS, compute_sha256, evaluate_policy, seal_raw_directory
-from harness import ensure_new_directory
+from harness import MetricsSampler, ensure_new_directory
 from manifest_generator import generate_profile_manifest
+from run_protocol_v1 import build_run_spec, validate_run_spec_shape
 
 
 def find_policy_path():
@@ -37,7 +39,11 @@ def write_jsonl(path, records):
 
 def required_metric_sample():
     with POLICY_PATH.open("r", encoding="utf-8") as stream:
-        required = json.load(stream)["required_metrics"]
+        metric_policy = json.load(stream)["required_metrics"]
+    if isinstance(metric_policy, dict):
+        required = metric_policy.get("common", []) + metric_policy.get("tgx", [])
+    else:
+        required = metric_policy
     sample = {field: 0 for field in required}
     sample.update(
         {
@@ -45,6 +51,7 @@ def required_metric_sample():
             "monotonic_elapsed_sec": 0.0,
             "engine": "tgx",
             "collection_errors": [],
+            "rolling_5s_bps": 25 * 1024 * 1024,
         }
     )
     return sample
@@ -58,6 +65,13 @@ def create_raw_fixture(
     terminal_state="COMPLETED",
     artifact_valid=True,
     missing_metric=None,
+    profile_id="P-S",
+    size_bucket="small_low",
+    active_bps=25 * 1024 * 1024,
+    paired_tdl_mbps=200.0,
+    engine="tgx",
+    baseline_trust="golden",
+    paired_attested_case_ids=None,
 ):
     raw = run_root / "raw"
     raw.mkdir(parents=True)
@@ -67,10 +81,11 @@ def create_raw_fixture(
     for index in range(case_count):
         manifest.append(
             {
-                "case_id": f"P-S-{index + 1:04d}",
+                "case_id": f"{profile_id}-{index + 1:04d}",
                 "baseline_sha256": "a" * 64,
-                "baseline_trust": "golden",
+                "baseline_trust": baseline_trust,
                 "expected_size": 1,
+                "size_bucket": size_bucket,
             }
         )
     write_jsonl(raw / "manifest.jsonl", manifest)
@@ -85,25 +100,34 @@ def create_raw_fixture(
         {
             "baseline_cohort_id": "p-s-fixture",
             "dc_pool_size": 32,
-            "engine": "tgx",
+            "engine": engine,
             "expected_binary_sha256": "2" * 64,
             "expected_source_commit": "1" * 40,
             "file_concurrency": 5,
             "manifest_sha256": compute_sha256(raw / "manifest.jsonl"),
             "net_concurrency": 32,
-            "profile_id": "P-S",
+            "paired_tdl_artifact_sha256": "3" * 64,
+            "paired_tdl_average_active_mbps": paired_tdl_mbps,
+            "paired_tdl_run_id": "fixture-tdl",
+            "paired_tdl_summary_sha256": "4" * 64,
+            "profile_id": profile_id,
             "protocol_sha256": protocol_sha256,
             "protocol_version": "1.0",
             "run_id": "fixture-run",
         },
     )
+    if paired_attested_case_ids is not None:
+        run_spec_path = raw / "run_spec.json"
+        run_spec = json.loads(run_spec_path.read_text(encoding="utf-8"))
+        run_spec["paired_tdl_attested_case_ids"] = paired_attested_case_ids
+        write_json(run_spec_path, run_spec)
     artifact = {
         "arch": "amd64",
         "build_time": "2026-09-04T00:00:00Z",
         "source_commit": "1" * 40,
         "source_dirty": False,
         "binary_sha256": "2" * 64,
-        "engine": "tgx",
+        "engine": engine,
         "go_version": "go1.25.0",
         "image_digest": "alpine@sha256:" + "3" * 64,
         "os": "linux",
@@ -130,6 +154,8 @@ def create_raw_fixture(
     write_jsonl(raw / "events.jsonl", [])
 
     metric = required_metric_sample()
+    metric["engine"] = engine
+    metric["rolling_5s_bps"] = active_bps
     if missing_metric:
         metric[missing_metric] = None
         metric["collection_errors"] = [
@@ -141,7 +167,12 @@ def create_raw_fixture(
     hashes = []
     errors = []
     for case in manifest[:result_count]:
-        error_code = None if terminal_state == "COMPLETED" else "FILE_MISSING"
+        if terminal_state == "COMPLETED":
+            error_code = None
+        elif terminal_state == "TIMED_OUT":
+            error_code = "TIMED_OUT"
+        else:
+            error_code = "FILE_MISSING"
         task_results.append(
             {
                 "case_id": case["case_id"],
@@ -154,6 +185,7 @@ def create_raw_fixture(
                 "case_id": case["case_id"],
                 "expected_size": 1,
                 "actual_size": 1 if terminal_state == "COMPLETED" else 0,
+                "size_match": terminal_state == "COMPLETED",
                 "sha_match": terminal_state == "COMPLETED",
             }
         )
@@ -184,7 +216,11 @@ def create_raw_fixture(
         ],
     )
     write_jsonl(raw / "errors.jsonl", errors)
-    (raw / "process.log").write_text("fixture process log\n", encoding="utf-8")
+    (raw / "process.log").write_text(
+        'fixture process log\n=== Container State ===\n'
+        '{"OOMKilled":false,"Running":true} restart_count=0\n',
+        encoding="utf-8",
+    )
 
     missing = [name for name in RAW_ARTIFACTS if not (raw / name).exists()]
     if missing:
@@ -194,6 +230,98 @@ def create_raw_fixture(
 
 
 class EvaluationSelfTest(unittest.TestCase):
+    def test_generated_run_spec_matches_schema_shape(self):
+        config = {
+            "api_base": "http://fixture",
+            "artifacts": {
+                "tgx": {
+                    "binary": "/fixture/tgx",
+                    "expected_commit": "1" * 40,
+                    "expected_sha256": "2" * 64,
+                    "source_repository": "https://example.invalid/tgx",
+                }
+            },
+            "docker_command": ["docker"],
+            "environment": {"host_id": "fixture"},
+            "eval_dir": "/fixture/evaluation",
+            "runner_image": "alpine@sha256:" + "3" * 64,
+            "session_source_dir": "/fixture/session",
+        }
+        cohort = {
+            "baseline_cohort_id": "p-s-fixture",
+            "manifest_path": "/fixture/P-S.jsonl",
+            "manifest_sha256": "4" * 64,
+            "sample_seed": 42,
+        }
+        spec = build_run_spec(
+            config,
+            "tgx",
+            "P-S",
+            cohort,
+            "fixture-run",
+            240,
+            15,
+            1,
+            32,
+            5,
+            32,
+        )
+        validate_run_spec_shape(spec)
+
+    def test_collector_maps_current_runtime_endpoints(self):
+        def fake_http(url, **_kwargs):
+            if url.endswith("/api/status"):
+                return {
+                    "rolling_5s_bps": 123,
+                    "queue_depth": 2,
+                    "active_files": [{"id": "one"}],
+                    "pool": {"size": 4, "reconnects": 1},
+                }
+            if url.endswith("/api/gate"):
+                return {
+                    "data_in_flight": 3,
+                    "ssd_reserved_bytes": 10,
+                    "ssd_available_bytes": 20,
+                }
+            if url.endswith("/api/system/storage"):
+                return {
+                    "free_bytes": 30,
+                    "total_bytes": 40,
+                    "used_bytes": 10,
+                    "archive": {
+                        "archive_backlog_files": 1,
+                        "archive_backlog_bytes": 50,
+                        "archive_active_workers": 1,
+                    },
+                }
+            raise AssertionError(url)
+
+        with tempfile.TemporaryDirectory() as temp, patch(
+            "harness.http_json", side_effect=fake_http
+        ):
+            sampler = MetricsSampler("http://fixture", Path(temp) / "metrics", "tgx")
+            sample = sampler.sample()
+        self.assertEqual(123, sample["rolling_5s_bps"])
+        self.assertEqual(1, sample["active_files"])
+        self.assertEqual(3, sample["active_rpc"])
+        self.assertEqual(10, sample["ssd_reserved_bytes"])
+        self.assertEqual(50, sample["archive_backlog_bytes"])
+        missing_sources = {error["source"] for error in sample["collection_errors"]}
+        self.assertIn("wire_rx_bytes", missing_sources)
+        self.assertIn("process_rss", missing_sources)
+
+    def test_collector_never_turns_collection_failure_into_zero(self):
+        with tempfile.TemporaryDirectory() as temp, patch(
+            "harness.http_json", side_effect=OSError("fixture unavailable")
+        ):
+            sampler = MetricsSampler("http://fixture", Path(temp) / "metrics", "tgx")
+            sample = sampler.sample()
+        self.assertIsNone(sample["rolling_5s_bps"])
+        self.assertIsNone(sample["ssd_free_bytes"])
+        error_sources = {error["source"] for error in sample["collection_errors"]}
+        self.assertIn("/api/status", error_sources)
+        self.assertIn("rolling_5s_bps", error_sources)
+
     def test_manifest_is_seeded_and_refuses_overwrite(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -284,7 +412,7 @@ class EvaluationSelfTest(unittest.TestCase):
     def test_analyzer_blocks_missing_measurement(self):
         with tempfile.TemporaryDirectory() as temp:
             run_root = Path(temp) / "run"
-            create_raw_fixture(run_root, missing_metric="process_rss")
+            create_raw_fixture(run_root, missing_metric="active_rpc")
             summary = evaluate_policy(run_root, POLICY_PATH)
             self.assertEqual("BLOCKED", summary["verdict"])
 
@@ -292,6 +420,82 @@ class EvaluationSelfTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             run_root = Path(temp) / "run"
             create_raw_fixture(run_root, terminal_state="FAILED")
+            summary = evaluate_policy(run_root, POLICY_PATH)
+            self.assertEqual("NO-GO", summary["verdict"])
+            self.assertFalse(
+                any("lacks trace fields" in reason for reason in summary["failure_reasons"])
+            )
+
+    def test_tdl_attests_local_reference_cases(self):
+        with tempfile.TemporaryDirectory() as temp:
+            run_root = Path(temp) / "run"
+            create_raw_fixture(
+                run_root,
+                engine="tdl",
+                baseline_trust="local_disk",
+            )
+            summary = evaluate_policy(run_root, POLICY_PATH)
+            self.assertEqual("GO", summary["verdict"])
+            self.assertEqual(["P-S-0001"], summary["golden_attested_case_ids"])
+
+    def test_tgx_local_reference_requires_matching_tdl_attestation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            run_root = Path(temp) / "run"
+            create_raw_fixture(run_root, baseline_trust="local_disk")
+            summary = evaluate_policy(run_root, POLICY_PATH)
+            self.assertEqual("BLOCKED", summary["verdict"])
+
+        with tempfile.TemporaryDirectory() as temp:
+            run_root = Path(temp) / "run"
+            create_raw_fixture(
+                run_root,
+                baseline_trust="local_disk",
+                paired_attested_case_ids=["P-S-0001"],
+            )
+            summary = evaluate_policy(run_root, POLICY_PATH)
+            self.assertEqual("GO", summary["verdict"])
+
+    def test_analyzer_enforces_small_file_throughput_gate(self):
+        with tempfile.TemporaryDirectory() as temp:
+            run_root = Path(temp) / "run"
+            create_raw_fixture(
+                run_root,
+                active_bps=100 * 1024 * 1024 // 8,
+                paired_tdl_mbps=400.0,
+            )
+            summary = evaluate_policy(run_root, POLICY_PATH)
+            self.assertEqual("NO-GO", summary["verdict"])
+
+    def test_large_file_timeout_is_not_a_correctness_failure(self):
+        with tempfile.TemporaryDirectory() as temp:
+            run_root = Path(temp) / "run"
+            create_raw_fixture(
+                run_root,
+                terminal_state="TIMED_OUT",
+                profile_id="P-L",
+                size_bucket="large_low",
+            )
+            summary = evaluate_policy(run_root, POLICY_PATH)
+            self.assertEqual("GO", summary["verdict"])
+
+    def test_analyzer_does_not_trust_completed_without_hash_match(self):
+        with tempfile.TemporaryDirectory() as temp:
+            run_root = Path(temp) / "run"
+            raw = create_raw_fixture(run_root)
+            (raw / "checksums.sha256").unlink()
+            write_jsonl(
+                raw / "hashes.jsonl",
+                [
+                    {
+                        "case_id": "P-S-0001",
+                        "expected_size": 1,
+                        "actual_size": 1,
+                        "size_match": True,
+                        "sha_match": False,
+                    }
+                ],
+            )
+            seal_raw_directory(raw)
             summary = evaluate_policy(run_root, POLICY_PATH)
             self.assertEqual("NO-GO", summary["verdict"])
 

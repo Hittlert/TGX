@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/flytam/filenamify"
+	"github.com/gotd/td/tgerr"
 	"go.uber.org/zap"
 
 	"github.com/Hittlert/TGX/core/transfer"
@@ -297,7 +298,26 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 	}
 
 	normalizedPeer := strings.TrimPrefix(strings.TrimSpace(chatID), "@")
-	resolvedMedia, err := o.access.Resolve(taskCtx, normalizedPeer, msgID)
+	var resolvedMedia ResolvedMedia
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		resolvedMedia, err = o.access.Resolve(taskCtx, normalizedPeer, msgID)
+		if err == nil {
+			break
+		}
+		if d, isFlood := tgerr.AsFloodWait(err); isFlood {
+			select {
+			case <-taskCtx.Done():
+				break
+			case <-time.After(d + time.Second):
+				continue
+			}
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
 	if err != nil {
 		o.logger.Warn("failed to resolve telegram media",
 			zap.String("task_id", taskID),

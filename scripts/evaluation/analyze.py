@@ -4,6 +4,7 @@
 import argparse
 import hashlib
 import json
+import re
 from pathlib import Path
 
 
@@ -111,15 +112,21 @@ def _artifact_identity_problems(artifact):
     build_time = str(artifact.get("build_time") or "").strip().lower()
     go_version = str(artifact.get("go_version") or "").strip().lower()
 
-    if commit in ("", "unknown") or len(commit) < 7:
+    if (
+        commit in ("", "unknown")
+        or len(commit) < 7
+        or any(character not in "0123456789abcdef" for character in commit)
+    ):
         problems.append("artifact source_commit is unknown")
     if version in ("", "dev", "unknown"):
         problems.append("artifact version is not release-identifiable")
     if artifact.get("source_dirty") is not False:
         problems.append("artifact source is dirty or unreported")
-    if len(binary_sha) != 64:
+    if len(binary_sha) != 64 or any(
+        character not in "0123456789abcdef" for character in binary_sha.lower()
+    ):
         problems.append("artifact binary_sha256 is invalid")
-    if not image_digest or image_digest.endswith(":latest"):
+    if image_digest in ("", "unknown") or image_digest.endswith(":latest"):
         problems.append("runner image is not immutable")
     if not source_repository:
         problems.append("artifact source_repository is missing")
@@ -142,15 +149,25 @@ def _duplicates(values):
     return sorted(duplicates)
 
 
-def _longest_zero_run(metrics):
-    longest = 0
-    current = 0
+def _longest_zero_seconds(metrics):
+    longest = 0.0
+    current = 0.0
+    previous_elapsed = None
     for record in metrics:
-        if record.get("rolling_5s_bps") == 0:
-            current += 1
+        elapsed = record.get("monotonic_elapsed_sec")
+        delta = 0.0
+        if isinstance(elapsed, (int, float)) and previous_elapsed is not None:
+            delta = max(0.0, elapsed - previous_elapsed)
+        busy = (record.get("active_files") or 0) > 0 or (
+            record.get("queued_jobs") or 0
+        ) > 0
+        if busy and record.get("rolling_5s_bps") == 0:
+            current += delta
             longest = max(longest, current)
         else:
-            current = 0
+            current = 0.0
+        if isinstance(elapsed, (int, float)):
+            previous_elapsed = elapsed
     return longest
 
 
@@ -174,6 +191,7 @@ def evaluate_policy(run_root, policy_path, overwrite=False):
     errors = []
     artifact = {}
     run_spec = {}
+    non_golden_case_ids = set()
 
     if not invalid_reasons:
         try:
@@ -193,6 +211,10 @@ def evaluate_policy(run_root, policy_path, overwrite=False):
             protocol = read_json(raw_path / "protocol.json")
             if run_spec.get("protocol_version") != protocol.get("protocol_version"):
                 invalid_reasons.append("RunSpec protocol version does not match raw protocol")
+            if policy.get("protocol_version") != protocol.get("protocol_version"):
+                invalid_reasons.append(
+                    "analysis policy protocol version does not match raw protocol"
+                )
             if run_spec.get("protocol_sha256") != protocol.get("protocol_sha256"):
                 invalid_reasons.append("RunSpec protocol hash does not match raw protocol")
             if run_spec.get("expected_binary_sha256") != artifact.get("binary_sha256"):
@@ -218,24 +240,41 @@ def evaluate_policy(run_root, policy_path, overwrite=False):
             if set(hash_ids) != set(manifest_ids):
                 invalid_reasons.append("hash results do not cover the manifest exactly")
 
-            non_golden = [
+            non_golden_case_ids = {
                 record.get("case_id")
                 for record in manifest
                 if record.get("baseline_trust") != "golden"
+            }
+            untrusted = [
+                record.get("case_id")
+                for record in manifest
+                if record.get("baseline_trust") not in ("golden", "local_disk")
             ]
-            if non_golden:
+            if untrusted:
                 blocked_reasons.append(
-                    f"{len(non_golden)} manifest cases lack golden baseline trust"
+                    f"{len(untrusted)} manifest cases lack a usable baseline reference"
                 )
 
             if not metrics:
                 blocked_reasons.append("metrics.jsonl contains no samples")
-            required_metrics = policy.get("required_metrics", [])
+            metric_policy = policy.get("required_metrics", {})
+            if isinstance(metric_policy, dict):
+                required_metrics = metric_policy.get("common", []) + metric_policy.get(
+                    run_spec.get("engine"), []
+                )
+            else:
+                required_metrics = metric_policy
             for index, record in enumerate(metrics):
                 collection_errors = record.get("collection_errors") or []
-                if collection_errors:
+                blocking_errors = [
+                    error
+                    for error in collection_errors
+                    if error.get("source") in required_metrics
+                    or str(error.get("source", "")).startswith("/api/")
+                ]
+                if blocking_errors:
                     blocked_reasons.append(
-                        f"metrics sample {index} has collection_errors"
+                        f"metrics sample {index} has required collection_errors"
                     )
                 for field in required_metrics:
                     if field not in record or record[field] is None:
@@ -248,20 +287,50 @@ def evaluate_policy(run_root, policy_path, overwrite=False):
                 if not environment.get(field):
                     invalid_reasons.append(f"environment field is missing: {field}")
 
+            process_log = (raw_path / "process.log").read_text(
+                encoding="utf-8", errors="replace"
+            )
+            marker = "=== Container State ==="
+            if marker not in process_log:
+                blocked_reasons.append("container exit/OOM/restart state was not collected")
+            else:
+                state = process_log.split(marker, 1)[1]
+                restart_match = re.search(r"restart_count=(\d+)", state)
+                if restart_match is None:
+                    blocked_reasons.append("container restart count is unavailable")
+                elif int(restart_match.group(1)) > 0:
+                    failure_reasons.append(
+                        f"container restart count is {restart_match.group(1)}"
+                    )
+                if re.search(r'"OOMKilled"\s*:\s*true', state):
+                    failure_reasons.append("container was OOM-killed")
+
             required_error_fields = policy.get("diagnosability", {}).get(
                 "required_error_fields", []
             )
             for index, record in enumerate(errors):
-                missing = [field for field in required_error_fields if not record.get(field)]
+                missing = [
+                    field
+                    for field in required_error_fields
+                    if field not in record or record[field] in (None, "")
+                ]
                 if missing:
                     failure_reasons.append(
                         f"error record {index} lacks trace fields: {', '.join(missing)}"
                     )
 
     total_cases = len(manifest)
-    completed_cases = sum(
-        1 for record in task_results if record.get("terminal_state") == "COMPLETED"
-    )
+    manifest_by_case = {record.get("case_id"): record for record in manifest}
+    task_by_case = {record.get("case_id"): record for record in task_results}
+    hash_by_case = {record.get("case_id"): record for record in hashes}
+    verified_completed = {
+        case_id
+        for case_id, record in task_by_case.items()
+        if record.get("terminal_state") == "COMPLETED"
+        and hash_by_case.get(case_id, {}).get("size_match") is True
+        and hash_by_case.get(case_id, {}).get("sha_match") is True
+    }
+    completed_cases = len(verified_completed)
     failed_cases = sum(
         1 for record in task_results if record.get("terminal_state") == "FAILED"
     )
@@ -273,13 +342,59 @@ def evaluate_policy(run_root, policy_path, overwrite=False):
     )
     match_fraction = completed_cases / total_cases if total_cases else 0.0
 
+    exempt_buckets = set(
+        policy.get("correctness", {}).get("completion_exempt_size_buckets", [])
+    )
+    required_case_ids = {
+        case_id
+        for case_id, record in manifest_by_case.items()
+        if record.get("size_bucket") not in exempt_buckets
+    }
+    required_completed = len(required_case_ids & verified_completed)
+    required_match_fraction = (
+        required_completed / len(required_case_ids) if required_case_ids else 1.0
+    )
     expected_fraction = policy.get("correctness", {}).get(
         "required_completed_file_match_fraction", 1.0
     )
-    if match_fraction < expected_fraction:
+    if required_match_fraction < expected_fraction:
         failure_reasons.append(
-            f"completed match fraction {match_fraction:.4f} is below {expected_fraction:.4f}"
+            "required completed match fraction "
+            f"{required_match_fraction:.4f} is below {expected_fraction:.4f}"
         )
+    mismatched_hashes = [
+        record.get("case_id")
+        for record in hashes
+        if (
+            record.get("case_id") in required_case_ids
+            or task_by_case.get(record.get("case_id"), {}).get("terminal_state")
+            == "COMPLETED"
+        )
+        and (record.get("size_match") is not True or record.get("sha_match") is not True)
+    ]
+    if mismatched_hashes:
+        failure_reasons.append(
+            f"size/SHA verification failed for {len(mismatched_hashes)} cases"
+        )
+
+    golden_attested_case_ids = []
+    if run_spec.get("engine") == "tdl":
+        golden_attested_case_ids = sorted(verified_completed)
+    elif run_spec.get("engine") == "tgx" and non_golden_case_ids:
+        paired_attested = set(run_spec.get("paired_tdl_attested_case_ids") or [])
+        completed_claims = {
+            case_id
+            for case_id, record in task_by_case.items()
+            if record.get("terminal_state") == "COMPLETED"
+        }
+        needs_attestation = non_golden_case_ids & (
+            required_case_ids | completed_claims
+        )
+        missing_attestation = needs_attestation - paired_attested
+        if missing_attestation:
+            blocked_reasons.append(
+                f"{len(missing_attestation)} cases lack matching TDL attestation"
+            )
 
     orphan_count = sum(
         1
@@ -290,8 +405,17 @@ def evaluate_policy(run_root, policy_path, overwrite=False):
         "allow_unowned_residue", False
     ):
         failure_reasons.append(f"unowned residue count is {orphan_count}")
-    if errors:
-        failure_reasons.append(f"error record count is {len(errors)}")
+    actionable_errors = [
+        record
+        for record in errors
+        if not (
+            record.get("error_code") == "TIMED_OUT"
+            and manifest_by_case.get(record.get("case_id"), {}).get("size_bucket")
+            in exempt_buckets
+        )
+    ]
+    if actionable_errors:
+        failure_reasons.append(f"actionable error record count is {len(actionable_errors)}")
 
     measurement_metrics = [
         record for record in metrics if record.get("phase", "measurement") == "measurement"
@@ -310,6 +434,75 @@ def evaluate_policy(run_root, policy_path, overwrite=False):
         if active_speeds
         else 0.0
     )
+    busy_metrics = [
+        record
+        for record in measurement_metrics
+        if (record.get("active_files") or 0) > 0
+        or (record.get("queued_jobs") or 0) > 0
+    ]
+    zero_speed_samples = sum(
+        1 for record in busy_metrics if record.get("rolling_5s_bps") == 0
+    )
+    zero_speed_fraction = (
+        zero_speed_samples / len(busy_metrics) if busy_metrics else 0.0
+    )
+    stability = policy.get("stability", {})
+    longest_zero_seconds = _longest_zero_seconds(measurement_metrics)
+    if longest_zero_seconds > stability.get(
+        "maximum_unexplained_zero_throughput_seconds", 10
+    ):
+        failure_reasons.append("unexplained zero-throughput run exceeded policy")
+    if zero_speed_fraction >= stability.get("maximum_zero_throughput_fraction", 1.0):
+        failure_reasons.append(
+            f"zero-throughput fraction {zero_speed_fraction:.4f} exceeds policy"
+        )
+
+    performance = policy.get("performance", {})
+    paired_tdl_mbps = None
+    throughput_ratio = None
+    if run_spec.get("engine") == "tdl" and average_active_mbps <= 0:
+        failure_reasons.append("TDL baseline has no active throughput")
+    if run_spec.get("engine") == "tgx":
+        paired_tdl_mbps = run_spec.get("paired_tdl_average_active_mbps")
+        paired_summary_sha = run_spec.get("paired_tdl_summary_sha256")
+        paired_artifact_sha = run_spec.get("paired_tdl_artifact_sha256")
+        if not isinstance(paired_tdl_mbps, (int, float)) or paired_tdl_mbps <= 0:
+            blocked_reasons.append("matching TDL active throughput is unavailable")
+        elif not paired_summary_sha or not paired_artifact_sha:
+            blocked_reasons.append("matching TDL identity is incomplete")
+        else:
+            throughput_ratio = average_active_mbps / paired_tdl_mbps
+            small_gate = performance.get(
+                "small_absolute_mbps_when_control_at_least_mbps", {}
+            )
+            if (
+                run_spec.get("profile_id") == "P-S"
+                and paired_tdl_mbps >= small_gate.get("control_minimum_mbps", 250)
+            ):
+                required_mbps = small_gate.get("required_tgx_mbps", 200)
+                if average_active_mbps < required_mbps:
+                    failure_reasons.append(
+                        f"small-file active throughput {average_active_mbps:.2f} Mbps "
+                        f"is below {required_mbps:.2f} Mbps"
+                    )
+            else:
+                required_ratio = performance.get(
+                    "minimum_tgx_to_paired_tdl_payload_ratio", 0.75
+                )
+                if throughput_ratio < required_ratio:
+                    failure_reasons.append(
+                        f"TGX/TDL active throughput ratio {throughput_ratio:.4f} "
+                        f"is below {required_ratio:.4f}"
+                    )
+            if run_spec.get("profile_id") == "P-L":
+                required_large_mbps = performance.get(
+                    "large_minimum_active_mbps", 150
+                )
+                if average_active_mbps < required_large_mbps:
+                    failure_reasons.append(
+                        f"large-file active throughput {average_active_mbps:.2f} Mbps "
+                        f"is below {required_large_mbps:.2f} Mbps"
+                    )
 
     invalid_reasons = sorted(set(invalid_reasons))
     blocked_reasons = sorted(set(blocked_reasons))
@@ -345,14 +538,23 @@ def evaluate_policy(run_root, policy_path, overwrite=False):
         "verdict": verdict,
         "total_cases": total_cases,
         "completed_cases": completed_cases,
+        "required_cases": len(required_case_ids),
+        "required_completed_cases": required_completed,
         "failed_cases": failed_cases,
         "timed_out_cases": timed_out_cases,
         "canceled_cases": canceled_cases,
         "match_fraction": round(match_fraction, 4),
+        "required_match_fraction": round(required_match_fraction, 4),
         "orphan_residue_count": orphan_count,
         "average_total_mbps": round(average_total_mbps, 2),
         "average_active_mbps": round(average_active_mbps, 2),
-        "maximum_zero_speed_samples": _longest_zero_run(measurement_metrics),
+        "paired_tdl_average_active_mbps": paired_tdl_mbps,
+        "tgx_to_tdl_active_throughput_ratio": (
+            round(throughput_ratio, 4) if throughput_ratio is not None else None
+        ),
+        "golden_attested_case_ids": golden_attested_case_ids,
+        "maximum_zero_speed_seconds": round(longest_zero_seconds, 3),
+        "zero_speed_fraction": round(zero_speed_fraction, 4),
         "error_count": len(errors),
         "invalid_reasons": invalid_reasons,
         "blocked_reasons": blocked_reasons,
@@ -377,6 +579,10 @@ def evaluate_policy(run_root, policy_path, overwrite=False):
         stream.write(f"- Verdict: `{verdict}`\n")
         stream.write(f"- Completed: {completed_cases}/{total_cases}\n")
         stream.write(f"- SHA/file match fraction: {match_fraction:.1%}\n")
+        stream.write(
+            f"- Required non-large match: {required_completed}/"
+            f"{len(required_case_ids)} ({required_match_fraction:.1%})\n"
+        )
         stream.write(f"- Orphan residue: {orphan_count}\n")
         stream.write(f"- Average active throughput: {average_active_mbps:.2f} Mbps\n")
         for heading, reasons in (
@@ -392,8 +598,16 @@ def evaluate_policy(run_root, policy_path, overwrite=False):
     return summary
 
 
+def find_project_root():
+    p = Path(__file__).resolve()
+    for parent in [p.parent, p.parent.parent, p.parent.parent.parent]:
+        if (parent / "docs/evaluation/analysis-policy/baseline-v1.json").exists():
+            return parent
+    return p.parent.parent
+
+
 def main():
-    project_root = Path(__file__).resolve().parents[2]
+    project_root = find_project_root()
     default_policy = project_root / "docs/evaluation/analysis-policy/baseline-v1.json"
     parser = argparse.ArgumentParser(description="Analyze sealed TGX raw evidence")
     parser.add_argument("--run-root", required=True)

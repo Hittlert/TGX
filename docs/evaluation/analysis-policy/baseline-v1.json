@@ -3,22 +3,22 @@
   "protocol_version": "1.0",
   "missing_required_measurement": "BLOCKED",
   "invalid_artifact_identity": "INVALID",
-  "required_metrics": [
-    "wire_rx_bytes",
-    "rolling_5s_bps",
-    "active_rpc",
-    "queued_jobs",
-    "connection_failures",
-    "process_rss",
-    "ssd_free_bytes",
-    "ssd_reserved_bytes",
-    "archive_backlog_files",
-    "archive_backlog_bytes",
-    "archive_active_workers",
-    "target_write_bytes",
-    "target_read_bytes",
-    "target_backlog_bytes"
-  ],
+  "required_metrics": {
+    "common": [
+      "rolling_5s_bps",
+      "active_files",
+      "queued_jobs"
+    ],
+    "tdl": [],
+    "tgx": [
+      "active_rpc",
+      "ssd_free_bytes",
+      "ssd_reserved_bytes",
+      "archive_backlog_files",
+      "archive_backlog_bytes",
+      "archive_active_workers"
+    ]
+  },
   "required_environment_fields": [
     "host_id",
     "account_session_id",
@@ -31,6 +31,11 @@
   ],
   "correctness": {
     "required_completed_file_match_fraction": 1.0,
+    "completion_exempt_size_buckets": [
+      "large_low",
+      "large_mid",
+      "large_high"
+    ],
     "allow_unexpected_final_files": false,
     "allow_unowned_residue": false,
     "require_task_result_for_every_manifest_case": true
@@ -38,10 +43,12 @@
   "stability": {
     "allow_unexpected_process_restart": false,
     "maximum_unexplained_zero_throughput_seconds": 10,
+    "maximum_zero_throughput_fraction": 0.05,
     "require_ssd_admission_recovery": true,
     "require_target_backlog_drain": true
   },
   "performance": {
+    "large_minimum_active_mbps": 150,
     "small_absolute_mbps_when_control_at_least_mbps": {
       "control_minimum_mbps": 250,
       "required_tgx_mbps": 200
@@ -62,6 +69,13 @@
     ]
   },
   "diagnostic_only_metrics": [
+    "wire_rx_bytes",
+    "process_rss",
+    "connection_count",
+    "connection_failures",
+    "target_write_bytes",
+    "target_read_bytes",
+    "target_backlog_bytes",
     "throughput_cv",
     "gc_pause",
     "device_iops",

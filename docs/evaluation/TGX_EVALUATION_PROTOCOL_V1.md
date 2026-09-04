@@ -118,6 +118,11 @@ sample_seed
 
 Only Golden cases are used for hard SHA correctness. A Golden case requires two independent reference downloads matching the stored baseline SHA.
 
+A newly sampled `local_disk` reference becomes Golden for a specific case only
+after the independent TDL baseline reproduces its exact size and SHA. The TDL
+analysis records attested case IDs; candidate RunSpecs carry that sealed
+attestation instead of rewriting the original manifest.
+
 The selected manifest MUST be copied into each run's `raw/` directory. TDL and TGX comparison runs use byte-identical manifests.
 
 Manifest creation also writes immutable cohort metadata containing
@@ -175,6 +180,7 @@ Network:
 wire_rx_bytes
 unique_payload_bytes
 active_rpc
+active_files
 queued_jobs
 connection_count
 connection_failures
@@ -292,26 +298,28 @@ file_concurrency = 5
 dc_pool_size = 32
 duration_seconds = 240
 warmup_seconds = 15
-repetitions = 3
+repetitions = 1
 ```
+
+The canonical fixed-cohort baseline uses one completed repetition for each
+workload identity. That result is reused by later TGX candidates while the TDL
+artifact, cohort, host, account/session, proxy route, storage and concurrency
+remain unchanged. Re-running TDL for every TGX commit is prohibited.
 
 `P-LMS` additionally runs a concurrency sweep at `8, 16, 32, 48`, keeping file concurrency at 5.
 
-TDL and TGX paired order:
-
-```text
-round 1: TDL -> TGX
-round 2: TGX -> TDL
-round 3: TDL -> TGX
-```
-
-Each paired member uses a separate empty output directory.
+Additional TDL repetitions are allowed only as an explicit new measurement,
+for example after an environment identity changes or when a separately defined
+statistical-confidence policy requires them. Every repetition uses a separate
+empty output directory and never overwrites the fixed baseline.
 
 ## 13. First TGX Functional Run
 
 The first TGX functional run uses the exact TDL baseline manifests and canonical `32/5/32` concurrency. It runs each profile once for 240 seconds and focuses on raw correctness, lifecycle completeness, resource bounds and diagnosability.
 
-One TGX functional run does not establish performance stability. Performance comparison requires the full paired repetitions.
+One TGX functional run does not establish performance stability. A separate
+policy may require repeated TGX candidate runs while continuing to reuse the
+same matching sealed TDL baseline.
 
 ## 14. Analysis Policy
 

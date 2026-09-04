@@ -1,266 +1,95 @@
 #!/usr/bin/env python3
 """Execute one isolated TGX evaluation run and seal its raw facts."""
 
-import os
-import time
-import json
-import shutil
-import hashlib
 import argparse
-import threading
-import urllib.request
+import hashlib
+import json
+import os
+import shutil
 import subprocess
+import threading
+import time
+import urllib.request
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from analyze import seal_raw_directory
 
+
 PROTOCOL_VERSION = "1.0"
-PROTOCOL_SHA256 = "4dbdf4940f5c751d683c79f3392bbca770832ef258360f57244d69fc3d589c0e"
+PROTOCOL_SHA256 = "17a829372cffeb6ccdd2a591117219d70885c431f0b5bc83f53c2ca0e64daeda"
+METRIC_METADATA_FIELDS = {
+    "timestamp",
+    "monotonic_elapsed_sec",
+    "engine",
+    "phase",
+    "collection_errors",
+}
+TGX_INTERNAL_METRICS = {
+    "active_rpc",
+    "ssd_free_bytes",
+    "ssd_total_bytes",
+    "ssd_used_bytes",
+    "ssd_reserved_bytes",
+    "ssd_available_bytes",
+    "archive_backlog_files",
+    "archive_backlog_bytes",
+    "archive_active_workers",
+    "archive_archived_files",
+    "archive_conflict_count",
+}
 
-def compute_sha256(filepath):
-    if not os.path.isfile(filepath):
-        return None
-    h = hashlib.sha256()
-    with open(filepath, "rb") as f:
-        while chunk := f.read(1024 * 1024):
-            h.update(chunk)
-    return h.hexdigest()
 
-def http_get(url, timeout=5):
-    req = urllib.request.Request(url, headers={"User-Agent": "TGX-Protocol-Harness/1.0"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
-
-def http_post(url, data, timeout=5):
-    payload = json.dumps(data).encode("utf-8")
-    req = urllib.request.Request(url, data=payload, headers={
-        "Content-Type": "application/json",
-        "User-Agent": "TGX-Protocol-Harness/1.0"
-    })
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
-
-def iso_time(ts=None):
-    if ts is None:
-        ts = time.time()
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
-
-class MetricsSampler(threading.Thread):
-    def __init__(self, api_base, metrics_file, engine):
-        super().__init__(daemon=True)
-        self.api_base = api_base
-        self.metrics_file = metrics_file
-        self.engine = engine
-        self.stop_event = threading.Event()
-        self.samples = []
-        self.t0 = time.time()
-        self.phase = "setup"
-
-    def run(self):
-        with open(self.metrics_file, "w", encoding="utf-8") as f:
-            while not self.stop_event.is_set():
-                now = time.time()
-                elapsed = round(now - self.t0, 3)
-                
-                rec = {
-                    "timestamp": iso_time(now),
-                    "monotonic_elapsed_sec": elapsed,
-                    "engine": self.engine,
-                    "phase": self.phase,
-
-                    "wire_rx_bytes": None,
-                    "unique_payload_bytes": None,
-                    "rolling_5s_bps": None,
-                    "active_rpc": None,
-                    "queued_jobs": None,
-                    "connection_count": None,
-                    "connection_failures": None,
-                    "retry_count": None,
-                    "flood_wait_count": None,
-                    "flood_wait_seconds": None,
-                    "per_dc_payload_bps": None,
-                    "process_rss": None,
-                    "heap_alloc": None,
-                    "heap_inuse": None,
-                    "heap_objects": None,
-                    "gc_count": None,
-                    "gc_pause_total": None,
-                    "ssd_free_bytes": None,
-                    "ssd_total_bytes": None,
-                    "ssd_used_bytes": None,
-                    "ssd_reserved_bytes": None,
-                    "ssd_available_bytes": None,
-                    "archive_backlog_files": None,
-                    "archive_backlog_bytes": None,
-                    "archive_active_workers": None,
-                    "archive_archived_files": None,
-                    "archive_conflict_count": None,
-                    "target_write_bytes": None,
-                    "target_read_bytes": None,
-                    "target_durable_bytes": None,
-                    "target_writer_concurrency": None,
-                    "target_backlog_bytes": None,
-                    "fsync_count": None,
-                    "fsync_latency": None,
-                    "device_util": None,
-                    "device_await": None,
-                    "collection_errors": [],
-                }
-
-                try:
-                    st = http_get(f"{self.api_base}/api/status", timeout=1.5)
-                    rec["rolling_5s_bps"] = st.get("rolling_5s_bps")
-                    rec["queued_jobs"] = st.get("queue_depth")
-                    active_files = st.get("active_files")
-                    if isinstance(active_files, list):
-                        rec["active_rpc"] = len(active_files)
-                    pool = st.get("pool") or {}
-                    rec["connection_count"] = pool.get("size")
-                    rec["connection_failures"] = pool.get("reconnects")
-                except Exception as e:
-                    rec["collection_errors"].append({"source": "/api/status", "error": str(e)})
-
-                try:
-                    gate = http_get(f"{self.api_base}/api/gate", timeout=1.5)
-                    rec["ssd_reserved_bytes"] = gate.get("ssd_reserved_bytes")
-                    rec["ssd_available_bytes"] = gate.get("ssd_available_bytes")
-                except Exception as e:
-                    if self.engine == "tgx":
-                        rec["collection_errors"].append(
-                            {"source": "/api/gate", "error": str(e)}
-                        )
-
-                try:
-                    storage = http_get(f"{self.api_base}/api/system/storage", timeout=1.5)
-                    rec["ssd_free_bytes"] = storage.get("free_bytes")
-                    rec["ssd_total_bytes"] = storage.get("total_bytes")
-                    rec["ssd_used_bytes"] = storage.get("used_bytes")
-                    archive = storage.get("archive") or {}
-                    for field in (
-                        "archive_backlog_files",
-                        "archive_backlog_bytes",
-                        "archive_active_workers",
-                        "archive_archived_files",
-                        "archive_conflict_count",
-                    ):
-                        rec[field] = archive.get(field)
-                except Exception as e:
-                    if self.engine == "tgx":
-                        rec["collection_errors"].append({"source": "/api/system/storage", "error": str(e)})
-
-                f.write(json.dumps(rec) + "\n")
-                f.flush()
-                self.samples.append(rec)
-
-                rem = 1.0 - (time.time() - now)
-                if rem > 0.05:
-                    self.stop_event.wait(rem)
-
-    def stop(self):
-        self.stop_event.set()
-
-    def set_phase(self, phase):
-        self.phase = phase
-
-def extract_artifact_metadata(
-    engine_binary,
-    engine,
-    docker_command,
-    runner_image,
-    source_repository,
-):
-    binary_sha = compute_sha256(engine_binary) or "unknown"
-    harness_sha = compute_sha256(__file__) if os.path.exists(__file__) else "unknown"
-
-    img_digest = "unknown"
-    try:
-        d_cmd = docker_command + [
-            "inspect",
-            "--format={{range .RepoDigests}}{{.}}{{end}}",
-            runner_image,
-        ]
-        d_res = subprocess.run(d_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5)
-        d_str = d_res.stdout.strip()
-        if d_str:
-            img_digest = d_str
-        else:
-            id_cmd = docker_command + [
-                "inspect",
-                "--format={{.Id}}",
-                runner_image,
-            ]
-            id_res = subprocess.run(id_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5)
-            if id_res.stdout.strip():
-                img_digest = id_res.stdout.strip()
-    except Exception:
-        pass
-
-    meta = {
-        "engine": engine,
-        "source_repository": source_repository,
-        "source_commit": "unknown",
-        "source_dirty": None,
-        "binary_sha256": binary_sha,
-        "harness_sha256": harness_sha,
-        "image_digest": img_digest,
-        "version": "unknown",
-        "build_time": "unknown",
-        "go_version": "unknown",
-        "os": "linux",
-        "arch": "amd64",
-    }
-
-    try:
-        cmd = docker_command + [
-            "run",
-            "--rm",
-            "-v",
-            f"{os.path.abspath(engine_binary)}:/app/bin:ro",
-            runner_image,
-            "/app/bin",
-            "version",
-        ]
-        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10)
-        output = res.stdout + res.stderr
-        for line in output.splitlines():
-            line = line.strip()
-            if "=" in line:
-                k, v = line.split("=", 1)
-                k, v = k.strip(), v.strip()
-                if k == "main_revision":
-                    meta["source_commit"] = v
-                elif k == "tdl_revision":
-                    meta["tdl_revision"] = v
-                elif k == "go_version":
-                    meta["go_version"] = v
-                elif k == "main_dirty":
-                    meta["source_dirty"] = (v.lower() == "true")
-            elif ":" in line:
-                k, v = line.split(":", 1)
-                k, v = k.strip(), v.strip()
-                if k == "Version":
-                    meta["version"] = v
-                elif k == "Commit":
-                    meta["source_commit"] = v
-                elif k == "Date":
-                    meta["build_time"] = v
-            else:
-                parts = line.split()
-                if len(parts) == 2 and parts[0].startswith("go") and "/" in parts[1]:
-                    meta["go_version"] = parts[0]
-                    meta["os"], meta["arch"] = parts[1].split("/", 1)
-        if meta["version"] == "unknown" and meta.get("tdl_revision"):
-            meta["version"] = "1.0.0"
-    except Exception as e:
-        meta["extraction_error"] = str(e)
-    return meta
-
-def ensure_new_directory(path):
+def compute_sha256(path):
     path = Path(path)
-    if path.exists():
-        raise FileExistsError(f"refusing to reuse existing evaluation path: {path}")
-    path.mkdir(parents=True)
-    return path
+    if not path.is_file():
+        return None
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def iso_time(timestamp=None):
+    timestamp = time.time() if timestamp is None else timestamp
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(timestamp))
+
+
+def write_json(path, value):
+    with Path(path).open("x", encoding="utf-8", newline="\n") as stream:
+        json.dump(value, stream, indent=2, sort_keys=True)
+        stream.write("\n")
+
+
+def write_jsonl(path, records):
+    with Path(path).open("x", encoding="utf-8", newline="\n") as stream:
+        for record in records:
+            stream.write(json.dumps(record, sort_keys=True) + "\n")
+
+
+def http_json(url, method="GET", data=None, timeout=5):
+    body = None if data is None else json.dumps(data).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=body,
+        method=method,
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "TGX-Protocol-Harness/1.0",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def http_ok(url, timeout=5):
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": "TGX-Protocol-Harness/1.0"},
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return 200 <= response.status < 300
 
 
 def safe_relative_path(value):
@@ -270,516 +99,941 @@ def safe_relative_path(value):
     return str(path)
 
 
-def execute_run(run_spec, engine_binary, eval_dir, host_port=5890):
-    run_id = run_spec["run_id"]
-    engine = run_spec["engine"]
-    profile_id = run_spec["profile_id"]
-    duration_sec = run_spec["duration_seconds"]
-    warmup_sec = run_spec.get("warmup_seconds", 0)
-    drain_timeout_sec = run_spec.get("drain_timeout_seconds", 60)
-    net_concurrency = run_spec.get("net_concurrency", 32)
-    file_concurrency = run_spec.get("file_concurrency", 5)
-    dc_pool_size = run_spec.get("dc_pool_size", 32)
-    manifest_path = Path(run_spec["manifest_path"])
-    manifest_sha256 = compute_sha256(manifest_path)
-    if manifest_sha256 != run_spec.get("manifest_sha256"):
-        raise ValueError("RunSpec manifest_sha256 does not match the selected manifest")
-    if not run_spec.get("baseline_cohort_id"):
-        raise ValueError("RunSpec baseline_cohort_id is required")
+def ensure_new_directory(path):
+    path = Path(path)
+    if path.exists():
+        raise FileExistsError(f"refusing to reuse existing evaluation path: {path}")
+    path.mkdir(parents=True)
+    return path
 
-    docker_command = run_spec.get("docker_command")
-    if not isinstance(docker_command, list) or not docker_command:
-        raise ValueError("RunSpec docker_command must be a non-empty argument list")
-    runner_image = run_spec.get("runner_image")
-    if not runner_image:
-        raise ValueError("RunSpec runner_image is required")
-    api_base = run_spec.get("api_base") or f"http://127.0.0.1:{host_port}"
-    artifact_meta = extract_artifact_metadata(
-        engine_binary,
-        engine,
-        docker_command,
-        runner_image,
-        run_spec["source_repository"],
+
+def parse_binary_version(output):
+    metadata = {
+        "source_commit": "unknown",
+        "source_dirty": None,
+        "version": "unknown",
+        "build_time": "unknown",
+        "go_version": "unknown",
+        "os": "unknown",
+        "arch": "unknown",
+    }
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if "=" in line:
+            key, value = (part.strip() for part in line.split("=", 1))
+            if key == "main_revision":
+                metadata["source_commit"] = value
+            elif key == "main_dirty":
+                metadata["source_dirty"] = value.lower() == "true"
+            elif key == "go_version":
+                metadata["go_version"] = value
+            elif key == "tdl_revision":
+                metadata["tdl_revision"] = value
+            continue
+        if ":" in line:
+            key, value = (part.strip() for part in line.split(":", 1))
+            if key == "Version":
+                metadata["version"] = value
+            elif key == "Commit":
+                metadata["source_commit"] = value
+            elif key == "Date":
+                metadata["build_time"] = value
+            continue
+        parts = line.split()
+        if len(parts) == 2 and parts[0].startswith("go") and "/" in parts[1]:
+            metadata["go_version"] = parts[0]
+            metadata["os"], metadata["arch"] = parts[1].split("/", 1)
+
+    if metadata["version"] == "unknown" and metadata.get("tdl_revision"):
+        metadata["version"] = metadata["tdl_revision"]
+    if metadata["source_dirty"] is None and metadata["source_commit"] != "unknown":
+        metadata["source_dirty"] = False
+    return metadata
+
+
+def inspect_runner_image(docker_command, runner_image):
+    result = subprocess.run(
+        docker_command
+        + ["inspect", "--format={{json .RepoDigests}}", runner_image],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=10,
     )
-    if artifact_meta["binary_sha256"] != run_spec.get("expected_binary_sha256"):
-        raise ValueError("engine binary does not match RunSpec expected SHA-256")
-    if artifact_meta["source_commit"] != run_spec.get("expected_source_commit"):
-        raise ValueError("engine binary does not match RunSpec expected source commit")
-    if artifact_meta.get("source_dirty") is not False:
+    if result.returncode == 0:
+        try:
+            digests = json.loads(result.stdout.strip())
+        except json.JSONDecodeError:
+            digests = []
+        if digests:
+            return sorted(digests)[0]
+
+    result = subprocess.run(
+        docker_command + ["inspect", "--format={{.Id}}", runner_image],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=10,
+    )
+    return result.stdout.strip() if result.returncode == 0 else "unknown"
+
+
+def extract_artifact_metadata(run_spec, engine_binary):
+    docker_command = run_spec["docker_command"]
+    runner_image = run_spec["runner_image"]
+    result = subprocess.run(
+        docker_command
+        + [
+            "run",
+            "--rm",
+            "-v",
+            f"{Path(engine_binary).resolve()}:/app/bin:ro",
+            runner_image,
+            "/app/bin",
+            "version",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=30,
+    )
+    metadata = parse_binary_version(result.stdout + result.stderr)
+    metadata.update(
+        {
+            "engine": run_spec["engine"],
+            "source_repository": run_spec["source_repository"],
+            "binary_sha256": compute_sha256(engine_binary) or "unknown",
+            "harness_sha256": compute_sha256(__file__) or "unknown",
+            "image_digest": inspect_runner_image(docker_command, runner_image),
+        }
+    )
+    if result.returncode != 0:
+        metadata["extraction_error"] = result.stderr.strip()
+    return metadata
+
+
+def validate_artifact(run_spec, artifact):
+    checks = {
+        "binary SHA-256": (
+            artifact.get("binary_sha256"),
+            run_spec.get("expected_binary_sha256"),
+        ),
+        "source commit": (
+            artifact.get("source_commit"),
+            run_spec.get("expected_source_commit"),
+        ),
+    }
+    for name, (actual, expected) in checks.items():
+        if not expected or actual != expected:
+            raise ValueError(f"engine {name} does not match RunSpec expectation")
+    if artifact.get("source_dirty") is not False:
         raise ValueError("engine binary reports dirty or unknown source state")
-    if str(artifact_meta.get("version")).lower() in ("", "dev", "unknown"):
-        raise ValueError("engine binary does not report a release identity")
-    for field in ("build_time", "go_version", "os", "arch"):
-        if str(artifact_meta.get(field) or "").lower() in ("", "unknown"):
+    for field in ("version", "build_time", "go_version", "os", "arch"):
+        if str(artifact.get(field) or "").lower() in ("", "dev", "unknown"):
             raise ValueError(f"engine binary does not report {field}")
-    if artifact_meta.get("image_digest") == "unknown":
+    if artifact.get("image_digest") == "unknown":
         raise ValueError("runner image identity could not be resolved")
 
-    if engine == "tdl":
-        run_root = Path(eval_dir) / "baselines" / "tdl" / run_id
-    else:
-        run_root = Path(eval_dir) / "runs" / "tgx" / run_id
-    ensure_new_directory(run_root)
-    raw_dir = run_root / "raw"
-    raw_dir.mkdir()
 
-    scratch_root = ensure_new_directory(run_spec["scratch_root"])
-    output_dir = scratch_root / "output"
-    temp_dir = scratch_root / "temp"
-    session_dir = scratch_root / "session"
-    state_dir = scratch_root / "state"
-    log_dir = scratch_root / "logs"
-    for path in (output_dir, temp_dir, session_dir, state_dir, log_dir):
+class JSONLWriter:
+    def __init__(self, path):
+        self.path = Path(path)
+        self.stream = None
+
+    def __enter__(self):
+        self.stream = self.path.open("x", encoding="utf-8", newline="\n")
+        return self
+
+    def write(self, record):
+        self.stream.write(json.dumps(record, sort_keys=True) + "\n")
+        self.stream.flush()
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.stream.close()
+
+
+class MetricsSampler(threading.Thread):
+    def __init__(self, api_base, metrics_file, engine):
+        super().__init__(daemon=True)
+        self.api_base = api_base.rstrip("/")
+        self.metrics_file = Path(metrics_file)
+        self.engine = engine
+        self.stop_event = threading.Event()
+        self.started_at = time.monotonic()
+        self.phase = "setup"
+        self.error = None
+
+    def set_phase(self, phase):
+        self.phase = phase
+
+    def stop(self):
+        self.stop_event.set()
+
+    def sample(self):
+        record = {
+            "timestamp": iso_time(),
+            "monotonic_elapsed_sec": round(time.monotonic() - self.started_at, 3),
+            "engine": self.engine,
+            "phase": self.phase,
+            "wire_rx_bytes": None,
+            "unique_payload_bytes": None,
+            "rolling_5s_bps": None,
+            "active_files": None,
+            "active_rpc": None,
+            "queued_jobs": None,
+            "connection_count": None,
+            "connection_failures": None,
+            "retry_count": None,
+            "flood_wait_count": None,
+            "flood_wait_seconds": None,
+            "per_dc_payload_bps": None,
+            "process_rss": None,
+            "heap_alloc": None,
+            "heap_inuse": None,
+            "heap_objects": None,
+            "gc_count": None,
+            "gc_pause_total": None,
+            "ssd_free_bytes": None,
+            "ssd_total_bytes": None,
+            "ssd_used_bytes": None,
+            "ssd_reserved_bytes": None,
+            "ssd_available_bytes": None,
+            "archive_backlog_files": None,
+            "archive_backlog_bytes": None,
+            "archive_active_workers": None,
+            "archive_archived_files": None,
+            "archive_conflict_count": None,
+            "target_write_bytes": None,
+            "target_read_bytes": None,
+            "target_durable_bytes": None,
+            "target_writer_concurrency": None,
+            "target_backlog_bytes": None,
+            "fsync_count": None,
+            "fsync_latency": None,
+            "device_util": None,
+            "device_await": None,
+            "collection_errors": [],
+        }
+        try:
+            status = http_json(f"{self.api_base}/api/status", timeout=1.5)
+            record["rolling_5s_bps"] = status.get("rolling_5s_bps") or 0
+            record["queued_jobs"] = status.get("queue_depth") or 0
+            active_files = status.get("active_files")
+            if isinstance(active_files, list):
+                record["active_files"] = len(active_files)
+            elif isinstance(active_files, (int, float)):
+                record["active_files"] = int(active_files)
+            else:
+                record["active_files"] = 0
+            pool = status.get("pool") or {}
+            record["connection_count"] = pool.get("size") or 0
+            record["connection_failures"] = pool.get("reconnects") or 0
+        except Exception as error:
+            record["collection_errors"].append(
+                {"source": "/api/status", "error": str(error)}
+            )
+
+        if self.engine == "tgx":
+            try:
+                gate = http_json(f"{self.api_base}/api/gate", timeout=1.5)
+                val = gate.get("data_in_flight")
+                record["active_rpc"] = val if val is not None else 0
+                val = gate.get("ssd_reserved_bytes")
+                record["ssd_reserved_bytes"] = val if val is not None else 0
+                val = gate.get("ssd_available_bytes")
+                record["ssd_available_bytes"] = val if val is not None else 0
+            except Exception as error:
+                record["collection_errors"].append(
+                    {"source": "/api/gate", "error": str(error)}
+                )
+            try:
+                storage = http_json(
+                    f"{self.api_base}/api/system/storage", timeout=1.5
+                )
+                val = storage.get("free_bytes")
+                record["ssd_free_bytes"] = val if val is not None else 0
+                val = storage.get("total_bytes")
+                record["ssd_total_bytes"] = val if val is not None else 0
+                val = storage.get("used_bytes")
+                record["ssd_used_bytes"] = val if val is not None else 0
+                archive = storage.get("archive") or {}
+                for field in (
+                    "archive_backlog_files",
+                    "archive_backlog_bytes",
+                    "archive_active_workers",
+                    "archive_archived_files",
+                    "archive_conflict_count",
+                ):
+                    fval = archive.get(field)
+                    record[field] = fval if fval is not None else 0
+            except Exception as error:
+                record["collection_errors"].append(
+                    {"source": "/api/system/storage", "error": str(error)}
+                )
+        for field, value in record.items():
+            if value is not None or field in METRIC_METADATA_FIELDS:
+                continue
+            reason = "unavailable"
+            if self.engine == "tdl" and field in TGX_INTERNAL_METRICS:
+                reason = "unsupported_by_engine"
+            record["collection_errors"].append(
+                {"source": field, "error": reason}
+            )
+        return record
+
+    def run(self):
+        try:
+            with self.metrics_file.open("x", encoding="utf-8", newline="\n") as stream:
+                while not self.stop_event.is_set():
+                    sample_started = time.monotonic()
+                    stream.write(json.dumps(self.sample(), sort_keys=True) + "\n")
+                    stream.flush()
+                    remaining = 1.0 - (time.monotonic() - sample_started)
+                    if remaining > 0:
+                        self.stop_event.wait(remaining)
+        except Exception as error:
+            self.error = error
+
+
+@dataclass
+class RunPaths:
+    run_root: Path
+    raw: Path
+    scratch: Path
+    output: Path
+    temp: Path
+    session: Path
+    state: Path
+    logs: Path
+
+
+def prepare_paths(run_spec, eval_dir):
+    category = "baselines/tdl" if run_spec["engine"] == "tdl" else "runs/tgx"
+    run_root = ensure_new_directory(Path(eval_dir) / category / run_spec["run_id"])
+    scratch = ensure_new_directory(run_spec["scratch_root"])
+    paths = RunPaths(
+        run_root=run_root,
+        raw=run_root / "raw",
+        scratch=scratch,
+        output=scratch / "output",
+        temp=scratch / "temp",
+        session=scratch / "session",
+        state=scratch / "state",
+        logs=scratch / "logs",
+    )
+    for path in (
+        paths.raw,
+        paths.output,
+        paths.temp,
+        paths.session,
+        paths.state,
+        paths.logs,
+    ):
         path.mkdir()
 
-    source_session = Path(run_spec["session_source_dir"])
-    if not source_session.is_dir():
-        raise FileNotFoundError(f"session source does not exist: {source_session}")
-    for source in source_session.iterdir():
+    session_source = Path(run_spec["session_source_dir"])
+    if not session_source.is_dir():
+        raise FileNotFoundError(f"session source does not exist: {session_source}")
+    for source in session_source.iterdir():
         if source.is_file():
-            shutil.copy2(source, session_dir / source.name)
+            shutil.copy2(source, paths.session / source.name)
+    return paths
 
-    print(f"\n=======================================================")
-    print(f"  TGX Evaluation Protocol v1.0 - RUN: {run_id}")
-    print(f"  Engine: {engine.upper()} | Profile: {profile_id} | Duration: {duration_sec}s")
-    print(f"  Concurrency: net={net_concurrency}, file={file_concurrency}, pool={dc_pool_size}")
-    print(f"  Port: {host_port} | Isolated Output: {output_dir}")
-    print(f"  Raw Evidence Root: {raw_dir}")
-    print(f"=======================================================")
 
-    # 1. raw/protocol.json
-    with open(raw_dir / "protocol.json", "w", encoding="utf-8") as f:
-        json.dump({"protocol_version": PROTOCOL_VERSION, "protocol_sha256": PROTOCOL_SHA256}, f, indent=2)
+class DockerEngine:
+    def __init__(self, run_spec, engine_binary, paths, host_port):
+        self.run_spec = run_spec
+        self.engine_binary = Path(engine_binary).resolve()
+        self.paths = paths
+        self.host_port = host_port
+        self.docker = run_spec["docker_command"]
+        self.name = f"tgx-eval-runner-{run_spec['run_id']}"
+        self.api_base = run_spec.get("api_base") or f"http://127.0.0.1:{host_port}"
 
-    # 2. raw/run_spec.json
-    run_spec_copy = dict(run_spec)
-    run_spec_copy["output_dir"] = str(output_dir)
-    run_spec_copy["state_db"] = str(state_dir / "records.sqlite3")
-    run_spec_copy["log_dir"] = str(log_dir)
-    with open(raw_dir / "run_spec.json", "w", encoding="utf-8") as f:
-        json.dump(run_spec_copy, f, indent=2)
+    def _run_args(self):
+        args = self.docker + [
+            "run",
+            "-d",
+            "--name",
+            self.name,
+            "-v",
+            f"{self.engine_binary}:/app/telegram-downloader:ro",
+            "-v",
+            f"{self.paths.output}:/app/downloads",
+            "-v",
+            f"{self.paths.session}:/data",
+            "-v",
+            f"{self.paths.state}:/app/state",
+            "-v",
+            f"{self.paths.logs}:/app/logs",
+        ]
+        network_container = self.run_spec.get("network_container")
+        if network_container:
+            args.extend(["--net", f"container:{network_container}"])
+        else:
+            args.extend(["-p", f"127.0.0.1:{self.host_port}:5000"])
+        if self.run_spec["engine"] == "tdl":
+            args.extend(["-v", f"{self.paths.temp}:/app/temp/tdl"])
 
-    # 3. raw/artifact.json
-    with open(raw_dir / "artifact.json", "w", encoding="utf-8") as f:
-        json.dump(artifact_meta, f, indent=2)
+        args.extend(
+            [
+                self.run_spec["runner_image"],
+                "/app/telegram-downloader",
+                "serve",
+                "--dir",
+                "/app/downloads",
+                "--storage-path",
+                "/data",
+                "--db-path",
+                "/app/state/records.sqlite3",
+                "--namespace",
+                self.run_spec.get("namespace", "evaluation"),
+                "--listen",
+                "0.0.0.0:5000",
+                "--download-threads",
+                str(self.run_spec["net_concurrency"]),
+                "--file-concurrency",
+                str(self.run_spec["file_concurrency"]),
+                "--dc-pool-size",
+                str(self.run_spec["dc_pool_size"]),
+            ]
+        )
+        if self.run_spec["engine"] == "tdl":
+            args.extend(["--temp-dir", "/app/temp/tdl"])
+        return args
 
-    env_meta = dict(run_spec.get("environment") or {})
-    env_meta["container_identity"] = f"tgx-eval-runner-{run_id}"
-    with open(raw_dir / "environment.json", "w", encoding="utf-8") as f:
-        json.dump(env_meta, f, indent=2)
-
-    # 5. raw/manifest.jsonl (byte-identical copy)
-    raw_manifest_path = raw_dir / "manifest.jsonl"
-    shutil.copyfile(manifest_path, raw_manifest_path)
-
-    cases = []
-    with open(raw_manifest_path, "r", encoding="utf-8") as f:
-        for line in f:
-            if line.strip():
-                cases.append(json.loads(line))
-
-    # Initialize raw facts files
-    events_file = raw_dir / "events.jsonl"
-    errors_file = raw_dir / "errors.jsonl"
-    metrics_file = raw_dir / "metrics.jsonl"
-    process_log_file = raw_dir / "process.log"
-
-    events_fp = open(events_file, "w", encoding="utf-8")
-    errors_fp = open(errors_file, "w", encoding="utf-8")
-
-    def log_event(event_name, payload=None):
-        ev = {
-            "timestamp": iso_time(),
-            "event": event_name,
-            "engine": engine,
-            "payload": payload or {}
-        }
-        events_fp.write(json.dumps(ev) + "\n")
-        events_fp.flush()
-
-    container_name = f"tgx-eval-runner-{run_id}"
-
-    print(f"[*] Spawning Runner Container: {container_name}...")
-    serve_args = docker_command + [
-        "run", "-d",
-        "--name", container_name,
-        "-v", f"{os.path.abspath(engine_binary)}:/app/telegram-downloader:ro",
-        "-v", f"{output_dir}:/app/downloads",
-        "-v", f"{session_dir}:/data",
-        "-v", f"{state_dir}:/app/state",
-        "-v", f"{log_dir}:/app/logs",
-    ]
-    network_container = run_spec.get("network_container")
-    if network_container:
-        serve_args.extend(["--net", f"container:{network_container}"])
-    else:
-        serve_args.extend(["-p", f"127.0.0.1:{host_port}:5000"])
-    if engine == "tdl":
-        serve_args.extend(["-v", f"{temp_dir}:/app/temp/tdl"])
-
-    serve_args.extend([
-        runner_image,
-        "/app/telegram-downloader", "serve",
-        "--dir", "/app/downloads",
-        "--storage-path", "/data",
-        "--db-path", "/app/state/records.sqlite3",
-        "--namespace", run_spec.get("namespace", "evaluation"),
-        "--listen", "0.0.0.0:5000",
-        "--download-threads", str(net_concurrency),
-        "--file-concurrency", str(file_concurrency),
-        "--dc-pool-size", str(dc_pool_size),
-    ])
-    if engine == "tdl":
-        serve_args.extend(["--temp-dir", "/app/temp/tdl"])
-
-    res = subprocess.run(serve_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if res.returncode != 0:
-        raise RuntimeError(f"Failed to start container {container_name}: {res.stderr}")
-
-    # Wait for daemon health
-    print(f"[*] Waiting for {container_name} to be ready at {api_base}/healthz...")
-    ready = False
-    for _ in range(90):
-        time.sleep(1)
-        try:
-            req = urllib.request.Request(f"{api_base}/healthz")
-            with urllib.request.urlopen(req, timeout=1) as resp:
-                if resp.status == 200:
-                    ready = True
-                    break
-        except Exception:
-            pass
-
-    if not ready:
-        p_logs = subprocess.run(
-            docker_command + ["logs", container_name],
+    def start(self):
+        result = subprocess.run(
+            self._run_args(),
             stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
+            stderr=subprocess.PIPE,
             text=True,
         )
-        subprocess.run(
-            docker_command + ["rm", "-f", container_name],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        raise RuntimeError(f"Engine {engine} failed to start within 90s. Logs:\n{p_logs.stdout}")
+        if result.returncode != 0:
+            self.stop()
+            raise RuntimeError(f"failed to start {self.name}: {result.stderr.strip()}")
 
-    print("[OK] Engine daemon is healthy and ready!")
-    log_event("run.started", {"run_id": run_id, "cases_total": len(cases)})
+    def wait_ready(self, timeout=90):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                if http_ok(f"{self.api_base}/healthz", timeout=1):
+                    return
+            except Exception:
+                time.sleep(1)
+        raise TimeoutError(f"{self.name} did not become healthy within {timeout}s")
 
-    # Start 1s Metrics Sampler
-    sampler = MetricsSampler(api_base, metrics_file, engine)
-    sampler.start()
-
-    # Pause daemon while submitting tasks
-    try:
-        http_post(f"{api_base}/api/control", {"action": "pause"})
-        log_event("daemon.paused")
-    except Exception:
-        pass
-
-    # Submit tasks
-    task_submits = {}
-    for c in cases:
-        case_id = c["case_id"]
-        rel_path = safe_relative_path(
-            c["expected_tgx_path"] if engine == "tgx" else c["expected_tdl_path"]
-        )
-        task_id = f"{run_id}_{c['chat_id']}_{c['message_id']}"
-        req = {
-            "id": task_id,
-            "peer": str(c["chat_id"]),
-            "message_id": int(c["message_id"]),
-            "final_path": rel_path,
-            "expected_size": int(c["expected_size"]),
-        }
-        t_sub = time.time()
+    def capture_process(self):
         try:
-            http_post(f"{api_base}/api/tasks", req)
-            log_event("item.submitted", {"case_id": case_id, "task_id": task_id})
-            task_submits[case_id] = {"task_id": task_id, "submitted_at": t_sub, "submitted": True, "error": None}
-        except Exception as e:
-            err_entry = {
-                "case_id": case_id,
-                "attempt_id": "not-admitted",
-                "stage": "submit",
-                "op": "http_post",
-                "error_code": "SUBMIT_FAILED",
-                "error_cause": str(e),
-                "retryable": False,
-            }
-            errors_fp.write(json.dumps(err_entry) + "\n")
-            task_submits[case_id] = {"task_id": task_id, "submitted_at": t_sub, "submitted": False, "error": str(e)}
-
-    # Resume daemon
-    try:
-        http_post(f"{api_base}/api/control", {"action": "resume"})
-        log_event("daemon.resumed")
-    except Exception:
-        pass
-
-    if warmup_sec:
-        sampler.set_phase("warmup")
-        log_event("run.warmup.started", {"duration_seconds": warmup_sec})
-        time.sleep(warmup_sec)
-        log_event("run.warmup.finished")
-
-    sampler.set_phase("measurement")
-    start_time = time.time()
-    print(f"[*] Executing run for {duration_sec}s...")
-    
-    while time.time() - start_time < duration_sec:
-        time.sleep(2)
-        try:
-            st = http_get(f"{api_base}/api/status")
-            active = len(st.get("active_files") or [])
-            q = st.get("queue_depth", 0)
-            bps = st.get("rolling_5s_bps", 0)
-            mbps = (bps * 8) / (1024 * 1024)
-            elapsed = int(time.time() - start_time)
-            print(f"\r[*] Progress: {elapsed}/{duration_sec}s | Active: {active}, Queue: {q}, Speed: {mbps:.2f} Mbps      ", end="", flush=True)
-            if active == 0 and q == 0 and elapsed >= 30:
-                try:
-                    tasks_resp = http_get(f"{api_base}/api/tasks")
-                    term_count = sum(1 for t in tasks_resp if t.get("state") in ("success", "failed", "unavailable"))
-                    if term_count >= len(cases):
-                        print(f"\n[*] All {term_count}/{len(cases)} tasks finished ahead of duration timeout.")
-                        break
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-    # Enter Drain Mode
-    print("\n[*] Entering Drain Mode...")
-    log_event("run.draining")
-    drain_start = time.time()
-
-    while time.time() - drain_start < drain_timeout_sec:
-        time.sleep(2)
-        try:
-            st = http_get(f"{api_base}/api/status")
-            active = len(st.get("active_files") or [])
-            q = st.get("queue_depth", 0)
-            if active == 0 and q == 0:
-                print("[OK] Queue drained completely!")
-                break
-        except Exception:
-            pass
-
-    # Fetch Daemon Task Snapshots before tearing down container
-    engine_tasks = {}
-    try:
-        ts_resp = http_get(f"{api_base}/api/tasks", timeout=5)
-        if isinstance(ts_resp, list):
-            for t in ts_resp:
-                if "id" in t:
-                    engine_tasks[t["id"]] = t
-    except Exception:
-        pass
-
-    log_event("run.finished")
-    sampler.stop()
-    sampler.join()
-    events_fp.close()
-
-    # Capture process logs
-    with open(process_log_file, "w", encoding="utf-8") as f:
-        f.write(f"=== Process Log for Run {run_id} ===\n")
-        try:
-            p = subprocess.run(
-                docker_command + ["logs", container_name],
+            logs = subprocess.run(
+                self.docker + ["logs", self.name],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=30,
+            )
+            state = subprocess.run(
+                self.docker
+                + [
+                    "inspect",
+                    "--format={{json .State}} restart_count={{.RestartCount}}",
+                    self.name,
+                ],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
                 timeout=10,
             )
-            f.write(p.stdout)
-        except Exception as e:
-            f.write(f"Direct log capture: {e}\n")
+            return logs.stdout + "\n=== Container State ===\n" + state.stdout
+        except Exception as error:
+            return f"process evidence collection failed: {error}\n"
 
-    subprocess.run(
-        docker_command + ["rm", "-f", container_name],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    time.sleep(2)
-
-    # 7. raw/task_results.jsonl, raw/errors.jsonl, and raw/hashes.jsonl
-    print("[*] Generating task_results.jsonl, file_inventory.jsonl, and hashes.jsonl...")
-    task_results = []
-    hashes_records = []
-
-    for c in cases:
-        case_id = c["case_id"]
-        rel_path = safe_relative_path(
-            c["expected_tgx_path"] if engine == "tgx" else c["expected_tdl_path"]
+    def stop(self):
+        subprocess.run(
+            self.docker + ["rm", "-f", self.name],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
-        expected_size = c["expected_size"]
-        baseline_sha = c["baseline_sha256"]
-        target_file = output_dir / rel_path
-        task_id = f"{run_id}_{c['chat_id']}_{c['message_id']}"
 
-        actual_size = target_file.stat().st_size if target_file.is_file() else 0
-        actual_sha = compute_sha256(target_file) if target_file.is_file() else ""
+    def __enter__(self):
+        try:
+            self.start()
+            self.wait_ready()
+        except Exception:
+            self.stop()
+            raise
+        return self
 
-        size_match = (actual_size == expected_size and expected_size > 0)
-        sha_match = (actual_sha == baseline_sha and baseline_sha != "") if baseline_sha else size_match
-        file_present = target_file.is_file()
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.stop()
 
-        eng_t = engine_tasks.get(task_id, {})
-        eng_state = eng_t.get("state", "unknown")
-        admitted = (task_id in engine_tasks or task_submits.get(case_id, {}).get("submitted", False))
-        
-        err_code = None
-        err_stage = None
-        err_op = None
-        err_cause = None
 
-        if file_present and size_match and sha_match:
+def load_manifest(path, engine):
+    cases = []
+    seen = set()
+    with Path(path).open("r", encoding="utf-8") as stream:
+        for line_number, line in enumerate(stream, 1):
+            if not line.strip():
+                continue
+            case = json.loads(line)
+            case_id = case.get("case_id")
+            if not case_id or case_id in seen:
+                raise ValueError(f"invalid or duplicate case_id at manifest line {line_number}")
+            expected_path = case[
+                "expected_tgx_path" if engine == "tgx" else "expected_tdl_path"
+            ]
+            safe_relative_path(expected_path)
+            if int(case.get("expected_size") or 0) <= 0:
+                raise ValueError(f"invalid expected_size at manifest line {line_number}")
+            seen.add(case_id)
+            cases.append(case)
+    if not cases:
+        raise ValueError("manifest contains no cases")
+    return cases
+
+
+def append_run_error(writer, error_code, cause, op):
+    writer.write(
+        {
+            "case_id": "run",
+            "attempt_id": "collector",
+            "stage": "collection",
+            "op": op,
+            "error_code": error_code,
+            "error_cause": str(cause),
+            "retryable": False,
+        }
+    )
+
+
+def wait_for_measurement(engine, cases, duration, events):
+    deadline = time.monotonic() + duration
+    while time.monotonic() < deadline:
+        time.sleep(min(2, max(0, deadline - time.monotonic())))
+        try:
+            status = http_json(f"{engine.api_base}/api/status")
+            active = len(status.get("active_files") or [])
+            queued = status.get("queue_depth", 0)
+            speed = status.get("rolling_5s_bps", 0) * 8 / (1024 * 1024)
+            print(
+                f"Active={active} Queue={queued} Speed={speed:.2f} Mbps",
+                flush=True,
+            )
+            if active == 0 and queued == 0:
+                tasks = http_json(f"{engine.api_base}/api/tasks")
+                terminal = {"success", "failed", "unavailable", "canceled"}
+                if sum(task.get("state") in terminal for task in tasks) >= len(cases):
+                    events.write({"timestamp": iso_time(), "event": "run.completed_early"})
+                    return False
+        except Exception:
+            continue
+    return True
+
+
+def drain(engine, timeout):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            status = http_json(f"{engine.api_base}/api/status")
+            downloads_done = not status.get("active_files")
+            archive_done = True
+            if engine.run_spec["engine"] == "tgx":
+                storage = http_json(f"{engine.api_base}/api/system/storage")
+                archive = storage.get("archive") or {}
+                archive_done = archive.get("archive_backlog_files") == 0
+            if downloads_done and archive_done:
+                return True
+        except Exception:
+            pass
+        time.sleep(2)
+    return False
+
+
+def classify_results(cases, engine_name, paths, task_submits, engine_tasks, timed_out):
+    task_results = []
+    hashes = []
+    errors = []
+    for case in cases:
+        case_id = case["case_id"]
+        relative = safe_relative_path(
+            case["expected_tgx_path"]
+            if engine_name == "tgx"
+            else case["expected_tdl_path"]
+        )
+        target = paths.output / relative
+        expected_size = int(case["expected_size"])
+        expected_sha = case.get("baseline_sha256") or ""
+        actual_size = target.stat().st_size if target.is_file() else 0
+        actual_sha = compute_sha256(target) or ""
+        size_match = actual_size == expected_size
+        sha_match = bool(expected_sha) and actual_sha == expected_sha
+        snapshot = engine_tasks.get(task_submits[case_id]["task_id"], {})
+        state = snapshot.get("state", "unknown")
+
+        error_code = None
+        error_stage = None
+        error_op = None
+        error_cause = None
+        if target.is_file() and size_match and sha_match:
             terminal_state = "COMPLETED"
-        elif eng_state == "canceled" or (eng_t.get("error_class") == "canceled"):
+        elif not task_submits[case_id]["submitted"]:
+            terminal_state = "FAILED"
+            error_code = "SUBMIT_FAILED"
+            error_stage = "submit"
+            error_op = "http_post"
+            error_cause = task_submits[case_id]["error"]
+        elif state == "canceled" or snapshot.get("error_class") == "canceled":
             terminal_state = "CANCELED"
-            err_code = "CANCELED"
-            err_stage = "lifecycle"
-            err_op = "cancel"
-            err_cause = eng_t.get("error", "task canceled")
-        elif not file_present and (time.time() - start_time >= duration_sec or eng_state in ("queued", "downloading")):
+            error_code = "CANCELED"
+            error_stage = "lifecycle"
+            error_op = "cancel"
+            error_cause = snapshot.get("error") or "task canceled"
+        elif timed_out and state in ("queued", "resolving", "downloading"):
             terminal_state = "TIMED_OUT"
-            err_code = "TIMED_OUT"
-            err_stage = "lifecycle"
-            err_op = "drain"
-            err_cause = f"task did not complete before run duration ({duration_sec}s)"
+            error_code = "TIMED_OUT"
+            error_stage = "lifecycle"
+            error_op = "drain"
+            error_cause = "task did not complete before measurement and drain ended"
         else:
             terminal_state = "FAILED"
-            if eng_t.get("error_class"):
-                err_code = eng_t.get("error_class")
-                err_cause = eng_t.get("error", "engine error")
-                err_stage = "engine"
-                err_op = "download"
-            elif not file_present:
-                err_code = "FILE_MISSING"
-                err_stage = "storage"
-                err_op = "verify_presence"
-                err_cause = f"expected file {rel_path} not created on disk (engine state: {eng_state})"
-            elif not size_match:
-                err_code = "SIZE_MISMATCH"
-                err_stage = "oracle"
-                err_op = "verify_size"
-                err_cause = f"expected {expected_size} bytes, actual {actual_size} bytes"
-            elif not sha_match:
-                err_code = "SHA_MISMATCH"
-                err_stage = "oracle"
-                err_op = "verify_sha256"
-                err_cause = f"expected sha {baseline_sha[:12]}, actual sha {actual_sha[:12]}"
-            
-        if terminal_state != "COMPLETED":
-            err_entry = {
+            error_code = snapshot.get("error_class") or (
+                "FILE_MISSING" if not target.is_file() else "VERIFICATION_FAILED"
+            )
+            error_stage = "engine" if snapshot.get("error_class") else "oracle"
+            error_op = "download" if snapshot.get("error_class") else "verify_file"
+            error_cause = snapshot.get("error") or (
+                f"expected size/SHA {expected_size}/{expected_sha[:12]}, "
+                f"actual {actual_size}/{actual_sha[:12]}"
+            )
+
+        attempt_id = snapshot.get("attempt_generation")
+        if not task_submits[case_id]["submitted"]:
+            attempt_id = "not-admitted"
+        if terminal_state not in ("COMPLETED", "TIMED_OUT"):
+            errors.append(
+                {
+                    "case_id": case_id,
+                    "task_id": task_submits[case_id]["task_id"],
+                    "attempt_id": attempt_id,
+                    "stage": error_stage,
+                    "op": error_op,
+                    "error_code": error_code,
+                    "error_cause": error_cause,
+                    "retryable": False,
+                }
+            )
+        task_results.append(
+            {
                 "case_id": case_id,
-                "task_id": task_id,
-                "attempt_id": eng_t.get("attempt_generation"),
-                "stage": err_stage or "oracle",
-                "op": err_op or "verification",
-                "error_code": err_code or "FAILED",
-                "error_cause": err_cause or "unknown failure",
-                "retryable": False,
+                "task_id": task_submits[case_id]["task_id"],
+                "attempt_id": attempt_id,
+                "submitted": task_submits[case_id]["submitted"],
+                "admitted": bool(snapshot),
+                "terminal_state": terminal_state,
+                "attempt_count": snapshot.get("attempt_count"),
+                "error_code": error_code,
+                "error_stage": error_stage,
+                "error_op": error_op,
+                "error_cause": error_cause,
+                "started_at": snapshot.get("started_at"),
+                "finished_at": snapshot.get("finished_at"),
+                "network_unique_bytes": snapshot.get("net_downloaded"),
+                "target_durable_bytes": actual_size,
             }
-            errors_fp.write(json.dumps(err_entry) + "\n")
+        )
+        hashes.append(
+            {
+                "case_id": case_id,
+                "expected_path": relative,
+                "actual_path": str(target) if target.is_file() else None,
+                "expected_size": expected_size,
+                "actual_size": actual_size,
+                "baseline_sha256": expected_sha,
+                "actual_sha256": actual_sha,
+                "size_match": size_match,
+                "sha_match": sha_match,
+            }
+        )
+    return task_results, hashes, errors
 
-        t_res = {
-            "case_id": case_id,
-            "task_id": task_id,
-            "attempt_id": eng_t.get("attempt_generation"),
-            "submitted": task_submits.get(case_id, {}).get("submitted", False),
-            "admitted": admitted,
-            "terminal_state": terminal_state,
-            "attempt_count": 1,
-            "error_code": err_code,
-            "error_stage": err_stage,
-            "error_op": err_op,
-            "error_cause": err_cause,
-            "started_at": int(eng_t.get("started_at") or task_submits.get(case_id, {}).get("submitted_at", start_time)),
-            "finished_at": int(eng_t.get("finished_at") or time.time()),
-            "network_unique_bytes": eng_t.get("net_downloaded", actual_size),
-            "target_durable_bytes": actual_size,
-        }
-        task_results.append(t_res)
 
-        h_res = {
-            "case_id": case_id,
-            "expected_path": rel_path,
-            "actual_path": str(target_file) if file_present else None,
-            "expected_size": expected_size,
-            "actual_size": actual_size,
-            "baseline_sha256": baseline_sha,
-            "actual_sha256": actual_sha,
-            "size_match": size_match,
-            "sha_match": sha_match,
-        }
-        hashes_records.append(h_res)
-
-    errors_fp.close()
-
-    with open(raw_dir / "task_results.jsonl", "w", encoding="utf-8") as f:
-        for t in task_results:
-            f.write(json.dumps(t) + "\n")
-
-    with open(raw_dir / "hashes.jsonl", "w", encoding="utf-8") as f:
-        for h in hashes_records:
-            f.write(json.dumps(h) + "\n")
-
-    # 8. raw/file_inventory.jsonl
-    inventory = []
-    expected_paths = {
+def build_inventory(cases, engine_name, paths):
+    expected = {
         safe_relative_path(
             case["expected_tgx_path"]
-            if engine == "tgx"
+            if engine_name == "tgx"
             else case["expected_tdl_path"]
         )
         for case in cases
     }
-    for root, _, files in os.walk(output_dir):
-        for fl in files:
-            full = os.path.join(root, fl)
-            rel = os.path.relpath(full, output_dir).replace(os.sep, "/")
-            sz = os.path.getsize(full)
-            if rel in expected_paths:
+    inventory = []
+    for root, _, files in os.walk(paths.output):
+        for filename in files:
+            path = Path(root) / filename
+            relative = path.relative_to(paths.output).as_posix()
+            if relative in expected:
                 classification = "expected_target"
-            elif fl.endswith(".moving"):
+            elif filename.endswith(".moving"):
                 classification = "orphan_moving"
-            elif fl.endswith((".seg", ".meta", ".part", ".tmp")) or ".part." in fl:
+            elif filename.endswith((".seg", ".meta", ".part", ".tmp")) or ".part." in filename:
                 classification = "orphan_temporary"
             else:
                 classification = "unexpected_file"
             inventory.append(
-                {"path": rel, "size_bytes": sz, "classification": classification}
+                {
+                    "path": relative,
+                    "size_bytes": path.stat().st_size,
+                    "classification": classification,
+                }
             )
+    if engine_name == "tdl":
+        for root, _, files in os.walk(paths.temp):
+            for filename in files:
+                path = Path(root) / filename
+                inventory.append(
+                    {
+                        "path": f"temp/{path.relative_to(paths.temp).as_posix()}",
+                        "size_bytes": path.stat().st_size,
+                        "classification": "temp_residue",
+                    }
+                )
+    return sorted(inventory, key=lambda item: item["path"])
 
-    if os.path.exists(temp_dir):
-        for root, _, files in os.walk(temp_dir):
-            for fl in files:
-                full = os.path.join(root, fl)
-                rel = os.path.relpath(full, temp_dir)
-                sz = os.path.getsize(full)
-                inventory.append({"path": f"temp/{rel}", "size_bytes": sz, "classification": "temp_residue"})
 
-    with open(raw_dir / "file_inventory.jsonl", "w", encoding="utf-8") as f:
-        for inv in inventory:
-            f.write(json.dumps(inv) + "\n")
+def execute_run(run_spec, engine_binary, eval_dir, host_port=5890):
+    manifest_path = Path(run_spec["manifest_path"])
+    if compute_sha256(manifest_path) != run_spec.get("manifest_sha256"):
+        raise ValueError("RunSpec manifest_sha256 does not match the selected manifest")
+    if not run_spec.get("baseline_cohort_id"):
+        raise ValueError("RunSpec baseline_cohort_id is required")
+    if not isinstance(run_spec.get("docker_command"), list):
+        raise ValueError("RunSpec docker_command must be an argument list")
+    if not run_spec["docker_command"]:
+        raise ValueError("RunSpec docker_command must not be empty")
 
-    seal_raw_directory(raw_dir)
-    print("[OK] Raw evidence sealed with checksums.sha256.")
-    return str(run_root)
+    artifact = extract_artifact_metadata(run_spec, engine_binary)
+    validate_artifact(run_spec, artifact)
+    cases = load_manifest(manifest_path, run_spec["engine"])
+    paths = prepare_paths(run_spec, eval_dir)
+
+    run_spec_copy = dict(run_spec)
+    run_spec_copy.update(
+        {
+            "output_dir": str(paths.output),
+            "state_db": str(paths.state / "records.sqlite3"),
+            "log_dir": str(paths.logs),
+        }
+    )
+    write_json(
+        paths.raw / "protocol.json",
+        {"protocol_version": PROTOCOL_VERSION, "protocol_sha256": PROTOCOL_SHA256},
+    )
+    write_json(paths.raw / "run_spec.json", run_spec_copy)
+    write_json(paths.raw / "artifact.json", artifact)
+    environment = dict(run_spec["environment"])
+    environment["container_identity"] = f"tgx-eval-runner-{run_spec['run_id']}"
+    write_json(paths.raw / "environment.json", environment)
+    shutil.copyfile(manifest_path, paths.raw / "manifest.jsonl")
+
+    events_path = paths.raw / "events.jsonl"
+    errors_path = paths.raw / "errors.jsonl"
+    metrics_path = paths.raw / "metrics.jsonl"
+    process_path = paths.raw / "process.log"
+    task_submits = {}
+    engine_tasks = {}
+    measurement_timed_out = False
+
+    with JSONLWriter(events_path) as events, JSONLWriter(errors_path) as errors:
+        engine = DockerEngine(run_spec, engine_binary, paths, host_port)
+        with engine:
+            events.write(
+                {
+                    "timestamp": iso_time(),
+                    "event": "run.started",
+                    "engine": run_spec["engine"],
+                    "run_id": run_spec["run_id"],
+                }
+            )
+            sampler = MetricsSampler(engine.api_base, metrics_path, run_spec["engine"])
+            sampler.start()
+            try:
+                http_json(
+                    f"{engine.api_base}/api/control",
+                    method="POST",
+                    data={"action": "pause"},
+                )
+                for case in cases:
+                    task_id = (
+                        f"{run_spec['run_id']}_{case['chat_id']}_{case['message_id']}"
+                    )
+                    request = {
+                        "id": task_id,
+                        "peer": str(case["chat_id"]),
+                        "message_id": int(case["message_id"]),
+                        "final_path": safe_relative_path(
+                            case["expected_tgx_path"]
+                            if run_spec["engine"] == "tgx"
+                            else case["expected_tdl_path"]
+                        ),
+                        "expected_size": int(case["expected_size"]),
+                    }
+                    try:
+                        http_json(
+                            f"{engine.api_base}/api/tasks",
+                            method="POST",
+                            data=request,
+                        )
+                        task_submits[case["case_id"]] = {
+                            "task_id": task_id,
+                            "submitted": True,
+                            "error": None,
+                        }
+                        events.write(
+                            {
+                                "timestamp": iso_time(),
+                                "event": "item.submitted",
+                                "engine": run_spec["engine"],
+                                "case_id": case["case_id"],
+                                "task_id": task_id,
+                            }
+                        )
+                    except Exception as error:
+                        task_submits[case["case_id"]] = {
+                            "task_id": task_id,
+                            "submitted": False,
+                            "error": str(error),
+                        }
+
+                http_json(
+                    f"{engine.api_base}/api/control",
+                    method="POST",
+                    data={"action": "resume"},
+                )
+                warmup = run_spec.get("warmup_seconds", 0)
+                if warmup:
+                    sampler.set_phase("warmup")
+                    events.write(
+                        {
+                            "timestamp": iso_time(),
+                            "event": "run.warmup.started",
+                            "duration_seconds": warmup,
+                        }
+                    )
+                    time.sleep(warmup)
+                sampler.set_phase("measurement")
+                measurement_timed_out = wait_for_measurement(
+                    engine,
+                    cases,
+                    run_spec["duration_seconds"],
+                    events,
+                )
+                try:
+                    http_json(
+                        f"{engine.api_base}/api/control",
+                        method="POST",
+                        data={"action": "pause"},
+                    )
+                except Exception as error:
+                    append_run_error(
+                        errors,
+                        "ADMISSION_STOP_FAILED",
+                        error,
+                        "pause_after_measurement",
+                    )
+                events.write({"timestamp": iso_time(), "event": "run.draining"})
+                drained = drain(engine, run_spec.get("drain_timeout_seconds", 60))
+                if not drained:
+                    append_run_error(
+                        errors,
+                        "DRAIN_TIMEOUT",
+                        "active downloads or archive backlog did not drain before timeout",
+                        "drain",
+                    )
+                try:
+                    snapshots = http_json(f"{engine.api_base}/api/tasks")
+                    engine_tasks = {
+                        snapshot["id"]: snapshot
+                        for snapshot in snapshots
+                        if snapshot.get("id")
+                    }
+                except Exception as error:
+                    append_run_error(
+                        errors,
+                        "TASK_SNAPSHOT_FAILED",
+                        error,
+                        "get_tasks",
+                    )
+                events.write({"timestamp": iso_time(), "event": "run.finished"})
+            except Exception as error:
+                measurement_timed_out = True
+                append_run_error(
+                    errors,
+                    "RUN_EXECUTION_FAILED",
+                    error,
+                    "execute_run",
+                )
+                events.write(
+                    {
+                        "timestamp": iso_time(),
+                        "event": "run.aborted",
+                        "error": str(error),
+                    }
+                )
+            finally:
+                sampler.stop()
+                sampler.join()
+                if sampler.error:
+                    append_run_error(
+                        errors,
+                        "METRICS_COLLECTOR_FAILED",
+                        sampler.error,
+                        "sample_metrics",
+                    )
+                process_path.write_text(engine.capture_process(), encoding="utf-8")
+
+        for case in cases:
+            task_id = f"{run_spec['run_id']}_{case['chat_id']}_{case['message_id']}"
+            task_submits.setdefault(
+                case["case_id"],
+                {
+                    "task_id": task_id,
+                    "submitted": False,
+                    "error": "run aborted before task submission",
+                },
+            )
+        task_results, hashes, task_errors = classify_results(
+            cases,
+            run_spec["engine"],
+            paths,
+            task_submits,
+            engine_tasks,
+            measurement_timed_out,
+        )
+        for error in task_errors:
+            errors.write(error)
+
+    write_jsonl(paths.raw / "task_results.jsonl", task_results)
+    write_jsonl(paths.raw / "hashes.jsonl", hashes)
+    write_jsonl(
+        paths.raw / "file_inventory.jsonl",
+        build_inventory(cases, run_spec["engine"], paths),
+    )
+    seal_raw_directory(paths.raw)
+    print(f"Raw evidence sealed: {paths.raw}")
+    return str(paths.run_root)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--run-spec", required=True)
+    parser.add_argument("--engine-binary", required=True)
+    parser.add_argument("--eval-dir", required=True)
+    parser.add_argument("--port", type=int, default=5890)
+    args = parser.parse_args()
+    with open(args.run_spec, "r", encoding="utf-8") as stream:
+        run_spec = json.load(stream)
+    execute_run(run_spec, args.engine_binary, args.eval_dir, args.port)
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="TGX Evaluation Protocol v1 Reference Harness")
-    parser.add_argument("--run-spec", required=True, help="Path to run_spec.json")
-    parser.add_argument("--engine-binary", required=True, help="Path to engine executable")
-    parser.add_argument("--eval-dir", default="/volume2/docker/telegram_downloader_eval/evaluation")
-    parser.add_argument("--port", type=int, default=5890, help="Host port to bind runner container")
-    args = parser.parse_args()
-
-    with open(args.run_spec, "r", encoding="utf-8") as f:
-        spec = json.load(f)
-
-    execute_run(spec, args.engine_binary, eval_dir=args.eval_dir, host_port=args.port)
+    main()

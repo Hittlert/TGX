@@ -1,6 +1,6 @@
 # TGX Evaluation Standards Alignment (Phase A)
 
-**Date**: 2026-09-02  
+**Date**: 2026-09-04
 **Status**: **ALIGNED (FULL CONSENSUS)**
 
 ---
@@ -51,10 +51,10 @@ The following SHA256 hashes are frozen for all Phase B–E executions:
 
 | File | SHA256 Hash |
 |---|---|
-| `docs/evaluation/TGX_EVALUATION_PROTOCOL_V1.md` | `4dbdf4940f5c751d683c79f3392bbca770832ef258360f57244d69fc3d589c0e` |
+| `docs/evaluation/TGX_EVALUATION_PROTOCOL_V1.md` | `17a829372cffeb6ccdd2a591117219d70885c431f0b5bc83f53c2ca0e64daeda` |
 | `docs/evaluation/profiles-v1.json` | `6e0c0f38cde7f51aed3b4828c374611a9cda94d0258240abcd109b7164442438` |
-| `docs/evaluation/run-spec.schema.json` | `150209e2e2d7148ae8c39b966058dafdba03d245c4ae9d89c0d5d98f7ae0a8bb` |
-| `docs/evaluation/analysis-policy/baseline-v1.json` | `85d9eca8ddf98650088284e60dde0a3ff1776247ad0033c20c36db743d6ed188` |
+| `docs/evaluation/run-spec.schema.json` | `5117e7521686b5dbf8bd56b965d45ffcfdb83e7650b59cf63125d3ecb8b74f13` |
+| `docs/evaluation/analysis-policy/baseline-v1.json` | `2cbf7acd46168b4d59ef8ee6baa989c27f8c698295fab1fd747abaa33d93a9ee` |
 
 ---
 
@@ -63,5 +63,5 @@ The following SHA256 hashes are frozen for all Phase B–E executions:
 Proceed immediately to:
 1. **Phase B**: Implementation of Protocol v1 compliant evaluation harness and protocol self-validation tests;
 2. **Phase C**: Freezing independent TDL baseline artifact;
-3. **Phase D**: Executing 3-repetition TDL baseline runs on profiles `P-S`, `P-SM`, `P-LMS`, `P-L` and concurrency sweeps;
+3. **Phase D**: Executing one sealed, reusable TDL baseline per profile and concurrency identity;
 4. **Phase E**: Executing initial TGX functional evaluation runs using identical manifests.

@@ -67,10 +67,13 @@ file_concurrency=5
 dc_pool_size=32
 duration_seconds=240
 warmup_seconds=15
-repetitions=3
+repetitions=1
 ```
 
 Also run `P-LMS` with concurrency `8,16,32,48`, keeping file concurrency 5.
+Reuse these sealed TDL results for later TGX candidates while cohort, artifact,
+environment and concurrency identity remain unchanged; do not rerun TDL for
+each TGX commit.
 
 Use the same host, isolated session copy, proxy route and target storage for all runs. Every repetition uses a new empty output root.
 

@@ -44,9 +44,20 @@ The baseline command defaults to one repetition and refuses an already existing
 TDL baseline with the same cohort, artifact, concurrency, duration, and warmup.
 Use `--force` only for an intentional independent repetition.
 
-Newly sampled manifests use `baseline_trust=local_disk`. They cannot produce a
-hard correctness GO until the cohort has the independently verified `golden`
-trust required by the Protocol.
+The candidate command requires a checksum-valid, policy-GO TDL baseline with
+the same cohort and workload identity. TGX performance gates consume that
+baseline identity and throughput directly; reports never compare different
+cohorts in the same table.
+
+Newly sampled manifests use `baseline_trust=local_disk`. A checksum-valid,
+independent TDL run attests each case whose downloaded size and SHA match that
+reference. Later TGX runs may claim hard correctness only for cases covered by
+the matching TDL attestation; the original manifest remains immutable.
+
+Only `large_*` cases may end at the run timeout without becoming correctness
+failures. Small and medium cases must complete with exact size and SHA. A large
+case that reports success with a bad hash, ends in engine failure, or leaves
+residue still fails the run.
 
 The analyzer intentionally returns `BLOCKED` when a required network, memory,
 SSD, or target-storage measurement is unavailable. Add read-only instrumentation

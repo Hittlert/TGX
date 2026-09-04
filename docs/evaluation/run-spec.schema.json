@@ -64,6 +64,15 @@
     "api_base": {"type": "string", "minLength": 1},
     "namespace": {"type": "string", "minLength": 1},
     "environment": {"type": "object"},
+    "paired_tdl_run_id": {"type": "string", "minLength": 1},
+    "paired_tdl_summary_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "paired_tdl_artifact_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "paired_tdl_average_active_mbps": {"type": "number", "minimum": 0},
+    "paired_tdl_attested_case_ids": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1}
+    },
     "output_dir": {"type": "string", "minLength": 1},
     "state_db": {"type": "string", "minLength": 1},
     "log_dir": {"type": "string", "minLength": 1},

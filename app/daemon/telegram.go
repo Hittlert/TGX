@@ -59,7 +59,7 @@ func newTelegramMediaAccess(parentCtx context.Context, pool dcpool.Pool, manager
 		pool:        pool,
 		manager:     manager,
 		syncTimeout: syncTimeout,
-		limiter:     rate.NewLimiter(rate.Limit(25), 10),
+		limiter:     rate.NewLimiter(rate.Limit(8), 4),
 		msgCache:    make(map[string]messageCacheEntry),
 	}
 }
@@ -146,7 +146,7 @@ func (a *telegramMediaAccess) Resolve(ctx context.Context, peer string, messageI
 
 	// SingleFlight DoChan with daemon-owned context to isolate followers from leader cancellation
 	ch := a.sf.DoChan(batchKey, func() (interface{}, error) {
-		fetchCtx, fetchCancel := context.WithTimeout(a.parentCtx, 60*time.Second)
+		fetchCtx, fetchCancel := context.WithTimeout(a.parentCtx, 180*time.Second)
 		defer fetchCancel()
 
 		if a.limiter != nil {

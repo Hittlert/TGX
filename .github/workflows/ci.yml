@@ -25,6 +25,10 @@ jobs:
         run: |
           go test -v -race ./pkg/... ./app/... ./test/chaos/...
 
+      - name: Validate Evaluation Tools
+        run: |
+          python3 scripts/evaluation/run_protocol_v1.py self-test
+
       - name: Build Binary
         run: |
           go build -v -ldflags="-s -w" -o tgx ./main.go

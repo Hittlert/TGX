@@ -1,4 +1,4 @@
-.PHONY: all build test clean docker
+.PHONY: all build test eval-self-test clean docker
 
 BINARY_NAME=tgx
 
@@ -9,6 +9,9 @@ build:
 
 test:
 	go test ./pkg/...
+
+eval-self-test:
+	python3 scripts/evaluation/run_protocol_v1.py self-test
 
 clean:
 	rm -f $(BINARY_NAME)
