@@ -14,7 +14,7 @@ func TestOptionsDefaultsAndValidation(t *testing.T) {
 	if opts.Listen != "0.0.0.0:18080" || opts.OutputDir != "/app/downloads" {
 		t.Fatalf("unexpected path defaults: %#v", opts)
 	}
-	if opts.FileConcurrency != 5 || opts.Threads != 48 || opts.PoolSize != 48 {
+	if opts.FileConcurrency != 5 || opts.Threads != 8 || opts.PoolSize != 40 {
 		t.Fatalf("unexpected transfer defaults: %#v", opts)
 	}
 	if opts.QueueCapacity != 1000 || opts.TerminalLimit != 2000 || !opts.StartPaused {

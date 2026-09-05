@@ -34,7 +34,7 @@ type Options struct {
 	SingboxURL       string
 	QueueCapacity    int
 	TerminalLimit    int
-	FileConcurrency  int // default 32
+	FileConcurrency  int // default 5
 	Threads          int // max file threads, default 8
 	PoolSize         int // max data in-flight, default 40
 	StartPaused      bool
@@ -63,10 +63,10 @@ func (o Options) withDefaults() Options {
 		o.FileConcurrency = 5
 	}
 	if o.Threads <= 0 {
-		o.Threads = 48
+		o.Threads = 8
 	}
 	if o.PoolSize <= 0 {
-		o.PoolSize = 48
+		o.PoolSize = 40
 	}
 	if o.MinFreeSpace == 0 {
 		o.MinFreeSpace = fscommit.DefaultMinFreeSpace
