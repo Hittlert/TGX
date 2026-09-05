@@ -1667,7 +1667,7 @@ func (d *Database) CancelDownload(chatID string, messageID int, generation strin
 			error = ?,
 			updated_at = ?
 		WHERE chat_id = ? AND message_id = ?
-		  AND status IN ('pending', 'downloading', 'committing')
+		  AND status IN ('pending', 'downloading')
 		  AND (attempt_generation = ? OR attempt_generation = '' OR ? = '')
 	`, reason, now, chatID, messageID, generation, generation)
 	if err != nil {

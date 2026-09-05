@@ -402,6 +402,27 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 					task.FailDisposition(disp)
 					return
 				}
+				actualSHA, shaErr := computeFileSHA256(finalAbsPath)
+				if shaErr != nil || actualSHA != successProof.SHA256 {
+					o.logger.Warn("already success in DB but physical file hash mismatch on disk",
+						zap.String("task_id", taskID),
+						zap.String("expected_path", finalAbsPath),
+						zap.String("expected_sha", successProof.SHA256),
+						zap.String("actual_sha", actualSHA),
+					)
+					disp := FailureDisposition{
+						Stage:       "admission",
+						Op:          "db_begin_download",
+						Class:       "corrupt",
+						Unavailable: false,
+						Retryable:   false,
+						RetryOwner:  "none",
+						Message:     fmt.Sprintf("record is success in DB but file corrupted on disk (%s): sha mismatch", successProof.SavePath),
+						Cause:       shaErr,
+					}
+					task.FailDisposition(disp)
+					return
+				}
 				o.logger.Info("task already completed successfully in DB and verified on disk",
 					zap.String("task_id", taskID),
 					zap.String("path", successProof.SavePath),
@@ -661,6 +682,27 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 						RetryOwner:  "none",
 						Message:     fmt.Sprintf("record is success in DB with planned path but file missing on disk (%s)", successProof.SavePath),
 						Cause:       statErr,
+					}
+					task.FailDisposition(disp)
+					return
+				}
+				actualSHA, shaErr := computeFileSHA256(finalAbsPath)
+				if shaErr != nil || actualSHA != successProof.SHA256 {
+					o.logger.Warn("already success in DB but physical file hash mismatch on disk with planned path",
+						zap.String("task_id", taskID),
+						zap.String("expected_path", finalAbsPath),
+						zap.String("expected_sha", successProof.SHA256),
+						zap.String("actual_sha", actualSHA),
+					)
+					disp := FailureDisposition{
+						Stage:       "admission",
+						Op:          "db_begin_download",
+						Class:       "corrupt",
+						Unavailable: false,
+						Retryable:   false,
+						RetryOwner:  "none",
+						Message:     fmt.Sprintf("record is success in DB with planned path but file corrupted on disk (%s): sha mismatch", successProof.SavePath),
+						Cause:       shaErr,
 					}
 					task.FailDisposition(disp)
 					return

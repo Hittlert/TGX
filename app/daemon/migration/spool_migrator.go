@@ -864,35 +864,122 @@ func ReconcilePendingQuarantines(ctx context.Context, dbPath string, bufferDir s
 			}
 			report.CleanedDirs = append(report.CleanedDirs, qDir)
 		} else {
-			// Crash occurred BEFORE or DURING DB commit: restore original files
-			for _, f := range manifest.Files {
-				if _, err := os.Stat(f.StagedPath); err == nil {
+			// Crash occurred BEFORE or DURING DB commit: restore original files.
+			// Implement strict 2-phase validation and deduplication per specification:
+			// 1. Verify manifest object paths, size, and SHA-256 for all existing copies.
+			// 2. original not exist & staged valid -> non-overwriting rename.
+			// 3. both exist & identical -> deduplicate (remove staged).
+			// 4. both exist & conflict -> FAIL CLOSED (no overwrite).
+			// 5. either copy corrupted or missing both -> FAIL CLOSED.
+
+			// Phase 1: Pre-validation of all manifest items
+			type itemPlan struct {
+				file        QuarantineFileEntry
+				stagedExist bool
+				origExist   bool
+			}
+			plans := make([]itemPlan, len(manifest.Files))
+
+			for i, f := range manifest.Files {
+				// Path sanity check
+				if strings.Contains(f.OriginalPath, "..") || strings.Contains(f.StagedPath, "..") {
+					return nil, fmt.Errorf("reconcile restore: unsafe path traversal in manifest item %s (fail-closed)", f.OriginalPath)
+				}
+
+				stagedInfo, stagedErr := os.Stat(f.StagedPath)
+				origInfo, origErr := os.Stat(f.OriginalPath)
+
+				stagedExist := (stagedErr == nil)
+				origExist := (origErr == nil)
+
+				if stagedErr != nil && !os.IsNotExist(stagedErr) {
+					return nil, fmt.Errorf("stat staged file %s: %w (fail-closed)", f.StagedPath, stagedErr)
+				}
+				if origErr != nil && !os.IsNotExist(origErr) {
+					return nil, fmt.Errorf("stat original file %s: %w (fail-closed)", f.OriginalPath, origErr)
+				}
+
+				// Neither exists: fatal integrity loss
+				if !stagedExist && !origExist {
+					return nil, fmt.Errorf("reconcile restore: file missing from both staged (%s) and original (%s): %w (fail-closed)", f.StagedPath, f.OriginalPath, origErr)
+				}
+
+				// If staged exists, verify its size and SHA-256 against manifest
+				if stagedExist {
+					if stagedInfo.Size() != f.Size {
+						return nil, fmt.Errorf("reconcile restore: staged file %s size mismatch: got %d, want %d (fail-closed)", f.StagedPath, stagedInfo.Size(), f.Size)
+					}
+					stagedSHA, shaErr := computeFileSHA256(f.StagedPath)
+					if shaErr != nil {
+						return nil, fmt.Errorf("reconcile restore: compute staged file %s sha256: %w (fail-closed)", f.StagedPath, shaErr)
+					}
+					if stagedSHA != f.SHA256 {
+						return nil, fmt.Errorf("reconcile restore: staged file %s sha256 mismatch: got %s, want %s (fail-closed)", f.StagedPath, stagedSHA, f.SHA256)
+					}
+				}
+
+				// If original exists, verify its size and SHA-256 against manifest
+				if origExist {
+					if origInfo.Size() != f.Size {
+						return nil, fmt.Errorf("reconcile restore: original file %s size mismatch: got %d, want %d (fail-closed)", f.OriginalPath, origInfo.Size(), f.Size)
+					}
+					origSHA, shaErr := computeFileSHA256(f.OriginalPath)
+					if shaErr != nil {
+						return nil, fmt.Errorf("reconcile restore: compute original file %s sha256: %w (fail-closed)", f.OriginalPath, shaErr)
+					}
+					if origSHA != f.SHA256 {
+						return nil, fmt.Errorf("reconcile restore: original file %s sha256 mismatch: got %s, want %s (fail-closed)", f.OriginalPath, origSHA, f.SHA256)
+					}
+				}
+
+				plans[i] = itemPlan{
+					file:        f,
+					stagedExist: stagedExist,
+					origExist:   origExist,
+				}
+			}
+
+			// Phase 2: Execute safe non-overwriting restore / deduplication
+			for _, p := range plans {
+				f := p.file
+				if p.stagedExist && !p.origExist {
+					// Original does not exist, staged is verified: safe non-overwriting restore
 					if err := os.MkdirAll(filepath.Dir(f.OriginalPath), 0o755); err != nil {
 						return nil, fmt.Errorf("reconcile restore mkdir %s: %w (fail-closed)", filepath.Dir(f.OriginalPath), err)
 					}
 					if err := os.Rename(f.StagedPath, f.OriginalPath); err != nil {
 						return nil, fmt.Errorf("reconcile restore rename %s -> %s: %w (fail-closed)", f.StagedPath, f.OriginalPath, err)
 					}
-					report.RestoredFiles = append(report.RestoredFiles, f.OriginalPath)
-				} else if os.IsNotExist(err) {
-					// Staged file does not exist. Verify that it is present in OriginalPath!
-					if _, origErr := os.Stat(f.OriginalPath); origErr != nil {
-						return nil, fmt.Errorf("reconcile restore: file missing from both staged (%s) and original (%s): %w (fail-closed)", f.StagedPath, f.OriginalPath, origErr)
+					if parentDir, err := os.Open(filepath.Dir(f.OriginalPath)); err == nil {
+						_ = parentDir.Sync()
+						_ = parentDir.Close()
 					}
-					// File was not moved before crash, verified safe in OriginalPath!
-				} else {
-					return nil, fmt.Errorf("stat staged file %s: %w (fail-closed)", f.StagedPath, err)
+					report.RestoredFiles = append(report.RestoredFiles, f.OriginalPath)
+				} else if p.stagedExist && p.origExist {
+					// Both exist and both are verified byte-for-byte identical to manifest: deduplicate staged
+					if err := os.Remove(f.StagedPath); err != nil && !os.IsNotExist(err) {
+						return nil, fmt.Errorf("reconcile deduplicate remove staged %s: %w (fail-closed)", f.StagedPath, err)
+					}
+					report.RestoredFiles = append(report.RestoredFiles, f.OriginalPath)
+				} else if !p.stagedExist && p.origExist {
+					// Already in original path and verified: never moved, nothing to restore
 				}
 			}
-			// Verify that no staged files remain AND that every original file exists before purging manifest or directory
+
+			// Phase 3: Post-verification of all items before manifest/quarantine removal
 			for _, f := range manifest.Files {
 				if _, err := os.Stat(f.StagedPath); err == nil {
 					return nil, fmt.Errorf("staged file %s still present after restore (fail-closed)", f.StagedPath)
 				}
-				if _, err := os.Stat(f.OriginalPath); err != nil {
+				info, err := os.Stat(f.OriginalPath)
+				if err != nil {
 					return nil, fmt.Errorf("reconcile restore: original file %s does not exist after restore: %w (fail-closed)", f.OriginalPath, err)
 				}
+				if info.Size() != f.Size {
+					return nil, fmt.Errorf("reconcile restore: original file %s size mismatch after restore: got %d, want %d (fail-closed)", f.OriginalPath, info.Size(), f.Size)
+				}
 			}
+
 			if err := os.Remove(manifestPath); err != nil && !os.IsNotExist(err) {
 				return nil, fmt.Errorf("reconcile remove manifest %s: %w (fail-closed)", manifestPath, err)
 			}

@@ -153,8 +153,8 @@ func TestDB_StaleAttemptCannotComplete(t *testing.T) {
 	}
 }
 
-// 4. Cancel during Sync/Hash/rename cannot be overwritten by the canceled attempt.
-func TestDB_CancelDuringCommitCannotBeOverwritten(t *testing.T) {
+// 4a. Cancel during downloading cannot be overwritten by late commit/complete.
+func TestDB_CancelDuringDownloadingCannotBeOverwritten(t *testing.T) {
 	db, cleanup := setupTestDB(t)
 	defer cleanup()
 
@@ -162,20 +162,22 @@ func TestDB_CancelDuringCommitCannotBeOverwritten(t *testing.T) {
 	msgID := 104
 	gen := "gen_1"
 
-	// Begin download and prepare commit
+	// Begin download
 	if err := db.BeginDownload(chatID, msgID, gen, "test.mp4", "path/test.mp4", "video", 1024); err != nil {
 		t.Fatalf("BeginDownload failed: %v", err)
 	}
-	if err := db.PrepareDownloadCommit(chatID, msgID, gen, "path/test.mp4", 1024, "aabbcc"); err != nil {
-		t.Fatalf("PrepareDownloadCommit failed: %v", err)
-	}
 
-	// User cancels task while worker is computing hash
+	// User cancels task while worker is still downloading
 	if err := db.CancelDownload(chatID, msgID, gen, "user canceled"); err != nil {
 		t.Fatalf("CancelDownload failed: %v", err)
 	}
 
-	// Canceled worker finishes hash and tries to complete -> rejected!
+	// Canceled worker tries to prepare commit -> rejected!
+	if err := db.PrepareDownloadCommit(chatID, msgID, gen, "path/test.mp4", 1024, "aabbcc"); !errors.Is(err, ErrStateConflict) {
+		t.Fatalf("expected ErrStateConflict when preparing commit on canceled task, got: %v", err)
+	}
+
+	// Canceled worker tries to complete -> rejected!
 	err := db.CompleteDownloadAndQueueArchive(chatID, msgID, gen, "path/test.mp4", 1024, "aabbcc", false)
 	if !errors.Is(err, ErrStateConflict) {
 		t.Fatalf("expected ErrStateConflict when completing canceled task, got: %v", err)
@@ -188,6 +190,42 @@ func TestDB_CancelDuringCommitCannotBeOverwritten(t *testing.T) {
 	}
 	if rec.Status != "failed" {
 		t.Fatalf("expected status failed, got: %s", rec.Status)
+	}
+}
+
+// 4b. Once PrepareDownloadCommit succeeds (status=committing), durable publish intent is established; late cancel is rejected.
+func TestDB_CancelDuringCommit_RejectedDueToAuthoritativePublishIntent(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	chatID := "-1001234567"
+	msgID := 1042
+	gen := "gen_1"
+
+	if err := db.BeginDownload(chatID, msgID, gen, "test.mp4", "path/test.mp4", "video", 1024); err != nil {
+		t.Fatalf("BeginDownload failed: %v", err)
+	}
+	if err := db.PrepareDownloadCommit(chatID, msgID, gen, "path/test.mp4", 1024, "aabbcc"); err != nil {
+		t.Fatalf("PrepareDownloadCommit failed: %v", err)
+	}
+
+	// Late cancel must be rejected by DB to protect publishing window
+	err := db.CancelDownload(chatID, msgID, gen, "late cancel")
+	if !errors.Is(err, ErrStateConflict) {
+		t.Fatalf("expected ErrStateConflict when canceling committing task, got: %v", err)
+	}
+
+	// Worker proceeds to complete -> succeeds!
+	if err := db.CompleteDownloadAndQueueArchive(chatID, msgID, gen, "path/test.mp4", 1024, "aabbcc", false); err != nil {
+		t.Fatalf("CompleteDownloadAndQueueArchive failed: %v", err)
+	}
+
+	rec, err := db.GetDownloadRecord(chatID, msgID)
+	if err != nil {
+		t.Fatalf("failed to get record: %v", err)
+	}
+	if rec.Status != "success" {
+		t.Fatalf("expected status success, got: %s", rec.Status)
 	}
 }
 

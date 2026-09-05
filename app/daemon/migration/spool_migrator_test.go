@@ -744,6 +744,8 @@ func TestMigration_QuarantineManifest_CrashBeforeCommitRestoresFilesOnRestart(t 
 		t.Fatalf("failed to write staged file: %v", err)
 	}
 
+	h1 := sha256.Sum256(content1)
+	h2 := sha256.Sum256(content2)
 	manifest := migration.QuarantineManifest{
 		MigrationID:   "mig_crash_before_test",
 		QuarantineDir: qDir,
@@ -754,12 +756,14 @@ func TestMigration_QuarantineManifest_CrashBeforeCommitRestoresFilesOnRestart(t 
 				StagedName:   "staged_0_in_flight_1.spool",
 				StagedPath:   stagedFile1,
 				Size:         int64(len(content1)),
+				SHA256:       hex.EncodeToString(h1[:]),
 			},
 			{
 				OriginalPath: origFile2,
 				StagedName:   "staged_1_in_flight_2.part",
 				StagedPath:   stagedFile2,
 				Size:         int64(len(content2)),
+				SHA256:       hex.EncodeToString(h2[:]),
 			},
 		},
 	}
@@ -989,6 +993,8 @@ func TestMigration_QuarantineManifest_CrashDuringStagingPartialRenameRestoresCor
 		t.Fatalf("failed to write original file 2: %v", err)
 	}
 
+	h1 := sha256.Sum256(content1)
+	h2 := sha256.Sum256(content2)
 	manifest := migration.QuarantineManifest{
 		MigrationID:   "mig_partial_staging_crash",
 		QuarantineDir: qDir,
@@ -999,12 +1005,14 @@ func TestMigration_QuarantineManifest_CrashDuringStagingPartialRenameRestoresCor
 				StagedName:   "staged_0_partially_staged_1.spool",
 				StagedPath:   stagedFile1,
 				Size:         int64(len(content1)),
+				SHA256:       hex.EncodeToString(h1[:]),
 			},
 			{
 				OriginalPath: origFile2,
 				StagedName:   "staged_1_not_yet_staged_2.spool",
 				StagedPath:   stagedFile2,
 				Size:         int64(len(content2)),
+				SHA256:       hex.EncodeToString(h2[:]),
 			},
 		},
 	}
@@ -1071,6 +1079,7 @@ func TestMigration_QuarantineManifest_RestoreFailureFailsClosedAndRetainsData(t 
 		t.Fatalf("failed to write staged file: %v", err)
 	}
 
+	hVal := sha256.Sum256(valuableData)
 	manifest := migration.QuarantineManifest{
 		MigrationID:   "mig_restore_fail_test",
 		QuarantineDir: qDir,
@@ -1081,6 +1090,7 @@ func TestMigration_QuarantineManifest_RestoreFailureFailsClosedAndRetainsData(t 
 				StagedName:   "staged_0_file.spool",
 				StagedPath:   stagedFile,
 				Size:         int64(len(valuableData)),
+				SHA256:       hex.EncodeToString(hVal[:]),
 			},
 		},
 	}
@@ -1206,6 +1216,7 @@ func TestMigration_QuarantineManifest_VerdictLookupFailureFailsClosedAndLeavesFi
 		t.Fatalf("failed to write staged file: %v", err)
 	}
 
+	hCrit := sha256.Sum256(criticalData)
 	manifest := migration.QuarantineManifest{
 		MigrationID:   migrationID,
 		QuarantineDir: qDir,
@@ -1216,6 +1227,7 @@ func TestMigration_QuarantineManifest_VerdictLookupFailureFailsClosedAndLeavesFi
 				StagedName:   "staged_0_critical_spool.data",
 				StagedPath:   stagedFile,
 				Size:         int64(len(criticalData)),
+				SHA256:       hex.EncodeToString(hCrit[:]),
 			},
 		},
 	}
@@ -1435,6 +1447,7 @@ func TestMigration_StagedAndOriginalBothMissing_FailsClosedAndRetainsManifest(t 
 				StagedName:   "staged_0_non_existent.spool",
 				StagedPath:   filepath.Join(qDir, "staged_0_non_existent.spool"),
 				Size:         100,
+				SHA256:       "sha_double_missing",
 			},
 		},
 	}
@@ -1453,5 +1466,233 @@ func TestMigration_StagedAndOriginalBothMissing_FailsClosedAndRetainsManifest(t 
 	}
 	if _, statErr := os.Stat(qDir); os.IsNotExist(statErr) {
 		t.Fatal("quarantine directory was deleted despite double missing file! Fail-closed violated!")
+	}
+}
+
+// 21. Acceptance Test: Reconcile restore fails closed if staged file is corrupted.
+func TestMigration_Reconcile_StagedCorrupted_FailsClosed(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "state.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("failed to open sqlite3: %v", err)
+	}
+	defer db.Close()
+
+	bufferDir := filepath.Join(tempDir, "buffer")
+	_ = os.MkdirAll(bufferDir, 0o755)
+	qDir := filepath.Join(bufferDir, ".migrator_quarantine_corrupt_staged")
+	_ = os.MkdirAll(qDir, 0o755)
+
+	manifestPath := filepath.Join(qDir, "quarantine_manifest.json")
+	origFile := filepath.Join(bufferDir, "orig_corrupt_test.spool")
+	stagedFile := filepath.Join(qDir, "staged_corrupt.spool")
+
+	// Write corrupted content to staged file
+	_ = os.WriteFile(stagedFile, []byte("corrupted staged data"), 0o644)
+
+	manifest := migration.QuarantineManifest{
+		MigrationID: "mig_corrupt_staged",
+		CreatedAt:   time.Now().Unix(),
+		Files: []migration.QuarantineFileEntry{
+			{
+				OriginalPath: origFile,
+				StagedName:   "staged_corrupt.spool",
+				StagedPath:   stagedFile,
+				Size:         int64(len("authentic expected data")),
+				SHA256:       "authentic_hash_expected_123",
+			},
+		},
+	}
+	data, _ := json.MarshalIndent(manifest, "", "  ")
+	_ = os.WriteFile(manifestPath, data, 0o644)
+
+	_, err = migration.ReconcilePendingQuarantines(context.Background(), dbPath, bufferDir)
+	if err == nil {
+		t.Fatal("expected error from ReconcilePendingQuarantines when staged file is corrupted, got nil")
+	}
+
+	// Fail-closed verification
+	if _, statErr := os.Stat(manifestPath); os.IsNotExist(statErr) {
+		t.Fatal("manifest was deleted despite corrupted staged file! Fail-closed violated!")
+	}
+	if _, statErr := os.Stat(stagedFile); os.IsNotExist(statErr) {
+		t.Fatal("staged file was deleted despite being corrupted! Fail-closed violated!")
+	}
+}
+
+// 22. Acceptance Test: Reconcile restore fails closed if original file is corrupted.
+func TestMigration_Reconcile_OriginalCorrupted_FailsClosed(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "state.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("failed to open sqlite3: %v", err)
+	}
+	defer db.Close()
+
+	bufferDir := filepath.Join(tempDir, "buffer")
+	_ = os.MkdirAll(bufferDir, 0o755)
+	qDir := filepath.Join(bufferDir, ".migrator_quarantine_corrupt_orig")
+	_ = os.MkdirAll(qDir, 0o755)
+
+	manifestPath := filepath.Join(qDir, "quarantine_manifest.json")
+	origFile := filepath.Join(bufferDir, "orig_corrupt.spool")
+	stagedFile := filepath.Join(qDir, "staged_not_here.spool")
+
+	// Original exists but has corrupted content
+	_ = os.WriteFile(origFile, []byte("corrupted original content"), 0o644)
+
+	manifest := migration.QuarantineManifest{
+		MigrationID: "mig_corrupt_orig",
+		CreatedAt:   time.Now().Unix(),
+		Files: []migration.QuarantineFileEntry{
+			{
+				OriginalPath: origFile,
+				StagedName:   "staged_not_here.spool",
+				StagedPath:   stagedFile,
+				Size:         int64(len("authentic expected data")),
+				SHA256:       "authentic_hash_expected_456",
+			},
+		},
+	}
+	data, _ := json.MarshalIndent(manifest, "", "  ")
+	_ = os.WriteFile(manifestPath, data, 0o644)
+
+	_, err = migration.ReconcilePendingQuarantines(context.Background(), dbPath, bufferDir)
+	if err == nil {
+		t.Fatal("expected error from ReconcilePendingQuarantines when original file is corrupted, got nil")
+	}
+
+	// Fail-closed verification
+	if _, statErr := os.Stat(manifestPath); os.IsNotExist(statErr) {
+		t.Fatal("manifest was deleted despite corrupted original file! Fail-closed violated!")
+	}
+}
+
+// 23. Acceptance Test: Reconcile restore safely deduplicates when both copies exist and are byte-for-byte identical.
+func TestMigration_Reconcile_BothExistIdentical_Deduplicates(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "state.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("failed to open sqlite3: %v", err)
+	}
+	_, _ = db.Exec("CREATE TABLE dummy (id INT)")
+	defer db.Close()
+
+	bufferDir := filepath.Join(tempDir, "buffer")
+	_ = os.MkdirAll(bufferDir, 0o755)
+	qDir := filepath.Join(bufferDir, ".migrator_quarantine_both_identical")
+	_ = os.MkdirAll(qDir, 0o755)
+
+	manifestPath := filepath.Join(qDir, "quarantine_manifest.json")
+	origFile := filepath.Join(bufferDir, "orig_identical.spool")
+	stagedFile := filepath.Join(qDir, "staged_identical.spool")
+
+	payload := []byte("identical authentic data 123456789")
+	hash := sha256.Sum256(payload)
+	shaHex := hex.EncodeToString(hash[:])
+
+	// Both files exist with exact authentic payload
+	_ = os.WriteFile(origFile, payload, 0o644)
+	_ = os.WriteFile(stagedFile, payload, 0o644)
+
+	manifest := migration.QuarantineManifest{
+		MigrationID: "mig_both_identical",
+		CreatedAt:   time.Now().Unix(),
+		Files: []migration.QuarantineFileEntry{
+			{
+				OriginalPath: origFile,
+				StagedName:   "staged_identical.spool",
+				StagedPath:   stagedFile,
+				Size:         int64(len(payload)),
+				SHA256:       shaHex,
+			},
+		},
+	}
+	data, _ := json.MarshalIndent(manifest, "", "  ")
+	_ = os.WriteFile(manifestPath, data, 0o644)
+
+	report, err := migration.ReconcilePendingQuarantines(context.Background(), dbPath, bufferDir)
+	if err != nil {
+		t.Fatalf("ReconcilePendingQuarantines failed on identical copies: %v", err)
+	}
+	if len(report.RestoredFiles) != 1 || report.RestoredFiles[0] != origFile {
+		t.Fatalf("unexpected RestoredFiles: %+v", report.RestoredFiles)
+	}
+
+	// Verify deduplication: staged file removed, original file intact
+	if _, statErr := os.Stat(stagedFile); !os.IsNotExist(statErr) {
+		t.Fatalf("staged file should be removed after deduplication, but exists: %v", statErr)
+	}
+	origBytes, readErr := os.ReadFile(origFile)
+	if readErr != nil || string(origBytes) != string(payload) {
+		t.Fatalf("original file was corrupted or missing: %v", readErr)
+	}
+	// Quarantine directory and manifest cleaned
+	if _, statErr := os.Stat(manifestPath); !os.IsNotExist(statErr) {
+		t.Fatalf("manifest should be removed after successful deduplication: %v", statErr)
+	}
+}
+
+// 24. Acceptance Test: Reconcile restore fails closed without overwriting when both copies exist but conflict.
+func TestMigration_Reconcile_BothExistConflicting_FailsClosed(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "state.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("failed to open sqlite3: %v", err)
+	}
+	defer db.Close()
+
+	bufferDir := filepath.Join(tempDir, "buffer")
+	_ = os.MkdirAll(bufferDir, 0o755)
+	qDir := filepath.Join(bufferDir, ".migrator_quarantine_both_conflict")
+	_ = os.MkdirAll(qDir, 0o755)
+
+	manifestPath := filepath.Join(qDir, "quarantine_manifest.json")
+	origFile := filepath.Join(bufferDir, "orig_conflict.spool")
+	stagedFile := filepath.Join(qDir, "staged_conflict.spool")
+
+	payloadOrig := []byte("original content version A")
+	payloadStaged := []byte("staged content version B differs!!")
+
+	// Both files exist but have conflicting content
+	_ = os.WriteFile(origFile, payloadOrig, 0o644)
+	_ = os.WriteFile(stagedFile, payloadStaged, 0o644)
+
+	manifest := migration.QuarantineManifest{
+		MigrationID: "mig_both_conflict",
+		CreatedAt:   time.Now().Unix(),
+		Files: []migration.QuarantineFileEntry{
+			{
+				OriginalPath: origFile,
+				StagedName:   "staged_conflict.spool",
+				StagedPath:   stagedFile,
+				Size:         int64(len(payloadStaged)),
+				SHA256:       "some_hash_that_does_not_match_orig",
+			},
+		},
+	}
+	data, _ := json.MarshalIndent(manifest, "", "  ")
+	_ = os.WriteFile(manifestPath, data, 0o644)
+
+	_, err = migration.ReconcilePendingQuarantines(context.Background(), dbPath, bufferDir)
+	if err == nil {
+		t.Fatal("expected error from ReconcilePendingQuarantines when both copies conflict, got nil")
+	}
+
+	// Crucial assertion: original file MUST NOT be overwritten!
+	origContent, readErr := os.ReadFile(origFile)
+	if readErr != nil || string(origContent) != string(payloadOrig) {
+		t.Fatalf("original file was overwritten or corrupted! got %q, want %q", string(origContent), string(payloadOrig))
+	}
+	// Manifest and staged file retained
+	if _, statErr := os.Stat(manifestPath); os.IsNotExist(statErr) {
+		t.Fatal("manifest was deleted despite conflict! Fail-closed violated!")
+	}
+	if _, statErr := os.Stat(stagedFile); os.IsNotExist(statErr) {
+		t.Fatal("staged file was deleted despite conflict! Fail-closed violated!")
 	}
 }

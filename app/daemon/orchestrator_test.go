@@ -1573,11 +1573,18 @@ func TestOrchestrator_AlreadySuccessVerifiesPhysicalFileOnDisk(t *testing.T) {
 	relPath := "Vault/2026_09/333 - doc.bin"
 	absPath := filepath.Join(saveDir, filepath.FromSlash(relPath))
 
+	payload := make([]byte, 512)
+	for i := range payload {
+		payload[i] = byte(i % 256)
+	}
+	realHash := sha256.Sum256(payload)
+	realSHA := hex.EncodeToString(realHash[:])
+
 	// Pre-seed DB with success
 	_, err := db.Execute(`
 		INSERT INTO download_records (chat_id, message_id, status, file_name, save_path, media_type, file_size, sha256, attempt_generation, created_at, updated_at)
-		VALUES (?, ?, 'success', 'doc.bin', ?, 'document', 512, 'sha_512', 'gen_done', ?, ?)
-	`, chatID, msgID, relPath, now, now)
+		VALUES (?, ?, 'success', 'doc.bin', ?, 'document', 512, ?, 'gen_done', ?, ?)
+	`, chatID, msgID, relPath, realSHA, now, now)
 	if err != nil {
 		t.Fatalf("seed DB failed: %v", err)
 	}
@@ -1602,12 +1609,36 @@ func TestOrchestrator_AlreadySuccessVerifiesPhysicalFileOnDisk(t *testing.T) {
 		t.Fatalf("expected ErrorClass 'missing_file', got: %s", snap1.ErrorClass)
 	}
 
-	// 2. Physical file EXISTS with matching size: downloadOne must succeed
+	// 2. Physical file exists but is CORRUPTED (same size, wrong SHA): must fail with class 'corrupt'
 	if err := os.MkdirAll(filepath.Dir(absPath), 0o755); err != nil {
 		t.Fatalf("mkdir failed: %v", err)
 	}
-	if err := os.WriteFile(absPath, make([]byte, 512), 0o644); err != nil {
+	if err := os.WriteFile(absPath, make([]byte, 512), 0o644); err != nil { // all zero bytes != payload
 		t.Fatalf("write file failed: %v", err)
+	}
+
+	reqCorrupt := TaskRequest{
+		ID:           "case_already_success_corrupt",
+		Peer:         chatID,
+		MessageID:    msgID,
+		FinalPath:    relPath,
+		ExpectedSize: 512,
+	}
+	_, _, _ = registry.Submit(reqCorrupt)
+	taskCorrupt, _ := registry.Next(context.Background())
+	orch.downloadOne(context.Background(), taskCorrupt)
+
+	snapCorrupt := taskCorrupt.Snapshot()
+	if snapCorrupt.State != StateFailed {
+		t.Fatalf("expected StateFailed on corrupted physical file, got: %s", snapCorrupt.State)
+	}
+	if snapCorrupt.ErrorClass != "corrupt" {
+		t.Fatalf("expected ErrorClass 'corrupt', got: %s", snapCorrupt.ErrorClass)
+	}
+
+	// 3. Physical file EXISTS with matching size and matching SHA-256: downloadOne must succeed
+	if err := os.WriteFile(absPath, payload, 0o644); err != nil {
+		t.Fatalf("write authentic payload failed: %v", err)
 	}
 
 	reqPresent := TaskRequest{
@@ -1629,7 +1660,7 @@ func TestOrchestrator_AlreadySuccessVerifiesPhysicalFileOnDisk(t *testing.T) {
 		t.Fatalf("expected FinalPath %q, got %q", relPath, snap2.FinalPath)
 	}
 
-	// 3. Conflicting request path with DB success proof: admission rejected
+	// 4. Conflicting request path with DB success proof: admission rejected
 	reqConflict := TaskRequest{
 		ID:           "case_already_success_conflict",
 		Peer:         chatID,
@@ -1647,5 +1678,91 @@ func TestOrchestrator_AlreadySuccessVerifiesPhysicalFileOnDisk(t *testing.T) {
 	}
 	if snap3.ErrorClass != "db_conflict" {
 		t.Fatalf("expected ErrorClass 'db_conflict', got: %s", snap3.ErrorClass)
+	}
+}
+
+func TestOrchestrator_CancelAfterPrepareCommitRejectedAndPublishesSuccess(t *testing.T) {
+	data := make([]byte, 1024)
+	for i := range data {
+		data[i] = byte(i % 256)
+	}
+
+	var chatID = "-1007779"
+	var msgID = 889
+	var orchRef *Orchestrator
+
+	invoker := invokerFunc(func(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
+		setUploadFile(output, data)
+		return nil
+	})
+
+	access := &mockAccessWithPool{
+		pool: &mockPool{invoker: invoker},
+		resolveFn: func(ctx context.Context, peer string, messageID int) (ResolvedMedia, error) {
+			return ResolvedMedia{
+				File:      &orchMockMediaFile{loc: &tg.InputDocumentFileLocation{ID: 1001, AccessHash: 2002}, sz: 1024, dc: 2},
+				Name:      "commit_cancel_test.mp4",
+				Size:      1024,
+				DCID:      2,
+				MediaType: "video",
+				Date:      1725518400,
+			}, nil
+		},
+	}
+
+	orch, registry, db, saveDir := setupTestOrchestratorWithAccess(t, access)
+	orchRef = orch
+	defer db.Close()
+
+	req := TaskRequest{
+		ID:          "case_cancel_after_commit_rejected",
+		Peer:        chatID,
+		MessageID:   msgID,
+		TargetTitle: "RaceChannel",
+		Date:        1725518400,
+	}
+
+	_, _, _ = registry.Submit(req)
+	task, _ := registry.Next(context.Background())
+
+	// We intercept right when task enters committing status in DB:
+	cancelAttemptDone := make(chan struct{})
+	go func() {
+		defer close(cancelAttemptDone)
+		for {
+			rec, err := db.GetDownloadRecord(chatID, msgID)
+			if err == nil && rec != nil && rec.Status == "committing" {
+				// DB has accepted durable commit intent! Now attempt target cancellation!
+				orchRef.CancelTasksByChatID(chatID)
+				return
+			}
+			time.Sleep(100 * time.Microsecond)
+		}
+	}()
+
+	orch.downloadOne(context.Background(), task)
+	<-cancelAttemptDone
+
+	finalRelPath := "RaceChannel/2024_09/889 - commit_cancel_test.mp4"
+	finalAbsPath := filepath.Join(saveDir, filepath.FromSlash(finalRelPath))
+
+	// 1. Final file MUST be published because commit intent was accepted
+	if _, err := os.Stat(finalAbsPath); err != nil {
+		t.Fatalf("expected final file to be published, but got err: %v", err)
+	}
+
+	// 2. DB status MUST be 'success', NOT 'failed'
+	rec, err := db.GetDownloadRecord(chatID, msgID)
+	if err != nil || rec == nil {
+		t.Fatalf("failed to query DB record: %v", err)
+	}
+	if rec.Status != "success" {
+		t.Fatalf("expected DB status 'success', got: %q", rec.Status)
+	}
+
+	// 3. Registry task state MUST be StateSuccess, NOT StateFailed
+	snap := task.Snapshot()
+	if snap.State != StateSuccess {
+		t.Fatalf("expected Registry StateSuccess, got: %s", snap.State)
 	}
 }
