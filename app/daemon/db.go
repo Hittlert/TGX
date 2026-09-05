@@ -49,9 +49,10 @@ func (d *Database) Close() error {
 }
 
 var (
-	ErrStateConflict  = errors.New("state conflict: invalid state transition")
-	ErrStaleAttempt   = errors.New("stale attempt: generation mismatch")
-	ErrAlreadySuccess = errors.New("download already completed successfully")
+	ErrStateConflict   = errors.New("state conflict: invalid state transition")
+	ErrStaleAttempt    = errors.New("stale attempt: generation mismatch")
+	ErrAlreadySuccess  = errors.New("download already completed successfully")
+	ErrArchiveConflict = fmt.Errorf("%w: archive identity mismatch on duplicate completion", ErrStateConflict)
 )
 
 // SuccessProof carries the authoritative terminal proof for a successful download record.
@@ -1158,6 +1159,12 @@ func (d *Database) CompleteDownloadAndQueueArchive(chatID string, messageID int,
 		}
 		if queueArchive {
 			if queueErr := d.ensureArchiveJobLocked(tx, chatID, messageID, relPath, size, sha256Hex, now); queueErr != nil {
+				if errors.Is(queueErr, ErrArchiveConflict) {
+					if commitErr := tx.Commit(); commitErr != nil {
+						return fmt.Errorf("commit archive conflict disposition: %w", commitErr)
+					}
+					return ErrArchiveConflict
+				}
 				return queueErr
 			}
 		}
@@ -1208,6 +1215,12 @@ func (d *Database) CompleteDownloadAndQueueArchive(chatID string, messageID int,
 
 	if queueArchive {
 		if queueErr := d.ensureArchiveJobLocked(tx, chatID, messageID, relPath, size, sha256Hex, now); queueErr != nil {
+			if errors.Is(queueErr, ErrArchiveConflict) {
+				if commitErr := tx.Commit(); commitErr != nil {
+					return fmt.Errorf("commit archive conflict disposition: %w", commitErr)
+				}
+				return ErrArchiveConflict
+			}
 			return queueErr
 		}
 	}
@@ -1288,6 +1301,12 @@ func (d *Database) CompleteExistingDownload(chatID string, messageID int, genera
 
 	if queueArchive {
 		if queueErr := d.ensureArchiveJobLocked(tx, chatID, messageID, relPath, size, sha256Hex, now); queueErr != nil {
+			if errors.Is(queueErr, ErrArchiveConflict) {
+				if commitErr := tx.Commit(); commitErr != nil {
+					return fmt.Errorf("commit archive conflict disposition: %w", commitErr)
+				}
+				return ErrArchiveConflict
+			}
 			return queueErr
 		}
 	}
@@ -1331,7 +1350,7 @@ func (d *Database) ensureArchiveJobLocked(tx *sql.Tx, chatID string, messageID i
 			if err != nil {
 				return fmt.Errorf("set archive conflict: %w", err)
 			}
-			return fmt.Errorf("%w: duplicate completion identity mismatch with archived job", ErrStateConflict)
+			return fmt.Errorf("%w: duplicate completion identity mismatch with archived job", ErrArchiveConflict)
 		}
 		// If sha, path, and size match, preserve terminal 'archived' state!
 		return nil
@@ -1339,14 +1358,14 @@ func (d *Database) ensureArchiveJobLocked(tx *sql.Tx, chatID string, messageID i
 	case "conflict":
 		// Already in conflict state: do not overwrite
 		if arcSHA != sha256Hex || arcPath != relPath || arcSize != size {
-			return fmt.Errorf("%w: duplicate completion identity mismatch on conflicted archive job", ErrStateConflict)
+			return fmt.Errorf("%w: duplicate completion identity mismatch on conflicted archive job", ErrArchiveConflict)
 		}
 		return nil
 
 	case "copying":
 		// Strict guard: DO NOT mutate an active copy's identity!
 		if arcSHA != sha256Hex || arcPath != relPath || arcSize != size {
-			return fmt.Errorf("%w: duplicate completion identity mismatch while archive job is actively copying", ErrStateConflict)
+			return fmt.Errorf("%w: duplicate completion identity mismatch while archive job is actively copying", ErrArchiveConflict)
 		}
 		// Matching identity: no-op, active copy will complete
 		return nil
@@ -1365,7 +1384,7 @@ func (d *Database) ensureArchiveJobLocked(tx *sql.Tx, chatID string, messageID i
 		if err != nil {
 			return fmt.Errorf("update pending archive job to conflict: %w", err)
 		}
-		return fmt.Errorf("%w: duplicate completion identity mismatch with pending archive job", ErrStateConflict)
+		return fmt.Errorf("%w: duplicate completion identity mismatch with pending archive job", ErrArchiveConflict)
 	}
 }
 

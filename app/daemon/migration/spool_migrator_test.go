@@ -2052,3 +2052,282 @@ func TestMigration_Reconcile_ParentDirSyncFailure_RetainsManifest(t *testing.T) 
 	t.Logf("[Test 29: DIR_SYNC_FAIL] Verified fail-closed: manifest retained when parent dir sync fails")
 }
 
+// 30. Acceptance Test: safeNoReplaceLinkOrMove copy fallback (cross-device) verifies size and SHA before source deletion.
+func TestMigration_Reconcile_CopyFallback_VerifiedAndRestored(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "state.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("failed to open sqlite3: %v", err)
+	}
+	_, _ = db.Exec("CREATE TABLE dummy (id INT)")
+	defer db.Close()
+
+	bufferDir := filepath.Join(tempDir, "buffer")
+	_ = os.MkdirAll(bufferDir, 0o755)
+	qDir := filepath.Join(bufferDir, ".migrator_quarantine_copy_fallback")
+	_ = os.MkdirAll(qDir, 0o755)
+
+	manifestPath := filepath.Join(qDir, "quarantine_manifest.json")
+	origFile := filepath.Join(bufferDir, "copy_fallback.spool")
+	stagedFile := filepath.Join(qDir, "staged_copy_fallback.spool")
+
+	payload := []byte("copy fallback authentic data payload 999888777")
+	hash := sha256.Sum256(payload)
+	shaHex := hex.EncodeToString(hash[:])
+	_ = os.WriteFile(stagedFile, payload, 0o644)
+
+	// Force copy fallback path (simulating cross-device EXDEV / no-hardlink filesystem)
+	migration.SetTestHooks(migration.MigratorTestHooks{
+		ForceCopyFallback: true,
+	})
+	defer migration.SetTestHooks(migration.MigratorTestHooks{})
+
+	manifest := migration.QuarantineManifest{
+		MigrationID: "mig_copy_fallback",
+		CreatedAt:   time.Now().Unix(),
+		Files: []migration.QuarantineFileEntry{
+			{
+				OriginalPath: origFile,
+				StagedName:   "staged_copy_fallback.spool",
+				StagedPath:   stagedFile,
+				Size:         int64(len(payload)),
+				SHA256:       shaHex,
+			},
+		},
+	}
+	data, _ := json.MarshalIndent(manifest, "", "  ")
+	_ = os.WriteFile(manifestPath, data, 0o644)
+
+	t.Logf("[Test 30: COPY_FALLBACK] Invoking ReconcilePendingQuarantines with ForceCopyFallback=true...")
+	report, err := migration.ReconcilePendingQuarantines(context.Background(), dbPath, bufferDir)
+	if err != nil {
+		t.Fatalf("ReconcilePendingQuarantines failed with copy fallback: %v", err)
+	}
+	t.Logf("[Test 30: COPY_FALLBACK] Reconcile report: RestoredFiles=%v, CleanedDirs=%v", report.RestoredFiles, report.CleanedDirs)
+	if len(report.RestoredFiles) != 1 || report.RestoredFiles[0] != origFile {
+		t.Fatalf("unexpected RestoredFiles: %+v", report.RestoredFiles)
+	}
+
+	// Verify restored file exists with matching payload and staged file is deleted
+	content, readErr := os.ReadFile(origFile)
+	if readErr != nil || string(content) != string(payload) {
+		t.Fatalf("restored file was corrupted or missing: %v", readErr)
+	}
+	if _, statErr := os.Stat(stagedFile); !os.IsNotExist(statErr) {
+		t.Fatalf("staged file still exists after copy fallback restore: %v", statErr)
+	}
+	if _, statErr := os.Stat(manifestPath); !os.IsNotExist(statErr) {
+		t.Fatalf("manifest should be removed after successful copy fallback restore: %v", statErr)
+	}
+	t.Logf("[Test 30: COPY_FALLBACK] Verified: copy fallback safely verified integrity and restored file")
+}
+
+// 31. Acceptance Test: Deferred rollback reconciliation failure during Run preserves durable quarantine evidence.
+func TestMigration_Run_DeferredRollbackReconcileFailure_PreservesQuarantineEvidence(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "defer_fail.sqlite3")
+	bufferDir := filepath.Join(tempDir, "buffer")
+	if err := os.MkdirAll(bufferDir, 0o755); err != nil {
+		t.Fatalf("failed to create buffer dir: %v", err)
+	}
+
+	spoolFile := filepath.Join(bufferDir, "defer_evidence.spool")
+	evidenceContent := []byte("defer evidence content for failure injection")
+	if err := os.WriteFile(spoolFile, evidenceContent, 0o644); err != nil {
+		t.Fatalf("failed to write spool file: %v", err)
+	}
+
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("failed to open sqlite: %v", err)
+	}
+	_, err = db.Exec(`
+		CREATE TABLE target_commits (
+			chat_id TEXT NOT NULL,
+			message_id INTEGER NOT NULL,
+			save_path TEXT,
+			file_size INTEGER,
+			sha256 TEXT,
+			committed_at INTEGER,
+			PRIMARY KEY (chat_id, message_id)
+		);
+		INSERT INTO target_commits VALUES ('-10099', 1, 'vid.mp4', 100, 'hash', 1000);
+	`)
+	if err != nil {
+		t.Fatalf("failed to setup legacy table: %v", err)
+	}
+
+	// Lock table target_commits by holding an active read query in an explicit transaction
+	lockingDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("failed to open locking db: %v", err)
+	}
+	defer lockingDB.Close()
+
+	lockTx, err := lockingDB.Begin()
+	if err != nil {
+		t.Fatalf("failed to begin lock transaction: %v", err)
+	}
+	rows, err := lockTx.Query("SELECT * FROM target_commits")
+	if err != nil {
+		t.Fatalf("failed to query for lock: %v", err)
+	}
+
+	// Inject parent directory sync failure into the reconciliation primitive
+	migration.SetTestHooks(migration.MigratorTestHooks{
+		ParentDirSyncHook: func(dir string) error {
+			if filepath.Clean(dir) == filepath.Clean(bufferDir) {
+				return errors.New("injected defer sync failure")
+			}
+			return nil
+		},
+	})
+	defer migration.SetTestHooks(migration.MigratorTestHooks{})
+
+	opts := migration.MigrationOptions{
+		DBPath:           dbPath,
+		BufferDir:        bufferDir,
+		DropLegacyTables: true,
+	}
+
+	// Run should stage files, fail on DROP TABLE, trigger defer -> ReconcilePendingQuarantines -> fail on dir sync!
+	report, runErr := migration.Run(context.Background(), opts)
+	_ = report
+	_ = rows.Close()
+	_ = lockTx.Rollback()
+	db.Close()
+
+	if runErr == nil {
+		t.Fatal("expected migration Run to fail, got nil")
+	}
+
+	// Verify fail-closed behavior: quarantine directory and manifest MUST be preserved intact!
+	matches, globErr := filepath.Glob(filepath.Join(bufferDir, ".migrator_quarantine_*"))
+	if globErr != nil || len(matches) != 1 {
+		t.Fatalf("expected 1 quarantine dir preserved on defer failure, got %v (err: %v)", matches, globErr)
+	}
+	manifestPath := filepath.Join(matches[0], "quarantine_manifest.json")
+	if _, statErr := os.Stat(manifestPath); statErr != nil {
+		t.Fatalf("quarantine manifest must be preserved on defer failure: %v", statErr)
+	}
+
+	// Now clear the hook to simulate next restart reconciliation
+	migration.SetTestHooks(migration.MigratorTestHooks{})
+
+	reconcileReport, recErr := migration.ReconcilePendingQuarantines(context.Background(), dbPath, bufferDir)
+	if recErr != nil {
+		t.Fatalf("restart reconciliation failed after clearing hook: %v", recErr)
+	}
+	if len(reconcileReport.CleanedDirs) != 1 {
+		t.Fatalf("expected 1 quarantine dir cleaned on restart, got: %+v", reconcileReport.CleanedDirs)
+	}
+
+	// Verify final restoration
+	restoredContent, readErr := os.ReadFile(spoolFile)
+	if readErr != nil || string(restoredContent) != string(evidenceContent) {
+		t.Fatalf("evidence corrupted after restart reconciliation: %v", readErr)
+	}
+	if _, statErr := os.Stat(manifestPath); !os.IsNotExist(statErr) {
+		t.Fatalf("quarantine manifest should be deleted after successful restart reconciliation")
+	}
+	t.Logf("[Test 31: DEFER_RECONCILE_FAIL] Verified: defer failure preserves durable manifest, restart successfully restores")
+}
+
+// 32. Acceptance Test: safeNoReplaceLinkOrMove copy fallback detects partial/corrupt copy, preserving source file and manifest.
+func TestMigration_Reconcile_CopyFallback_PartialCopyDetected_PreservesSourceAndManifest(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "state.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("failed to open sqlite3: %v", err)
+	}
+	_, _ = db.Exec("CREATE TABLE dummy (id INT)")
+	defer db.Close()
+
+	bufferDir := filepath.Join(tempDir, "buffer")
+	_ = os.MkdirAll(bufferDir, 0o755)
+	qDir := filepath.Join(bufferDir, ".migrator_quarantine_copy_corrupt")
+	_ = os.MkdirAll(qDir, 0o755)
+
+	manifestPath := filepath.Join(qDir, "quarantine_manifest.json")
+	origFile := filepath.Join(bufferDir, "copy_corrupt.spool")
+	stagedFile := filepath.Join(qDir, "staged_copy_corrupt.spool")
+
+	payload := []byte("authentic original payload before partial copy failure 123456789")
+	hash := sha256.Sum256(payload)
+	shaHex := hex.EncodeToString(hash[:])
+	_ = os.WriteFile(stagedFile, payload, 0o644)
+
+	// Simulate cross-device copy fallback with partial/corrupted write
+	migration.SetTestHooks(migration.MigratorTestHooks{
+		ForceCopyFallback:   true,
+		CorruptCopyFallback: true,
+	})
+	defer migration.SetTestHooks(migration.MigratorTestHooks{})
+
+	manifest := migration.QuarantineManifest{
+		MigrationID: "mig_copy_corrupt",
+		CreatedAt:   time.Now().Unix(),
+		Files: []migration.QuarantineFileEntry{
+			{
+				OriginalPath: origFile,
+				StagedName:   "staged_copy_corrupt.spool",
+				StagedPath:   stagedFile,
+				Size:         int64(len(payload)),
+				SHA256:       shaHex,
+			},
+		},
+	}
+	data, _ := json.MarshalIndent(manifest, "", "  ")
+	_ = os.WriteFile(manifestPath, data, 0o644)
+
+	t.Logf("[Test 32: COPY_PARTIAL] Invoking ReconcilePendingQuarantines with CorruptCopyFallback=true...")
+	_, err = migration.ReconcilePendingQuarantines(context.Background(), dbPath, bufferDir)
+	if err == nil {
+		t.Fatal("expected ReconcilePendingQuarantines to fail when copy fallback is corrupted, got nil")
+	}
+	t.Logf("[Test 32: COPY_PARTIAL] Reconcile correctly returned error: %v", err)
+
+	// Assert fail-closed: staged source must be preserved intact!
+	srcContent, readErr := os.ReadFile(stagedFile)
+	if readErr != nil || string(srcContent) != string(payload) {
+		t.Fatalf("staged source was deleted or corrupted on copy failure: %v", readErr)
+	}
+
+	// Corrupted destination must be cleaned up to prevent half-baked artifacts
+	if _, statErr := os.Stat(origFile); !os.IsNotExist(statErr) {
+		t.Fatalf("corrupted destination file was left on disk: %v", statErr)
+	}
+
+	// Manifest must be preserved
+	if _, statErr := os.Stat(manifestPath); os.IsNotExist(statErr) {
+		t.Fatal("quarantine manifest was deleted despite copy failure")
+	}
+
+	// Now clear the corruption hook and retry (simulating subsequent reconcile)
+	migration.SetTestHooks(migration.MigratorTestHooks{
+		ForceCopyFallback: true,
+	})
+
+	report, err := migration.ReconcilePendingQuarantines(context.Background(), dbPath, bufferDir)
+	if err != nil {
+		t.Fatalf("ReconcilePendingQuarantines failed after clearing corrupt hook: %v", err)
+	}
+	if len(report.RestoredFiles) != 1 || report.RestoredFiles[0] != origFile {
+		t.Fatalf("unexpected RestoredFiles: %+v", report.RestoredFiles)
+	}
+
+	// Verify successful restore
+	dstContent, readErr := os.ReadFile(origFile)
+	if readErr != nil || string(dstContent) != string(payload) {
+		t.Fatalf("restored file was corrupted: %v", readErr)
+	}
+	if _, statErr := os.Stat(stagedFile); !os.IsNotExist(statErr) {
+		t.Fatalf("staged file still exists after successful restore")
+	}
+	if _, statErr := os.Stat(manifestPath); !os.IsNotExist(statErr) {
+		t.Fatalf("manifest should be removed after successful restore")
+	}
+	t.Logf("[Test 32: COPY_PARTIAL] Verified: partial copy failed-closed, source preserved, subsequent restore succeeded")
+}

@@ -371,12 +371,29 @@ func Run(ctx context.Context, opts MigrationOptions) (*MigrationReport, error) {
 		report.BackupPath = backupPath
 	}
 
+	var (
+		committed     bool
+		quarantineDir string
+	)
+
 	// 11. Apply Changes in Transaction
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return report, fmt.Errorf("begin transaction: %w", err)
 	}
-	defer tx.Rollback()
+	// In case of error during staging or database operations, rollback the transaction first to
+	// release locks and revert uncommitted state, then invoke the single authoritative
+	// ReconcilePendingQuarantines primitive to restore original files using the exact same path containment,
+	// object identity (size + SHA256), atomic no-replace, and directory durability rules.
+	// If reconciliation fails, the durable manifest is preserved intact for restart recovery.
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+			if quarantineDir != "" {
+				_, _ = ReconcilePendingQuarantines(ctx, opts.DBPath, opts.BufferDir)
+			}
+		}
+	}()
 
 	now := time.Now().Unix()
 
@@ -453,8 +470,6 @@ func Run(ctx context.Context, opts MigrationOptions) (*MigrationReport, error) {
 
 	// 12. Stage buffer files to recoverable quarantine before database mutation
 	var staged []QuarantineFileEntry
-	var quarantineDir string
-	committed := false
 	migrationID := fmt.Sprintf("mig_%d_%d", now, os.Getpid())
 
 	if len(report.PlannedCleanFiles) > 0 && opts.BufferDir != "" {
@@ -526,30 +541,6 @@ func Run(ctx context.Context, opts MigrationOptions) (*MigrationReport, error) {
 		if err := df.Close(); err != nil {
 			return report, fmt.Errorf("close quarantine directory: %w", err)
 		}
-
-		// In case of error during staging or database operations, fail-closed restore staged files.
-		// Immediately disarmed upon successful tx.Commit()!
-		defer func() {
-			if !committed && quarantineDir != "" {
-				allRestored := true
-				for _, sf := range staged {
-					if _, err := os.Stat(sf.StagedPath); err == nil {
-						if err := os.MkdirAll(filepath.Dir(sf.OriginalPath), 0o755); err != nil {
-							allRestored = false
-							continue
-						}
-						if err := safeNoReplaceLinkOrMove(sf.StagedPath, sf.OriginalPath); err != nil {
-							allRestored = false
-							continue
-						}
-					}
-				}
-				if allRestored {
-					_ = os.Remove(filepath.Join(quarantineDir, "quarantine_manifest.json"))
-					_ = os.RemoveAll(quarantineDir)
-				}
-			}
-		}()
 
 		// Perform physical move of planned buffer files into quarantine staging
 		for _, sf := range staged {
@@ -754,8 +745,10 @@ func contains(slice []string, s string) bool {
 
 // MigratorTestHooks allows unit tests to inject deterministic hooks during migration and reconciliation.
 type MigratorTestHooks struct {
-	BeforeRestoreMove func(stagedPath, origPath string)
-	ParentDirSyncHook func(dir string) error
+	BeforeRestoreMove   func(stagedPath, origPath string)
+	ParentDirSyncHook   func(dir string) error
+	ForceCopyFallback   bool
+	CorruptCopyFallback bool
 }
 
 var testHooks MigratorTestHooks
@@ -802,15 +795,17 @@ func validateQuarantinePaths(manifest QuarantineManifest, qDir string, bufferDir
 
 func safeNoReplaceLinkOrMove(src, dst string) error {
 	// Try atomic hardlink first (fast & guaranteed no-overwrite on POSIX)
-	err := os.Link(src, dst)
-	if err == nil {
-		if rmErr := os.Remove(src); rmErr != nil && !os.IsNotExist(rmErr) {
-			return fmt.Errorf("remove src after link: %w", rmErr)
+	if !testHooks.ForceCopyFallback {
+		err := os.Link(src, dst)
+		if err == nil {
+			if rmErr := os.Remove(src); rmErr != nil && !os.IsNotExist(rmErr) {
+				return fmt.Errorf("remove src after link: %w", rmErr)
+			}
+			return nil
 		}
-		return nil
-	}
-	if errors.Is(err, os.ErrExist) {
-		return err
+		if errors.Is(err, os.ErrExist) {
+			return err
+		}
 	}
 
 	// Fallback for cross-device links (EXDEV) or filesystems where link(2) is not permitted:
@@ -841,6 +836,26 @@ func safeNoReplaceLinkOrMove(src, dst string) error {
 		_ = os.Remove(dst)
 		return closeErr
 	}
+
+	if testHooks.CorruptCopyFallback {
+		// Simulate partial copy or data corruption
+		_ = os.WriteFile(dst, []byte("corrupted partial copy payload"), 0o644)
+	}
+
+	// Before removing source, verify destination integrity matches source exactly
+	srcInfo, statSrcErr := os.Stat(src)
+	dstInfo, statDstErr := os.Stat(dst)
+	if statSrcErr != nil || statDstErr != nil || srcInfo.Size() != dstInfo.Size() {
+		_ = os.Remove(dst)
+		return fmt.Errorf("copy fallback integrity verification failed: size mismatch")
+	}
+	srcSHA, shaSrcErr := computeFileSHA256(src)
+	dstSHA, shaDstErr := computeFileSHA256(dst)
+	if shaSrcErr != nil || shaDstErr != nil || srcSHA != dstSHA {
+		_ = os.Remove(dst)
+		return fmt.Errorf("copy fallback integrity verification failed: sha mismatch")
+	}
+
 	return os.Remove(src)
 }
 

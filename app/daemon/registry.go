@@ -728,6 +728,51 @@ func (r *Registry) FinishTask(id, gen string, status TaskState, class, message, 
 	return FinishAcceptedNewTerminal
 }
 
+// FinishTaskByMessage finishes an active task matching chatID, messageID, and attempt generation.
+func (r *Registry) FinishTaskByMessage(chatID string, messageID int, gen string, status TaskState, class, message, finalPath string, already bool, sha256 string) FinishResult {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	cleanChatID := strings.TrimPrefix(chatID, "@")
+	for _, state := range r.tasks {
+		peer := strings.TrimPrefix(state.request.Peer, "@")
+		if (peer == cleanChatID || peer == chatID) && state.request.MessageID == messageID {
+			if gen != "" && state.attemptGen != gen {
+				return FinishRejectedStale
+			}
+			if isTerminal(state.state) {
+				if state.state == status {
+					return FinishAlreadySameTerminal
+				}
+				return FinishConflictingTerminal
+			}
+			state.state = status
+			state.errorClass = class
+			state.errorText = message
+			state.alreadyExists = already
+			state.sha256 = sha256
+			state.finishedAt = r.now()
+			if isTerminal(status) && state.cancel != nil {
+				state.cancel()
+			}
+			if finalPath != "" {
+				state.request.FinalPath = finalPath
+			}
+			if message != "" {
+				r.lastError = message
+			}
+			r.terminalOrder = append(r.terminalOrder, state.request.ID)
+			for len(r.terminalOrder) > r.terminalLimit {
+				oldest := r.terminalOrder[0]
+				r.terminalOrder = r.terminalOrder[1:]
+				delete(r.tasks, oldest)
+			}
+			return FinishAcceptedNewTerminal
+		}
+	}
+	return FinishNotFound
+}
+
 // RegisterRecoveredTask registers a task recovered from startup crash recovery into the
 // active Registry so its finalization callback can be authoritatively validated and accepted.
 func (r *Registry) RegisterRecoveredTask(id, gen, finalPath string, expectedSize int64) {

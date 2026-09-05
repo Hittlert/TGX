@@ -317,8 +317,104 @@ func (o *Orchestrator) TriggerStreamDispatch(ctx context.Context, record Downloa
 	}
 }
 
+// ReconcileCommitting scans and reconciles all download records in 'committing' status.
+// It serves as the continuous online owner of the committing state, converging transient
+// database errors to terminal verdicts and driving Registry state without restarting.
+func (o *Orchestrator) ReconcileCommitting(ctx context.Context) error {
+	if o.db == nil {
+		return nil
+	}
+	archiveEnabled := o.archiveWorker != nil && o.archiveWorker.IsEnabled()
+
+	committingRecs, err := o.db.GetPendingCommittingDownloads()
+	if err != nil {
+		return fmt.Errorf("get pending committing downloads: %w", err)
+	}
+	if len(committingRecs) == 0 {
+		return nil
+	}
+
+	for _, rec := range committingRecs {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		finalAbsPath := filepath.Join(o.saveDir, filepath.FromSlash(rec.SavePath))
+		partAbsPath := finalAbsPath + ".part"
+
+		// 1. Final SSD file already exists and matches committed size and SHA proof
+		if finInfo, statErr := os.Stat(finalAbsPath); statErr == nil && finInfo.Size() == rec.FileSize {
+			sha, shaErr := computeFileSHA256(finalAbsPath)
+			if shaErr == nil && rec.SHA256 != "" && sha == rec.SHA256 {
+				_ = os.Remove(partAbsPath)
+				completeErr := o.db.CompleteDownloadAndQueueArchive(rec.ChatID, rec.MessageID, rec.AttemptGeneration, rec.SavePath, rec.FileSize, sha, archiveEnabled)
+				if completeErr == nil || errors.Is(completeErr, ErrArchiveConflict) {
+					o.logger.Info("online committing reconciler finalized download to success",
+						zap.String("chat_id", rec.ChatID),
+						zap.Int("message_id", rec.MessageID),
+					)
+					if o.registry != nil {
+						o.registry.FinishTaskByMessage(rec.ChatID, rec.MessageID, rec.AttemptGeneration, StateSuccess, "", "", rec.SavePath, false, sha)
+					}
+					continue
+				} else {
+					o.logger.Warn("online committing reconciler retry failed",
+						zap.String("chat_id", rec.ChatID),
+						zap.Int("message_id", rec.MessageID),
+						zap.Error(completeErr),
+					)
+					continue
+				}
+			}
+		}
+
+		// 2. .part file exists with matching SHA -> commit sibling part and complete
+		if partInfo, statErr := os.Stat(partAbsPath); statErr == nil && partInfo.Size() == rec.FileSize {
+			sha, shaErr := computeFileSHA256(partAbsPath)
+			if shaErr == nil && rec.SHA256 != "" && sha == rec.SHA256 {
+				if commitErr := fscommit.CommitSiblingPart(partAbsPath, finalAbsPath); commitErr == nil {
+					completeErr := o.db.CompleteDownloadAndQueueArchive(rec.ChatID, rec.MessageID, rec.AttemptGeneration, rec.SavePath, rec.FileSize, sha, archiveEnabled)
+					if completeErr == nil || errors.Is(completeErr, ErrArchiveConflict) {
+						o.logger.Info("online committing reconciler committed part and finalized download to success",
+							zap.String("chat_id", rec.ChatID),
+							zap.Int("message_id", rec.MessageID),
+						)
+						if o.registry != nil {
+							o.registry.FinishTaskByMessage(rec.ChatID, rec.MessageID, rec.AttemptGeneration, StateSuccess, "", "", rec.SavePath, false, sha)
+						}
+						continue
+					} else {
+						o.logger.Warn("online committing reconciler retry failed after commit part",
+							zap.String("chat_id", rec.ChatID),
+							zap.Int("message_id", rec.MessageID),
+							zap.Error(completeErr),
+						)
+						continue
+					}
+				}
+			}
+		}
+
+		// 3. Neither valid: reset to pending so it can be re-downloaded
+		_ = os.Remove(partAbsPath)
+		if updateErr := o.db.UpdateDownloadStatus(rec.ChatID, rec.MessageID, "pending", rec.FileName, rec.SavePath, rec.MediaType, rec.FileSize, ""); updateErr != nil {
+			o.logger.Error("online committing reconciler failed to reset invalid committing record",
+				zap.String("chat_id", rec.ChatID),
+				zap.Int("message_id", rec.MessageID),
+				zap.Error(updateErr),
+			)
+		} else {
+			o.logger.Warn("online committing reconciler reset incomplete committing record to pending",
+				zap.String("chat_id", rec.ChatID),
+				zap.Int("message_id", rec.MessageID),
+			)
+		}
+	}
+	return nil
+}
+
 func (o *Orchestrator) scanLoop(ctx context.Context) {
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
 	for {
@@ -328,6 +424,11 @@ func (o *Orchestrator) scanLoop(ctx context.Context) {
 		case <-ticker.C:
 			if !o.IsRunning() || o.db == nil {
 				continue
+			}
+
+			// 1. Reconcile committing downloads first (online continuous owner for committing state)
+			if err := o.ReconcileCommitting(ctx); err != nil {
+				o.logger.Error("online committing reconciliation failed", zap.Error(err))
 			}
 
 			records, err := o.db.GetPendingDownloads(50)
@@ -1183,7 +1284,8 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 		// First acquire DB failure verdict; do not ignore durable transition error
 		if o.db != nil {
 			if dbErr := o.db.FailDownloadDisposition(chatID, msgID, gen, fileName, finalRelPath, mediaType, authoritativeSize, disp); dbErr != nil {
-				o.logger.Error("failed to record failure in DB after rename error", zap.Error(dbErr))
+				o.logger.Error("failed to record failure in DB after rename error; refusing to fake Registry terminal state", zap.Error(dbErr))
+				return
 			}
 		}
 		task.FailDisposition(disp)
@@ -1219,29 +1321,34 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 	// 13. Complete download and queue archive in single DB transaction
 	queueArchive := o.archiveWorker != nil && o.archiveWorker.IsEnabled()
 	if o.db != nil {
-		var completeErr error
-		const maxCompleteRetries = 10
-		for attempt := 0; attempt < maxCompleteRetries; attempt++ {
-			if o.testHooks.BeforeCompleteDB != nil {
-				o.testHooks.BeforeCompleteDB(taskID, chatID, msgID)
-			}
-			completeErr = o.db.CompleteDownloadAndQueueArchive(chatID, msgID, gen, finalRelPath, stat.Size(), shaHex, queueArchive)
-			if completeErr == nil {
-				break
-			}
-			o.logger.Warn("temporary failure completing download in DB, retrying online to converge state",
-				zap.Int("attempt", attempt+1),
-				zap.Error(completeErr),
-			)
-			time.Sleep(5 * time.Millisecond * time.Duration(1<<attempt))
+		if o.testHooks.BeforeCompleteDB != nil {
+			o.testHooks.BeforeCompleteDB(taskID, chatID, msgID)
 		}
-
+		completeErr := o.db.CompleteDownloadAndQueueArchive(chatID, msgID, gen, finalRelPath, stat.Size(), shaHex, queueArchive)
 		if completeErr != nil {
-			o.logger.Error("fatal failure completing download in DB after rename; preserving publishing state, never faking terminal failed", zap.Error(completeErr))
-			return
+			if errors.Is(completeErr, ErrArchiveConflict) {
+				// Authoritative conflict accepted: DB has committed download=success and archive=conflict!
+				o.logger.Warn("archive conflict disposition committed for duplicate download completion",
+					zap.String("chat_id", chatID),
+					zap.Int("message_id", msgID),
+					zap.Error(completeErr),
+				)
+			} else {
+				// Transient or DB error: do not fake terminal failed!
+				// Keep publishing; trigger online committing reconciler to finalize convergence.
+				o.logger.Warn("temporary failure completing download in DB, triggering online committing reconciler",
+					zap.String("chat_id", chatID),
+					zap.Int("message_id", msgID),
+					zap.Error(completeErr),
+				)
+				go func() {
+					_ = o.ReconcileCommitting(context.Background())
+				}()
+				return
+			}
 		}
 
-		if queueArchive {
+		if queueArchive && !errors.Is(completeErr, ErrArchiveConflict) {
 			EmitLifecycle(o.logger, LifecycleEvent{
 				Event:     EventArchiveQueued,
 				TaskID:    taskID,

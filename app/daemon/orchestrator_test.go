@@ -2028,30 +2028,49 @@ func TestOrchestrator_Deterministic_DBCompleteTransientFailure_RetriesAndConverg
 	orch.downloadOne(context.Background(), task)
 
 	// Assertions:
-	// 1. Hook was called more than once (proving retry loop was triggered!)
-	invoked := atomic.LoadInt32(&hookInvocations)
-	t.Logf("[POST-ASSERT] Total BeforeCompleteDB hook invocations: %d", invoked)
-	if invoked < 2 {
-		t.Fatalf("expected retry loop to trigger BeforeCompleteDB at least 2 times, got: %d", invoked)
-	}
-
-	// 2. Physical file must be on disk
+	// 1. Physical file must be on disk
 	if _, err := os.Stat(finalAbsPath); err != nil {
 		t.Fatalf("physical file missing on disk: %v", err)
 	}
 	t.Logf("[POST-ASSERT] Physical file confirmed on disk: %s", finalAbsPath)
 
-	// 3. DB must have converged to success!
+	// 2. Immediately after downloadOne failed on lock, Registry MUST NOT be failed!
+	// It remains non-terminal (publishing), never faking failed!
+	initialSnap := task.Snapshot()
+	t.Logf("[POST-ASSERT] Registry state immediately after DB error: %s (must not be failed)", initialSnap.State)
+	if initialSnap.State == StateFailed {
+		t.Fatalf("Registry was improperly marked failed on DB error: state=%s", initialSnap.State)
+	}
+
+	// 3. DB status must be 'committing' (durable commit intent preserved)
+	initialRec, err := db.GetDownloadRecord(chatID, msgID)
+	if err != nil || initialRec == nil {
+		t.Fatalf("query DB record failed: %v", err)
+	}
+	t.Logf("[POST-ASSERT] DB status immediately after transient error: %s", initialRec.Status)
+	if initialRec.Status != "committing" {
+		t.Fatalf("expected DB status 'committing', got: %q", initialRec.Status)
+	}
+
+	// 4. Wait for transient DB lock to release (30ms)
+	time.Sleep(50 * time.Millisecond)
+
+	// 5. Invoke online continuous committing reconciler (without restarting daemon process!)
+	if recErr := orch.ReconcileCommitting(context.Background()); recErr != nil {
+		t.Fatalf("ReconcileCommitting failed: %v", recErr)
+	}
+
+	// 6. DB must have converged to success!
 	rec, err := db.GetDownloadRecord(chatID, msgID)
 	if err != nil || rec == nil {
 		t.Fatalf("query DB record failed: %v", err)
 	}
 	t.Logf("[POST-ASSERT] Final DB record: status=%s, path=%s, size=%d, sha=%s", rec.Status, rec.SavePath, rec.FileSize, rec.SHA256)
 	if rec.Status != "success" {
-		t.Fatalf("expected DB status 'success' after retry, got: %q", rec.Status)
+		t.Fatalf("expected DB status 'success' after online reconciliation, got: %q", rec.Status)
 	}
 
-	// 4. Registry task MUST be StateSuccess (never failed!)
+	// 7. Registry task MUST have converged to StateSuccess without restart!
 	snap := task.Snapshot()
 	t.Logf("[POST-ASSERT] Final Registry task state: %s", snap.State)
 	if snap.State != StateSuccess {
@@ -2132,5 +2151,71 @@ func TestOrchestrator_Deterministic_RenameFailure_SyncsDBFailureBeforeRegistryTe
 	t.Logf("[POST-ASSERT] DB record status=%s, error=%s", rec.Status, rec.Error)
 	if rec.Status != "failed" {
 		t.Fatalf("expected DB record status 'failed', got: %s", rec.Status)
+	}
+}
+
+func TestOrchestrator_Deterministic_RenameFailure_DBFailureFailsClosedWithoutRegistryTerminal(t *testing.T) {
+	data := make([]byte, 1024)
+	for i := range data {
+		data[i] = byte(i % 256)
+	}
+
+	var chatID = "-1007779"
+	var msgID = 893
+
+	invoker := invokerFunc(func(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
+		setUploadFile(output, data)
+		return nil
+	})
+
+	access := &mockAccessWithPool{
+		pool: &mockPool{invoker: invoker},
+		resolveFn: func(ctx context.Context, peer string, messageID int) (ResolvedMedia, error) {
+			return ResolvedMedia{
+				File:      &orchMockMediaFile{loc: &tg.InputDocumentFileLocation{ID: 1001, AccessHash: 2002}, sz: 1024, dc: 2},
+				Name:      "rename_fail_db_lock.mp4",
+				Size:      1024,
+				DCID:      2,
+				MediaType: "video",
+				Date:      1725518400,
+			}, nil
+		},
+	}
+
+	orch, registry, db, saveDir := setupTestOrchestratorWithAccess(t, access)
+	defer db.Close()
+
+	finalRelPath := "RaceChannel/2024_09/893 - rename_fail_db_lock.mp4"
+	finalAbsPath := filepath.Join(saveDir, filepath.FromSlash(finalRelPath))
+
+	orch.SetTestHooks(OrchestratorTestHooks{
+		BeforeRename: func(taskID, cID string, mID int) {
+			t.Logf("[HOOK: BeforeRename] Sabotaging target destination %s to trigger atomic commit failure", finalAbsPath)
+			_ = os.MkdirAll(finalAbsPath, 0o755) // directory causes rename failure!
+
+			// Close database connection to simulate DB verdict failure deterministically
+			t.Logf("[HOOK: BeforeRename] Closing database to simulate DB failure verdict error...")
+			_ = db.Close()
+		},
+	})
+
+	req := TaskRequest{
+		ID:          "case_rename_fail_db_lock",
+		Peer:        chatID,
+		MessageID:   msgID,
+		TargetTitle: "RaceChannel",
+		Date:        1725518400,
+	}
+
+	_, _, _ = registry.Submit(req)
+	task, _ := registry.Next(context.Background())
+	orch.downloadOne(context.Background(), task)
+
+	// Assertions:
+	// 1. Registry task MUST NOT be StateFailed because DB failure verdict was rejected!
+	snap := task.Snapshot()
+	t.Logf("[POST-ASSERT] Registry task state=%s (must not be failed without DB verdict)", snap.State)
+	if snap.State == StateFailed {
+		t.Fatalf("expected Registry to NOT be StateFailed when DB verdict rejected, got: %s", snap.State)
 	}
 }
