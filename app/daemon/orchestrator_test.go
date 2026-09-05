@@ -2219,3 +2219,234 @@ func TestOrchestrator_Deterministic_RenameFailure_DBFailureFailsClosedWithoutReg
 		t.Fatalf("expected Registry to NOT be StateFailed when DB verdict rejected, got: %s", snap.State)
 	}
 }
+
+// Acceptance Test (Issue #4): Active Publisher Exclusion.
+// Worker pauses between PrepareDownloadCommit and Rename; Finalizer is triggered concurrently
+// and MUST skip this active worker, preserving .part file and allowing the worker to complete normally.
+func TestOrchestrator_Deterministic_ActivePublisherExclusion_FinalizerSkipsInFlightWorker(t *testing.T) {
+	chatID := "-1008881"
+	msgID := 901
+	data := make([]byte, 1024)
+	for i := range data {
+		data[i] = byte(i % 251)
+	}
+	hash := sha256.Sum256(data)
+	shaHex := hex.EncodeToString(hash[:])
+
+	invoker := invokerFunc(func(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
+		setUploadFile(output, data)
+		return nil
+	})
+
+	access := &mockAccessWithPool{
+		pool: &mockPool{invoker: invoker},
+		resolveFn: func(ctx context.Context, peer string, messageID int) (ResolvedMedia, error) {
+			return ResolvedMedia{
+				File:      &orchMockMediaFile{loc: &tg.InputDocumentFileLocation{ID: 1001, AccessHash: 2002}, sz: 1024, dc: 2},
+				Name:      "publisher_exclusion.mp4",
+				Size:      1024,
+				DCID:      2,
+				MediaType: "video",
+				Date:      1725518400,
+			}, nil
+		},
+	}
+
+	orch, registry, db, saveDir := setupTestOrchestratorWithAccess(t, access)
+	defer db.Close()
+
+	finalRelPath := "RaceChannel/2024_09/901 - publisher_exclusion.mp4"
+	finalAbsPath := filepath.Join(saveDir, filepath.FromSlash(finalRelPath))
+	partAbsPath := finalAbsPath + ".part"
+
+	workerPaused := make(chan struct{})
+	resumeWorker := make(chan struct{})
+
+	orch.SetTestHooks(OrchestratorTestHooks{
+		BeforeRename: func(taskID, cID string, mID int) {
+			t.Logf("[HOOK: BeforeRename] Worker reached rename phase; signaling pause...")
+			close(workerPaused)
+			<-resumeWorker
+			t.Logf("[HOOK: BeforeRename] Resuming worker rename...")
+		},
+	})
+
+	req := TaskRequest{
+		ID:          "case_active_publisher_exclusion",
+		Peer:        chatID,
+		MessageID:   msgID,
+		TargetTitle: "RaceChannel",
+		Date:        1725518400,
+	}
+
+	_, _, _ = registry.Submit(req)
+	task, _ := registry.Next(context.Background())
+
+	workerDone := make(chan struct{})
+	go func() {
+		defer close(workerDone)
+		orch.downloadOne(context.Background(), task)
+	}()
+
+	// Wait for worker to pause after PrepareDownloadCommit and before Rename
+	<-workerPaused
+
+	// Assertions during pause:
+	// 1. DB status MUST be 'committing'
+	var dbStatus string
+	err := db.db.QueryRow(`SELECT status FROM download_records WHERE chat_id = ? AND message_id = ?`, chatID, msgID).Scan(&dbStatus)
+	if err != nil || dbStatus != "committing" {
+		t.Fatalf("expected committing DB status, got %q (err: %v)", dbStatus, err)
+	}
+
+	// 2. .part file MUST exist
+	if _, statErr := os.Stat(partAbsPath); statErr != nil {
+		t.Fatalf(".part file missing while worker is paused: %v", statErr)
+	}
+
+	// 3. Now trigger online committing reconciler!
+	t.Logf("[TEST] Triggering online ReconcileCommitting while worker is active publisher...")
+	recErr := orch.ReconcileCommitting(context.Background())
+	if recErr != nil {
+		t.Fatalf("ReconcileCommitting returned unexpected error: %v", recErr)
+	}
+
+	// 4. Assert: Finalizer MUST HAVE SKIPPED the active worker!
+	// The DB record must still be 'committing' (NOT reset to pending)
+	err = db.db.QueryRow(`SELECT status FROM download_records WHERE chat_id = ? AND message_id = ?`, chatID, msgID).Scan(&dbStatus)
+	if err != nil || dbStatus != "committing" {
+		t.Fatalf("expected committing DB status preserved by exclusion, got %q", dbStatus)
+	}
+	// The .part file must NOT have been removed by finalizer
+	if _, statErr := os.Stat(partAbsPath); statErr != nil {
+		t.Fatalf(".part file was deleted by finalizer despite active publisher exclusion: %v", statErr)
+	}
+
+	// Resume worker to allow complete
+	close(resumeWorker)
+	<-workerDone
+
+	// 5. Final assertion: Worker completes cleanly to success
+	snap := task.Snapshot()
+	if snap.State != StateSuccess {
+		t.Fatalf("expected Registry task state success, got %s", snap.State)
+	}
+	err = db.db.QueryRow(`SELECT status, sha256 FROM download_records WHERE chat_id = ? AND message_id = ?`, chatID, msgID).Scan(&dbStatus, &shaHex)
+	if err != nil || dbStatus != "success" {
+		t.Fatalf("expected final DB status success, got %q", dbStatus)
+	}
+	t.Logf("[POST-ASSERT] Verified: Active publisher exclusion protected in-flight worker; completed to success!")
+}
+
+// Acceptance Test (Issue #4): Concurrent wakeFinalizer calls execute single-flight without race or blocking.
+func TestOrchestrator_Deterministic_ConcurrentWakeup_SingleFlightNoRace(t *testing.T) {
+	orch := &Orchestrator{
+		finalizerWakeCh: make(chan struct{}, 1),
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 50; j++ {
+				orch.wakeFinalizer()
+			}
+		}()
+	}
+	wg.Wait()
+
+	// Drain channel, at most 1 token present
+	count := 0
+	for {
+		select {
+		case <-orch.finalizerWakeCh:
+			count++
+		default:
+			goto drained
+		}
+	}
+drained:
+	if count > 1 {
+		t.Fatalf("expected at most 1 debounced signal in finalizerWakeCh, got %d", count)
+	}
+	t.Logf("[POST-ASSERT] Verified: 1000 concurrent wakeFinalizer calls safely debounced into single-flight signal")
+}
+
+// Acceptance Test (Issue #4): CommitSiblingPart encountering ErrTargetExists re-reads and validates proof, promoting to success.
+func TestRecovery_ReconcileCommittingRecord_TargetExists_RevalidatesProofAndPromotesSuccess(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "state.db")
+	db, err := NewDatabase(dbPath)
+	if err != nil {
+		t.Fatalf("failed to init database: %v", err)
+	}
+	defer db.Close()
+
+	saveDir := filepath.Join(tempDir, "downloads")
+	_ = os.MkdirAll(saveDir, 0o755)
+
+	chatID := "-100999"
+	msgID := 555
+	now := time.Now().Unix()
+	payload := []byte("target exists revalidation test payload 12345")
+	hash := sha256.Sum256(payload)
+	shaHex := hex.EncodeToString(hash[:])
+	size := int64(len(payload))
+	relPath := "Channel/2026_09/555 - target_exists.bin"
+
+	finalAbsPath := filepath.Join(saveDir, filepath.FromSlash(relPath))
+	partAbsPath := finalAbsPath + ".part"
+	_ = os.MkdirAll(filepath.Dir(finalAbsPath), 0o755)
+
+	// Both final file and part file exist on disk
+	_ = os.WriteFile(finalAbsPath, payload, 0o644)
+	_ = os.WriteFile(partAbsPath, []byte("stale residual part content"), 0o644)
+
+	// Seed DB in committing status
+	_, err = db.Execute(`
+		INSERT INTO download_records (
+			chat_id, message_id, status, file_name, save_path, file_size, sha256,
+			attempt_generation, created_at, updated_at
+		) VALUES (?, ?, 'committing', 'target_exists.bin', ?, ?, ?, 'gen_te', ?, ?)
+	`, chatID, msgID, relPath, size, shaHex, now, now)
+	if err != nil {
+		t.Fatalf("seed DB: %v", err)
+	}
+
+	rec := DownloadRecord{
+		ChatID:            chatID,
+		MessageID:         msgID,
+		Status:            "committing",
+		FileName:          "target_exists.bin",
+		SavePath:          relPath,
+		FileSize:          size,
+		SHA256:            shaHex,
+		AttemptGeneration: "gen_te",
+	}
+
+	logger := zap.NewNop()
+	recErr := ReconcileCommittingRecord(context.Background(), db, saveDir, false, rec, nil, logger)
+	if recErr != nil {
+		t.Fatalf("ReconcileCommittingRecord returned error: %v", recErr)
+	}
+
+	// 1. Assert DB status is now 'success' (NOT reset to pending!)
+	var status string
+	err = db.db.QueryRow(`SELECT status FROM download_records WHERE chat_id = ? AND message_id = ?`, chatID, msgID).Scan(&status)
+	if err != nil || status != "success" {
+		t.Fatalf("expected status promoted to 'success', got %q (err: %v)", status, err)
+	}
+
+	// 2. Residual .part file must have been cleaned
+	if _, statErr := os.Stat(partAbsPath); !os.IsNotExist(statErr) {
+		t.Fatalf("residual .part file was not cleaned: %v", statErr)
+	}
+
+	// 3. Final file intact
+	content, readErr := os.ReadFile(finalAbsPath)
+	if readErr != nil || string(content) != string(payload) {
+		t.Fatalf("final file was corrupted or missing: %v", readErr)
+	}
+	t.Logf("[POST-ASSERT] Verified: ReconcileCommittingRecord safely re-read matching target file and converged to success")
+}

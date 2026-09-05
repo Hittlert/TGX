@@ -1340,17 +1340,7 @@ func (d *Database) ensureArchiveJobLocked(tx *sql.Tx, chatID string, messageID i
 	switch arcState {
 	case "archived":
 		if arcSHA != sha256Hex || arcPath != relPath || arcSize != size {
-			_, err = tx.Exec(`
-				UPDATE archive_jobs
-				SET state = 'conflict',
-					last_error = 'archive identity mismatch on duplicate complete',
-					updated_at = ?
-				WHERE chat_id = ? AND message_id = ?
-			`, now, chatID, messageID)
-			if err != nil {
-				return fmt.Errorf("set archive conflict: %w", err)
-			}
-			return fmt.Errorf("%w: duplicate completion identity mismatch with archived job", ErrArchiveConflict)
+			return fmt.Errorf("%w: duplicate completion identity mismatch with archived job (archived state remains immutable)", ErrArchiveConflict)
 		}
 		// If sha, path, and size match, preserve terminal 'archived' state!
 		return nil

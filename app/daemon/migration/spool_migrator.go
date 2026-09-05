@@ -99,12 +99,12 @@ type MigrationReport struct {
 }
 
 // Run executes the migration evaluation and optional mutation.
-func Run(ctx context.Context, opts MigrationOptions) (*MigrationReport, error) {
+func Run(ctx context.Context, opts MigrationOptions) (report *MigrationReport, retErr error) {
 	if opts.DBPath == "" {
 		return nil, fmt.Errorf("db-path must be specified")
 	}
 
-	report := &MigrationReport{
+	report = &MigrationReport{
 		DBPath:            opts.DBPath,
 		DryRun:            opts.DryRun,
 		PlannedCleanFiles: make([]string, 0),
@@ -390,7 +390,14 @@ func Run(ctx context.Context, opts MigrationOptions) (*MigrationReport, error) {
 		if !committed {
 			_ = tx.Rollback()
 			if quarantineDir != "" {
-				_, _ = ReconcilePendingQuarantines(ctx, opts.DBPath, opts.BufferDir)
+				_, recErr := ReconcilePendingQuarantines(ctx, opts.DBPath, opts.BufferDir)
+				if recErr != nil {
+					if retErr == nil {
+						retErr = fmt.Errorf("reconcile pending quarantines after rollback: %w", recErr)
+					} else {
+						retErr = fmt.Errorf("%w; reconcile pending quarantines error: %v", retErr, recErr)
+					}
+				}
 			}
 		}
 	}()
@@ -542,39 +549,14 @@ func Run(ctx context.Context, opts MigrationOptions) (*MigrationReport, error) {
 			return report, fmt.Errorf("close quarantine directory: %w", err)
 		}
 
-		// Perform physical move of planned buffer files into quarantine staging
+		// Perform durable physical move of planned buffer files into quarantine staging
 		for _, sf := range staged {
 			if _, err := os.Stat(sf.OriginalPath); err != nil {
 				return report, fmt.Errorf("stat buffer file before staging %s: %w", sf.OriginalPath, err)
 			}
-			if err := safeNoReplaceLinkOrMove(sf.OriginalPath, sf.StagedPath); err != nil {
+			if err := durableNoReplaceMove(sf.OriginalPath, sf.StagedPath, sf.Size, sf.SHA256); err != nil {
 				return report, fmt.Errorf("stage buffer file %s to quarantine: %w", sf.OriginalPath, err)
 			}
-			// Sync source parent directory to guarantee rename durability
-			if srcDir, err := os.Open(filepath.Dir(sf.OriginalPath)); err == nil {
-				if err := srcDir.Sync(); err != nil {
-					_ = srcDir.Close()
-					return report, fmt.Errorf("sync source directory %s: %w", filepath.Dir(sf.OriginalPath), err)
-				}
-				if err := srcDir.Close(); err != nil {
-					return report, fmt.Errorf("close source directory %s: %w", filepath.Dir(sf.OriginalPath), err)
-				}
-			} else {
-				return report, fmt.Errorf("open source directory %s: %w", filepath.Dir(sf.OriginalPath), err)
-			}
-		}
-
-		// Sync quarantine directory after file renames
-		dfAfter, err := os.Open(quarantineDir)
-		if err != nil {
-			return report, fmt.Errorf("open quarantine directory after renames: %w", err)
-		}
-		if err := dfAfter.Sync(); err != nil {
-			_ = dfAfter.Close()
-			return report, fmt.Errorf("sync quarantine directory after renames: %w", err)
-		}
-		if err := dfAfter.Close(); err != nil {
-			return report, fmt.Errorf("close quarantine directory after renames: %w", err)
 		}
 	}
 
@@ -747,6 +729,8 @@ func contains(slice []string, s string) bool {
 type MigratorTestHooks struct {
 	BeforeRestoreMove   func(stagedPath, origPath string)
 	ParentDirSyncHook   func(dir string) error
+	DstDirSyncHook      func(dir string) error
+	SrcDirSyncHook      func(dir string) error
 	ForceCopyFallback   bool
 	CorruptCopyFallback bool
 }
@@ -793,70 +777,158 @@ func validateQuarantinePaths(manifest QuarantineManifest, qDir string, bufferDir
 	return nil
 }
 
-func safeNoReplaceLinkOrMove(src, dst string) error {
-	// Try atomic hardlink first (fast & guaranteed no-overwrite on POSIX)
+// durableNoReplaceMove performs a single-ownership, fully ordered durable file move transaction:
+// 1. destination create/link (O_EXCL atomic no-replace)
+// 2. fsync destination file (if copied)
+// 3. fsync destination directory (if failed, remove destination and abort without touching source)
+// 4. verify destination against expected manifest identity (size + SHA-256; if mismatch, remove destination and abort)
+// 5. remove source file
+// 6. fsync source directory (if failed, return error; destination remains durably committed)
+func durableNoReplaceMove(src, dst string, expectedSize int64, expectedSHA string) error {
+	if expectedSize <= 0 {
+		if fi, err := os.Stat(src); err == nil {
+			expectedSize = fi.Size()
+		}
+	}
+	if expectedSHA == "" {
+		if hash, err := computeFileSHA256(src); err == nil {
+			expectedSHA = hash
+		}
+	}
+
+	// 1. Create/link destination
+	var copied bool
 	if !testHooks.ForceCopyFallback {
 		err := os.Link(src, dst)
 		if err == nil {
-			if rmErr := os.Remove(src); rmErr != nil && !os.IsNotExist(rmErr) {
-				return fmt.Errorf("remove src after link: %w", rmErr)
-			}
-			return nil
-		}
-		if errors.Is(err, os.ErrExist) {
+			copied = false
+		} else if errors.Is(err, os.ErrExist) {
 			return err
+		} else {
+			// Link failed (e.g. cross-device EXDEV), fallback to copy
+			copied = true
+		}
+	} else {
+		copied = true
+	}
+
+	if copied {
+		out, createErr := os.OpenFile(dst, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+		if createErr != nil {
+			return createErr
+		}
+		in, openErr := os.Open(src)
+		if openErr != nil {
+			_ = out.Close()
+			_ = os.Remove(dst)
+			return openErr
+		}
+		_, copyErr := io.Copy(out, in)
+		_ = in.Close()
+		if copyErr != nil {
+			_ = out.Close()
+			_ = os.Remove(dst)
+			return copyErr
+		}
+
+		// 2. Fsync destination file (if copied)
+		syncErr := out.Sync()
+		closeErr := out.Close()
+		if syncErr != nil {
+			_ = os.Remove(dst)
+			return fmt.Errorf("sync dst file %s: %w", dst, syncErr)
+		}
+		if closeErr != nil {
+			_ = os.Remove(dst)
+			return fmt.Errorf("close dst file %s: %w", dst, closeErr)
+		}
+
+		if testHooks.CorruptCopyFallback {
+			// Simulate partial copy or data corruption
+			_ = os.WriteFile(dst, []byte("corrupted partial copy payload"), 0o644)
 		}
 	}
 
-	// Fallback for cross-device links (EXDEV) or filesystems where link(2) is not permitted:
-	// O_CREATE | O_EXCL guarantees atomic creation failure if dst exists.
-	out, createErr := os.OpenFile(dst, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
-	if createErr != nil {
-		return createErr
-	}
-	in, openErr := os.Open(src)
-	if openErr != nil {
-		_ = out.Close()
+	// 3. Fsync destination dir
+	dstDir, err := os.Open(filepath.Dir(dst))
+	if err != nil {
 		_ = os.Remove(dst)
-		return openErr
+		return fmt.Errorf("open dst dir %s for sync: %w", filepath.Dir(dst), err)
 	}
-	_, copyErr := io.Copy(out, in)
-	_ = in.Close()
-	syncErr := out.Sync()
-	closeErr := out.Close()
-	if copyErr != nil {
-		_ = os.Remove(dst)
-		return copyErr
+	if testHooks.DstDirSyncHook != nil {
+		if hookErr := testHooks.DstDirSyncHook(filepath.Dir(dst)); hookErr != nil {
+			_ = dstDir.Close()
+			_ = os.Remove(dst)
+			return fmt.Errorf("sync dst dir hook %s: %w", filepath.Dir(dst), hookErr)
+		}
+	} else if testHooks.ParentDirSyncHook != nil {
+		if hookErr := testHooks.ParentDirSyncHook(filepath.Dir(dst)); hookErr != nil {
+			_ = dstDir.Close()
+			_ = os.Remove(dst)
+			return fmt.Errorf("sync dst dir hook %s: %w", filepath.Dir(dst), hookErr)
+		}
 	}
-	if syncErr != nil {
+	if syncErr := dstDir.Sync(); syncErr != nil {
+		_ = dstDir.Close()
 		_ = os.Remove(dst)
-		return syncErr
+		return fmt.Errorf("sync dst dir %s: %w", filepath.Dir(dst), syncErr)
 	}
-	if closeErr != nil {
+	if closeErr := dstDir.Close(); closeErr != nil {
 		_ = os.Remove(dst)
-		return closeErr
+		return fmt.Errorf("close dst dir %s: %w", filepath.Dir(dst), closeErr)
 	}
 
-	if testHooks.CorruptCopyFallback {
-		// Simulate partial copy or data corruption
-		_ = os.WriteFile(dst, []byte("corrupted partial copy payload"), 0o644)
-	}
-
-	// Before removing source, verify destination integrity matches source exactly
-	srcInfo, statSrcErr := os.Stat(src)
+	// 4. Verify destination against expected manifest identity (size + SHA)
 	dstInfo, statDstErr := os.Stat(dst)
-	if statSrcErr != nil || statDstErr != nil || srcInfo.Size() != dstInfo.Size() {
+	if statDstErr != nil {
 		_ = os.Remove(dst)
-		return fmt.Errorf("copy fallback integrity verification failed: size mismatch")
+		return fmt.Errorf("verify dst stat %s: %w", dst, statDstErr)
 	}
-	srcSHA, shaSrcErr := computeFileSHA256(src)
-	dstSHA, shaDstErr := computeFileSHA256(dst)
-	if shaSrcErr != nil || shaDstErr != nil || srcSHA != dstSHA {
+	if expectedSize > 0 && dstInfo.Size() != expectedSize {
 		_ = os.Remove(dst)
-		return fmt.Errorf("copy fallback integrity verification failed: sha mismatch")
+		return fmt.Errorf("verify dst size mismatch on %s: got %d, want %d", dst, dstInfo.Size(), expectedSize)
+	}
+	if expectedSHA != "" {
+		dstSHA, shaDstErr := computeFileSHA256(dst)
+		if shaDstErr != nil {
+			_ = os.Remove(dst)
+			return fmt.Errorf("verify dst sha compute %s: %w", dst, shaDstErr)
+		}
+		if dstSHA != expectedSHA {
+			_ = os.Remove(dst)
+			return fmt.Errorf("verify dst sha mismatch on %s: got %s, want %s", dst, dstSHA, expectedSHA)
+		}
 	}
 
-	return os.Remove(src)
+	// 5. Remove source
+	if rmErr := os.Remove(src); rmErr != nil && !os.IsNotExist(rmErr) {
+		return fmt.Errorf("remove src %s: %w", src, rmErr)
+	}
+
+	// 6. Fsync source dir
+	srcDir, err := os.Open(filepath.Dir(src))
+	if err != nil {
+		return fmt.Errorf("open src dir %s for sync: %w", filepath.Dir(src), err)
+	}
+	if testHooks.SrcDirSyncHook != nil {
+		if hookErr := testHooks.SrcDirSyncHook(filepath.Dir(src)); hookErr != nil {
+			_ = srcDir.Close()
+			return fmt.Errorf("sync src dir hook %s: %w", filepath.Dir(src), hookErr)
+		}
+	}
+	if syncErr := srcDir.Sync(); syncErr != nil {
+		_ = srcDir.Close()
+		return fmt.Errorf("sync src dir %s: %w", filepath.Dir(src), syncErr)
+	}
+	if closeErr := srcDir.Close(); closeErr != nil {
+		return fmt.Errorf("close src dir %s: %w", filepath.Dir(src), closeErr)
+	}
+
+	return nil
+}
+
+func safeNoReplaceLinkOrMove(src, dst string) error {
+	return durableNoReplaceMove(src, dst, 0, "")
 }
 
 // ReconcilePendingQuarantines scans for interrupted quarantine staging directories from previous crashes.
@@ -1062,25 +1134,8 @@ func ReconcilePendingQuarantines(ctx context.Context, dbPath string, bufferDir s
 					if testHooks.BeforeRestoreMove != nil {
 						testHooks.BeforeRestoreMove(f.StagedPath, f.OriginalPath)
 					}
-					if err := safeNoReplaceLinkOrMove(f.StagedPath, f.OriginalPath); err != nil {
-						return nil, fmt.Errorf("reconcile restore link/move %s -> %s: %w (fail-closed)", f.StagedPath, f.OriginalPath, err)
-					}
-					parentDir, err := os.Open(filepath.Dir(f.OriginalPath))
-					if err != nil {
-						return nil, fmt.Errorf("open parent dir %s for sync: %w (fail-closed)", filepath.Dir(f.OriginalPath), err)
-					}
-					if testHooks.ParentDirSyncHook != nil {
-						if hookErr := testHooks.ParentDirSyncHook(filepath.Dir(f.OriginalPath)); hookErr != nil {
-							_ = parentDir.Close()
-							return nil, fmt.Errorf("sync parent dir %s: %w (fail-closed)", filepath.Dir(f.OriginalPath), hookErr)
-						}
-					}
-					if syncErr := parentDir.Sync(); syncErr != nil {
-						_ = parentDir.Close()
-						return nil, fmt.Errorf("sync parent dir %s: %w (fail-closed)", filepath.Dir(f.OriginalPath), syncErr)
-					}
-					if closeErr := parentDir.Close(); closeErr != nil {
-						return nil, fmt.Errorf("close parent dir %s: %w (fail-closed)", filepath.Dir(f.OriginalPath), closeErr)
+					if err := durableNoReplaceMove(f.StagedPath, f.OriginalPath, f.Size, f.SHA256); err != nil {
+						return nil, fmt.Errorf("reconcile restore durable move %s -> %s: %w (fail-closed)", f.StagedPath, f.OriginalPath, err)
 					}
 					report.RestoredFiles = append(report.RestoredFiles, f.OriginalPath)
 				} else if p.stagedExist && p.origExist {

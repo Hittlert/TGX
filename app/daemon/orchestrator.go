@@ -34,8 +34,10 @@ type Orchestrator struct {
 	runningMu     sync.Mutex
 	running       bool
 	inFlight      sync.Map
-	activeTasks   int64
-	taskSlotFreed chan struct{}
+	activeTasks      int64
+	taskSlotFreed    chan struct{}
+	activePublishers sync.Map // map[string]string: "chatID:msgID" -> attemptGeneration
+	finalizerWakeCh  chan struct{}
 
 	testHooks OrchestratorTestHooks
 }
@@ -67,16 +69,17 @@ func NewOrchestrator(
 	saveDir string,
 ) *Orchestrator {
 	return &Orchestrator{
-		db:            db,
-		transferMgr:   transferMgr,
-		ssdAdmission:  ssdAdmission,
-		proxyManager:  proxyManager,
-		access:        access,
-		registry:      registry,
-		logger:        logger,
-		saveDir:       saveDir,
-		running:       true,
-		taskSlotFreed: make(chan struct{}, 64),
+		db:              db,
+		transferMgr:     transferMgr,
+		ssdAdmission:    ssdAdmission,
+		proxyManager:    proxyManager,
+		access:          access,
+		registry:        registry,
+		logger:          logger,
+		saveDir:         saveDir,
+		running:         true,
+		taskSlotFreed:   make(chan struct{}, 64),
+		finalizerWakeCh: make(chan struct{}, 1),
 	}
 }
 
@@ -147,14 +150,29 @@ func (p PathPlanner) Plan(peer string, channelTitle string, msgID int, rawName s
 	return finalRelPath
 }
 
+// wakeFinalizer non-blockingly signals the single managed finalizer loop to run an immediate reconciliation.
+func (o *Orchestrator) wakeFinalizer() {
+	if o == nil || o.finalizerWakeCh == nil {
+		return
+	}
+	select {
+	case o.finalizerWakeCh <- struct{}{}:
+	default:
+	}
+}
+
 // Start launches the background orchestrator loops.
 func (o *Orchestrator) Start(ctx context.Context) {
 	if o.taskSlotFreed == nil {
 		o.taskSlotFreed = make(chan struct{}, 64)
 	}
+	if o.finalizerWakeCh == nil {
+		o.finalizerWakeCh = make(chan struct{}, 1)
+	}
 	go o.dispatchLoop(ctx)
 	go o.scanLoop(ctx)
 	go o.metricsLoop(ctx)
+	go o.finalizerLoop(ctx)
 }
 
 func (o *Orchestrator) dispatchLoop(ctx context.Context) {
@@ -317,9 +335,37 @@ func (o *Orchestrator) TriggerStreamDispatch(ctx context.Context, record Downloa
 	}
 }
 
+// finalizerLoop runs the single managed online finalizer loop under the daemon context.
+// It is triggered by the wakeFinalizer signal channel or a periodic 5s safety ticker.
+func (o *Orchestrator) finalizerLoop(ctx context.Context) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if !o.IsRunning() || o.db == nil {
+				continue
+			}
+			if err := o.ReconcileCommitting(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				o.logger.Error("periodic finalizer committing reconciliation failed", zap.Error(err))
+			}
+		case <-o.finalizerWakeCh:
+			if !o.IsRunning() || o.db == nil {
+				continue
+			}
+			if err := o.ReconcileCommitting(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				o.logger.Error("triggered finalizer committing reconciliation failed", zap.Error(err))
+			}
+		}
+	}
+}
+
 // ReconcileCommitting scans and reconciles all download records in 'committing' status.
-// It serves as the continuous online owner of the committing state, converging transient
-// database errors to terminal verdicts and driving Registry state without restarting.
+// It uses the authoritative ReconcileCommittingRecord primitive while skipping any records
+// currently owned by active publishers to prevent publisher/finalizer races.
 func (o *Orchestrator) ReconcileCommitting(ctx context.Context) error {
 	if o.db == nil {
 		return nil
@@ -339,74 +385,20 @@ func (o *Orchestrator) ReconcileCommitting(ctx context.Context) error {
 			return ctx.Err()
 		}
 
-		finalAbsPath := filepath.Join(o.saveDir, filepath.FromSlash(rec.SavePath))
-		partAbsPath := finalAbsPath + ".part"
-
-		// 1. Final SSD file already exists and matches committed size and SHA proof
-		if finInfo, statErr := os.Stat(finalAbsPath); statErr == nil && finInfo.Size() == rec.FileSize {
-			sha, shaErr := computeFileSHA256(finalAbsPath)
-			if shaErr == nil && rec.SHA256 != "" && sha == rec.SHA256 {
-				_ = os.Remove(partAbsPath)
-				completeErr := o.db.CompleteDownloadAndQueueArchive(rec.ChatID, rec.MessageID, rec.AttemptGeneration, rec.SavePath, rec.FileSize, sha, archiveEnabled)
-				if completeErr == nil || errors.Is(completeErr, ErrArchiveConflict) {
-					o.logger.Info("online committing reconciler finalized download to success",
-						zap.String("chat_id", rec.ChatID),
-						zap.Int("message_id", rec.MessageID),
-					)
-					if o.registry != nil {
-						o.registry.FinishTaskByMessage(rec.ChatID, rec.MessageID, rec.AttemptGeneration, StateSuccess, "", "", rec.SavePath, false, sha)
-					}
-					continue
-				} else {
-					o.logger.Warn("online committing reconciler retry failed",
-						zap.String("chat_id", rec.ChatID),
-						zap.Int("message_id", rec.MessageID),
-						zap.Error(completeErr),
-					)
-					continue
-				}
-			}
-		}
-
-		// 2. .part file exists with matching SHA -> commit sibling part and complete
-		if partInfo, statErr := os.Stat(partAbsPath); statErr == nil && partInfo.Size() == rec.FileSize {
-			sha, shaErr := computeFileSHA256(partAbsPath)
-			if shaErr == nil && rec.SHA256 != "" && sha == rec.SHA256 {
-				if commitErr := fscommit.CommitSiblingPart(partAbsPath, finalAbsPath); commitErr == nil {
-					completeErr := o.db.CompleteDownloadAndQueueArchive(rec.ChatID, rec.MessageID, rec.AttemptGeneration, rec.SavePath, rec.FileSize, sha, archiveEnabled)
-					if completeErr == nil || errors.Is(completeErr, ErrArchiveConflict) {
-						o.logger.Info("online committing reconciler committed part and finalized download to success",
-							zap.String("chat_id", rec.ChatID),
-							zap.Int("message_id", rec.MessageID),
-						)
-						if o.registry != nil {
-							o.registry.FinishTaskByMessage(rec.ChatID, rec.MessageID, rec.AttemptGeneration, StateSuccess, "", "", rec.SavePath, false, sha)
-						}
-						continue
-					} else {
-						o.logger.Warn("online committing reconciler retry failed after commit part",
-							zap.String("chat_id", rec.ChatID),
-							zap.Int("message_id", rec.MessageID),
-							zap.Error(completeErr),
-						)
-						continue
-					}
-				}
-			}
-		}
-
-		// 3. Neither valid: reset to pending so it can be re-downloaded
-		_ = os.Remove(partAbsPath)
-		if updateErr := o.db.UpdateDownloadStatus(rec.ChatID, rec.MessageID, "pending", rec.FileName, rec.SavePath, rec.MediaType, rec.FileSize, ""); updateErr != nil {
-			o.logger.Error("online committing reconciler failed to reset invalid committing record",
+		pubKey := fmt.Sprintf("%s:%d", rec.ChatID, rec.MessageID)
+		if _, active := o.activePublishers.Load(pubKey); active {
+			o.logger.Debug("online committing reconciler skipping active publisher",
 				zap.String("chat_id", rec.ChatID),
 				zap.Int("message_id", rec.MessageID),
-				zap.Error(updateErr),
 			)
-		} else {
-			o.logger.Warn("online committing reconciler reset incomplete committing record to pending",
+			continue
+		}
+
+		if err := ReconcileCommittingRecord(ctx, o.db, o.saveDir, archiveEnabled, rec, o.registry, o.logger); err != nil {
+			o.logger.Warn("reconciliation of committing record encountered error",
 				zap.String("chat_id", rec.ChatID),
 				zap.Int("message_id", rec.MessageID),
+				zap.Error(err),
 			)
 		}
 	}
@@ -424,11 +416,6 @@ func (o *Orchestrator) scanLoop(ctx context.Context) {
 		case <-ticker.C:
 			if !o.IsRunning() || o.db == nil {
 				continue
-			}
-
-			// 1. Reconcile committing downloads first (online continuous owner for committing state)
-			if err := o.ReconcileCommitting(ctx); err != nil {
-				o.logger.Error("online committing reconciliation failed", zap.Error(err))
 			}
 
 			records, err := o.db.GetPendingDownloads(50)
@@ -1209,6 +1196,10 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 		return
 	}
 
+	var (
+		pubKey             string
+		activePubHandedOff bool
+	)
 	if o.db != nil {
 		if err := o.db.PrepareDownloadCommit(chatID, msgID, gen, finalRelPath, stat.Size(), shaHex); err != nil {
 			_ = os.Remove(partAbsPath)
@@ -1225,6 +1216,14 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 			task.FailDisposition(disp)
 			return
 		}
+		// Active publisher exclusion: worker holds exclusive publishing ownership until terminal completion or explicit handoff
+		pubKey = fmt.Sprintf("%s:%d", chatID, msgID)
+		o.activePublishers.Store(pubKey, gen)
+		defer func() {
+			if !activePubHandedOff && pubKey != "" {
+				o.activePublishers.Delete(pubKey)
+			}
+		}()
 		EmitLifecycle(o.logger, LifecycleEvent{
 			Event:           EventSSDCommitPrepared,
 			TaskID:          taskID,
@@ -1335,15 +1334,17 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 				)
 			} else {
 				// Transient or DB error: do not fake terminal failed!
-				// Keep publishing; trigger online committing reconciler to finalize convergence.
-				o.logger.Warn("temporary failure completing download in DB, triggering online committing reconciler",
+				// Keep publishing; explicitly hand off to single managed finalizer by releasing active publisher exclusion and waking finalizer.
+				o.logger.Warn("temporary failure completing download in DB, handing off to online finalizer",
 					zap.String("chat_id", chatID),
 					zap.Int("message_id", msgID),
 					zap.Error(completeErr),
 				)
-				go func() {
-					_ = o.ReconcileCommitting(context.Background())
-				}()
+				activePubHandedOff = true
+				if pubKey != "" {
+					o.activePublishers.Delete(pubKey)
+				}
+				o.wakeFinalizer()
 				return
 			}
 		}

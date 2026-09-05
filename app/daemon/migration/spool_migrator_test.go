@@ -2331,3 +2331,178 @@ func TestMigration_Reconcile_CopyFallback_PartialCopyDetected_PreservesSourceAnd
 	}
 	t.Logf("[Test 32: COPY_PARTIAL] Verified: partial copy failed-closed, source preserved, subsequent restore succeeded")
 }
+
+// 33. Acceptance Test (Issue #2): Destination directory fsync failure rolls back destination and preserves source file and manifest.
+func TestMigration_Reconcile_DestinationDirSyncFailure_RollsBackDestinationAndPreservesSource(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "state.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("failed to open sqlite3: %v", err)
+	}
+	_, _ = db.Exec("CREATE TABLE dummy (id INT)")
+	defer db.Close()
+
+	bufferDir := filepath.Join(tempDir, "buffer")
+	_ = os.MkdirAll(bufferDir, 0o755)
+	qDir := filepath.Join(bufferDir, ".migrator_quarantine_dst_sync_fail")
+	_ = os.MkdirAll(qDir, 0o755)
+
+	manifestPath := filepath.Join(qDir, "quarantine_manifest.json")
+	origFile := filepath.Join(bufferDir, "dst_sync_fail.spool")
+	stagedFile := filepath.Join(qDir, "staged_dst_sync_fail.spool")
+
+	payload := []byte("destination directory sync failure payload")
+	hash := sha256.Sum256(payload)
+	shaHex := hex.EncodeToString(hash[:])
+	_ = os.WriteFile(stagedFile, payload, 0o644)
+
+	// Inject DstDirSyncHook failure
+	migration.SetTestHooks(migration.MigratorTestHooks{
+		DstDirSyncHook: func(dir string) error {
+			t.Logf("[HOOK: DstDirSyncHook] Simulating destination dir sync failure for %s", dir)
+			return errors.New("simulated destination directory sync failure")
+		},
+	})
+	defer migration.SetTestHooks(migration.MigratorTestHooks{})
+
+	manifest := migration.QuarantineManifest{
+		MigrationID: "mig_dst_sync_fail",
+		CreatedAt:   time.Now().Unix(),
+		Files: []migration.QuarantineFileEntry{
+			{
+				OriginalPath: origFile,
+				StagedName:   "staged_dst_sync_fail.spool",
+				StagedPath:   stagedFile,
+				Size:         int64(len(payload)),
+				SHA256:       shaHex,
+			},
+		},
+	}
+	data, _ := json.MarshalIndent(manifest, "", "  ")
+	_ = os.WriteFile(manifestPath, data, 0o644)
+
+	t.Logf("[Test 33: DST_SYNC_FAIL] Invoking ReconcilePendingQuarantines...")
+	_, err = migration.ReconcilePendingQuarantines(context.Background(), dbPath, bufferDir)
+	if err == nil {
+		t.Fatal("expected error when destination dir sync fails, got nil")
+	}
+	t.Logf("[Test 33: DST_SYNC_FAIL] Reconcile correctly returned error: %v", err)
+
+	// Destination must be rolled back (unlinked/deleted)
+	if _, statErr := os.Stat(origFile); !os.IsNotExist(statErr) {
+		t.Fatalf("destination file was not unlinked on destination dir sync failure: %v", statErr)
+	}
+
+	// Source staged file must be preserved intact
+	srcContent, readErr := os.ReadFile(stagedFile)
+	if readErr != nil || string(srcContent) != string(payload) {
+		t.Fatalf("source staged file was deleted or corrupted: %v", readErr)
+	}
+
+	// Manifest must be retained
+	if _, statErr := os.Stat(manifestPath); os.IsNotExist(statErr) {
+		t.Fatal("quarantine manifest was deleted despite destination dir sync failure")
+	}
+
+	// Clear hook and verify retry succeeds
+	migration.SetTestHooks(migration.MigratorTestHooks{})
+	report, err := migration.ReconcilePendingQuarantines(context.Background(), dbPath, bufferDir)
+	if err != nil {
+		t.Fatalf("ReconcilePendingQuarantines failed after clearing hook: %v", err)
+	}
+	if len(report.RestoredFiles) != 1 || report.RestoredFiles[0] != origFile {
+		t.Fatalf("unexpected RestoredFiles: %+v", report.RestoredFiles)
+	}
+	if _, statErr := os.Stat(origFile); statErr != nil {
+		t.Fatalf("expected restored destination file to exist: %v", statErr)
+	}
+	t.Logf("[Test 33: DST_SYNC_FAIL] Verified: destination rolled back, source and manifest preserved, retry succeeded")
+}
+
+// 34. Acceptance Test (Issue #2): Source directory fsync failure leaves destination durably preserved and retains manifest without data loss.
+func TestMigration_Reconcile_SourceDeleteBeforeSourceSyncFailure_DestinationPreserved(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "state.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("failed to open sqlite3: %v", err)
+	}
+	_, _ = db.Exec("CREATE TABLE dummy (id INT)")
+	defer db.Close()
+
+	bufferDir := filepath.Join(tempDir, "buffer")
+	_ = os.MkdirAll(bufferDir, 0o755)
+	qDir := filepath.Join(bufferDir, ".migrator_quarantine_src_sync_fail")
+	_ = os.MkdirAll(qDir, 0o755)
+
+	manifestPath := filepath.Join(qDir, "quarantine_manifest.json")
+	origFile := filepath.Join(bufferDir, "src_sync_fail.spool")
+	stagedFile := filepath.Join(qDir, "staged_src_sync_fail.spool")
+
+	payload := []byte("source directory sync failure payload")
+	hash := sha256.Sum256(payload)
+	shaHex := hex.EncodeToString(hash[:])
+	_ = os.WriteFile(stagedFile, payload, 0o644)
+
+	// Inject SrcDirSyncHook failure
+	migration.SetTestHooks(migration.MigratorTestHooks{
+		SrcDirSyncHook: func(dir string) error {
+			t.Logf("[HOOK: SrcDirSyncHook] Simulating source dir sync failure for %s", dir)
+			return errors.New("simulated source directory sync failure")
+		},
+	})
+	defer migration.SetTestHooks(migration.MigratorTestHooks{})
+
+	manifest := migration.QuarantineManifest{
+		MigrationID: "mig_src_sync_fail",
+		CreatedAt:   time.Now().Unix(),
+		Files: []migration.QuarantineFileEntry{
+			{
+				OriginalPath: origFile,
+				StagedName:   "staged_src_sync_fail.spool",
+				StagedPath:   stagedFile,
+				Size:         int64(len(payload)),
+				SHA256:       shaHex,
+			},
+		},
+	}
+	data, _ := json.MarshalIndent(manifest, "", "  ")
+	_ = os.WriteFile(manifestPath, data, 0o644)
+
+	t.Logf("[Test 34: SRC_SYNC_FAIL] Invoking ReconcilePendingQuarantines...")
+	_, err = migration.ReconcilePendingQuarantines(context.Background(), dbPath, bufferDir)
+	if err == nil {
+		t.Fatal("expected error when source dir sync fails, got nil")
+	}
+	t.Logf("[Test 34: SRC_SYNC_FAIL] Reconcile correctly returned error: %v", err)
+
+	// Crucial assertion: destination must be preserved intact! (It was durable before source deletion)
+	dstContent, readErr := os.ReadFile(origFile)
+	if readErr != nil || string(dstContent) != string(payload) {
+		t.Fatalf("destination file was missing or corrupted despite durable move: %v", readErr)
+	}
+
+	// Manifest must be retained because reconcile did not finish cleanly
+	if _, statErr := os.Stat(manifestPath); os.IsNotExist(statErr) {
+		t.Fatal("quarantine manifest was deleted despite source dir sync failure")
+	}
+
+	// Clear hook and retry reconcile: since destination already exists with verified identity, reconcile should cleanly resolve
+	migration.SetTestHooks(migration.MigratorTestHooks{})
+	report, err := migration.ReconcilePendingQuarantines(context.Background(), dbPath, bufferDir)
+	if err != nil {
+		t.Fatalf("subsequent ReconcilePendingQuarantines failed: %v", err)
+	}
+	t.Logf("[Test 34: SRC_SYNC_FAIL] Subsequent reconcile completed cleanly: RestoredFiles=%v, CleanedDirs=%v", report.RestoredFiles, report.CleanedDirs)
+
+	// Final check: destination intact, manifest and quarantine cleaned
+	dstContentAfter, readErr := os.ReadFile(origFile)
+	if readErr != nil || string(dstContentAfter) != string(payload) {
+		t.Fatalf("destination file corrupted after cleanup: %v", readErr)
+	}
+	if _, statErr := os.Stat(manifestPath); !os.IsNotExist(statErr) {
+		t.Fatalf("manifest should be removed after clean resolution")
+	}
+	t.Logf("[Test 34: SRC_SYNC_FAIL] Verified: destination preserved, manifest retained, subsequent reconcile succeeded without data loss")
+}

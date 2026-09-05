@@ -24,56 +24,13 @@ func ReconcileOnStartup(ctx context.Context, db *Database, ssdDir, archiveDir st
 		errs = append(errs, fmt.Errorf("get pending committing: %w", err))
 	} else {
 		for _, rec := range committingRecs {
-			finalAbsPath := filepath.Join(ssdDir, filepath.FromSlash(rec.SavePath))
-			partAbsPath := finalAbsPath + ".part"
-
-			// Check if final SSD file already exists and matches committed SHA proof
-			if finInfo, statErr := os.Stat(finalAbsPath); statErr == nil && finInfo.Size() == rec.FileSize {
-				sha, shaErr := computeFileSHA256(finalAbsPath)
-				if shaErr == nil && rec.SHA256 != "" && sha == rec.SHA256 {
-					_ = os.Remove(partAbsPath)
-					if completeErr := db.CompleteDownloadAndQueueArchive(rec.ChatID, rec.MessageID, rec.AttemptGeneration, rec.SavePath, rec.FileSize, sha, archiveEnabled); completeErr != nil {
-						logger.Error("failed to complete recovered committing download", zap.String("chat_id", rec.ChatID), zap.Int("message_id", rec.MessageID), zap.Error(completeErr))
-						errs = append(errs, fmt.Errorf("complete recovered committing (%s:%d): %w", rec.ChatID, rec.MessageID, completeErr))
-					} else {
-						logger.Info("recovered committing record to success from final file",
-							zap.String("chat_id", rec.ChatID),
-							zap.Int("message_id", rec.MessageID),
-						)
-					}
-					continue
-				}
-			}
-
-			// Check if .part file exists with matching SHA
-			if partInfo, statErr := os.Stat(partAbsPath); statErr == nil && partInfo.Size() == rec.FileSize {
-				sha, shaErr := computeFileSHA256(partAbsPath)
-				if shaErr == nil && rec.SHA256 != "" && sha == rec.SHA256 {
-					if commitErr := fscommit.CommitSiblingPart(partAbsPath, finalAbsPath); commitErr == nil {
-						if completeErr := db.CompleteDownloadAndQueueArchive(rec.ChatID, rec.MessageID, rec.AttemptGeneration, rec.SavePath, rec.FileSize, sha, archiveEnabled); completeErr != nil {
-							logger.Error("failed to complete atomic part commit during recovery", zap.String("chat_id", rec.ChatID), zap.Int("message_id", rec.MessageID), zap.Error(completeErr))
-							errs = append(errs, fmt.Errorf("complete atomic part commit (%s:%d): %w", rec.ChatID, rec.MessageID, completeErr))
-						} else {
-							logger.Info("recovered committing record to success via atomic part commit",
-								zap.String("chat_id", rec.ChatID),
-								zap.Int("message_id", rec.MessageID),
-							)
-						}
-						continue
-					}
-				}
-			}
-
-			// Neither valid: reset to pending
-			_ = os.Remove(partAbsPath)
-			if updateErr := db.UpdateDownloadStatus(rec.ChatID, rec.MessageID, "pending", rec.FileName, rec.SavePath, rec.MediaType, rec.FileSize, ""); updateErr != nil {
-				logger.Error("failed to reset incomplete committing record to pending", zap.String("chat_id", rec.ChatID), zap.Int("message_id", rec.MessageID), zap.Error(updateErr))
-				errs = append(errs, fmt.Errorf("reset incomplete committing (%s:%d): %w", rec.ChatID, rec.MessageID, updateErr))
-			} else {
-				logger.Warn("reset incomplete committing record to pending",
+			if recErr := ReconcileCommittingRecord(ctx, db, ssdDir, archiveEnabled, rec, nil, logger); recErr != nil {
+				logger.Error("failed to reconcile committing download during startup recovery",
 					zap.String("chat_id", rec.ChatID),
 					zap.Int("message_id", rec.MessageID),
+					zap.Error(recErr),
 				)
+				errs = append(errs, fmt.Errorf("reconcile committing (%s:%d): %w", rec.ChatID, rec.MessageID, recErr))
 			}
 		}
 	}
@@ -191,5 +148,113 @@ func ReconcileOnStartup(ctx context.Context, db *Database, ssdDir, archiveDir st
 	if len(errs) > 0 {
 		return errors.Join(errs...)
 	}
+	return nil
+}
+
+// ReconcileCommittingRecord executes the authoritative recovery state machine for a single committing record.
+// Both startup crash recovery and the online finalizer loop MUST share this exact primitive.
+func ReconcileCommittingRecord(
+	ctx context.Context,
+	db *Database,
+	ssdDir string,
+	archiveEnabled bool,
+	rec DownloadRecord,
+	registry *Registry,
+	logger *zap.Logger,
+) error {
+	if db == nil {
+		return nil
+	}
+	finalAbsPath := filepath.Join(ssdDir, filepath.FromSlash(rec.SavePath))
+	partAbsPath := finalAbsPath + ".part"
+
+	// 1. Final SSD file already exists and matches committed size and SHA proof
+	if finInfo, statErr := os.Stat(finalAbsPath); statErr == nil && finInfo.Size() == rec.FileSize {
+		sha, shaErr := computeFileSHA256(finalAbsPath)
+		if shaErr == nil && rec.SHA256 != "" && sha == rec.SHA256 {
+			_ = os.Remove(partAbsPath)
+			completeErr := db.CompleteDownloadAndQueueArchive(rec.ChatID, rec.MessageID, rec.AttemptGeneration, rec.SavePath, rec.FileSize, sha, archiveEnabled)
+			if completeErr == nil || errors.Is(completeErr, ErrArchiveConflict) {
+				logger.Info("reconciled committing record to success from final file",
+					zap.String("chat_id", rec.ChatID),
+					zap.Int("message_id", rec.MessageID),
+				)
+				if registry != nil {
+					registry.FinishTaskByMessage(rec.ChatID, rec.MessageID, rec.AttemptGeneration, StateSuccess, "", "", rec.SavePath, false, sha)
+				}
+				return nil
+			}
+			logger.Warn("reconciler failed to complete download in DB from final file",
+				zap.String("chat_id", rec.ChatID),
+				zap.Int("message_id", rec.MessageID),
+				zap.Error(completeErr),
+			)
+			return completeErr
+		}
+	}
+
+	// 2. .part file exists with matching SHA -> commit sibling part and complete
+	if partInfo, statErr := os.Stat(partAbsPath); statErr == nil && partInfo.Size() == rec.FileSize {
+		sha, shaErr := computeFileSHA256(partAbsPath)
+		if shaErr == nil && rec.SHA256 != "" && sha == rec.SHA256 {
+			commitErr := fscommit.CommitSiblingPart(partAbsPath, finalAbsPath)
+			if commitErr == nil {
+				completeErr := db.CompleteDownloadAndQueueArchive(rec.ChatID, rec.MessageID, rec.AttemptGeneration, rec.SavePath, rec.FileSize, sha, archiveEnabled)
+				if completeErr == nil || errors.Is(completeErr, ErrArchiveConflict) {
+					logger.Info("reconciled committing record to success via atomic part commit",
+						zap.String("chat_id", rec.ChatID),
+						zap.Int("message_id", rec.MessageID),
+					)
+					if registry != nil {
+						registry.FinishTaskByMessage(rec.ChatID, rec.MessageID, rec.AttemptGeneration, StateSuccess, "", "", rec.SavePath, false, sha)
+					}
+					return nil
+				}
+				logger.Warn("reconciler failed to complete download in DB after commit part",
+					zap.String("chat_id", rec.ChatID),
+					zap.Int("message_id", rec.MessageID),
+					zap.Error(completeErr),
+				)
+				return completeErr
+			}
+
+			// If target exists, re-read and verify final file rather than blindly resetting to pending
+			if errors.Is(commitErr, fscommit.ErrTargetExists) || errors.Is(commitErr, os.ErrExist) {
+				if finInfo, statErr := os.Stat(finalAbsPath); statErr == nil && finInfo.Size() == rec.FileSize {
+					finSHA, finSHAErr := computeFileSHA256(finalAbsPath)
+					if finSHAErr == nil && rec.SHA256 != "" && finSHA == rec.SHA256 {
+						_ = os.Remove(partAbsPath)
+						completeErr := db.CompleteDownloadAndQueueArchive(rec.ChatID, rec.MessageID, rec.AttemptGeneration, rec.SavePath, rec.FileSize, finSHA, archiveEnabled)
+						if completeErr == nil || errors.Is(completeErr, ErrArchiveConflict) {
+							logger.Info("reconciled committing record with existing target to success",
+								zap.String("chat_id", rec.ChatID),
+								zap.Int("message_id", rec.MessageID),
+							)
+							if registry != nil {
+								registry.FinishTaskByMessage(rec.ChatID, rec.MessageID, rec.AttemptGeneration, StateSuccess, "", "", rec.SavePath, false, finSHA)
+							}
+							return nil
+						}
+						return completeErr
+					}
+				}
+			}
+		}
+	}
+
+	// 3. Neither valid: reset to pending so it can be re-downloaded
+	_ = os.Remove(partAbsPath)
+	if updateErr := db.UpdateDownloadStatus(rec.ChatID, rec.MessageID, "pending", rec.FileName, rec.SavePath, rec.MediaType, rec.FileSize, ""); updateErr != nil {
+		logger.Error("reconciler failed to reset invalid committing record to pending",
+			zap.String("chat_id", rec.ChatID),
+			zap.Int("message_id", rec.MessageID),
+			zap.Error(updateErr),
+		)
+		return updateErr
+	}
+	logger.Warn("reconciler reset incomplete committing record to pending",
+		zap.String("chat_id", rec.ChatID),
+		zap.Int("message_id", rec.MessageID),
+	)
 	return nil
 }

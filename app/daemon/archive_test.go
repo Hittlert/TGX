@@ -265,6 +265,13 @@ func TestArchive_DuplicateCompletion_DifferentIdentity_ReturnsConflict(t *testin
 		t.Fatalf("insert archived: %v", err)
 	}
 
+	// Also simulate physical archive file
+	archiveFile := filepath.Join(tempDir, "archive", relPath)
+	_ = os.MkdirAll(filepath.Dir(archiveFile), 0o755)
+	if err := os.WriteFile(archiveFile, []byte("original archived content"), 0o644); err != nil {
+		t.Fatalf("write archive file: %v", err)
+	}
+
 	// 3. Call REAL production API: CompleteDownloadAndQueueArchive
 	completeErr := db.CompleteDownloadAndQueueArchive("101", 1, gen, relPath, size, differentSHA, true)
 	if !errors.Is(completeErr, ErrArchiveConflict) {
@@ -278,11 +285,77 @@ func TestArchive_DuplicateCompletion_DifferentIdentity_ReturnsConflict(t *testin
 		t.Fatalf("expected durable download status 'success', got %q (err: %v)", dlStatus, err)
 	}
 
-	// 5. Verify durable archive state: MUST be 'conflict'
+	// 5. Verify durable archive state: MUST REMAIN 'archived' (Terminal Immutability per Issue #6)
+	var arcState, actualSHA string
+	err = db.db.QueryRow(`SELECT state, sha256 FROM archive_jobs WHERE chat_id = '101' AND message_id = 1`).Scan(&arcState, &actualSHA)
+	if err != nil {
+		t.Fatalf("query archive_jobs: %v", err)
+	}
+	if arcState != "archived" {
+		t.Fatalf("expected durable archive state to remain 'archived', got %q", arcState)
+	}
+	if actualSHA != shaHex {
+		t.Fatalf("expected durable archive sha256 proof to remain %q, got %q", shaHex, actualSHA)
+	}
+
+	// 6. Verify physical archive file is untouched and not deleted
+	content, err := os.ReadFile(archiveFile)
+	if err != nil {
+		t.Fatalf("expected physical archive file to still exist: %v", err)
+	}
+	if string(content) != "original archived content" {
+		t.Fatalf("expected physical archive file content to be unchanged, got %q", string(content))
+	}
+}
+
+func TestArchive_PendingJob_DuplicateCompletion_DifferentIdentity_MarksConflict(t *testing.T) {
+	tempDir := t.TempDir()
+	db, err := NewDatabase(filepath.Join(tempDir, "test.db"))
+	if err != nil {
+		t.Fatalf("new db: %v", err)
+	}
+	defer db.Close()
+
+	now := time.Now().Unix()
+	relPath := "chat/video2.mp4"
+	shaHex := "1111111111111111111111111111111111111111111111111111111111111111"
+	differentSHA := "2222222222222222222222222222222222222222222222222222222222222222"
+	size := int64(2048)
+	gen := "gen_pending_conflict_test"
+
+	// Seed committing download record
+	_, err = db.Execute(`
+		INSERT INTO download_records (
+			chat_id, message_id, status, file_name, save_path, file_size, sha256,
+			attempt_generation, created_at, updated_at
+		) VALUES ('102', 1, 'committing', 'video2.mp4', ?, ?, ?, ?, ?, ?)
+	`, relPath, size, differentSHA, gen, now, now)
+	if err != nil {
+		t.Fatalf("insert download_records: %v", err)
+	}
+
+	// Seed existing pending archive job with original shaHex
+	_, err = db.Execute(`
+		INSERT INTO archive_jobs (
+			chat_id, message_id, relative_path, expected_size, sha256,
+			state, attempts, next_retry_at, claim_id, created_at, updated_at
+		) VALUES ('102', 1, ?, ?, ?, 'pending', 0, 0, '', ?, ?)
+	`, relPath, size, shaHex, now, now)
+	if err != nil {
+		t.Fatalf("insert pending archive: %v", err)
+	}
+
+	// Duplicate completion with different identity on pending job
+	completeErr := db.CompleteDownloadAndQueueArchive("102", 1, gen, relPath, size, differentSHA, true)
+	if !errors.Is(completeErr, ErrArchiveConflict) {
+		t.Fatalf("expected ErrArchiveConflict on pending conflict, got %v", completeErr)
+	}
+
+	// For pending job, it transitions to conflict
 	var arcState string
-	err = db.db.QueryRow(`SELECT state FROM archive_jobs WHERE chat_id = '101' AND message_id = 1`).Scan(&arcState)
+	err = db.db.QueryRow(`SELECT state FROM archive_jobs WHERE chat_id = '102' AND message_id = 1`).Scan(&arcState)
 	if err != nil || arcState != "conflict" {
-		t.Fatalf("expected durable archive state 'conflict', got %q (err: %v)", arcState, err)
+		t.Fatalf("expected pending archive job to transition to 'conflict', got %q (err: %v)", arcState, err)
 	}
 }
 
