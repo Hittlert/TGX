@@ -1455,7 +1455,9 @@ func TestMigration_StagedAndOriginalBothMissing_FailsClosedAndRetainsManifest(t 
 	_ = os.WriteFile(manifestPath, data, 0o644)
 
 	// Call ReconcilePendingQuarantines: must fail-closed because file is missing from both locations!
+	t.Logf("[Test 20: DOUBLE_MISSING] Invoking ReconcilePendingQuarantines with missing staged and original files...")
 	_, err = migration.ReconcilePendingQuarantines(context.Background(), dbPath, bufferDir)
+	t.Logf("[Test 20: DOUBLE_MISSING] ReconcilePendingQuarantines returned err: %v", err)
 	if err == nil {
 		t.Fatal("expected error when file is missing from both staged and original, got nil")
 	}
@@ -1467,6 +1469,7 @@ func TestMigration_StagedAndOriginalBothMissing_FailsClosedAndRetainsManifest(t 
 	if _, statErr := os.Stat(qDir); os.IsNotExist(statErr) {
 		t.Fatal("quarantine directory was deleted despite double missing file! Fail-closed violated!")
 	}
+	t.Logf("[Test 20: DOUBLE_MISSING] Verified fail-closed: manifest and quarantine dir preserved intact")
 }
 
 // 21. Acceptance Test: Reconcile restore fails closed if staged file is corrupted.
@@ -1477,6 +1480,7 @@ func TestMigration_Reconcile_StagedCorrupted_FailsClosed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open sqlite3: %v", err)
 	}
+	_, _ = db.Exec("CREATE TABLE dummy (id INT)")
 	defer db.Close()
 
 	bufferDir := filepath.Join(tempDir, "buffer")
@@ -1489,7 +1493,9 @@ func TestMigration_Reconcile_StagedCorrupted_FailsClosed(t *testing.T) {
 	stagedFile := filepath.Join(qDir, "staged_corrupt.spool")
 
 	// Write corrupted content to staged file
-	_ = os.WriteFile(stagedFile, []byte("corrupted staged data"), 0o644)
+	corruptContent := []byte("corrupted staged data")
+	_ = os.WriteFile(stagedFile, corruptContent, 0o644)
+	t.Logf("[Test 21: STAGED_CORRUPTED] Created staged file with %d bytes corrupt content", len(corruptContent))
 
 	manifest := migration.QuarantineManifest{
 		MigrationID: "mig_corrupt_staged",
@@ -1507,7 +1513,9 @@ func TestMigration_Reconcile_StagedCorrupted_FailsClosed(t *testing.T) {
 	data, _ := json.MarshalIndent(manifest, "", "  ")
 	_ = os.WriteFile(manifestPath, data, 0o644)
 
+	t.Logf("[Test 21: STAGED_CORRUPTED] Invoking ReconcilePendingQuarantines...")
 	_, err = migration.ReconcilePendingQuarantines(context.Background(), dbPath, bufferDir)
+	t.Logf("[Test 21: STAGED_CORRUPTED] ReconcilePendingQuarantines returned err: %v", err)
 	if err == nil {
 		t.Fatal("expected error from ReconcilePendingQuarantines when staged file is corrupted, got nil")
 	}
@@ -1519,6 +1527,7 @@ func TestMigration_Reconcile_StagedCorrupted_FailsClosed(t *testing.T) {
 	if _, statErr := os.Stat(stagedFile); os.IsNotExist(statErr) {
 		t.Fatal("staged file was deleted despite being corrupted! Fail-closed violated!")
 	}
+	t.Logf("[Test 21: STAGED_CORRUPTED] Verified fail-closed: manifest and corrupt staged file retained")
 }
 
 // 22. Acceptance Test: Reconcile restore fails closed if original file is corrupted.
@@ -1529,6 +1538,7 @@ func TestMigration_Reconcile_OriginalCorrupted_FailsClosed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open sqlite3: %v", err)
 	}
+	_, _ = db.Exec("CREATE TABLE dummy (id INT)")
 	defer db.Close()
 
 	bufferDir := filepath.Join(tempDir, "buffer")
@@ -1541,7 +1551,9 @@ func TestMigration_Reconcile_OriginalCorrupted_FailsClosed(t *testing.T) {
 	stagedFile := filepath.Join(qDir, "staged_not_here.spool")
 
 	// Original exists but has corrupted content
-	_ = os.WriteFile(origFile, []byte("corrupted original content"), 0o644)
+	corruptOrig := []byte("corrupted original content")
+	_ = os.WriteFile(origFile, corruptOrig, 0o644)
+	t.Logf("[Test 22: ORIG_CORRUPTED] Created original file with %d bytes corrupt content", len(corruptOrig))
 
 	manifest := migration.QuarantineManifest{
 		MigrationID: "mig_corrupt_orig",
@@ -1559,7 +1571,9 @@ func TestMigration_Reconcile_OriginalCorrupted_FailsClosed(t *testing.T) {
 	data, _ := json.MarshalIndent(manifest, "", "  ")
 	_ = os.WriteFile(manifestPath, data, 0o644)
 
+	t.Logf("[Test 22: ORIG_CORRUPTED] Invoking ReconcilePendingQuarantines...")
 	_, err = migration.ReconcilePendingQuarantines(context.Background(), dbPath, bufferDir)
+	t.Logf("[Test 22: ORIG_CORRUPTED] ReconcilePendingQuarantines returned err: %v", err)
 	if err == nil {
 		t.Fatal("expected error from ReconcilePendingQuarantines when original file is corrupted, got nil")
 	}
@@ -1568,6 +1582,7 @@ func TestMigration_Reconcile_OriginalCorrupted_FailsClosed(t *testing.T) {
 	if _, statErr := os.Stat(manifestPath); os.IsNotExist(statErr) {
 		t.Fatal("manifest was deleted despite corrupted original file! Fail-closed violated!")
 	}
+	t.Logf("[Test 22: ORIG_CORRUPTED] Verified fail-closed: manifest retained")
 }
 
 // 23. Acceptance Test: Reconcile restore safely deduplicates when both copies exist and are byte-for-byte identical.
@@ -1597,6 +1612,7 @@ func TestMigration_Reconcile_BothExistIdentical_Deduplicates(t *testing.T) {
 	// Both files exist with exact authentic payload
 	_ = os.WriteFile(origFile, payload, 0o644)
 	_ = os.WriteFile(stagedFile, payload, 0o644)
+	t.Logf("[Test 23: DEDUPLICATE] Created identical copies at orig (%s) and staged (%s), sha=%s", origFile, stagedFile, shaHex)
 
 	manifest := migration.QuarantineManifest{
 		MigrationID: "mig_both_identical",
@@ -1614,10 +1630,12 @@ func TestMigration_Reconcile_BothExistIdentical_Deduplicates(t *testing.T) {
 	data, _ := json.MarshalIndent(manifest, "", "  ")
 	_ = os.WriteFile(manifestPath, data, 0o644)
 
+	t.Logf("[Test 23: DEDUPLICATE] Invoking ReconcilePendingQuarantines...")
 	report, err := migration.ReconcilePendingQuarantines(context.Background(), dbPath, bufferDir)
 	if err != nil {
 		t.Fatalf("ReconcilePendingQuarantines failed on identical copies: %v", err)
 	}
+	t.Logf("[Test 23: DEDUPLICATE] Reconcile report: RestoredFiles=%v, CleanedDirs=%v", report.RestoredFiles, report.CleanedDirs)
 	if len(report.RestoredFiles) != 1 || report.RestoredFiles[0] != origFile {
 		t.Fatalf("unexpected RestoredFiles: %+v", report.RestoredFiles)
 	}
@@ -1634,6 +1652,7 @@ func TestMigration_Reconcile_BothExistIdentical_Deduplicates(t *testing.T) {
 	if _, statErr := os.Stat(manifestPath); !os.IsNotExist(statErr) {
 		t.Fatalf("manifest should be removed after successful deduplication: %v", statErr)
 	}
+	t.Logf("[Test 23: DEDUPLICATE] Verified: staged file deduplicated, original file intact with verified payload")
 }
 
 // 24. Acceptance Test: Reconcile restore fails closed without overwriting when both copies exist but conflict.
@@ -1644,6 +1663,7 @@ func TestMigration_Reconcile_BothExistConflicting_FailsClosed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open sqlite3: %v", err)
 	}
+	_, _ = db.Exec("CREATE TABLE dummy (id INT)")
 	defer db.Close()
 
 	bufferDir := filepath.Join(tempDir, "buffer")
@@ -1661,6 +1681,7 @@ func TestMigration_Reconcile_BothExistConflicting_FailsClosed(t *testing.T) {
 	// Both files exist but have conflicting content
 	_ = os.WriteFile(origFile, payloadOrig, 0o644)
 	_ = os.WriteFile(stagedFile, payloadStaged, 0o644)
+	t.Logf("[Test 24: CONFLICT] Created conflicting copies: orig=%q, staged=%q", string(payloadOrig), string(payloadStaged))
 
 	manifest := migration.QuarantineManifest{
 		MigrationID: "mig_both_conflict",
@@ -1678,7 +1699,9 @@ func TestMigration_Reconcile_BothExistConflicting_FailsClosed(t *testing.T) {
 	data, _ := json.MarshalIndent(manifest, "", "  ")
 	_ = os.WriteFile(manifestPath, data, 0o644)
 
+	t.Logf("[Test 24: CONFLICT] Invoking ReconcilePendingQuarantines...")
 	_, err = migration.ReconcilePendingQuarantines(context.Background(), dbPath, bufferDir)
+	t.Logf("[Test 24: CONFLICT] ReconcilePendingQuarantines returned err: %v", err)
 	if err == nil {
 		t.Fatal("expected error from ReconcilePendingQuarantines when both copies conflict, got nil")
 	}
@@ -1695,4 +1718,74 @@ func TestMigration_Reconcile_BothExistConflicting_FailsClosed(t *testing.T) {
 	if _, statErr := os.Stat(stagedFile); os.IsNotExist(statErr) {
 		t.Fatal("staged file was deleted despite conflict! Fail-closed violated!")
 	}
+	t.Logf("[Test 24: CONFLICT] Verified fail-closed: original file untouched, manifest and staged retained")
+}
+
+// 25. Acceptance Test: Reconcile restore safely restores valid staged file when original is missing.
+func TestMigration_Reconcile_StagedValid_OriginalMissing_RestoresSuccessfully(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "state.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("failed to open sqlite3: %v", err)
+	}
+	_, _ = db.Exec("CREATE TABLE dummy (id INT)")
+	defer db.Close()
+
+	bufferDir := filepath.Join(tempDir, "buffer")
+	_ = os.MkdirAll(bufferDir, 0o755)
+	qDir := filepath.Join(bufferDir, ".migrator_quarantine_single_valid")
+	_ = os.MkdirAll(qDir, 0o755)
+
+	manifestPath := filepath.Join(qDir, "quarantine_manifest.json")
+	origFile := filepath.Join(bufferDir, "orig_restored.spool")
+	stagedFile := filepath.Join(qDir, "staged_restored.spool")
+
+	payload := []byte("valid staged payload awaiting restore 987654321")
+	hash := sha256.Sum256(payload)
+	shaHex := hex.EncodeToString(hash[:])
+
+	_ = os.WriteFile(stagedFile, payload, 0o644)
+	t.Logf("[Test 25: RESTORE_VALID] Created valid staged file (%d bytes, sha=%s), original missing", len(payload), shaHex)
+
+	manifest := migration.QuarantineManifest{
+		MigrationID: "mig_single_valid",
+		CreatedAt:   time.Now().Unix(),
+		Files: []migration.QuarantineFileEntry{
+			{
+				OriginalPath: origFile,
+				StagedName:   "staged_restored.spool",
+				StagedPath:   stagedFile,
+				Size:         int64(len(payload)),
+				SHA256:       shaHex,
+			},
+		},
+	}
+	data, _ := json.MarshalIndent(manifest, "", "  ")
+	_ = os.WriteFile(manifestPath, data, 0o644)
+
+	t.Logf("[Test 25: RESTORE_VALID] Invoking ReconcilePendingQuarantines...")
+	report, err := migration.ReconcilePendingQuarantines(context.Background(), dbPath, bufferDir)
+	if err != nil {
+		t.Fatalf("ReconcilePendingQuarantines failed on valid staged copy: %v", err)
+	}
+	t.Logf("[Test 25: RESTORE_VALID] Reconcile report: RestoredFiles=%v, CleanedDirs=%v", report.RestoredFiles, report.CleanedDirs)
+	if len(report.RestoredFiles) != 1 || report.RestoredFiles[0] != origFile {
+		t.Fatalf("unexpected RestoredFiles: %+v", report.RestoredFiles)
+	}
+
+	// Verify original file exists and has correct payload
+	origBytes, readErr := os.ReadFile(origFile)
+	if readErr != nil || string(origBytes) != string(payload) {
+		t.Fatalf("original file was not correctly restored: %v", readErr)
+	}
+	// Staged file should be moved
+	if _, statErr := os.Stat(stagedFile); !os.IsNotExist(statErr) {
+		t.Fatalf("staged file still exists after restore: %v", statErr)
+	}
+	// Quarantine directory and manifest cleaned
+	if _, statErr := os.Stat(manifestPath); !os.IsNotExist(statErr) {
+		t.Fatalf("manifest should be removed after restore: %v", statErr)
+	}
+	t.Logf("[Test 25: RESTORE_VALID] Verified: original file restored byte-for-byte, staged file and manifest cleaned")
 }

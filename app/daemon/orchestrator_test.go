@@ -1590,6 +1590,7 @@ func TestOrchestrator_AlreadySuccessVerifiesPhysicalFileOnDisk(t *testing.T) {
 	}
 
 	// 1. Physical file is MISSING on disk: downloadOne must fail with missing_file
+	t.Logf("[BRANCH 1: MISSING] Testing AlreadySuccess when physical file is missing from disk: %s", absPath)
 	reqMissing := TaskRequest{
 		ID:           "case_already_success_missing",
 		Peer:         chatID,
@@ -1602,6 +1603,7 @@ func TestOrchestrator_AlreadySuccessVerifiesPhysicalFileOnDisk(t *testing.T) {
 	orch.downloadOne(context.Background(), task1)
 
 	snap1 := task1.Snapshot()
+	t.Logf("[BRANCH 1: MISSING] Result: state=%s, error_class=%s, err=%s", snap1.State, snap1.ErrorClass, snap1.Error)
 	if snap1.State != StateFailed {
 		t.Fatalf("expected StateFailed when physical file is missing, got: %s", snap1.State)
 	}
@@ -1616,6 +1618,7 @@ func TestOrchestrator_AlreadySuccessVerifiesPhysicalFileOnDisk(t *testing.T) {
 	if err := os.WriteFile(absPath, make([]byte, 512), 0o644); err != nil { // all zero bytes != payload
 		t.Fatalf("write file failed: %v", err)
 	}
+	t.Logf("[BRANCH 2: CORRUPT] Created corrupted physical file with same size (512 bytes zeros, wrong hash)")
 
 	reqCorrupt := TaskRequest{
 		ID:           "case_already_success_corrupt",
@@ -1629,6 +1632,7 @@ func TestOrchestrator_AlreadySuccessVerifiesPhysicalFileOnDisk(t *testing.T) {
 	orch.downloadOne(context.Background(), taskCorrupt)
 
 	snapCorrupt := taskCorrupt.Snapshot()
+	t.Logf("[BRANCH 2: CORRUPT] Result: state=%s, error_class=%s, err=%s", snapCorrupt.State, snapCorrupt.ErrorClass, snapCorrupt.Error)
 	if snapCorrupt.State != StateFailed {
 		t.Fatalf("expected StateFailed on corrupted physical file, got: %s", snapCorrupt.State)
 	}
@@ -1640,6 +1644,7 @@ func TestOrchestrator_AlreadySuccessVerifiesPhysicalFileOnDisk(t *testing.T) {
 	if err := os.WriteFile(absPath, payload, 0o644); err != nil {
 		t.Fatalf("write authentic payload failed: %v", err)
 	}
+	t.Logf("[BRANCH 3: AUTHENTIC] Written authentic payload matching DB proof (512 bytes, sha=%s)", realSHA)
 
 	reqPresent := TaskRequest{
 		ID:           "case_already_success_present",
@@ -1653,6 +1658,7 @@ func TestOrchestrator_AlreadySuccessVerifiesPhysicalFileOnDisk(t *testing.T) {
 	orch.downloadOne(context.Background(), task2)
 
 	snap2 := task2.Snapshot()
+	t.Logf("[BRANCH 3: AUTHENTIC] Result: state=%s, final_path=%s", snap2.State, snap2.FinalPath)
 	if snap2.State != StateSuccess {
 		t.Fatalf("expected StateSuccess when physical file is verified, got: %s", snap2.State)
 	}
@@ -1661,6 +1667,7 @@ func TestOrchestrator_AlreadySuccessVerifiesPhysicalFileOnDisk(t *testing.T) {
 	}
 
 	// 4. Conflicting request path with DB success proof: admission rejected
+	t.Logf("[BRANCH 4: CONFLICT] Submitting conflicting path request against authoritative DB proof...")
 	reqConflict := TaskRequest{
 		ID:           "case_already_success_conflict",
 		Peer:         chatID,
@@ -1673,6 +1680,7 @@ func TestOrchestrator_AlreadySuccessVerifiesPhysicalFileOnDisk(t *testing.T) {
 	orch.downloadOne(context.Background(), task3)
 
 	snap3 := task3.Snapshot()
+	t.Logf("[BRANCH 4: CONFLICT] Result: state=%s, error_class=%s, err=%s", snap3.State, snap3.ErrorClass, snap3.Error)
 	if snap3.State != StateFailed {
 		t.Fatalf("expected StateFailed on conflicting path, got: %s", snap3.State)
 	}
@@ -1681,7 +1689,7 @@ func TestOrchestrator_AlreadySuccessVerifiesPhysicalFileOnDisk(t *testing.T) {
 	}
 }
 
-func TestOrchestrator_CancelAfterPrepareCommitRejectedAndPublishesSuccess(t *testing.T) {
+func TestOrchestrator_Deterministic_CancelAfterSetPublishingBeforeRename_RejectedAndPublishesSuccess(t *testing.T) {
 	data := make([]byte, 1024)
 	for i := range data {
 		data[i] = byte(i % 256)
@@ -1714,8 +1722,61 @@ func TestOrchestrator_CancelAfterPrepareCommitRejectedAndPublishesSuccess(t *tes
 	orchRef = orch
 	defer db.Close()
 
+	finalRelPath := "RaceChannel/2024_09/889 - commit_cancel_test.mp4"
+	finalAbsPath := filepath.Join(saveDir, filepath.FromSlash(finalRelPath))
+	partAbsPath := finalAbsPath + ".part"
+
+	hookExecuted := false
+	orch.SetTestHooks(OrchestratorTestHooks{
+		AfterSetPublishing: func(taskID, cID string, mID int) {
+			hookExecuted = true
+			t.Logf("[HOOK: AfterSetPublishing] Arrived at publishing window: taskID=%s, chatID=%s, msgID=%d", taskID, cID, mID)
+
+			// 1. Assert DB is in 'committing' state
+			rec, err := db.GetDownloadRecord(cID, mID)
+			if err != nil || rec == nil {
+				t.Fatalf("failed to query DB record during hook: %v", err)
+			}
+			t.Logf("[HOOK: AfterSetPublishing] Verified DB status: %s, gen=%s", rec.Status, rec.AttemptGeneration)
+			if rec.Status != "committing" {
+				t.Fatalf("expected DB status 'committing', got: %s", rec.Status)
+			}
+
+			// 2. Assert .part exists and final file does NOT exist yet
+			if _, statErr := os.Stat(partAbsPath); statErr != nil {
+				t.Fatalf("expected .part file to exist before rename, got err: %v", statErr)
+			}
+			if _, statErr := os.Stat(finalAbsPath); !os.IsNotExist(statErr) {
+				t.Fatalf("final file should not exist before rename, but found: %s", finalAbsPath)
+			}
+			t.Logf("[HOOK: AfterSetPublishing] Physical check: .part exists, final file does not exist yet")
+
+			// 3. Attempt concurrent cancel while in publishing window
+			t.Logf("[HOOK: AfterSetPublishing] Concurrently injecting CancelTasksByChatID(%s)...", cID)
+			orchRef.CancelTasksByChatID(cID)
+
+			// 4. Assert DB rejected cancel due to committing status barrier
+			recAfter, err := db.GetDownloadRecord(cID, mID)
+			if err != nil || recAfter == nil {
+				t.Fatalf("failed to query DB record after cancel: %v", err)
+			}
+			t.Logf("[HOOK: AfterSetPublishing] DB status after cancel injection: %s (must remain 'committing')", recAfter.Status)
+			if recAfter.Status != "committing" {
+				t.Fatalf("expected DB status to remain 'committing', got: %s", recAfter.Status)
+			}
+
+			// 5. Assert Registry task state is NOT transitioned to failed
+			if snap, ok := registry.Task(taskID); ok {
+				t.Logf("[HOOK: AfterSetPublishing] Registry task state after cancel injection: %s", snap.State)
+				if snap.State == StateFailed {
+					t.Fatalf("Registry task was illegally canceled during publishing window!")
+				}
+			}
+		},
+	})
+
 	req := TaskRequest{
-		ID:          "case_cancel_after_commit_rejected",
+		ID:          "case_cancel_after_set_publishing",
 		Peer:        chatID,
 		MessageID:   msgID,
 		TargetTitle: "RaceChannel",
@@ -1724,44 +1785,153 @@ func TestOrchestrator_CancelAfterPrepareCommitRejectedAndPublishesSuccess(t *tes
 
 	_, _, _ = registry.Submit(req)
 	task, _ := registry.Next(context.Background())
-
-	// We intercept right when task enters committing status in DB:
-	cancelAttemptDone := make(chan struct{})
-	go func() {
-		defer close(cancelAttemptDone)
-		for {
-			rec, err := db.GetDownloadRecord(chatID, msgID)
-			if err == nil && rec != nil && rec.Status == "committing" {
-				// DB has accepted durable commit intent! Now attempt target cancellation!
-				orchRef.CancelTasksByChatID(chatID)
-				return
-			}
-			time.Sleep(100 * time.Microsecond)
-		}
-	}()
-
 	orch.downloadOne(context.Background(), task)
-	<-cancelAttemptDone
 
-	finalRelPath := "RaceChannel/2024_09/889 - commit_cancel_test.mp4"
-	finalAbsPath := filepath.Join(saveDir, filepath.FromSlash(finalRelPath))
+	if !hookExecuted {
+		t.Fatal("expected AfterSetPublishing test hook to be executed!")
+	}
 
-	// 1. Final file MUST be published because commit intent was accepted
+	// Post-execution assertions:
+	// 1. Final file MUST be published
 	if _, err := os.Stat(finalAbsPath); err != nil {
 		t.Fatalf("expected final file to be published, but got err: %v", err)
 	}
+	t.Logf("[POST-ASSERT] Physical file published: %s", finalAbsPath)
 
-	// 2. DB status MUST be 'success', NOT 'failed'
+	// 2. DB status MUST be 'success'
 	rec, err := db.GetDownloadRecord(chatID, msgID)
 	if err != nil || rec == nil {
 		t.Fatalf("failed to query DB record: %v", err)
 	}
+	t.Logf("[POST-ASSERT] DB final record: status=%s, path=%s, size=%d, sha=%s", rec.Status, rec.SavePath, rec.FileSize, rec.SHA256)
 	if rec.Status != "success" {
 		t.Fatalf("expected DB status 'success', got: %q", rec.Status)
 	}
 
-	// 3. Registry task state MUST be StateSuccess, NOT StateFailed
+	// 3. Registry task state MUST be StateSuccess
 	snap := task.Snapshot()
+	t.Logf("[POST-ASSERT] Registry task final state: %s", snap.State)
+	if snap.State != StateSuccess {
+		t.Fatalf("expected Registry StateSuccess, got: %s", snap.State)
+	}
+}
+
+func TestOrchestrator_Deterministic_CancelAfterRenameBeforeCompleteDB_RejectedAndCompletesSuccess(t *testing.T) {
+	data := make([]byte, 1024)
+	for i := range data {
+		data[i] = byte(i % 256)
+	}
+
+	var chatID = "-1007779"
+	var msgID = 890
+	var orchRef *Orchestrator
+
+	invoker := invokerFunc(func(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
+		setUploadFile(output, data)
+		return nil
+	})
+
+	access := &mockAccessWithPool{
+		pool: &mockPool{invoker: invoker},
+		resolveFn: func(ctx context.Context, peer string, messageID int) (ResolvedMedia, error) {
+			return ResolvedMedia{
+				File:      &orchMockMediaFile{loc: &tg.InputDocumentFileLocation{ID: 1001, AccessHash: 2002}, sz: 1024, dc: 2},
+				Name:      "rename_window_test.mp4",
+				Size:      1024,
+				DCID:      2,
+				MediaType: "video",
+				Date:      1725518400,
+			}, nil
+		},
+	}
+
+	orch, registry, db, saveDir := setupTestOrchestratorWithAccess(t, access)
+	orchRef = orch
+	defer db.Close()
+
+	finalRelPath := "RaceChannel/2024_09/890 - rename_window_test.mp4"
+	finalAbsPath := filepath.Join(saveDir, filepath.FromSlash(finalRelPath))
+
+	hookExecuted := false
+	orch.SetTestHooks(OrchestratorTestHooks{
+		AfterRename: func(taskID, cID string, mID int) {
+			hookExecuted = true
+			t.Logf("[HOOK: AfterRename] Arrived after atomic rename: taskID=%s, chatID=%s, msgID=%d", taskID, cID, mID)
+
+			// 1. Final file is now physically on disk!
+			if _, statErr := os.Stat(finalAbsPath); statErr != nil {
+				t.Fatalf("expected final file to exist after rename, got err: %v", statErr)
+			}
+			t.Logf("[HOOK: AfterRename] Verified physical file is already on disk: %s", finalAbsPath)
+
+			// 2. DB status is still 'committing' (before CompleteDownload is called)
+			rec, err := db.GetDownloadRecord(cID, mID)
+			if err != nil || rec == nil {
+				t.Fatalf("failed to query DB record: %v", err)
+			}
+			t.Logf("[HOOK: AfterRename] Verified DB status is 'committing': %s", rec.Status)
+			if rec.Status != "committing" {
+				t.Fatalf("expected DB status 'committing', got: %s", rec.Status)
+			}
+
+			// 3. Attempt cancel right between rename and DB completion
+			t.Logf("[HOOK: AfterRename] Concurrently injecting CancelTasksByChatID(%s)...", cID)
+			orchRef.CancelTasksByChatID(cID)
+
+			// 4. Assert DB rejected cancel
+			recAfter, err := db.GetDownloadRecord(cID, mID)
+			if err != nil || recAfter == nil {
+				t.Fatalf("failed to query DB record after cancel: %v", err)
+			}
+			t.Logf("[HOOK: AfterRename] DB status after cancel injection: %s (must remain 'committing')", recAfter.Status)
+			if recAfter.Status != "committing" {
+				t.Fatalf("expected DB status to remain 'committing', got: %s", recAfter.Status)
+			}
+
+			// 5. Assert Registry task state is NOT failed
+			if snap, ok := registry.Task(taskID); ok {
+				t.Logf("[HOOK: AfterRename] Registry task state after cancel injection: %s", snap.State)
+				if snap.State == StateFailed {
+					t.Fatalf("Registry task was illegally canceled after rename!")
+				}
+			}
+		},
+	})
+
+	req := TaskRequest{
+		ID:          "case_cancel_after_rename",
+		Peer:        chatID,
+		MessageID:   msgID,
+		TargetTitle: "RaceChannel",
+		Date:        1725518400,
+	}
+
+	_, _, _ = registry.Submit(req)
+	task, _ := registry.Next(context.Background())
+	orch.downloadOne(context.Background(), task)
+
+	if !hookExecuted {
+		t.Fatal("expected AfterRename test hook to be executed!")
+	}
+
+	// 1. Final file MUST be present on disk
+	if _, err := os.Stat(finalAbsPath); err != nil {
+		t.Fatalf("expected final file to be present, but got err: %v", err)
+	}
+
+	// 2. DB status MUST be 'success'
+	rec, err := db.GetDownloadRecord(chatID, msgID)
+	if err != nil || rec == nil {
+		t.Fatalf("failed to query DB record: %v", err)
+	}
+	t.Logf("[POST-ASSERT] DB final record: status=%s, path=%s, size=%d, sha=%s", rec.Status, rec.SavePath, rec.FileSize, rec.SHA256)
+	if rec.Status != "success" {
+		t.Fatalf("expected DB status 'success', got: %q", rec.Status)
+	}
+
+	// 3. Registry state MUST be StateSuccess
+	snap := task.Snapshot()
+	t.Logf("[POST-ASSERT] Registry task final state: %s", snap.State)
 	if snap.State != StateSuccess {
 		t.Fatalf("expected Registry StateSuccess, got: %s", snap.State)
 	}

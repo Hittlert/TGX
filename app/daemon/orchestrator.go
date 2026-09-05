@@ -36,6 +36,23 @@ type Orchestrator struct {
 	inFlight      sync.Map
 	activeTasks   int64
 	taskSlotFreed chan struct{}
+
+	testHooks OrchestratorTestHooks
+}
+
+// OrchestratorTestHooks provides deterministic interception points during commit/publish lifecycle.
+type OrchestratorTestHooks struct {
+	BeforePrepareCommit func(taskID, chatID string, msgID int)
+	AfterPrepareCommit  func(taskID, chatID string, msgID int)
+	AfterSetPublishing  func(taskID, chatID string, msgID int)
+	BeforeRename        func(taskID, chatID string, msgID int)
+	AfterRename         func(taskID, chatID string, msgID int)
+	BeforeCompleteDB    func(taskID, chatID string, msgID int)
+}
+
+// SetTestHooks sets deterministic lifecycle interception hooks for testing.
+func (o *Orchestrator) SetTestHooks(hooks OrchestratorTestHooks) {
+	o.testHooks = hooks
 }
 
 // NewOrchestrator creates a new direct-SSD download orchestrator.
@@ -1069,6 +1086,9 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 	}
 
 	// 10. Durable commit intent in DB
+	if o.testHooks.BeforePrepareCommit != nil {
+		o.testHooks.BeforePrepareCommit(taskID, chatID, msgID)
+	}
 	if task.IsTerminal() || taskCtx.Err() != nil {
 		_ = os.Remove(partAbsPath)
 		if o.db != nil {
@@ -1127,6 +1147,9 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 			},
 		})
 	}
+	if o.testHooks.AfterPrepareCommit != nil {
+		o.testHooks.AfterPrepareCommit(taskID, chatID, msgID)
+	}
 
 	// 11. Preserve timestamp if present
 	if resolvedMedia.Date > 0 {
@@ -1135,24 +1158,15 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 	}
 
 	// 12. Atomic sibling rename .part -> final
-	if task.IsTerminal() || taskCtx.Err() != nil || !task.SetPublishing() {
-		_ = os.Remove(partAbsPath)
-		if o.db != nil {
-			_ = o.db.CancelDownload(chatID, msgID, gen, "canceled before publish")
-		}
-		if !task.IsTerminal() {
-			task.FailDisposition(FailureDisposition{
-				Stage:       "commit",
-				Op:          "set_publishing",
-				Class:       "canceled",
-				Unavailable: false,
-				Retryable:   false,
-				RetryOwner:  "none",
-				Message:     "task canceled before publish",
-			})
-		}
-		return
+	// Durable publish intent is authoritative in DB. Worker has single ownership of the publishing window.
+	task.SetPublishing()
+	if o.testHooks.AfterSetPublishing != nil {
+		o.testHooks.AfterSetPublishing(taskID, chatID, msgID)
 	}
+	if o.testHooks.BeforeRename != nil {
+		o.testHooks.BeforeRename(taskID, chatID, msgID)
+	}
+
 	if err := fscommit.CommitSiblingPart(partAbsPath, finalAbsPath); err != nil {
 		_ = os.Remove(partAbsPath)
 		o.logger.Error("atomic commit failed", zap.Error(err))
@@ -1173,6 +1187,9 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 		return
 	}
 	committed = true
+	if o.testHooks.AfterRename != nil {
+		o.testHooks.AfterRename(taskID, chatID, msgID)
+	}
 	EmitLifecycle(o.logger, LifecycleEvent{
 		Event:           EventSSDCommitted,
 		TaskID:          taskID,
@@ -1197,6 +1214,9 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 	})
 
 	// 13. Complete download and queue archive in single DB transaction
+	if o.testHooks.BeforeCompleteDB != nil {
+		o.testHooks.BeforeCompleteDB(taskID, chatID, msgID)
+	}
 	queueArchive := o.archiveWorker != nil && o.archiveWorker.IsEnabled()
 	if o.db != nil {
 		if err := o.db.CompleteDownloadAndQueueArchive(chatID, msgID, gen, finalRelPath, stat.Size(), shaHex, queueArchive); err != nil {

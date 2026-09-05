@@ -163,31 +163,38 @@ func TestDB_CancelDuringDownloadingCannotBeOverwritten(t *testing.T) {
 	gen := "gen_1"
 
 	// Begin download
+	t.Logf("[Test 4a] BeginDownload chatID=%s, msgID=%d, gen=%s", chatID, msgID, gen)
 	if err := db.BeginDownload(chatID, msgID, gen, "test.mp4", "path/test.mp4", "video", 1024); err != nil {
 		t.Fatalf("BeginDownload failed: %v", err)
 	}
 
 	// User cancels task while worker is still downloading
+	t.Logf("[Test 4a] Calling CancelDownload during downloading state...")
 	if err := db.CancelDownload(chatID, msgID, gen, "user canceled"); err != nil {
 		t.Fatalf("CancelDownload failed: %v", err)
 	}
 
 	// Canceled worker tries to prepare commit -> rejected!
+	t.Logf("[Test 4a] Worker attempts PrepareDownloadCommit on canceled task...")
 	if err := db.PrepareDownloadCommit(chatID, msgID, gen, "path/test.mp4", 1024, "aabbcc"); !errors.Is(err, ErrStateConflict) {
 		t.Fatalf("expected ErrStateConflict when preparing commit on canceled task, got: %v", err)
 	}
+	t.Logf("[Test 4a] PrepareDownloadCommit correctly rejected with ErrStateConflict")
 
 	// Canceled worker tries to complete -> rejected!
+	t.Logf("[Test 4a] Worker attempts CompleteDownloadAndQueueArchive on canceled task...")
 	err := db.CompleteDownloadAndQueueArchive(chatID, msgID, gen, "path/test.mp4", 1024, "aabbcc", false)
 	if !errors.Is(err, ErrStateConflict) {
 		t.Fatalf("expected ErrStateConflict when completing canceled task, got: %v", err)
 	}
+	t.Logf("[Test 4a] CompleteDownloadAndQueueArchive correctly rejected with ErrStateConflict")
 
 	// Status must remain failed
 	rec, err := db.GetDownloadRecord(chatID, msgID)
 	if err != nil {
 		t.Fatalf("failed to get record: %v", err)
 	}
+	t.Logf("[Test 4a] Final DB record: status=%s, error=%s", rec.Status, rec.Error)
 	if rec.Status != "failed" {
 		t.Fatalf("expected status failed, got: %s", rec.Status)
 	}
@@ -202,20 +209,25 @@ func TestDB_CancelDuringCommit_RejectedDueToAuthoritativePublishIntent(t *testin
 	msgID := 1042
 	gen := "gen_1"
 
+	t.Logf("[Test 4b] BeginDownload chatID=%s, msgID=%d, gen=%s", chatID, msgID, gen)
 	if err := db.BeginDownload(chatID, msgID, gen, "test.mp4", "path/test.mp4", "video", 1024); err != nil {
 		t.Fatalf("BeginDownload failed: %v", err)
 	}
+	t.Logf("[Test 4b] PrepareDownloadCommit advancing state to 'committing'...")
 	if err := db.PrepareDownloadCommit(chatID, msgID, gen, "path/test.mp4", 1024, "aabbcc"); err != nil {
 		t.Fatalf("PrepareDownloadCommit failed: %v", err)
 	}
 
 	// Late cancel must be rejected by DB to protect publishing window
+	t.Logf("[Test 4b] Concurrently injecting CancelDownload on committing task...")
 	err := db.CancelDownload(chatID, msgID, gen, "late cancel")
+	t.Logf("[Test 4b] CancelDownload result: %v (expected ErrStateConflict)", err)
 	if !errors.Is(err, ErrStateConflict) {
 		t.Fatalf("expected ErrStateConflict when canceling committing task, got: %v", err)
 	}
 
 	// Worker proceeds to complete -> succeeds!
+	t.Logf("[Test 4b] Worker executing CompleteDownloadAndQueueArchive...")
 	if err := db.CompleteDownloadAndQueueArchive(chatID, msgID, gen, "path/test.mp4", 1024, "aabbcc", false); err != nil {
 		t.Fatalf("CompleteDownloadAndQueueArchive failed: %v", err)
 	}
@@ -224,6 +236,7 @@ func TestDB_CancelDuringCommit_RejectedDueToAuthoritativePublishIntent(t *testin
 	if err != nil {
 		t.Fatalf("failed to get record: %v", err)
 	}
+	t.Logf("[Test 4b] Final DB record: status=%s, path=%s, size=%d, sha=%s", rec.Status, rec.SavePath, rec.FileSize, rec.SHA256)
 	if rec.Status != "success" {
 		t.Fatalf("expected status success, got: %s", rec.Status)
 	}
