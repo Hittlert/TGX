@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -736,13 +737,17 @@ func ReconcilePendingQuarantines(ctx context.Context, dbPath string, bufferDir s
 	report.QuarantineDirsScanned = len(matches)
 
 	var db *sql.DB
-	if dbPath != "" {
-		if _, err := os.Stat(dbPath); err == nil {
-			var openErr error
-			db, openErr = sql.Open("sqlite", dbPath)
-			if openErr != nil {
-				return nil, fmt.Errorf("open db for quarantine reconcile: %w", openErr)
-			}
+	var dbErr error
+	if dbPath == "" {
+		dbErr = fmt.Errorf("dbPath is empty")
+	} else if _, err := os.Stat(dbPath); err != nil {
+		dbErr = fmt.Errorf("stat db-path %s: %w", dbPath, err)
+	} else {
+		var openErr error
+		db, openErr = sql.Open("sqlite", dbPath)
+		if openErr != nil {
+			dbErr = fmt.Errorf("open sqlite db %s: %w", dbPath, openErr)
+		} else {
 			defer db.Close()
 		}
 	}
@@ -775,18 +780,39 @@ func ReconcilePendingQuarantines(ctx context.Context, dbPath string, bufferDir s
 			return nil, fmt.Errorf("unmarshal quarantine manifest %s: %w (fail-closed to prevent data loss)", manifestPath, err)
 		}
 
-		// Check verdict in DB
+		// Check verdict in DB with strict authority and fail-closed error propagation
+		if dbErr != nil {
+			return nil, fmt.Errorf("cannot reconcile quarantine %s: database access failed: %w (verdict unknown, fail-closed to prevent data loss)", manifestPath, dbErr)
+		}
+
+		var tblExists int
+		err = db.QueryRowContext(ctx, "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='_tgx_migration_verdicts'").Scan(&tblExists)
+		if err != nil {
+			return nil, fmt.Errorf("check _tgx_migration_verdicts table existence for %s: %w (verdict unknown, fail-closed to prevent data loss)", manifestPath, err)
+		}
+
 		var isCommitted bool
-		if db != nil {
-			var tblExists int
-			_ = db.QueryRowContext(ctx, "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='_tgx_migration_verdicts'").Scan(&tblExists)
-			if tblExists > 0 {
-				var verdictStatus string
-				err := db.QueryRowContext(ctx, "SELECT status FROM _tgx_migration_verdicts WHERE migration_id = ?", manifest.MigrationID).Scan(&verdictStatus)
-				if err == nil && verdictStatus == "COMMITTED" {
-					isCommitted = true
+		if tblExists > 0 {
+			var verdictStatus string
+			err := db.QueryRowContext(ctx, "SELECT status FROM _tgx_migration_verdicts WHERE migration_id = ?", manifest.MigrationID).Scan(&verdictStatus)
+			if err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					// Authoritative verdict absent: transaction did NOT commit
+					isCommitted = false
+				} else {
+					// Query failure (e.g. database locked, I/O error, table corrupted):
+					// Verdict is UNKNOWN. Must FAIL-CLOSED without touching any staged file or manifest!
+					return nil, fmt.Errorf("query migration verdict for %s (migration_id=%s): %w (verdict unknown, fail-closed to prevent data loss)", manifestPath, manifest.MigrationID, err)
 				}
+			} else if verdictStatus == "COMMITTED" {
+				isCommitted = true
+			} else {
+				isCommitted = false
 			}
+		} else {
+			// Table does not exist: since table is created in the same transaction as verdict insertion,
+			// table absence authoritatively indicates transaction never committed.
+			isCommitted = false
 		}
 
 		if isCommitted {

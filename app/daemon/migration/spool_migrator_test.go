@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	_ "modernc.org/sqlite"
 
@@ -1158,5 +1159,136 @@ func TestMigration_QuarantineManifest_NonEmptyOrphanDirFailsClosed(t *testing.T)
 	}
 	if _, err := os.Stat(emptyQDir); !os.IsNotExist(err) {
 		t.Fatal("empty orphan quarantine dir should have been removed")
+	}
+}
+
+// 18. Acceptance Test: When a COMMITTED verdict exists but verdict lookup fails (e.g. exclusive DB lock),
+// reconciliation treats verdict as UNKNOWN, fails closed, and leaves every staged file and manifest completely untouched.
+func TestMigration_QuarantineManifest_VerdictLookupFailureFailsClosedAndLeavesFilesUntouched(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "lookup_fail.sqlite3")
+	bufferDir := filepath.Join(tempDir, "buffer")
+	if err := os.MkdirAll(bufferDir, 0o755); err != nil {
+		t.Fatalf("failed to create buffer dir: %v", err)
+	}
+
+	migrationID := "mig_committed_but_locked_test"
+
+	// 1. Create SQLite DB with COMMITTED verdict
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("failed to open sqlite: %v", err)
+	}
+	_, err = db.Exec(`
+		CREATE TABLE _tgx_migration_verdicts (
+			migration_id TEXT PRIMARY KEY,
+			committed_at INTEGER NOT NULL,
+			status TEXT NOT NULL
+		);
+		INSERT INTO _tgx_migration_verdicts VALUES (?, 1700000000, 'COMMITTED');
+	`, migrationID)
+	if err != nil {
+		t.Fatalf("failed to insert verdict: %v", err)
+	}
+	db.Close()
+
+	// 2. Setup quarantine directory, staged file, and manifest
+	qDir := filepath.Join(bufferDir, ".migrator_quarantine_554433")
+	if err := os.MkdirAll(qDir, 0o755); err != nil {
+		t.Fatalf("failed to create qDir: %v", err)
+	}
+
+	origFile := filepath.Join(bufferDir, "critical_spool.data")
+	stagedFile := filepath.Join(qDir, "staged_0_critical_spool.data")
+	criticalData := []byte("critical data that must not be deleted or incorrectly restored")
+	if err := os.WriteFile(stagedFile, criticalData, 0o644); err != nil {
+		t.Fatalf("failed to write staged file: %v", err)
+	}
+
+	manifest := migration.QuarantineManifest{
+		MigrationID:   migrationID,
+		QuarantineDir: qDir,
+		CreatedAt:     554433,
+		Files: []migration.QuarantineFileEntry{
+			{
+				OriginalPath: origFile,
+				StagedName:   "staged_0_critical_spool.data",
+				StagedPath:   stagedFile,
+				Size:         int64(len(criticalData)),
+			},
+		},
+	}
+	manifestBytes, _ := json.MarshalIndent(manifest, "", "  ")
+	manifestPath := filepath.Join(qDir, "quarantine_manifest.json")
+	if err := os.WriteFile(manifestPath, manifestBytes, 0o644); err != nil {
+		t.Fatalf("failed to write manifest: %v", err)
+	}
+
+	// 3. Hold an EXCLUSIVE write lock on the database to force verdict lookup to fail with 'database is locked'
+	lockDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open lock db: %v", err)
+	}
+	defer lockDB.Close()
+
+	// Begin immediate/exclusive write transaction
+	_, err = lockDB.Exec("BEGIN EXCLUSIVE")
+	if err != nil {
+		t.Fatalf("failed to acquire exclusive transaction lock: %v", err)
+	}
+	defer func() {
+		_, _ = lockDB.Exec("ROLLBACK")
+	}()
+
+	// 4. Trigger reconciliation with a context timeout so it fails quickly on lock
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	_, err = migration.ReconcilePendingQuarantines(ctx, dbPath, bufferDir)
+	if err == nil {
+		t.Fatal("expected error from ReconcilePendingQuarantines when verdict query fails, got nil")
+	}
+
+	// 5. Fail-Closed Verification:
+	// The staged file MUST still exist with exact original content!
+	stagedRead, readErr := os.ReadFile(stagedFile)
+	if readErr != nil {
+		t.Fatalf("staged file missing or unreadable after query failure: %v (data loss!)", readErr)
+	}
+	if string(stagedRead) != string(criticalData) {
+		t.Fatal("staged file content corrupted!")
+	}
+
+	// The manifest MUST still exist!
+	if _, statErr := os.Stat(manifestPath); os.IsNotExist(statErr) {
+		t.Fatal("quarantine manifest was deleted after verdict lookup failure! Fail-closed violated!")
+	}
+
+	// The quarantine directory MUST NOT have been removed!
+	if _, statErr := os.Stat(qDir); os.IsNotExist(statErr) {
+		t.Fatal("quarantine directory was deleted after verdict lookup failure! Fail-closed violated!")
+	}
+
+	// The original file MUST NOT have been created by a mistaken pre-commit restore!
+	if _, statErr := os.Stat(origFile); !os.IsNotExist(statErr) {
+		t.Fatal("origFile was unexpectedly restored while verdict was unknown!")
+	}
+
+	// 6. Also verify that when dbPath is unopenable/inaccessible, it fails closed
+	unopenableDBPath := filepath.Join(tempDir, "inaccessible.sqlite3")
+	_ = os.WriteFile(unopenableDBPath, []byte("not a sqlite db"), 0o000)
+	defer func() { _ = os.Chmod(unopenableDBPath, 0o644) }()
+
+	_, err = migration.ReconcilePendingQuarantines(context.Background(), unopenableDBPath, bufferDir)
+	if err == nil {
+		t.Fatal("expected error for inaccessible dbPath, got nil")
+	}
+
+	// Again, verify staged file, manifest, and qDir remain untouched
+	if _, statErr := os.Stat(stagedFile); os.IsNotExist(statErr) {
+		t.Fatal("staged file deleted when dbPath is inaccessible!")
+	}
+	if _, statErr := os.Stat(manifestPath); os.IsNotExist(statErr) {
+		t.Fatal("manifest deleted when dbPath is inaccessible!")
 	}
 }
