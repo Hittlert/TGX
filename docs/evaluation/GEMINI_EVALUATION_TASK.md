@@ -51,7 +51,7 @@ Evaluation-only code and read-only observability instrumentation may be changed.
 
 ## Phase C: Freeze Independent TDL Artifact
 
-Use a known-good TDL binary independent of the TGX candidate source tree. Record source version and binary SHA256. The current TGX HEAD `tdl dl` command is not an independent baseline because it shares candidate `core/downloader`.
+Use a known-good TDL binary independent of the TGX candidate source tree. Record source version and binary SHA256. The current TGX HEAD `tdl dl` command is not an independent baseline because an independent baseline must use an immutable, external TDL release binary rather than code compiled from the TGX candidate tree.
 
 If an independent TDL artifact cannot be established, mark Phase C `BLOCKED` and stop. Do not substitute an unidentified `dev/unknown` binary.
 

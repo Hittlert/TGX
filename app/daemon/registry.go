@@ -339,22 +339,20 @@ func (r *Registry) RetryTaskWithDecider(
 	decider func(newGen string) error,
 ) (TaskSnapshot, error) {
 	r.mu.Lock()
+	defer r.mu.Unlock()
 
 	// 1. Capacity check
 	if len(r.queue) >= r.queueCapacity {
-		r.mu.Unlock()
 		return TaskSnapshot{}, ErrQueueFull
 	}
 
 	// 2. State check: task must not be actively running
 	existing, exists := r.tasks[id]
 	if exists && !isTerminal(existing.state) {
-		r.mu.Unlock()
 		return TaskSnapshot{}, ErrTaskActive
 	}
 
 	if !exists && fallbackReq == nil {
-		r.mu.Unlock()
 		return TaskSnapshot{}, ErrTaskNotFound
 	}
 
@@ -374,9 +372,8 @@ func (r *Registry) RetryTaskWithDecider(
 		attemptCount = 1
 	}
 
-	r.mu.Unlock()
-
 	// 3. Execute external durable state transition (e.g. DB conflict -> pending)
+	// while holding the single admission boundary.
 	if decider != nil {
 		if err := decider(newGen); err != nil {
 			return TaskSnapshot{}, err
@@ -384,8 +381,6 @@ func (r *Registry) RetryTaskWithDecider(
 	}
 
 	// 4. DB transition succeeded -> commit to Registry
-	r.mu.Lock()
-	defer r.mu.Unlock()
 
 	// Archive old attempt metrics to keep cumulative network/retry counters monotonic
 	if existing != nil {

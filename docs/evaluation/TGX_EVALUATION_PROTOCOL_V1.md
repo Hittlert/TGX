@@ -279,7 +279,7 @@ This status is a fact, not a Go verdict.
 
 ## 12. TDL Baseline
 
-The TDL baseline MUST use a frozen, known-good TDL artifact that is independent of the TGX candidate source tree. Rebuilding `tdl dl` from the TGX candidate does not qualify because it shares the candidate `core/downloader`.
+The TDL baseline MUST use a frozen, known-good TDL artifact that is independent of the TGX candidate source tree. Rebuilding `tdl dl` from the TGX candidate does not qualify because an independent baseline must use an immutable, external TDL release binary rather than code compiled from the TGX candidate tree.
 
 TDL baseline purpose:
 
