@@ -2652,3 +2652,107 @@ func TestWebServer_ObservabilityEndpointsContract(t *testing.T) {
 		}
 	}
 }
+
+func TestWebServer_ConflictEndpoints_ContractAndBearerAuth(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "test.db")
+	db, err := NewDatabase(dbPath)
+	if err != nil {
+		t.Fatalf("NewDatabase: %v", err)
+	}
+	defer db.Close()
+
+	password := "secret-operator-pass"
+	reg := NewRegistry(100, 100, time.Now)
+	ws := NewWebServer(db, nil, nil, nil, nil, nil, reg, zap.NewNop(), password)
+	server := httptest.NewServer(ws.Handler())
+	defer server.Close()
+
+	// 1. Unauthenticated request to /api/conflicts should return 401
+	resp, err := http.Get(server.URL + "/api/conflicts")
+	if err != nil {
+		t.Fatalf("GET /api/conflicts failed: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 without auth, got %d", resp.StatusCode)
+	}
+
+	// 2. Request with invalid Bearer token should return 401
+	req, _ := http.NewRequest(http.MethodGet, server.URL+"/api/conflicts", nil)
+	req.Header.Set("Authorization", "Bearer wrong-pass")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET /api/conflicts with wrong bearer: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 with wrong bearer, got %d", resp.StatusCode)
+	}
+
+	// 3. Request with valid Bearer token should return 200 with empty list
+	req, _ = http.NewRequest(http.MethodGet, server.URL+"/api/conflicts", nil)
+	req.Header.Set("Authorization", "Bearer "+password)
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET /api/conflicts with valid bearer: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 with valid bearer, got %d", resp.StatusCode)
+	}
+	var list []DownloadRecord
+	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+		t.Fatalf("decode /api/conflicts: %v", err)
+	}
+	if len(list) != 0 {
+		t.Fatalf("expected empty list, got %d", len(list))
+	}
+
+	// 4. Seed a conflict record in DB and verify structured response
+	disp := FailureDisposition{
+		Stage:      "commit",
+		Op:         "target_check",
+		Class:      "target_conflict",
+		Message:    "target file exists",
+		Retryable:  false,
+		RetryOwner: "operator",
+	}
+	if err := db.RecordTargetConflict("channel_1", 101, "gen_1", "vid.mp4", "/downloads/vid.mp4", "video", 5000, disp); err != nil {
+		t.Fatalf("RecordTargetConflict: %v", err)
+	}
+
+	req, _ = http.NewRequest(http.MethodGet, server.URL+"/api/conflicts", nil)
+	req.Header.Set("Authorization", "Bearer "+password)
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET /api/conflicts: %v", err)
+	}
+	defer resp.Body.Close()
+	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+		t.Fatalf("decode /api/conflicts after seed: %v", err)
+	}
+	if len(list) != 1 {
+		t.Fatalf("expected 1 conflict record, got %d", len(list))
+	}
+	rec := list[0]
+	if rec.ChatID != "channel_1" || rec.MessageID != 101 || rec.Status != "conflict" {
+		t.Errorf("unexpected record identity: %+v", rec)
+	}
+	if rec.ErrorClass != "target_conflict" || rec.Retryable != false || rec.RetryOwner != "operator" {
+		t.Errorf("unexpected structured error: %+v", rec)
+	}
+
+	// 5. POST /api/conflicts/resolve without body/params should return 400
+	resolveReq, _ := http.NewRequest(http.MethodPost, server.URL+"/api/conflicts/resolve", strings.NewReader(`{}`))
+	resolveReq.Header.Set("Authorization", "Bearer "+password)
+	resolveReq.Header.Set("Content-Type", "application/json")
+	resp, err = http.DefaultClient.Do(resolveReq)
+	if err != nil {
+		t.Fatalf("POST /api/conflicts/resolve: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 for empty resolve request, got %d", resp.StatusCode)
+	}
+}

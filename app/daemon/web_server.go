@@ -294,10 +294,6 @@ func (s *WebServer) Handler() http.Handler {
 	})).Methods(http.MethodGet)
 
 	r.HandleFunc("/api/conflicts/resolve", s.requireAuth(func(w http.ResponseWriter, r *http.Request) {
-		if s.orchestrator == nil {
-			writeError(w, http.StatusInternalServerError, "orchestrator not available")
-			return
-		}
 		var req struct {
 			ChatID    string `json:"chat_id"`
 			MessageID int    `json:"message_id"`
@@ -310,6 +306,10 @@ func (s *WebServer) Handler() http.Handler {
 		}
 		if req.ChatID == "" || req.MessageID == 0 {
 			writeError(w, http.StatusBadRequest, "chat_id and message_id are required")
+			return
+		}
+		if s.orchestrator == nil {
+			writeError(w, http.StatusInternalServerError, "orchestrator not available")
 			return
 		}
 		if err := s.orchestrator.ResolveTargetConflict(req.ChatID, req.MessageID); err != nil {
@@ -414,6 +414,25 @@ func (s *WebServer) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 		if s.password == "" {
 			next(w, r)
 			return
+		}
+
+		// Check Bearer token in Authorization header for API / CLI access
+		authHeader := r.Header.Get("Authorization")
+		if strings.HasPrefix(authHeader, "Bearer ") {
+			token := strings.TrimSpace(strings.TrimPrefix(authHeader, "Bearer "))
+			if token != "" {
+				if token == s.password {
+					next(w, r)
+					return
+				}
+				s.sessionsMu.RLock()
+				expireAt, ok := s.sessions[token]
+				s.sessionsMu.RUnlock()
+				if ok && time.Now().Before(expireAt) {
+					next(w, r)
+					return
+				}
+			}
 		}
 
 		cookie, err := r.Cookie("tg_downloader_session")

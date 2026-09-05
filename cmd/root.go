@@ -117,6 +117,7 @@ func New() *cobra.Command {
 		NewHealthcheck(),
 		NewVersion(),
 		NewMigrateSpool(),
+		NewConflict(),
 	)
 
 	cmd.PersistentFlags().String("storage-path", "", "storage directory path")
