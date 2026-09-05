@@ -129,7 +129,7 @@ func (tc TransferTaskContext) GetFailedAttempt(rangeLabel string) string {
 			return val.(string)
 		}
 	}
-	return tc.GetLatestPhysicalAttemptID()
+	return ""
 }
 
 // GetLatestPhysicalAttemptID returns the most recent physical invocation ID.

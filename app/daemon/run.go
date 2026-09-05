@@ -148,9 +148,24 @@ func Run(ctx context.Context, client *telegram.Client, kvd storage.Storage, opts
 		MaxDataInFlight: int64(opts.PoolSize),
 		TaskRetryHandler: func(taskCtx context.Context, event downloader.RetryEvent) {
 			tc, _ := transfer.TransferTaskFromContext(taskCtx)
-			physAttemptID := tc.GetFailedAttempt(event.Operation)
-			if physAttemptID == "" {
-				physAttemptID = fmt.Sprintf("%s-p%d", tc.AttemptID, event.Attempt)
+			physAttemptID, rangeLabel, ok := transfer.ExtractPhysicalAttempt(event.Err)
+			if !ok || physAttemptID == "" {
+				physAttemptID = tc.GetFailedAttempt(event.Operation)
+				if physAttemptID == "" {
+					physAttemptID = fmt.Sprintf("%s-p%d", tc.AttemptID, event.Attempt)
+				}
+			}
+			op := event.Operation
+			if rangeLabel != "" {
+				op = fmt.Sprintf("%s:%s", event.Operation, rangeLabel)
+			}
+			extra := map[string]any{
+				"operation":           event.Operation,
+				"attempt":             event.Attempt,
+				"physical_attempt_id": physAttemptID,
+			}
+			if rangeLabel != "" {
+				extra["range"] = rangeLabel
 			}
 			EmitLifecycle(logger, LifecycleEvent{
 				Event:             EventRPCRetry,
@@ -160,14 +175,10 @@ func Run(ctx context.Context, client *telegram.Client, kvd storage.Storage, opts
 				ChatID:            tc.ChatID,
 				MessageID:         tc.MessageID,
 				DC:                tc.DCID,
-				Op:                event.Operation,
+				Op:                op,
 				PhysicalRetries:   int64(event.Attempt),
 				Error:             fmt.Sprintf("%v", event.Err),
-				Extra: map[string]any{
-					"operation":           event.Operation,
-					"attempt":             event.Attempt,
-					"physical_attempt_id": physAttemptID,
-				},
+				Extra:             extra,
 			})
 		},
 	})

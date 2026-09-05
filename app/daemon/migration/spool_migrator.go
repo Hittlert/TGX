@@ -459,20 +459,8 @@ func Run(ctx context.Context, opts MigrationOptions) (*MigrationReport, error) {
 		if err := os.MkdirAll(quarantineDir, 0o755); err != nil {
 			return report, fmt.Errorf("create quarantine directory: %w", err)
 		}
-		// In case of error during staging or database operations, restore staged files
-		defer func() {
-			if quarantineDir != "" {
-				for _, sf := range staged {
-					if _, err := os.Stat(sf.StagedPath); err == nil {
-						_ = os.MkdirAll(filepath.Dir(sf.OriginalPath), 0o755)
-						_ = os.Rename(sf.StagedPath, sf.OriginalPath)
-					}
-				}
-				_ = os.Remove(filepath.Join(quarantineDir, "quarantine_manifest.json"))
-				_ = os.RemoveAll(quarantineDir)
-			}
-		}()
 
+		// Pre-compute planned staging entries BEFORE performing any rename
 		for idx, p := range report.PlannedCleanFiles {
 			stagedName := fmt.Sprintf("staged_%d_%s", idx, filepath.Base(p))
 			stagedPath := filepath.Join(quarantineDir, stagedName)
@@ -483,10 +471,6 @@ func Run(ctx context.Context, opts MigrationOptions) (*MigrationReport, error) {
 				size = fi.Size()
 				hashStr, _ = computeFileSHA256(p)
 			}
-
-			if err := os.Rename(p, stagedPath); err != nil {
-				return report, fmt.Errorf("stage buffer file %s to quarantine: %w", p, err)
-			}
 			staged = append(staged, QuarantineFileEntry{
 				OriginalPath: p,
 				StagedName:   stagedName,
@@ -496,7 +480,7 @@ func Run(ctx context.Context, opts MigrationOptions) (*MigrationReport, error) {
 			})
 		}
 
-		// Persist quarantine manifest to disk before any DB commit
+		// Persist quarantine manifest to disk and double-fsync (file + dir) BEFORE any file rename
 		manifest := QuarantineManifest{
 			MigrationID:   migrationID,
 			QuarantineDir: quarantineDir,
@@ -516,8 +500,64 @@ func Run(ctx context.Context, opts MigrationOptions) (*MigrationReport, error) {
 			_ = mf.Close()
 			return report, fmt.Errorf("write quarantine manifest: %w", err)
 		}
-		_ = mf.Sync()
-		_ = mf.Close()
+		if err := mf.Sync(); err != nil {
+			_ = mf.Close()
+			return report, fmt.Errorf("fsync quarantine manifest file: %w", err)
+		}
+		if err := mf.Close(); err != nil {
+			return report, fmt.Errorf("close quarantine manifest file: %w", err)
+		}
+
+		// Fsync parent quarantine directory to guarantee manifest directory entry durability
+		df, err := os.Open(quarantineDir)
+		if err != nil {
+			return report, fmt.Errorf("open quarantine dir for fsync: %w", err)
+		}
+		if err := df.Sync(); err != nil {
+			_ = df.Close()
+			return report, fmt.Errorf("fsync quarantine directory: %w", err)
+		}
+		if err := df.Close(); err != nil {
+			return report, fmt.Errorf("close quarantine directory: %w", err)
+		}
+
+		// In case of error during staging or database operations, fail-closed restore staged files
+		defer func() {
+			if quarantineDir != "" {
+				allRestored := true
+				for _, sf := range staged {
+					if _, err := os.Stat(sf.StagedPath); err == nil {
+						if err := os.MkdirAll(filepath.Dir(sf.OriginalPath), 0o755); err != nil {
+							allRestored = false
+							continue
+						}
+						if err := os.Rename(sf.StagedPath, sf.OriginalPath); err != nil {
+							allRestored = false
+							continue
+						}
+					}
+				}
+				if allRestored {
+					_ = os.Remove(filepath.Join(quarantineDir, "quarantine_manifest.json"))
+					_ = os.RemoveAll(quarantineDir)
+				}
+			}
+		}()
+
+		// Perform physical rename of planned buffer files into quarantine staging
+		for _, sf := range staged {
+			if _, err := os.Stat(sf.OriginalPath); err == nil {
+				if err := os.Rename(sf.OriginalPath, sf.StagedPath); err != nil {
+					return report, fmt.Errorf("stage buffer file %s to quarantine: %w", sf.OriginalPath, err)
+				}
+			}
+		}
+
+		// Sync directory after file renames
+		if df, err := os.Open(quarantineDir); err == nil {
+			_ = df.Sync()
+			_ = df.Close()
+		}
 	}
 
 	// 13. Drop legacy tables if requested
@@ -557,16 +597,21 @@ func Run(ctx context.Context, opts MigrationOptions) (*MigrationReport, error) {
 		return report, fmt.Errorf("commit migration transaction: %w", err)
 	}
 
-	// 14. Finalize deletion: ONLY after database transaction is durably committed!
+	// 14. Finalize deletion: ONLY after database transaction is durably committed! Fail-closed on errors.
 	if quarantineDir != "" {
 		for _, sf := range staged {
-			if err := os.Remove(sf.StagedPath); err != nil {
+			if err := os.Remove(sf.StagedPath); err != nil && !os.IsNotExist(err) {
 				return report, fmt.Errorf("finalize removal of staged file %s: %w", sf.StagedPath, err)
 			}
 			report.CleanedFiles = append(report.CleanedFiles, sf.OriginalPath)
 		}
-		_ = os.Remove(filepath.Join(quarantineDir, "quarantine_manifest.json"))
-		_ = os.RemoveAll(quarantineDir)
+		manifestPath := filepath.Join(quarantineDir, "quarantine_manifest.json")
+		if err := os.Remove(manifestPath); err != nil && !os.IsNotExist(err) {
+			return report, fmt.Errorf("finalize removal of quarantine manifest: %w", err)
+		}
+		if err := os.RemoveAll(quarantineDir); err != nil {
+			return report, fmt.Errorf("finalize removal of quarantine dir: %w", err)
+		}
 		quarantineDir = "" // prevent defer from running
 	}
 
@@ -706,19 +751,28 @@ func ReconcilePendingQuarantines(ctx context.Context, dbPath string, bufferDir s
 		manifestPath := filepath.Join(qDir, "quarantine_manifest.json")
 		manifestBytes, err := os.ReadFile(manifestPath)
 		if err != nil {
-			// No manifest found: if directory is empty, clean it up
-			entries, readErr := os.ReadDir(qDir)
-			if readErr == nil && len(entries) == 0 {
-				_ = os.Remove(qDir)
-				report.CleanedDirs = append(report.CleanedDirs, qDir)
+			if os.IsNotExist(err) {
+				entries, readErr := os.ReadDir(qDir)
+				if readErr != nil {
+					return nil, fmt.Errorf("read quarantine dir %s without manifest: %w", qDir, readErr)
+				}
+				if len(entries) == 0 {
+					// Empty orphan quarantine directory: safely remove
+					if err := os.Remove(qDir); err != nil {
+						return nil, fmt.Errorf("remove empty orphan quarantine dir %s: %w", qDir, err)
+					}
+					report.CleanedDirs = append(report.CleanedDirs, qDir)
+					continue
+				}
+				// Non-empty directory without manifest: fail-closed to prevent data loss!
+				return nil, fmt.Errorf("quarantine directory %s is non-empty but missing quarantine_manifest.json (fail-closed to prevent data loss)", qDir)
 			}
-			continue
+			return nil, fmt.Errorf("read quarantine manifest %s: %w", manifestPath, err)
 		}
 
 		var manifest QuarantineManifest
 		if err := json.Unmarshal(manifestBytes, &manifest); err != nil {
-			// Corrupted manifest
-			continue
+			return nil, fmt.Errorf("unmarshal quarantine manifest %s: %w (fail-closed to prevent data loss)", manifestPath, err)
 		}
 
 		// Check verdict in DB
@@ -738,25 +792,50 @@ func ReconcilePendingQuarantines(ctx context.Context, dbPath string, bufferDir s
 		if isCommitted {
 			// Crash occurred AFTER DB commit: finalize deletion of staged files
 			for _, f := range manifest.Files {
-				if err := os.Remove(f.StagedPath); err == nil || os.IsNotExist(err) {
-					report.CleanedFiles = append(report.CleanedFiles, f.OriginalPath)
+				if err := os.Remove(f.StagedPath); err != nil && !os.IsNotExist(err) {
+					return nil, fmt.Errorf("reconcile purge staged file %s: %w (fail-closed)", f.StagedPath, err)
 				}
+				report.CleanedFiles = append(report.CleanedFiles, f.OriginalPath)
 			}
-			_ = os.Remove(manifestPath)
-			_ = os.RemoveAll(qDir)
+			if err := os.Remove(manifestPath); err != nil && !os.IsNotExist(err) {
+				return nil, fmt.Errorf("reconcile remove manifest %s: %w (fail-closed)", manifestPath, err)
+			}
+			if err := os.RemoveAll(qDir); err != nil {
+				return nil, fmt.Errorf("reconcile remove quarantine dir %s: %w (fail-closed)", qDir, err)
+			}
 			report.CleanedDirs = append(report.CleanedDirs, qDir)
 		} else {
 			// Crash occurred BEFORE or DURING DB commit: restore original files
 			for _, f := range manifest.Files {
 				if _, err := os.Stat(f.StagedPath); err == nil {
-					_ = os.MkdirAll(filepath.Dir(f.OriginalPath), 0o755)
-					if err := os.Rename(f.StagedPath, f.OriginalPath); err == nil {
-						report.RestoredFiles = append(report.RestoredFiles, f.OriginalPath)
+					if err := os.MkdirAll(filepath.Dir(f.OriginalPath), 0o755); err != nil {
+						return nil, fmt.Errorf("reconcile restore mkdir %s: %w (fail-closed)", filepath.Dir(f.OriginalPath), err)
 					}
+					if err := os.Rename(f.StagedPath, f.OriginalPath); err != nil {
+						return nil, fmt.Errorf("reconcile restore rename %s -> %s: %w (fail-closed)", f.StagedPath, f.OriginalPath, err)
+					}
+					report.RestoredFiles = append(report.RestoredFiles, f.OriginalPath)
+				} else if os.IsNotExist(err) {
+					// Staged file does not exist. Verify if it's already in OriginalPath
+					if _, origErr := os.Stat(f.OriginalPath); origErr == nil {
+						// File was not moved before crash, safe!
+					}
+				} else {
+					return nil, fmt.Errorf("stat staged file %s: %w (fail-closed)", f.StagedPath, err)
 				}
 			}
-			_ = os.Remove(manifestPath)
-			_ = os.RemoveAll(qDir)
+			// Verify that no staged files remain before purging manifest or directory
+			for _, f := range manifest.Files {
+				if _, err := os.Stat(f.StagedPath); err == nil {
+					return nil, fmt.Errorf("staged file %s still present after restore (fail-closed)", f.StagedPath)
+				}
+			}
+			if err := os.Remove(manifestPath); err != nil && !os.IsNotExist(err) {
+				return nil, fmt.Errorf("reconcile remove manifest %s: %w (fail-closed)", manifestPath, err)
+			}
+			if err := os.RemoveAll(qDir); err != nil {
+				return nil, fmt.Errorf("reconcile remove quarantine dir %s: %w (fail-closed)", qDir, err)
+			}
 			report.CleanedDirs = append(report.CleanedDirs, qDir)
 		}
 	}

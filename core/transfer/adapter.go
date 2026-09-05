@@ -2,6 +2,7 @@ package transfer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"sync/atomic"
@@ -11,6 +12,37 @@ import (
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
 )
+
+// InvocationError directly and authoritatively binds a physical invocation attempt ID and range label
+// to an error returned from an RPC call, eliminating concurrent key mismatch or race conditions.
+type InvocationError struct {
+	Err               error
+	PhysicalAttemptID string
+	RangeLabel        string
+}
+
+func (e *InvocationError) Error() string {
+	if e == nil || e.Err == nil {
+		return ""
+	}
+	return e.Err.Error()
+}
+
+func (e *InvocationError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+// ExtractPhysicalAttempt retrieves the authoritative physical invocation identity and range label from an error.
+func ExtractPhysicalAttempt(err error) (physicalID string, rangeLabel string, ok bool) {
+	var invErr *InvocationError
+	if errors.As(err, &invErr) {
+		return invErr.PhysicalAttemptID, invErr.RangeLabel, true
+	}
+	return "", "", false
+}
 
 // CDNProviderFunc defines the function signature for acquiring a CDN invoker.
 type CDNProviderFunc func(ctx context.Context, dc int, max int64) (tg.Invoker, io.Closer, error)
@@ -79,6 +111,13 @@ func (g *GatedInvoker) Invoke(ctx context.Context, input bin.Encoder, output bin
 				if hasTask {
 					tc.RecordFailedAttempt(rangeLabel, physID, ErrRequestBudgetExhausted)
 				}
+				if physID != "" {
+					return &InvocationError{
+						Err:               ErrRequestBudgetExhausted,
+						PhysicalAttemptID: physID,
+						RangeLabel:        rangeLabel,
+					}
+				}
 				return ErrRequestBudgetExhausted
 			}
 			if atomic.CompareAndSwapInt64(tc.RequestCount, cur, cur+1) {
@@ -92,6 +131,13 @@ func (g *GatedInvoker) Invoke(ctx context.Context, input bin.Encoder, output bin
 		if err != nil {
 			if hasTask {
 				tc.RecordFailedAttempt(rangeLabel, physID, err)
+			}
+			if physID != "" {
+				return &InvocationError{
+					Err:               err,
+					PhysicalAttemptID: physID,
+					RangeLabel:        rangeLabel,
+				}
 			}
 			return err
 		}
@@ -118,6 +164,13 @@ func (g *GatedInvoker) Invoke(ctx context.Context, input bin.Encoder, output bin
 	if hasTask && tc.WireBytes != nil {
 		if b := extractWireBytes(output); b > 0 {
 			atomic.AddInt64(tc.WireBytes, b)
+		}
+	}
+	if err != nil && physID != "" {
+		return &InvocationError{
+			Err:               err,
+			PhysicalAttemptID: physID,
+			RangeLabel:        rangeLabel,
 		}
 	}
 	return err

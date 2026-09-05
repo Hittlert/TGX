@@ -304,9 +304,12 @@ func TestLifecycle_RPCRetryHandler(t *testing.T) {
 		TaskRetryHandler: func(taskCtx context.Context, event downloader.RetryEvent) {
 			retryEventFired = true
 			tc, _ := transfer.TransferTaskFromContext(taskCtx)
-			physAttemptID := tc.GetFailedAttempt(event.Operation)
-			if physAttemptID == "" {
-				physAttemptID = fmt.Sprintf("%s-p%d", tc.AttemptID, event.Attempt)
+			physAttemptID, _, ok := transfer.ExtractPhysicalAttempt(event.Err)
+			if !ok || physAttemptID == "" {
+				physAttemptID = tc.GetFailedAttempt(event.Operation)
+				if physAttemptID == "" {
+					physAttemptID = fmt.Sprintf("%s-p%d", tc.AttemptID, event.Attempt)
+				}
 			}
 			EmitLifecycle(logger, LifecycleEvent{
 				Event:             EventRPCRetry,

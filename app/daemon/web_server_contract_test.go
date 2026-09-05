@@ -2518,49 +2518,68 @@ func TestWebServer_SSEHeartbeat(t *testing.T) {
 }
 
 func TestWebServer_SSEStalledClientBackpressure(t *testing.T) {
-	registry := NewRegistry(5, 100, time.Now)
+	registry := NewRegistry(100, 100, time.Now)
+	// Add active tasks with substantial payload so telemetry snapshots generate ~100KB per update,
+	// quickly filling kernel socket buffers and enforcing write deadline backpressure.
+	padding := strings.Repeat("x", 2048)
+	for i := 0; i < 50; i++ {
+		_, _, _ = registry.Submit(TaskRequest{
+			ID:           fmt.Sprintf("backpressure_task_%d", i),
+			Peer:         "-100123456789",
+			MessageID:    1000 + i,
+			FinalPath:    fmt.Sprintf("Channel_Test/%s_%d.bin", padding, i),
+			ExpectedSize: 1024 * 1024 * 50,
+		})
+		_, _ = registry.Next(context.Background())
+	}
+
 	ws := NewWebServer(nil, nil, nil, nil, nil, nil, registry, zap.NewNop(), "")
-	// Set very fast update interval (10ms) and short write timeout (50ms)
-	ws.SetSSEIntervals(10*time.Millisecond, 50*time.Millisecond, 50*time.Millisecond)
+	// Set 2ms updates, 20ms heartbeat, and 50ms write deadline
+	ws.SetSSEIntervals(2*time.Millisecond, 20*time.Millisecond, 50*time.Millisecond)
 
 	server := httptest.NewServer(ws.Handler())
 	defer server.Close()
 
-	// Connect using raw TCP dial to simulate a stalled client that stops reading
+	// Connect using raw TCP dial to simulate a stalled client that NEVER reads from socket
 	conn, err := net.Dial("tcp", strings.TrimPrefix(server.URL, "http://"))
 	if err != nil {
 		t.Fatalf("dial server: %v", err)
 	}
+	defer conn.Close()
+
+	if tcp, ok := conn.(*net.TCPConn); ok {
+		_ = tcp.SetReadBuffer(256)
+	}
 
 	// Send HTTP GET /api/events
 	reqStr := "GET /api/events HTTP/1.1\r\nHost: localhost\r\nAccept: text/event-stream\r\n\r\n"
-	_, err = conn.Write([]byte(reqStr))
-	if err != nil {
+	if _, err := conn.Write([]byte(reqStr)); err != nil {
 		t.Fatalf("write request: %v", err)
 	}
 
-	// Read headers and first snapshot
-	buf := make([]byte, 4096)
-	n, err := conn.Read(buf)
-	if err != nil || n == 0 {
-		t.Fatalf("read initial response: %v", err)
+	// Wait for server to accept and register active SSE connection
+	activeStart := time.Now()
+	for ws.ActiveSSEConnections() == 0 && time.Since(activeStart) < 300*time.Millisecond {
+		time.Sleep(2 * time.Millisecond)
 	}
-	if !strings.Contains(string(buf[:n]), "text/event-stream") {
-		t.Fatalf("expected text/event-stream, got: %s", string(buf[:n]))
+	if ws.ActiveSSEConnections() == 0 {
+		t.Fatal("expected ActiveSSEConnections to become > 0")
 	}
 
-	// Now client STALLS completely: stops reading anything from the connection.
-	// Server continues trying to write updates with 50ms write deadline.
-	// After write deadline fires, server should detect error and close connection.
-
-	// Wait up to 2 seconds for server to close the connection from its end
-	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	for {
-		_, err := conn.Read(buf)
-		if err != nil {
-			// Connection closed by server due to write deadline or EOF!
-			break
-		}
+	// Client STALLS completely: zero calls to conn.Read!
+	// Server continuously attempts to flush snapshots.
+	// Kernel socket buffer quickly saturates, causing SetWriteDeadline(50ms) to trigger.
+	// Assert server-side handler exits and ActiveSSEConnections drops to 0 well within 500ms (far less than 2s).
+	deadlineStart := time.Now()
+	for ws.ActiveSSEConnections() > 0 && time.Since(deadlineStart) < 600*time.Millisecond {
+		time.Sleep(5 * time.Millisecond)
 	}
-	_ = conn.Close()
+	elapsed := time.Since(deadlineStart)
+
+	if ws.ActiveSSEConnections() != 0 {
+		t.Fatalf("expected ActiveSSEConnections == 0 after server write deadline, but still %d after %v", ws.ActiveSSEConnections(), elapsed)
+	}
+	if elapsed > 450*time.Millisecond {
+		t.Fatalf("server took too long to enforce write deadline: %v (expected < 450ms, well below 2s)", elapsed)
+	}
 }

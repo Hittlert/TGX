@@ -948,3 +948,215 @@ func TestMigration_QuarantineManifest_NormalRunRecordsVerdictAndPurgesQuarantine
 		t.Fatalf("expected 0 quarantine directories remaining, found: %v", matches)
 	}
 }
+
+// 15. Acceptance Test: Crash during staging (partial rename) restores staged files and verifies intact unstaged files.
+func TestMigration_QuarantineManifest_CrashDuringStagingPartialRenameRestoresCorrectly(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "partial_crash.sqlite3")
+	bufferDir := filepath.Join(tempDir, "buffer")
+	if err := os.MkdirAll(bufferDir, 0o755); err != nil {
+		t.Fatalf("failed to create buffer dir: %v", err)
+	}
+
+	// Create SQLite DB without COMMITTED verdict (simulating crash before commit)
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("failed to open sqlite: %v", err)
+	}
+	_, _ = db.Exec("CREATE TABLE _tgx_migration_verdicts (migration_id TEXT PRIMARY KEY, committed_at INTEGER, status TEXT);")
+	db.Close()
+
+	qDir := filepath.Join(bufferDir, ".migrator_quarantine_987654")
+	if err := os.MkdirAll(qDir, 0o755); err != nil {
+		t.Fatalf("failed to create qDir: %v", err)
+	}
+
+	// File 1 was staged before crash
+	origFile1 := filepath.Join(bufferDir, "partially_staged_1.spool")
+	stagedFile1 := filepath.Join(qDir, "staged_0_partially_staged_1.spool")
+	content1 := []byte("already staged before crash")
+	if err := os.WriteFile(stagedFile1, content1, 0o644); err != nil {
+		t.Fatalf("failed to write staged file 1: %v", err)
+	}
+
+	// File 2 was planned in manifest, but crash occurred before it was renamed! So it remains at origFile2
+	origFile2 := filepath.Join(bufferDir, "not_yet_staged_2.spool")
+	stagedFile2 := filepath.Join(qDir, "staged_1_not_yet_staged_2.spool")
+	content2 := []byte("crash occurred before rename - still at original path")
+	if err := os.WriteFile(origFile2, content2, 0o644); err != nil {
+		t.Fatalf("failed to write original file 2: %v", err)
+	}
+
+	manifest := migration.QuarantineManifest{
+		MigrationID:   "mig_partial_staging_crash",
+		QuarantineDir: qDir,
+		CreatedAt:     987654,
+		Files: []migration.QuarantineFileEntry{
+			{
+				OriginalPath: origFile1,
+				StagedName:   "staged_0_partially_staged_1.spool",
+				StagedPath:   stagedFile1,
+				Size:         int64(len(content1)),
+			},
+			{
+				OriginalPath: origFile2,
+				StagedName:   "staged_1_not_yet_staged_2.spool",
+				StagedPath:   stagedFile2,
+				Size:         int64(len(content2)),
+			},
+		},
+	}
+	manifestBytes, _ := json.MarshalIndent(manifest, "", "  ")
+	if err := os.WriteFile(filepath.Join(qDir, "quarantine_manifest.json"), manifestBytes, 0o644); err != nil {
+		t.Fatalf("failed to write manifest: %v", err)
+	}
+
+	// Reconcile pending quarantines
+	recReport, err := migration.ReconcilePendingQuarantines(context.Background(), dbPath, bufferDir)
+	if err != nil {
+		t.Fatalf("reconcile pending quarantines failed: %v", err)
+	}
+
+	// File 1 should be restored to original path
+	if len(recReport.RestoredFiles) != 1 || recReport.RestoredFiles[0] != origFile1 {
+		t.Fatalf("expected restored files to contain origFile1, got: %v", recReport.RestoredFiles)
+	}
+
+	read1, err := os.ReadFile(origFile1)
+	if err != nil || string(read1) != string(content1) {
+		t.Fatalf("origFile1 content mismatch: %v, err: %v", string(read1), err)
+	}
+
+	// File 2 should remain intact at its original path
+	read2, err := os.ReadFile(origFile2)
+	if err != nil || string(read2) != string(content2) {
+		t.Fatalf("origFile2 content mismatch: %v, err: %v", string(read2), err)
+	}
+
+	// Quarantine directory should be cleaned up
+	if _, err := os.Stat(qDir); !os.IsNotExist(err) {
+		t.Fatalf("quarantine dir should be cleaned up after successful reconcile")
+	}
+}
+
+// 16. Acceptance Test: Failure during file restoration fails closed and preserves quarantine directory and files without data loss.
+func TestMigration_QuarantineManifest_RestoreFailureFailsClosedAndRetainsData(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "restore_fail.sqlite3")
+	bufferDir := filepath.Join(tempDir, "buffer")
+	if err := os.MkdirAll(bufferDir, 0o755); err != nil {
+		t.Fatalf("failed to create buffer dir: %v", err)
+	}
+
+	qDir := filepath.Join(bufferDir, ".migrator_quarantine_112233")
+	if err := os.MkdirAll(qDir, 0o755); err != nil {
+		t.Fatalf("failed to create qDir: %v", err)
+	}
+
+	// Original path is inside a read-only directory to force rename failure
+	blockedDir := filepath.Join(bufferDir, "blocked_dir")
+	if err := os.MkdirAll(blockedDir, 0o555); err != nil {
+		t.Fatalf("failed to create blocked dir: %v", err)
+	}
+	defer func() {
+		_ = os.Chmod(blockedDir, 0o755)
+	}()
+
+	origFile := filepath.Join(blockedDir, "cannot_restore_here.spool")
+	stagedFile := filepath.Join(qDir, "staged_0_file.spool")
+	valuableData := []byte("irreplaceable data that must not be deleted on restore failure")
+	if err := os.WriteFile(stagedFile, valuableData, 0o644); err != nil {
+		t.Fatalf("failed to write staged file: %v", err)
+	}
+
+	manifest := migration.QuarantineManifest{
+		MigrationID:   "mig_restore_fail_test",
+		QuarantineDir: qDir,
+		CreatedAt:     112233,
+		Files: []migration.QuarantineFileEntry{
+			{
+				OriginalPath: origFile,
+				StagedName:   "staged_0_file.spool",
+				StagedPath:   stagedFile,
+				Size:         int64(len(valuableData)),
+			},
+		},
+	}
+	manifestBytes, _ := json.MarshalIndent(manifest, "", "  ")
+	if err := os.WriteFile(filepath.Join(qDir, "quarantine_manifest.json"), manifestBytes, 0o644); err != nil {
+		t.Fatalf("failed to write manifest: %v", err)
+	}
+
+	// Reconcile pending quarantines must FAIL CLOSED because restore to read-only dir fails
+	_, err := migration.ReconcilePendingQuarantines(context.Background(), dbPath, bufferDir)
+	if err == nil {
+		t.Fatal("expected error from ReconcilePendingQuarantines when restore fails, got nil")
+	}
+
+	// Quarantine directory and staged file MUST still exist!
+	if _, err := os.Stat(stagedFile); os.IsNotExist(err) {
+		t.Fatal("staged file was unexpectedly deleted after restore failure! Data loss occurred!")
+	}
+	readStaged, err := os.ReadFile(stagedFile)
+	if err != nil || string(readStaged) != string(valuableData) {
+		t.Fatalf("staged data damaged: %v, err: %v", string(readStaged), err)
+	}
+	if _, err := os.Stat(qDir); os.IsNotExist(err) {
+		t.Fatal("quarantine directory was unexpectedly deleted after restore failure!")
+	}
+}
+
+// 17. Acceptance Test: Non-empty quarantine directory without manifest fails closed and is never silently deleted.
+func TestMigration_QuarantineManifest_NonEmptyOrphanDirFailsClosed(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "orphan.sqlite3")
+	bufferDir := filepath.Join(tempDir, "buffer")
+	if err := os.MkdirAll(bufferDir, 0o755); err != nil {
+		t.Fatalf("failed to create buffer dir: %v", err)
+	}
+
+	// 1. Non-empty quarantine directory without manifest
+	nonEmptyQDir := filepath.Join(bufferDir, ".migrator_quarantine_non_empty")
+	if err := os.MkdirAll(nonEmptyQDir, 0o755); err != nil {
+		t.Fatalf("failed to create non-empty qDir: %v", err)
+	}
+	orphanFilePath := filepath.Join(nonEmptyQDir, "unmanifested_leftover.spool")
+	orphanData := []byte("unmanifested data that must be preserved")
+	if err := os.WriteFile(orphanFilePath, orphanData, 0o644); err != nil {
+		t.Fatalf("failed to write orphan file: %v", err)
+	}
+
+	// Reconcile should FAIL-CLOSED with an error
+	_, err := migration.ReconcilePendingQuarantines(context.Background(), dbPath, bufferDir)
+	if err == nil {
+		t.Fatal("expected error for non-empty quarantine directory without manifest, got nil")
+	}
+
+	// The orphan file and directory must NOT be removed
+	if _, err := os.Stat(orphanFilePath); os.IsNotExist(err) {
+		t.Fatal("orphan file was unexpectedly deleted!")
+	}
+	if _, err := os.Stat(nonEmptyQDir); os.IsNotExist(err) {
+		t.Fatal("non-empty orphan quarantine dir was unexpectedly deleted!")
+	}
+
+	// 2. An empty orphan directory SHOULD be safely pruned
+	_ = os.Remove(orphanFilePath)
+	_ = os.Remove(nonEmptyQDir)
+
+	emptyQDir := filepath.Join(bufferDir, ".migrator_quarantine_empty")
+	if err := os.MkdirAll(emptyQDir, 0o755); err != nil {
+		t.Fatalf("failed to create empty qDir: %v", err)
+	}
+
+	recReport, err := migration.ReconcilePendingQuarantines(context.Background(), dbPath, bufferDir)
+	if err != nil {
+		t.Fatalf("expected no error for empty quarantine dir, got: %v", err)
+	}
+	if len(recReport.CleanedDirs) != 1 || recReport.CleanedDirs[0] != emptyQDir {
+		t.Fatalf("expected emptyQDir in CleanedDirs, got: %v", recReport.CleanedDirs)
+	}
+	if _, err := os.Stat(emptyQDir); !os.IsNotExist(err) {
+		t.Fatal("empty orphan quarantine dir should have been removed")
+	}
+}

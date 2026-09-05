@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -40,6 +41,11 @@ type WebServer struct {
 	sseUpdateInterval    time.Duration
 	sseHeartbeatInterval time.Duration
 	sseWriteTimeout      time.Duration
+	activeSSE            atomic.Int64
+}
+
+func (s *WebServer) ActiveSSEConnections() int64 {
+	return s.activeSSE.Load()
 }
 
 func (s *WebServer) SetAuthWizard(w *AuthWizard) {
@@ -658,6 +664,9 @@ func (s *WebServer) handleEventsStream(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "streaming unsupported")
 		return
 	}
+
+	s.activeSSE.Add(1)
+	defer s.activeSSE.Add(-1)
 
 	rc := http.NewResponseController(w)
 	updateInt, heartbeatInt, writeTimeout := s.getSSEIntervals()

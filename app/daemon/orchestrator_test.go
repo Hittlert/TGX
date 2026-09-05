@@ -121,9 +121,24 @@ func setupTestOrchestratorWithAccess(t *testing.T, access TelegramAccess) (*Orch
 		MaxDataInFlight: 10,
 		TaskRetryHandler: func(taskCtx context.Context, event downloader.RetryEvent) {
 			tc, _ := transfer.TransferTaskFromContext(taskCtx)
-			physAttemptID := tc.GetFailedAttempt(event.Operation)
-			if physAttemptID == "" {
-				physAttemptID = fmt.Sprintf("%s-p%d", tc.AttemptID, event.Attempt)
+			physAttemptID, rangeLabel, ok := transfer.ExtractPhysicalAttempt(event.Err)
+			if !ok || physAttemptID == "" {
+				physAttemptID = tc.GetFailedAttempt(event.Operation)
+				if physAttemptID == "" {
+					physAttemptID = fmt.Sprintf("%s-p%d", tc.AttemptID, event.Attempt)
+				}
+			}
+			op := event.Operation
+			if rangeLabel != "" {
+				op = fmt.Sprintf("%s:%s", event.Operation, rangeLabel)
+			}
+			extra := map[string]any{
+				"operation":           event.Operation,
+				"attempt":             event.Attempt,
+				"physical_attempt_id": physAttemptID,
+			}
+			if rangeLabel != "" {
+				extra["range"] = rangeLabel
 			}
 			EmitLifecycle(zap.NewNop(), LifecycleEvent{
 				Event:             EventRPCRetry,
@@ -133,14 +148,10 @@ func setupTestOrchestratorWithAccess(t *testing.T, access TelegramAccess) (*Orch
 				ChatID:            tc.ChatID,
 				MessageID:         tc.MessageID,
 				DC:                tc.DCID,
-				Op:                event.Operation,
+				Op:                op,
 				PhysicalRetries:   int64(event.Attempt),
 				Error:             fmt.Sprintf("%v", event.Err),
-				Extra: map[string]any{
-					"operation":           event.Operation,
-					"attempt":             event.Attempt,
-					"physical_attempt_id": physAttemptID,
-				},
+				Extra:             extra,
 			})
 		},
 	})
@@ -1132,5 +1143,164 @@ func TestOrchestrator_MultiPartConcurrentRetry_UniquenessAndCausality(t *testing
 	expectedRetryPhysID := fmt.Sprintf("%s-chunk-%d-a1", gen, chunkSize)
 	if retryEvt.PhysicalAttemptID != expectedRetryPhysID {
 		t.Fatalf("expected retry event to carry causally linked physical attempt %s, got %s", expectedRetryPhysID, retryEvt.PhysicalAttemptID)
+	}
+}
+
+// 11. Two concurrent failing chunks with interleaved retries:
+// Strictly asserts that when multiple chunks fail concurrently, each RetryEvent authoritatively
+// carries its OWN physical attempt ID (derived directly from the failed invocation error) without
+// any cross-talk, race conditions, or fallback to the other chunk's ID.
+func TestOrchestrator_TwoConcurrentChunkFailures_InterleavedCausality(t *testing.T) {
+	var (
+		invocationsMu sync.Mutex
+		allPhysIDs    []string
+		chunk0Calls   int64
+		chunk1Calls   int64
+	)
+
+	chunkSize := 512 * 1024
+	totalSize := int64(chunkSize * 2)
+
+	invoker := invokerFunc(func(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
+		req, ok := input.(*tg.UploadGetFileRequest)
+		if !ok {
+			return errors.New("unsupported request type")
+		}
+
+		physID := transfer.PhysicalAttemptIDFromContext(ctx)
+		invocationsMu.Lock()
+		allPhysIDs = append(allPhysIDs, physID)
+		invocationsMu.Unlock()
+
+		if req.Offset == 0 {
+			call := atomic.AddInt64(&chunk0Calls, 1)
+			if call == 1 {
+				// Chunk 0 fails on attempt 1 with transient timeout
+				return tgerr.New(500, tg.ErrTimeout)
+			}
+		} else if req.Offset == int64(chunkSize) {
+			call := atomic.AddInt64(&chunk1Calls, 1)
+			if call == 1 {
+				// Chunk 1 fails on attempt 1 with transient timeout
+				return tgerr.New(500, tg.ErrTimeout)
+			}
+		}
+
+		remaining := totalSize - req.Offset
+		if remaining <= 0 {
+			setUploadFile(output, []byte{})
+			return nil
+		}
+		limit := req.Limit
+		if remaining < int64(limit) {
+			limit = int(remaining)
+		}
+		data := make([]byte, limit)
+		for i := range data {
+			data[i] = byte((int(req.Offset) + i) % 256)
+		}
+		setUploadFile(output, data)
+		return nil
+	})
+
+	var observedEvents []LifecycleEvent
+	var obsMu sync.Mutex
+	unreg := RegisterLifecycleObserver(LifecycleObserverFunc(func(evt LifecycleEvent) {
+		obsMu.Lock()
+		defer obsMu.Unlock()
+		observedEvents = append(observedEvents, evt)
+	}))
+	defer unreg()
+
+	access := &mockAccessWithPool{
+		pool: &mockPool{invoker: invoker},
+		resolveFn: func(ctx context.Context, peer string, messageID int) (ResolvedMedia, error) {
+			return ResolvedMedia{
+				File:      &orchMockMediaFile{loc: &tg.InputDocumentFileLocation{ID: 7777, AccessHash: 6666}, sz: totalSize, dc: 2},
+				Name:      "concurrent_failures.bin",
+				Size:      totalSize,
+				DCID:      2,
+				MediaType: "document",
+				Date:      time.Now().Unix(),
+			}, nil
+		},
+	}
+	orch, registry, db, saveDir := setupTestOrchestratorWithAccess(t, access)
+	defer db.Close()
+
+	req := TaskRequest{
+		ID:           "case_two_concurrent_failures",
+		Peer:         "-1007777",
+		MessageID:    666,
+		FinalPath:    "Concurrent/concurrent_failures.bin",
+		ExpectedSize: totalSize,
+		MaxRetries:   3,
+	}
+
+	_, _, _ = registry.Submit(req)
+	task, _ := registry.Next(context.Background())
+
+	orch.downloadOne(context.Background(), task)
+
+	snap := task.Snapshot()
+	if snap.State != StateSuccess {
+		t.Fatalf("expected StateSuccess, got: %s (err: %s)", snap.State, snap.Error)
+	}
+
+	// Verify file on disk
+	finalPath := filepath.Join(saveDir, filepath.FromSlash(req.FinalPath))
+	info, err := os.Stat(finalPath)
+	if err != nil {
+		t.Fatalf("final file missing: %v", err)
+	}
+	if info.Size() != totalSize {
+		t.Fatalf("expected size %d, got %d", totalSize, info.Size())
+	}
+
+	// Find the retry events for this task
+	obsMu.Lock()
+	defer obsMu.Unlock()
+	var retries []LifecycleEvent
+	for _, evt := range observedEvents {
+		if evt.TaskID == req.ID && evt.Event == EventRPCRetry {
+			retries = append(retries, evt)
+		}
+	}
+
+	if len(retries) != 2 {
+		t.Fatalf("expected exactly 2 EventRPCRetry events for the two failing chunks, got %d", len(retries))
+	}
+
+	gen := task.Generation()
+	expected0 := fmt.Sprintf("%s-chunk-0-a1", gen)
+	expected1 := fmt.Sprintf("%s-chunk-%d-a1", gen, chunkSize)
+
+	var found0, found1 bool
+	for _, r := range retries {
+		if r.PhysicalAttemptID == expected0 {
+			found0 = true
+			if r.Op != "reader.chunk:chunk-0" {
+				t.Fatalf("expected op reader.chunk:chunk-0 for chunk 0, got %s", r.Op)
+			}
+			if r.Extra["range"] != "chunk-0" {
+				t.Fatalf("expected extra.range chunk-0, got %v", r.Extra["range"])
+			}
+		}
+		if r.PhysicalAttemptID == expected1 {
+			found1 = true
+			if r.Op != fmt.Sprintf("reader.chunk:chunk-%d", chunkSize) {
+				t.Fatalf("expected op reader.chunk:chunk-%d for chunk 1, got %s", chunkSize, r.Op)
+			}
+			if r.Extra["range"] != fmt.Sprintf("chunk-%d", chunkSize) {
+				t.Fatalf("expected extra.range chunk-%d, got %v", chunkSize, r.Extra["range"])
+			}
+		}
+	}
+
+	if !found0 {
+		t.Fatalf("did not find RetryEvent for chunk 0 with attempt ID %s (got: %v)", expected0, retries)
+	}
+	if !found1 {
+		t.Fatalf("did not find RetryEvent for chunk 1 with attempt ID %s (got: %v)", expected1, retries)
 	}
 }
