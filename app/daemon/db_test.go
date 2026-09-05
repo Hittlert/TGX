@@ -292,3 +292,49 @@ func TestDB_CompleteExistingDownload_Guards(t *testing.T) {
 		t.Fatalf("expected CompleteExistingDownload on fresh record to succeed, got: %v", err)
 	}
 }
+
+// 8. Idempotent success checks SHA, path, and size (full three-way proof).
+func TestDB_IdempotentSuccess_RejectsConflictingPathOrSize(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	chatID := "-1001234567"
+	msgID := 109
+	gen := "gen_1"
+
+	// Transition to success with genuine proof
+	if err := db.BeginDownload(chatID, msgID, gen, "test.mp4", "path/test.mp4", "video", 1024); err != nil {
+		t.Fatalf("BeginDownload failed: %v", err)
+	}
+	if err := db.PrepareDownloadCommit(chatID, msgID, gen, "path/test.mp4", 1024, "hash123"); err != nil {
+		t.Fatalf("PrepareDownloadCommit failed: %v", err)
+	}
+	if err := db.CompleteDownloadAndQueueArchive(chatID, msgID, gen, "path/test.mp4", 1024, "hash123", false); err != nil {
+		t.Fatalf("CompleteDownloadAndQueueArchive failed: %v", err)
+	}
+
+	// 1. PrepareDownloadCommit called with same SHA but conflicting path must return ErrStateConflict
+	if err := db.PrepareDownloadCommit(chatID, msgID, gen, "conflicting/path.mp4", 1024, "hash123"); !errors.Is(err, ErrStateConflict) {
+		t.Fatalf("expected ErrStateConflict when PrepareDownloadCommit has conflicting path on success, got: %v", err)
+	}
+
+	// 2. PrepareDownloadCommit called with same SHA but conflicting size must return ErrStateConflict
+	if err := db.PrepareDownloadCommit(chatID, msgID, gen, "path/test.mp4", 2048, "hash123"); !errors.Is(err, ErrStateConflict) {
+		t.Fatalf("expected ErrStateConflict when PrepareDownloadCommit has conflicting size on success, got: %v", err)
+	}
+
+	// 3. CompleteExistingDownload called with same SHA but conflicting path must return ErrStateConflict
+	if err := db.CompleteExistingDownload(chatID, msgID, "gen_2", "conflicting/path.mp4", 1024, "hash123", false); !errors.Is(err, ErrStateConflict) {
+		t.Fatalf("expected ErrStateConflict when CompleteExistingDownload has conflicting path on success, got: %v", err)
+	}
+
+	// 4. CompleteExistingDownload called with same SHA but conflicting size must return ErrStateConflict
+	if err := db.CompleteExistingDownload(chatID, msgID, "gen_2", "path/test.mp4", 2048, "hash123", false); !errors.Is(err, ErrStateConflict) {
+		t.Fatalf("expected ErrStateConflict when CompleteExistingDownload has conflicting size on success, got: %v", err)
+	}
+
+	// 5. CompleteExistingDownload called with identical proof must succeed (idempotent)
+	if err := db.CompleteExistingDownload(chatID, msgID, "gen_2", "path/test.mp4", 1024, "hash123", false); err != nil {
+		t.Fatalf("expected identical CompleteExistingDownload on success to succeed, got: %v", err)
+	}
+}

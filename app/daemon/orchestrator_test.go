@@ -1304,3 +1304,49 @@ func TestOrchestrator_TwoConcurrentChunkFailures_InterleavedCausality(t *testing
 		t.Fatalf("did not find RetryEvent for chunk 1 with attempt ID %s (got: %v)", expected1, retries)
 	}
 }
+
+func TestOrchestrator_BeginDownloadRejectionFailsAdmissionImmediately(t *testing.T) {
+	resolveCalled := false
+	access := &mockAccessWithPool{
+		resolveFn: func(ctx context.Context, peer string, messageID int) (ResolvedMedia, error) {
+			resolveCalled = true
+			return ResolvedMedia{}, errors.New("should not be called when BeginDownload fails")
+		},
+	}
+	orch, registry, db, _ := setupTestOrchestratorWithAccess(t, access)
+	defer db.Close()
+
+	chatID := "-1008888"
+	msgID := 999
+	now := time.Now().Unix()
+
+	// Pre-seed an unavailable record in DB
+	_, _ = db.Execute(`
+		INSERT INTO download_records (chat_id, message_id, status, file_name, save_path, media_type, file_size, attempt_generation, created_at, updated_at)
+		VALUES (?, ?, 'unavailable', 'test.bin', 'test.bin', 'document', 100, 'old_gen', ?, ?)
+	`, chatID, msgID, now, now)
+
+	req := TaskRequest{
+		ID:           "case_begin_download_reject",
+		Peer:         chatID,
+		MessageID:    msgID,
+		FinalPath:    "Vault/test.bin",
+		ExpectedSize: 100,
+	}
+
+	_, _, _ = registry.Submit(req)
+	task, _ := registry.Next(context.Background())
+
+	orch.downloadOne(context.Background(), task)
+
+	snap := task.Snapshot()
+	if snap.State != StateFailed {
+		t.Fatalf("expected StateFailed, got: %s", snap.State)
+	}
+	if snap.ErrorClass != "db_conflict" {
+		t.Fatalf("expected ErrorClass 'db_conflict', got: %s", snap.ErrorClass)
+	}
+	if resolveCalled {
+		t.Fatal("TelegramAccess.Resolve was called despite BeginDownload rejection at admission!")
+	}
+}

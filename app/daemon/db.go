@@ -1013,9 +1013,13 @@ func (d *Database) PrepareDownloadCommit(chatID string, messageID int, generatio
 	if currentStatus == "committing" && currentGen == generation && currentSHA == sha256Hex && currentPath == relPath && currentSize == size {
 		return nil
 	}
-	// If already success with same sha256
-	if currentStatus == "success" && currentSHA == sha256Hex {
-		return nil
+	// Idempotency: if already success with matching three-way proof (sha256, path, and size)
+	if currentStatus == "success" {
+		if currentSHA == sha256Hex && currentPath == relPath && currentSize == size {
+			return nil
+		}
+		return fmt.Errorf("%w: already success with conflicting proof (sha: %q vs %q, size: %d vs %d, path: %q vs %q)",
+			ErrStateConflict, currentSHA, sha256Hex, currentSize, size, currentPath, relPath)
 	}
 	// Generation guard: reject stale attempts
 	if currentGen != generation {
@@ -1171,8 +1175,11 @@ func (d *Database) CompleteExistingDownload(chatID string, messageID int, genera
 		return err
 	} else {
 		if currentStatus == "success" {
-			if currentSHA != "" && currentSHA != sha256Hex {
-				return fmt.Errorf("%w: already success with different sha %q vs %q", ErrStateConflict, currentSHA, sha256Hex)
+			if (currentSHA != "" && currentSHA != sha256Hex) ||
+				(currentPath != "" && currentPath != relPath) ||
+				(currentSize > 0 && currentSize != size) {
+				return fmt.Errorf("%w: already success with conflicting proof (sha: %q vs %q, size: %d vs %d, path: %q vs %q)",
+					ErrStateConflict, currentSHA, sha256Hex, currentSize, size, currentPath, relPath)
 			}
 		} else if currentStatus == "committing" || currentStatus == "downloading" {
 			if currentGen != "" && generation != "" && currentGen != generation {

@@ -367,9 +367,28 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 
 	// 1. Media Ingress / Resolution (done first to obtain authoritative size and metadata)
 	if o.db != nil {
-		if beginErr := o.db.BeginDownload(chatID, msgID, gen, req.FileName, req.FinalPath, req.MediaType, req.ExpectedSize); errors.Is(beginErr, ErrAlreadySuccess) {
-			o.logger.Info("task already completed successfully in DB", zap.String("task_id", taskID))
-			task.Succeed(req.FinalPath, true)
+		beginErr := o.db.BeginDownload(chatID, msgID, gen, req.FileName, req.FinalPath, req.MediaType, req.ExpectedSize)
+		if beginErr != nil {
+			if errors.Is(beginErr, ErrAlreadySuccess) {
+				o.logger.Info("task already completed successfully in DB", zap.String("task_id", taskID))
+				task.Succeed(req.FinalPath, true)
+				return
+			}
+			o.logger.Warn("cannot begin download: DB state rejected",
+				zap.String("task_id", taskID),
+				zap.Error(beginErr),
+			)
+			disp := FailureDisposition{
+				Stage:       "admission",
+				Op:          "db_begin_download",
+				Class:       "db_conflict",
+				Unavailable: false,
+				Retryable:   false,
+				RetryOwner:  "none",
+				Message:     beginErr.Error(),
+				Cause:       beginErr,
+			}
+			task.FailDisposition(disp)
 			return
 		}
 	}
@@ -585,6 +604,11 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 	// 5. Durably accept planned path in DB and transition to downloading BEFORE filesystem mutation!
 	if o.db != nil {
 		if err := o.db.BeginDownload(chatID, msgID, gen, fileName, finalRelPath, mediaType, authoritativeSize); err != nil {
+			if errors.Is(err, ErrAlreadySuccess) {
+				o.logger.Info("task already completed successfully in DB with planned path", zap.String("task_id", taskID))
+				task.Succeed(finalRelPath, true)
+				return
+			}
 			o.logger.Error("failed to begin download in DB with planned path",
 				zap.String("task_id", taskID),
 				zap.String("planned_path", finalRelPath),
