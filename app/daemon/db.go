@@ -589,7 +589,7 @@ func (d *Database) UpdateDownloadStatus(chatID string, messageID int, status str
 	var currentAttempts int
 	_ = d.db.QueryRow(`SELECT status, attempts FROM download_records WHERE chat_id = ? AND message_id = ?`, chatID, messageID).Scan(&currentStatus, &currentAttempts)
 
-	if currentStatus == "success" {
+	if currentStatus == "success" || currentStatus == "conflict" {
 		return nil
 	}
 	if currentStatus == "failed" && status == "failed" {
@@ -1562,18 +1562,107 @@ func (d *Database) SetArchiveJobConflict(chatID string, messageID int, claimID s
 	return nil
 }
 
+// RecordTargetConflict records an authoritative, permanent target conflict transition.
+// It is generation-aware, durably sets status = 'conflict' and next_retry_at = 0,
+// permanently excluding the record from automatic GetPendingDownloads scans until deliberate manual resolution.
+func (d *Database) RecordTargetConflict(
+	chatID string, messageID int, generation string,
+	fileName, savePath, mediaType string, fileSize int64,
+	disp FailureDisposition,
+) error {
+	d.lock.Lock()
+	defer d.lock.Unlock()
+
+	now := time.Now().Unix()
+	var currentStatus, currentGen string
+	err := d.db.QueryRow(`
+		SELECT status, COALESCE(attempt_generation, '')
+		FROM download_records
+		WHERE chat_id = ? AND message_id = ?
+	`, chatID, messageID).Scan(&currentStatus, &currentGen)
+	if err == sql.ErrNoRows {
+		_, err = d.db.Exec(`
+			INSERT INTO download_records (
+				chat_id, message_id, status, file_name, save_path, media_type,
+				file_size, error, attempts, next_retry_at, attempt_generation, created_at, updated_at
+			) VALUES (?, ?, 'conflict', ?, ?, ?, ?, ?, 1, 0, ?, ?, ?)
+		`, chatID, messageID, fileName, savePath, mediaType, fileSize, disp.Error(), generation, now, now)
+		return err
+	} else if err != nil {
+		return err
+	}
+
+	if currentStatus == "success" || currentStatus == "conflict" {
+		return nil
+	}
+	if currentGen != "" && generation != "" && currentGen != generation {
+		return ErrStaleAttempt
+	}
+
+	res, err := d.db.Exec(`
+		UPDATE download_records
+		SET status = 'conflict',
+			file_name = CASE WHEN ? != '' THEN ? ELSE file_name END,
+			save_path = CASE WHEN ? != '' THEN ? ELSE save_path END,
+			media_type = CASE WHEN ? != '' THEN ? ELSE media_type END,
+			file_size = CASE WHEN ? > 0 THEN ? ELSE file_size END,
+			error = ?,
+			next_retry_at = 0,
+			updated_at = ?
+		WHERE chat_id = ? AND message_id = ?
+		  AND status != 'success'
+		  AND (attempt_generation = ? OR attempt_generation = '')
+	`, fileName, fileName, savePath, savePath, mediaType, mediaType, fileSize, fileSize,
+		disp.Error(), now, chatID, messageID, generation)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("%w: zero rows affected in RecordTargetConflict", ErrStaleAttempt)
+	}
+	return nil
+}
+
+// ResolveTargetConflict provides a deliberate manual resolution path, resetting a conflict record to pending.
+func (d *Database) ResolveTargetConflict(chatID string, messageID int) error {
+	d.lock.Lock()
+	defer d.lock.Unlock()
+
+	now := time.Now().Unix()
+	res, err := d.db.Exec(`
+		UPDATE download_records
+		SET status = 'pending',
+			error = '',
+			next_retry_at = 0,
+			updated_at = ?
+		WHERE chat_id = ? AND message_id = ? AND status = 'conflict'
+	`, now, chatID, messageID)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("no conflict record found for chat %s message %d", chatID, messageID)
+	}
+	return nil
+}
+
 // FailDownloadDisposition records download failure or unavailability using a structured FailureDisposition,
-// preventing confusion over positional boolean parameters.
+// routing non-retryable target conflicts to the permanent 'conflict' status.
 func (d *Database) FailDownloadDisposition(
 	chatID string, messageID int, generation string,
 	fileName, savePath, mediaType string, fileSize int64,
 	disp FailureDisposition,
 ) error {
+	if disp.Class == "target_conflict" {
+		return d.RecordTargetConflict(chatID, messageID, generation, fileName, savePath, mediaType, fileSize, disp)
+	}
 	return d.FailDownload(chatID, messageID, generation, fileName, savePath, mediaType, fileSize, disp.Error(), disp.Unavailable)
 }
 
 // FailDownload records download failure or unavailability, strictly honoring attempt generation
-// and never overwriting terminal 'success'.
+// and never overwriting terminal 'success' or 'conflict'.
 func (d *Database) FailDownload(chatID string, messageID int, generation string, fileName, savePath, mediaType string, fileSize int64, errMsg string, isUnavailable bool) error {
 	d.lock.Lock()
 	defer d.lock.Unlock()
@@ -1602,7 +1691,7 @@ func (d *Database) FailDownload(chatID string, messageID int, generation string,
 		return err
 	}
 
-	if currentStatus == "success" || currentStatus == "failed" || currentStatus == "unavailable" {
+	if currentStatus == "success" || currentStatus == "failed" || currentStatus == "unavailable" || currentStatus == "conflict" {
 		return nil
 	}
 	if currentGen != "" && generation != "" && currentGen != generation {
@@ -1646,7 +1735,7 @@ func (d *Database) FailDownload(chatID string, messageID int, generation string,
 			next_retry_at = ?,
 			updated_at = ?
 		WHERE chat_id = ? AND message_id = ?
-		  AND status != 'success'
+		  AND status NOT IN ('success', 'conflict')
 		  AND (attempt_generation = ? OR attempt_generation = '')
 	`, status, fileName, fileName, savePath, savePath, mediaType, mediaType, fileSize, fileSize,
 		errMsg, status, nextRetryAt, now, chatID, messageID, generation)

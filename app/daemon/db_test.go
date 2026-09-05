@@ -548,4 +548,3 @@ func TestDB_BeginDownload_UpdatesMetadataForSameGeneration(t *testing.T) {
 		t.Fatalf("expected FileName 'movie.mp4', got: %q", rec.FileName)
 	}
 }
-

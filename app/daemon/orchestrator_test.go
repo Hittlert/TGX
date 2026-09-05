@@ -2568,14 +2568,18 @@ func TestRecovery_ReconcileCommittingRecord_ConflictingFinal_PreservesProofsAndS
 		t.Fatalf("conflicting final file was deleted or corrupted: %v", err)
 	}
 
-	// 3. Assert DB record is failed with target_conflict (MUST NOT BE PENDING!)
+	// 3. Assert DB record is durably set to 'conflict' with next_retry_at = 0 (MUST NOT BE PENDING OR FAILED!)
 	var dbStatus, dbError string
-	err = db.db.QueryRow(`SELECT status, COALESCE(error, '') FROM download_records WHERE chat_id = ? AND message_id = ?`, chatID, msgID).Scan(&dbStatus, &dbError)
+	var nextRetryAt int64
+	err = db.db.QueryRow(`SELECT status, COALESCE(error, ''), next_retry_at FROM download_records WHERE chat_id = ? AND message_id = ?`, chatID, msgID).Scan(&dbStatus, &dbError, &nextRetryAt)
 	if err != nil {
 		t.Fatalf("query DB: %v", err)
 	}
-	if dbStatus != "failed" {
-		t.Fatalf("expected durable status 'failed', got %q (must not be reset to pending)", dbStatus)
+	if dbStatus != "conflict" {
+		t.Fatalf("expected durable status 'conflict', got %q (must not be reset to pending or failed)", dbStatus)
+	}
+	if nextRetryAt != 0 {
+		t.Fatalf("expected next_retry_at == 0 for permanent conflict, got %d", nextRetryAt)
 	}
 	if !strings.Contains(dbError, "target_conflict") {
 		t.Fatalf("expected error to contain 'target_conflict', got %q", dbError)
@@ -2721,14 +2725,18 @@ func TestRecovery_ReconcileCommittingRecord_InitialConflictingFinal_PreservesPro
 		t.Fatalf("conflicting final file was deleted or corrupted: %v", err)
 	}
 
-	// 3. Assert DB record is failed with target_conflict (MUST NOT BE PENDING!)
+	// 3. Assert DB record is durably set to 'conflict' with next_retry_at = 0 (MUST NOT BE PENDING OR FAILED!)
 	var dbStatus, dbError string
-	err = db.db.QueryRow(`SELECT status, COALESCE(error, '') FROM download_records WHERE chat_id = ? AND message_id = ?`, chatID, msgID).Scan(&dbStatus, &dbError)
+	var nextRetryAt int64
+	err = db.db.QueryRow(`SELECT status, COALESCE(error, ''), next_retry_at FROM download_records WHERE chat_id = ? AND message_id = ?`, chatID, msgID).Scan(&dbStatus, &dbError, &nextRetryAt)
 	if err != nil {
 		t.Fatalf("query DB: %v", err)
 	}
-	if dbStatus != "failed" {
-		t.Fatalf("expected durable status 'failed', got %q (must not be reset to pending)", dbStatus)
+	if dbStatus != "conflict" {
+		t.Fatalf("expected durable status 'conflict', got %q (must not be reset to pending or failed)", dbStatus)
+	}
+	if nextRetryAt != 0 {
+		t.Fatalf("expected next_retry_at == 0 for permanent conflict, got %d", nextRetryAt)
 	}
 	if !strings.Contains(dbError, "target_conflict") {
 		t.Fatalf("expected error to contain 'target_conflict', got %q", dbError)
@@ -2904,11 +2912,15 @@ func TestOrchestrator_Deterministic_DownloadOne_ErrTargetExists_ConflictingFinal
 		t.Fatalf("conflicting final file was deleted or corrupted: %v", err)
 	}
 
-	// 3. DB status MUST be 'failed' with target_conflict
+	// 3. DB status MUST be durably set to 'conflict' with next_retry_at = 0 (MUST NOT BE FAILED OR PENDING!)
 	var dbStatus, dbError string
-	err = db.db.QueryRow(`SELECT status, COALESCE(error, '') FROM download_records WHERE chat_id = ? AND message_id = ?`, chatID, msgID).Scan(&dbStatus, &dbError)
-	if err != nil || dbStatus != "failed" {
-		t.Fatalf("expected DB status failed, got %q (err: %v)", dbStatus, err)
+	var nextRetryAt int64
+	err = db.db.QueryRow(`SELECT status, COALESCE(error, ''), next_retry_at FROM download_records WHERE chat_id = ? AND message_id = ?`, chatID, msgID).Scan(&dbStatus, &dbError, &nextRetryAt)
+	if err != nil || dbStatus != "conflict" {
+		t.Fatalf("expected DB status conflict, got %q (err: %v)", dbStatus, err)
+	}
+	if nextRetryAt != 0 {
+		t.Fatalf("expected next_retry_at == 0 for permanent conflict, got %d", nextRetryAt)
 	}
 	if !strings.Contains(dbError, "target_conflict") {
 		t.Fatalf("expected DB error to contain target_conflict, got %q", dbError)
@@ -3007,4 +3019,166 @@ func TestRecovery_ReconcileCommittingRecord_NonTargetExistsCommitError_Preserves
 		t.Fatalf("illegal status transition: valid .part was reset to pending!")
 	}
 	t.Logf("[POST-ASSERT] Verified: non-target-exists commit error preserved valid .part and failed closed (DB status=%s)", dbStatus)
+}
+
+// Acceptance Test (Issue #4): Target conflict is durably excluded from GetPendingDownloads scans
+// even after retry backoff has elapsed, and only re-enters pending via deliberate manual resolution.
+func TestDatabase_TargetConflict_DurablePermanentExclusionFromPendingScan(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "state.db")
+	db, err := NewDatabase(dbPath)
+	if err != nil {
+		t.Fatalf("init database: %v", err)
+	}
+	defer db.Close()
+
+	now := time.Now().Unix()
+
+	// Seed listen target enabled = 1
+	targetChatID := "-100123"
+	_, err = db.Execute(`
+		INSERT INTO listen_targets (chat_id, enabled, title, created_at, updated_at) VALUES (?, 1, 'TestTarget', ?, ?)
+	`, targetChatID, now, now)
+	if err != nil {
+		t.Fatalf("insert listen target: %v", err)
+	}
+
+	// 1. Seed Case A: Ordinary transient failure with backoff (e.g. retryable network timeout)
+	msgIDTransient := 101
+	_, err = db.Execute(`
+		INSERT INTO download_records (
+			chat_id, message_id, status, file_name, save_path, file_size, attempts, next_retry_at, created_at, updated_at
+		) VALUES (?, ?, 'committing', 'transient.bin', 'transient.bin', 100, 0, 0, ?, ?)
+	`, targetChatID, msgIDTransient, now, now)
+	if err != nil {
+		t.Fatalf("insert transient record: %v", err)
+	}
+	transientDisp := FailureDisposition{
+		Stage:       "download",
+		Op:          "fetch",
+		Class:       "network_timeout",
+		Unavailable: false,
+		Retryable:   true,
+		RetryOwner:  "daemon",
+		Message:     "network timeout",
+	}
+	if err := db.FailDownloadDisposition(targetChatID, msgIDTransient, "", "transient.bin", "transient.bin", "video", 100, transientDisp); err != nil {
+		t.Fatalf("fail transient: %v", err)
+	}
+
+	// 2. Seed Case B: Target conflict (non-retryable permanent conflict)
+	msgIDConflict := 102
+	_, err = db.Execute(`
+		INSERT INTO download_records (
+			chat_id, message_id, status, file_name, save_path, file_size, attempts, next_retry_at, created_at, updated_at
+		) VALUES (?, ?, 'committing', 'conflict.bin', 'conflict.bin', 200, 0, 0, ?, ?)
+	`, targetChatID, msgIDConflict, now, now)
+	if err != nil {
+		t.Fatalf("insert conflict record: %v", err)
+	}
+	conflictDisp := FailureDisposition{
+		Stage:       "commit",
+		Op:          "target_exists",
+		Class:       "target_conflict",
+		Unavailable: false,
+		Retryable:   false,
+		RetryOwner:  "none",
+		Message:     "target exists with conflicting proof",
+	}
+	if err := db.RecordTargetConflict(targetChatID, msgIDConflict, "", "conflict.bin", "conflict.bin", "video", 200, conflictDisp); err != nil {
+		t.Fatalf("record target conflict: %v", err)
+	}
+
+	// Verify initial durable states
+	var transStatus, transError string
+	var transRetryAt int64
+	_ = db.db.QueryRow(`SELECT status, error, next_retry_at FROM download_records WHERE chat_id = ? AND message_id = ?`, targetChatID, msgIDTransient).Scan(&transStatus, &transError, &transRetryAt)
+	if transStatus != "failed" || transRetryAt <= now {
+		t.Fatalf("expected transient to be status=failed with future next_retry_at, got status=%s retryAt=%d", transStatus, transRetryAt)
+	}
+
+	var confStatus, confError string
+	var confRetryAt int64
+	_ = db.db.QueryRow(`SELECT status, error, next_retry_at FROM download_records WHERE chat_id = ? AND message_id = ?`, targetChatID, msgIDConflict).Scan(&confStatus, &confError, &confRetryAt)
+	if confStatus != "conflict" || confRetryAt != 0 {
+		t.Fatalf("expected conflict to be status=conflict with next_retry_at=0, got status=%s retryAt=%d", confStatus, confRetryAt)
+	}
+
+	// Phase 1: Immediately at 'now', transient is NOT due, conflict is NOT due
+	records, err := db.GetPendingDownloads(10)
+	if err != nil {
+		t.Fatalf("GetPendingDownloads: %v", err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("expected 0 pending records immediately, got %d", len(records))
+	}
+
+	// Phase 2: Simulate time passing well beyond transient retry backoff (e.g. +2 hours)
+	// Transient record must be picked up; permanent conflict record MUST REMAIN EXCLUDED!
+	futureTime := now + 7200
+	rows, err := db.db.Query(`
+		SELECT r.chat_id, r.message_id, r.status
+		FROM download_records r
+		INNER JOIN listen_targets t ON r.chat_id = t.chat_id
+		WHERE t.enabled = 1 AND (r.status = 'pending' OR (r.status = 'failed' AND r.next_retry_at <= ?))
+	`, futureTime)
+	if err != nil {
+		t.Fatalf("query future pending: %v", err)
+	}
+	defer rows.Close()
+
+	var pickedMsgIDs []int
+	for rows.Next() {
+		var cID, stat string
+		var mID int
+		_ = rows.Scan(&cID, &mID, &stat)
+		pickedMsgIDs = append(pickedMsgIDs, mID)
+	}
+
+	// Assertions:
+	// Transient message 101 MUST be picked up!
+	var foundTransient, foundConflict bool
+	for _, id := range pickedMsgIDs {
+		if id == msgIDTransient {
+			foundTransient = true
+		}
+		if id == msgIDConflict {
+			foundConflict = true
+		}
+	}
+	if !foundTransient {
+		t.Fatalf("expected transient record %d to be picked up after backoff, but was not", msgIDTransient)
+	}
+	if foundConflict {
+		t.Fatalf("CRITICAL DEFECT: permanent conflict record %d was re-admitted by pending scan!", msgIDConflict)
+	}
+	t.Logf("[POST-ASSERT] Verified: permanent conflict is durably excluded from pending scan even after backoff elapsed")
+
+	// Phase 3: Deliberate manual resolution
+	if err := db.ResolveTargetConflict(targetChatID, msgIDConflict); err != nil {
+		t.Fatalf("ResolveTargetConflict failed: %v", err)
+	}
+
+	// Verify status is now 'pending'
+	_ = db.db.QueryRow(`SELECT status FROM download_records WHERE chat_id = ? AND message_id = ?`, targetChatID, msgIDConflict).Scan(&confStatus)
+	if confStatus != "pending" {
+		t.Fatalf("expected status=pending after manual resolution, got %s", confStatus)
+	}
+
+	// Now GetPendingDownloads MUST pick up the resolved conflict record!
+	resolvedRecords, err := db.GetPendingDownloads(10)
+	if err != nil {
+		t.Fatalf("GetPendingDownloads after resolution: %v", err)
+	}
+	var resolvedPicked bool
+	for _, r := range resolvedRecords {
+		if r.MessageID == msgIDConflict {
+			resolvedPicked = true
+			break
+		}
+	}
+	if !resolvedPicked {
+		t.Fatalf("expected resolved record %d to be picked up by GetPendingDownloads, but was not", msgIDConflict)
+	}
+	t.Logf("[POST-ASSERT] Verified: deliberate manual resolution successfully re-admitted record to pending")
 }

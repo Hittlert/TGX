@@ -31,9 +31,9 @@ type Orchestrator struct {
 	logger        *zap.Logger
 	saveDir       string
 
-	runningMu     sync.Mutex
-	running       bool
-	inFlight      sync.Map
+	runningMu        sync.Mutex
+	running          bool
+	inFlight         sync.Map
 	activeTasks      int64
 	taskSlotFreed    chan struct{}
 	activePublishers sync.Map // map[string]string: "chatID:msgID" -> attemptGeneration
@@ -1270,69 +1270,38 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 		o.testHooks.BeforeRename(taskID, chatID, msgID)
 	}
 
-	if err := fscommit.CommitSiblingPart(partAbsPath, finalAbsPath); err != nil {
-		// If target exists, re-read and verify final file rather than blindly failing and deleting valid part
-		if errors.Is(err, fscommit.ErrTargetExists) || errors.Is(err, os.ErrExist) {
-			if finInfo, statErr := os.Stat(finalAbsPath); statErr == nil && !finInfo.IsDir() {
-				if finInfo.Size() == authoritativeSize {
-					finSHA, finSHAErr := computeFileSHA256(finalAbsPath)
-					if finSHAErr == nil && finSHA == shaHex {
-						// Existing final matches authentic proof: clean up part and advance as committed!
-						_ = os.Remove(partAbsPath)
-						goto commitSucceeded
-					}
-				}
-
-				// Target exists with conflicting proof:
-				// PRESERVE BOTH PROOFS! DO NOT DELETE PART! DO NOT OVERWRITE FINAL!
-				preservePart = true
-				o.logger.Error("target exists with conflicting proof against valid part during commit: preserving both",
-					zap.String("chat_id", chatID),
-					zap.Int("message_id", msgID),
-					zap.String("part_path", partAbsPath),
-					zap.String("final_path", finalAbsPath),
-				)
-				disp := FailureDisposition{
-					Stage:       "commit",
-					Op:          "target_exists",
-					Class:       "target_conflict",
-					Unavailable: false,
-					Retryable:   false,
-					RetryOwner:  "none",
-					Message:     fmt.Sprintf("target exists with conflicting proof against valid part (%s)", finalAbsPath),
-					Cause:       err,
-				}
-				if o.db != nil {
-					if dbErr := o.db.FailDownloadDisposition(chatID, msgID, gen, fileName, finalRelPath, mediaType, authoritativeSize, disp); dbErr != nil {
-						o.logger.Error("failed to record target conflict failure in DB; refusing to fake Registry terminal state", zap.Error(dbErr))
-						return
-					}
-				}
-				task.FailDisposition(disp)
+	commitErr := fscommit.CommitSiblingPart(partAbsPath, finalAbsPath)
+	decision := EvaluateCommitSiblingPart(partAbsPath, finalAbsPath, authoritativeSize, shaHex, commitErr)
+	var finalCommittedSHA string
+	switch decision.Type {
+	case CommitDecisionSuccess:
+		committed = true
+		finalCommittedSHA = decision.FinalSHA
+	case CommitDecisionTargetConflict:
+		preservePart = true
+		o.logger.Error("target exists with conflicting proof against valid part during commit: preserving both",
+			zap.String("chat_id", chatID),
+			zap.Int("message_id", msgID),
+			zap.String("part_path", partAbsPath),
+			zap.String("final_path", finalAbsPath),
+		)
+		if o.db != nil {
+			if dbErr := o.db.RecordTargetConflict(chatID, msgID, gen, fileName, finalRelPath, mediaType, authoritativeSize, decision.Disposition); dbErr != nil {
+				o.logger.Error("failed to record target conflict failure in DB; refusing to fake Registry terminal state", zap.Error(dbErr))
 				return
 			}
 		}
-
-		// Other atomic commit failure (e.g. EIO, EPERM, IsDir):
-		// DO NOT delete valid part! Preserve proof for recovery or inspection.
+		task.FailDisposition(decision.Disposition)
+		return
+	case CommitDecisionIOError:
 		preservePart = true
 		o.logger.Error("atomic commit failed: preserving valid part file",
 			zap.String("chat_id", chatID),
 			zap.Int("message_id", msgID),
 			zap.String("part_path", partAbsPath),
-			zap.Error(err),
+			zap.Error(decision.Err),
 		)
-		disp := FailureDisposition{
-			Stage:       "commit",
-			Op:          "rename",
-			Class:       "io",
-			Unavailable: false,
-			Retryable:   false,
-			RetryOwner:  "none",
-			Message:     err.Error(),
-			Cause:       err,
-		}
-		// First acquire DB failure verdict; do not ignore durable transition error
+		disp := decision.Disposition
 		if o.db != nil {
 			if dbErr := o.db.FailDownloadDisposition(chatID, msgID, gen, fileName, finalRelPath, mediaType, authoritativeSize, disp); dbErr != nil {
 				o.logger.Error("failed to record failure in DB after rename error; refusing to fake Registry terminal state", zap.Error(dbErr))
@@ -1342,9 +1311,6 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 		task.FailDisposition(disp)
 		return
 	}
-
-commitSucceeded:
-	committed = true
 	if o.testHooks.AfterRename != nil {
 		o.testHooks.AfterRename(taskID, chatID, msgID)
 	}
@@ -1356,7 +1322,7 @@ commitSucceeded:
 		MessageID:       msgID,
 		Path:            finalRelPath,
 		Size:            stat.Size(),
-		SHA256:          shaHex,
+		SHA256:          finalCommittedSHA,
 		PhysicalRetries: retries,
 		RequestCount:    reqTotal,
 		WireBytes:       wireTotal,
@@ -1377,7 +1343,7 @@ commitSucceeded:
 		if o.testHooks.BeforeCompleteDB != nil {
 			o.testHooks.BeforeCompleteDB(taskID, chatID, msgID)
 		}
-		completeErr := o.db.CompleteDownloadAndQueueArchive(chatID, msgID, gen, finalRelPath, stat.Size(), shaHex, queueArchive)
+		completeErr := o.db.CompleteDownloadAndQueueArchive(chatID, msgID, gen, finalRelPath, stat.Size(), finalCommittedSHA, queueArchive)
 		if completeErr != nil {
 			if errors.Is(completeErr, ErrArchiveConflict) {
 				// Authoritative conflict accepted: DB has committed download=success and archive=conflict!

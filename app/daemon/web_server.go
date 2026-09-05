@@ -26,13 +26,13 @@ import (
 var uiFS embed.FS
 
 type WebServer struct {
-	db           *Database
-	transferMgr  *transfer.TransferManager
-	ssdAdmission *fscommit.SSDAdmission
-	proxyManager *ProxyManager
-	orchestrator *Orchestrator
-	access       TelegramAccess
-	registry     *Registry
+	db                   *Database
+	transferMgr          *transfer.TransferManager
+	ssdAdmission         *fscommit.SSDAdmission
+	proxyManager         *ProxyManager
+	orchestrator         *Orchestrator
+	access               TelegramAccess
+	registry             *Registry
 	logger               *zap.Logger
 	password             string
 	sessionsMu           sync.RWMutex
