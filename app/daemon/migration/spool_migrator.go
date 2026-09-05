@@ -538,7 +538,7 @@ func Run(ctx context.Context, opts MigrationOptions) (*MigrationReport, error) {
 							allRestored = false
 							continue
 						}
-						if err := os.Rename(sf.StagedPath, sf.OriginalPath); err != nil {
+						if err := safeNoReplaceLinkOrMove(sf.StagedPath, sf.OriginalPath); err != nil {
 							allRestored = false
 							continue
 						}
@@ -551,12 +551,12 @@ func Run(ctx context.Context, opts MigrationOptions) (*MigrationReport, error) {
 			}
 		}()
 
-		// Perform physical rename of planned buffer files into quarantine staging
+		// Perform physical move of planned buffer files into quarantine staging
 		for _, sf := range staged {
 			if _, err := os.Stat(sf.OriginalPath); err != nil {
 				return report, fmt.Errorf("stat buffer file before staging %s: %w", sf.OriginalPath, err)
 			}
-			if err := os.Rename(sf.OriginalPath, sf.StagedPath); err != nil {
+			if err := safeNoReplaceLinkOrMove(sf.OriginalPath, sf.StagedPath); err != nil {
 				return report, fmt.Errorf("stage buffer file %s to quarantine: %w", sf.OriginalPath, err)
 			}
 			// Sync source parent directory to guarantee rename durability
@@ -715,12 +715,18 @@ func createVerifiedBackup(dbPath string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("create dst backup: %w", err)
 	}
-	defer dst.Close()
 
 	if _, err := io.Copy(dst, src); err != nil {
+		_ = dst.Close()
 		return "", fmt.Errorf("copy db: %w", err)
 	}
-	_ = dst.Sync()
+	if err := dst.Sync(); err != nil {
+		_ = dst.Close()
+		return "", fmt.Errorf("sync dst backup: %w", err)
+	}
+	if err := dst.Close(); err != nil {
+		return "", fmt.Errorf("close dst backup: %w", err)
+	}
 
 	// Verify backup with integrity_check
 	backupDB, err := sql.Open("sqlite", backupPath)
@@ -744,6 +750,98 @@ func contains(slice []string, s string) bool {
 		}
 	}
 	return false
+}
+
+// MigratorTestHooks allows unit tests to inject deterministic hooks during migration and reconciliation.
+type MigratorTestHooks struct {
+	BeforeRestoreMove func(stagedPath, origPath string)
+	ParentDirSyncHook func(dir string) error
+}
+
+var testHooks MigratorTestHooks
+
+// SetTestHooks sets global test hooks for migration testing.
+func SetTestHooks(hooks MigratorTestHooks) {
+	testHooks = hooks
+}
+
+func isStrictSubpath(baseDir, targetPath string) bool {
+	cleanBase := filepath.Clean(baseDir)
+	cleanTarget := filepath.Clean(targetPath)
+	rel, err := filepath.Rel(cleanBase, cleanTarget)
+	if err != nil {
+		return false
+	}
+	if rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return false
+	}
+	return true
+}
+
+func validateQuarantinePaths(manifest QuarantineManifest, qDir string, bufferDir string) error {
+	if !isStrictSubpath(bufferDir, qDir) {
+		return fmt.Errorf("quarantine dir %s escapes buffer dir %s", qDir, bufferDir)
+	}
+	for _, f := range manifest.Files {
+		if f.StagedName == "" || f.StagedName == "." || f.StagedName == ".." || strings.Contains(f.StagedName, string(filepath.Separator)) {
+			return fmt.Errorf("unsafe or empty staged name %q in manifest", f.StagedName)
+		}
+		expectedStaged := filepath.Join(qDir, f.StagedName)
+		if filepath.Clean(f.StagedPath) != filepath.Clean(expectedStaged) {
+			return fmt.Errorf("staged path %s does not match expected staging location %s", f.StagedPath, expectedStaged)
+		}
+		if !isStrictSubpath(qDir, f.StagedPath) {
+			return fmt.Errorf("staged path %s escapes quarantine dir %s", f.StagedPath, qDir)
+		}
+		if !isStrictSubpath(bufferDir, f.OriginalPath) {
+			return fmt.Errorf("original path %s escapes buffer dir %s", f.OriginalPath, bufferDir)
+		}
+	}
+	return nil
+}
+
+func safeNoReplaceLinkOrMove(src, dst string) error {
+	// Try atomic hardlink first (fast & guaranteed no-overwrite on POSIX)
+	err := os.Link(src, dst)
+	if err == nil {
+		if rmErr := os.Remove(src); rmErr != nil && !os.IsNotExist(rmErr) {
+			return fmt.Errorf("remove src after link: %w", rmErr)
+		}
+		return nil
+	}
+	if errors.Is(err, os.ErrExist) {
+		return err
+	}
+
+	// Fallback for cross-device links (EXDEV) or filesystems where link(2) is not permitted:
+	// O_CREATE | O_EXCL guarantees atomic creation failure if dst exists.
+	out, createErr := os.OpenFile(dst, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	if createErr != nil {
+		return createErr
+	}
+	in, openErr := os.Open(src)
+	if openErr != nil {
+		_ = out.Close()
+		_ = os.Remove(dst)
+		return openErr
+	}
+	_, copyErr := io.Copy(out, in)
+	_ = in.Close()
+	syncErr := out.Sync()
+	closeErr := out.Close()
+	if copyErr != nil {
+		_ = os.Remove(dst)
+		return copyErr
+	}
+	if syncErr != nil {
+		_ = os.Remove(dst)
+		return syncErr
+	}
+	if closeErr != nil {
+		_ = os.Remove(dst)
+		return closeErr
+	}
+	return os.Remove(src)
 }
 
 // ReconcilePendingQuarantines scans for interrupted quarantine staging directories from previous crashes.
@@ -811,6 +909,10 @@ func ReconcilePendingQuarantines(ctx context.Context, dbPath string, bufferDir s
 		var manifest QuarantineManifest
 		if err := json.Unmarshal(manifestBytes, &manifest); err != nil {
 			return nil, fmt.Errorf("unmarshal quarantine manifest %s: %w (fail-closed to prevent data loss)", manifestPath, err)
+		}
+
+		if err := validateQuarantinePaths(manifest, qDir, bufferDir); err != nil {
+			return nil, fmt.Errorf("validate quarantine paths %s: %w (fail-closed to prevent escape)", manifestPath, err)
 		}
 
 		// Check verdict in DB with strict authority and fail-closed error propagation
@@ -881,11 +983,6 @@ func ReconcilePendingQuarantines(ctx context.Context, dbPath string, bufferDir s
 			plans := make([]itemPlan, len(manifest.Files))
 
 			for i, f := range manifest.Files {
-				// Path sanity check
-				if strings.Contains(f.OriginalPath, "..") || strings.Contains(f.StagedPath, "..") {
-					return nil, fmt.Errorf("reconcile restore: unsafe path traversal in manifest item %s (fail-closed)", f.OriginalPath)
-				}
-
 				stagedInfo, stagedErr := os.Stat(f.StagedPath)
 				origInfo, origErr := os.Stat(f.OriginalPath)
 
@@ -947,12 +1044,28 @@ func ReconcilePendingQuarantines(ctx context.Context, dbPath string, bufferDir s
 					if err := os.MkdirAll(filepath.Dir(f.OriginalPath), 0o755); err != nil {
 						return nil, fmt.Errorf("reconcile restore mkdir %s: %w (fail-closed)", filepath.Dir(f.OriginalPath), err)
 					}
-					if err := os.Rename(f.StagedPath, f.OriginalPath); err != nil {
-						return nil, fmt.Errorf("reconcile restore rename %s -> %s: %w (fail-closed)", f.StagedPath, f.OriginalPath, err)
+					if testHooks.BeforeRestoreMove != nil {
+						testHooks.BeforeRestoreMove(f.StagedPath, f.OriginalPath)
 					}
-					if parentDir, err := os.Open(filepath.Dir(f.OriginalPath)); err == nil {
-						_ = parentDir.Sync()
+					if err := safeNoReplaceLinkOrMove(f.StagedPath, f.OriginalPath); err != nil {
+						return nil, fmt.Errorf("reconcile restore link/move %s -> %s: %w (fail-closed)", f.StagedPath, f.OriginalPath, err)
+					}
+					parentDir, err := os.Open(filepath.Dir(f.OriginalPath))
+					if err != nil {
+						return nil, fmt.Errorf("open parent dir %s for sync: %w (fail-closed)", filepath.Dir(f.OriginalPath), err)
+					}
+					if testHooks.ParentDirSyncHook != nil {
+						if hookErr := testHooks.ParentDirSyncHook(filepath.Dir(f.OriginalPath)); hookErr != nil {
+							_ = parentDir.Close()
+							return nil, fmt.Errorf("sync parent dir %s: %w (fail-closed)", filepath.Dir(f.OriginalPath), hookErr)
+						}
+					}
+					if syncErr := parentDir.Sync(); syncErr != nil {
 						_ = parentDir.Close()
+						return nil, fmt.Errorf("sync parent dir %s: %w (fail-closed)", filepath.Dir(f.OriginalPath), syncErr)
+					}
+					if closeErr := parentDir.Close(); closeErr != nil {
+						return nil, fmt.Errorf("close parent dir %s: %w (fail-closed)", filepath.Dir(f.OriginalPath), closeErr)
 					}
 					report.RestoredFiles = append(report.RestoredFiles, f.OriginalPath)
 				} else if p.stagedExist && p.origExist {

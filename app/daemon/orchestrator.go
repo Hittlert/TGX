@@ -1180,10 +1180,13 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 			Message:     err.Error(),
 			Cause:       err,
 		}
-		task.FailDisposition(disp)
+		// First acquire DB failure verdict; do not ignore durable transition error
 		if o.db != nil {
-			_ = o.db.FailDownloadDisposition(chatID, msgID, gen, fileName, finalRelPath, mediaType, authoritativeSize, disp)
+			if dbErr := o.db.FailDownloadDisposition(chatID, msgID, gen, fileName, finalRelPath, mediaType, authoritativeSize, disp); dbErr != nil {
+				o.logger.Error("failed to record failure in DB after rename error", zap.Error(dbErr))
+			}
 		}
+		task.FailDisposition(disp)
 		return
 	}
 	committed = true
@@ -1214,26 +1217,30 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 	})
 
 	// 13. Complete download and queue archive in single DB transaction
-	if o.testHooks.BeforeCompleteDB != nil {
-		o.testHooks.BeforeCompleteDB(taskID, chatID, msgID)
-	}
 	queueArchive := o.archiveWorker != nil && o.archiveWorker.IsEnabled()
 	if o.db != nil {
-		if err := o.db.CompleteDownloadAndQueueArchive(chatID, msgID, gen, finalRelPath, stat.Size(), shaHex, queueArchive); err != nil {
-			o.logger.Error("failed to complete download in DB", zap.Error(err))
-			disp := FailureDisposition{
-				Stage:       "commit",
-				Op:          "db_complete",
-				Class:       "db_conflict",
-				Unavailable: false,
-				Retryable:   false,
-				RetryOwner:  "none",
-				Message:     err.Error(),
-				Cause:       err,
+		var completeErr error
+		const maxCompleteRetries = 10
+		for attempt := 0; attempt < maxCompleteRetries; attempt++ {
+			if o.testHooks.BeforeCompleteDB != nil {
+				o.testHooks.BeforeCompleteDB(taskID, chatID, msgID)
 			}
-			task.FailDisposition(disp)
+			completeErr = o.db.CompleteDownloadAndQueueArchive(chatID, msgID, gen, finalRelPath, stat.Size(), shaHex, queueArchive)
+			if completeErr == nil {
+				break
+			}
+			o.logger.Warn("temporary failure completing download in DB, retrying online to converge state",
+				zap.Int("attempt", attempt+1),
+				zap.Error(completeErr),
+			)
+			time.Sleep(5 * time.Millisecond * time.Duration(1<<attempt))
+		}
+
+		if completeErr != nil {
+			o.logger.Error("fatal failure completing download in DB after rename; preserving publishing state, never faking terminal failed", zap.Error(completeErr))
 			return
 		}
+
 		if queueArchive {
 			EmitLifecycle(o.logger, LifecycleEvent{
 				Event:     EventArchiveQueued,

@@ -1789,3 +1789,266 @@ func TestMigration_Reconcile_StagedValid_OriginalMissing_RestoresSuccessfully(t 
 	}
 	t.Logf("[Test 25: RESTORE_VALID] Verified: original file restored byte-for-byte, staged file and manifest cleaned")
 }
+
+// 26. Acceptance Test: Reconcile restore fails closed when manifest specifies absolute path outside bufferDir or outside quarantineDir.
+func TestMigration_Reconcile_AbsoluteOutsidePath_FailsClosed(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "state.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("failed to open sqlite3: %v", err)
+	}
+	_, _ = db.Exec("CREATE TABLE dummy (id INT)")
+	defer db.Close()
+
+	bufferDir := filepath.Join(tempDir, "buffer")
+	outsideDir := filepath.Join(tempDir, "outside")
+	_ = os.MkdirAll(bufferDir, 0o755)
+	_ = os.MkdirAll(outsideDir, 0o755)
+
+	qDir := filepath.Join(bufferDir, ".migrator_quarantine_outside_escape")
+	_ = os.MkdirAll(qDir, 0o755)
+
+	manifestPath := filepath.Join(qDir, "quarantine_manifest.json")
+	escapedOrigFile := filepath.Join(outsideDir, "escaped.spool")
+	stagedFile := filepath.Join(qDir, "staged_outside.spool")
+
+	_ = os.WriteFile(stagedFile, []byte("some data"), 0o644)
+
+	manifest := migration.QuarantineManifest{
+		MigrationID: "mig_outside_escape",
+		CreatedAt:   time.Now().Unix(),
+		Files: []migration.QuarantineFileEntry{
+			{
+				OriginalPath: escapedOrigFile, // points outside bufferDir!
+				StagedName:   "staged_outside.spool",
+				StagedPath:   stagedFile,
+				Size:         int64(len("some data")),
+				SHA256:       "dummy_hash",
+			},
+		},
+	}
+	data, _ := json.MarshalIndent(manifest, "", "  ")
+	_ = os.WriteFile(manifestPath, data, 0o644)
+
+	t.Logf("[Test 26: OUTSIDE_ESCAPE] Invoking ReconcilePendingQuarantines with outside path %s...", escapedOrigFile)
+	_, err = migration.ReconcilePendingQuarantines(context.Background(), dbPath, bufferDir)
+	t.Logf("[Test 26: OUTSIDE_ESCAPE] ReconcilePendingQuarantines returned err: %v", err)
+	if err == nil {
+		t.Fatal("expected error when manifest contains outside path escaping bufferDir, got nil")
+	}
+
+	// Fail-closed verification: manifest and quarantine intact, escaped file never created
+	if _, statErr := os.Stat(manifestPath); os.IsNotExist(statErr) {
+		t.Fatal("manifest was deleted despite path escape! Fail-closed violated!")
+	}
+	if _, statErr := os.Stat(escapedOrigFile); !os.IsNotExist(statErr) {
+		t.Fatalf("escaped file was created outside bufferDir: %v", statErr)
+	}
+	t.Logf("[Test 26: OUTSIDE_ESCAPE] Verified fail-closed: outside escape blocked, manifest retained")
+}
+
+// 27. Acceptance Test: Reconcile restore accepts legal double dots in filename (e.g. video..spool) and restores safely.
+func TestMigration_Reconcile_LegalDoubleDotsInFilename_AcceptedAndRestored(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "state.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("failed to open sqlite3: %v", err)
+	}
+	_, _ = db.Exec("CREATE TABLE dummy (id INT)")
+	defer db.Close()
+
+	bufferDir := filepath.Join(tempDir, "buffer")
+	_ = os.MkdirAll(bufferDir, 0o755)
+	qDir := filepath.Join(bufferDir, ".migrator_quarantine_double_dots")
+	_ = os.MkdirAll(qDir, 0o755)
+
+	manifestPath := filepath.Join(qDir, "quarantine_manifest.json")
+	// Legal filename containing ".." in the name (not as a directory traversal)
+	origFile := filepath.Join(bufferDir, "video..spool")
+	stagedFile := filepath.Join(qDir, "staged_video..spool")
+
+	payload := []byte("legal double dots video content 12345")
+	hash := sha256.Sum256(payload)
+	shaHex := hex.EncodeToString(hash[:])
+
+	_ = os.WriteFile(stagedFile, payload, 0o644)
+	t.Logf("[Test 27: LEGAL_DOUBLE_DOTS] Created staged file with legal double-dots in name: %s", stagedFile)
+
+	manifest := migration.QuarantineManifest{
+		MigrationID: "mig_double_dots",
+		CreatedAt:   time.Now().Unix(),
+		Files: []migration.QuarantineFileEntry{
+			{
+				OriginalPath: origFile,
+				StagedName:   "staged_video..spool",
+				StagedPath:   stagedFile,
+				Size:         int64(len(payload)),
+				SHA256:       shaHex,
+			},
+		},
+	}
+	data, _ := json.MarshalIndent(manifest, "", "  ")
+	_ = os.WriteFile(manifestPath, data, 0o644)
+
+	t.Logf("[Test 27: LEGAL_DOUBLE_DOTS] Invoking ReconcilePendingQuarantines...")
+	report, err := migration.ReconcilePendingQuarantines(context.Background(), dbPath, bufferDir)
+	if err != nil {
+		t.Fatalf("ReconcilePendingQuarantines failed on legal double-dots filename: %v", err)
+	}
+	t.Logf("[Test 27: LEGAL_DOUBLE_DOTS] Reconcile report: RestoredFiles=%v, CleanedDirs=%v", report.RestoredFiles, report.CleanedDirs)
+	if len(report.RestoredFiles) != 1 || report.RestoredFiles[0] != origFile {
+		t.Fatalf("unexpected RestoredFiles: %+v", report.RestoredFiles)
+	}
+
+	// Verify restored file exists and has correct payload
+	origBytes, readErr := os.ReadFile(origFile)
+	if readErr != nil || string(origBytes) != string(payload) {
+		t.Fatalf("restored file with double-dots was corrupted or missing: %v", readErr)
+	}
+	if _, statErr := os.Stat(stagedFile); !os.IsNotExist(statErr) {
+		t.Fatalf("staged file still exists after restore: %v", statErr)
+	}
+	t.Logf("[Test 27: LEGAL_DOUBLE_DOTS] Verified: legal filename with double-dots restored successfully")
+}
+
+// 28. Acceptance Test: Target appears between Phase 1 and Phase 2 (TOCTOU race), safe link/move fails closed without overwriting.
+func TestMigration_Reconcile_TargetAppearsBetweenPhases_FailsClosedWithoutOverwrite(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "state.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("failed to open sqlite3: %v", err)
+	}
+	_, _ = db.Exec("CREATE TABLE dummy (id INT)")
+	defer db.Close()
+
+	bufferDir := filepath.Join(tempDir, "buffer")
+	_ = os.MkdirAll(bufferDir, 0o755)
+	qDir := filepath.Join(bufferDir, ".migrator_quarantine_toctou")
+	_ = os.MkdirAll(qDir, 0o755)
+
+	manifestPath := filepath.Join(qDir, "quarantine_manifest.json")
+	origFile := filepath.Join(bufferDir, "target_race.spool")
+	stagedFile := filepath.Join(qDir, "staged_race.spool")
+
+	stagedPayload := []byte("authentic staged content")
+	hash := sha256.Sum256(stagedPayload)
+	shaHex := hex.EncodeToString(hash[:])
+	_ = os.WriteFile(stagedFile, stagedPayload, 0o644)
+
+	racePayload := []byte("concurrently created target file during race window")
+
+	// In BeforeRestoreMove hook (fired right before physical link/move in Phase 2),
+	// simulate a race condition where another process creates the target file!
+	migration.SetTestHooks(migration.MigratorTestHooks{
+		BeforeRestoreMove: func(stagedPath, origPath string) {
+			t.Logf("[HOOK: BeforeRestoreMove] Simulating TOCTOU race: creating %s before restore...", origPath)
+			_ = os.WriteFile(origPath, racePayload, 0o644)
+		},
+	})
+	defer migration.SetTestHooks(migration.MigratorTestHooks{})
+
+	manifest := migration.QuarantineManifest{
+		MigrationID: "mig_toctou_race",
+		CreatedAt:   time.Now().Unix(),
+		Files: []migration.QuarantineFileEntry{
+			{
+				OriginalPath: origFile,
+				StagedName:   "staged_race.spool",
+				StagedPath:   stagedFile,
+				Size:         int64(len(stagedPayload)),
+				SHA256:       shaHex,
+			},
+		},
+	}
+	data, _ := json.MarshalIndent(manifest, "", "  ")
+	_ = os.WriteFile(manifestPath, data, 0o644)
+
+	t.Logf("[Test 28: TOCTOU_RACE] Invoking ReconcilePendingQuarantines...")
+	_, err = migration.ReconcilePendingQuarantines(context.Background(), dbPath, bufferDir)
+	t.Logf("[Test 28: TOCTOU_RACE] ReconcilePendingQuarantines returned err: %v", err)
+	if err == nil {
+		t.Fatal("expected error when target appears between Phase 1 and Phase 2, got nil")
+	}
+
+	// Crucial assertion: the concurrently created file MUST NOT be overwritten!
+	currentContent, readErr := os.ReadFile(origFile)
+	if readErr != nil || string(currentContent) != string(racePayload) {
+		t.Fatalf("concurrently created file was overwritten! got %q, want %q", string(currentContent), string(racePayload))
+	}
+	// Staged file and manifest retained
+	if _, statErr := os.Stat(manifestPath); os.IsNotExist(statErr) {
+		t.Fatal("manifest was deleted despite TOCTOU collision! Fail-closed violated!")
+	}
+	if _, statErr := os.Stat(stagedFile); os.IsNotExist(statErr) {
+		t.Fatal("staged file was deleted despite TOCTOU collision! Fail-closed violated!")
+	}
+	t.Logf("[Test 28: TOCTOU_RACE] Verified fail-closed: concurrent target file preserved without overwrite, manifest retained")
+}
+
+// 29. Acceptance Test: Parent directory Sync failure prevents manifest removal and retains quarantine.
+func TestMigration_Reconcile_ParentDirSyncFailure_RetainsManifest(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "state.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("failed to open sqlite3: %v", err)
+	}
+	_, _ = db.Exec("CREATE TABLE dummy (id INT)")
+	defer db.Close()
+
+	bufferDir := filepath.Join(tempDir, "buffer")
+	_ = os.MkdirAll(bufferDir, 0o755)
+	qDir := filepath.Join(bufferDir, ".migrator_quarantine_sync_fail")
+	_ = os.MkdirAll(qDir, 0o755)
+
+	manifestPath := filepath.Join(qDir, "quarantine_manifest.json")
+	origFile := filepath.Join(bufferDir, "sync_fail.spool")
+	stagedFile := filepath.Join(qDir, "staged_sync_fail.spool")
+
+	payload := []byte("payload for sync failure test")
+	hash := sha256.Sum256(payload)
+	shaHex := hex.EncodeToString(hash[:])
+	_ = os.WriteFile(stagedFile, payload, 0o644)
+
+	// Inject parent directory sync error
+	migration.SetTestHooks(migration.MigratorTestHooks{
+		ParentDirSyncHook: func(dir string) error {
+			t.Logf("[HOOK: ParentDirSyncHook] Simulating parent dir sync error for %s", dir)
+			return errors.New("simulated parent directory sync failure")
+		},
+	})
+	defer migration.SetTestHooks(migration.MigratorTestHooks{})
+
+	manifest := migration.QuarantineManifest{
+		MigrationID: "mig_sync_fail",
+		CreatedAt:   time.Now().Unix(),
+		Files: []migration.QuarantineFileEntry{
+			{
+				OriginalPath: origFile,
+				StagedName:   "staged_sync_fail.spool",
+				StagedPath:   stagedFile,
+				Size:         int64(len(payload)),
+				SHA256:       shaHex,
+			},
+		},
+	}
+	data, _ := json.MarshalIndent(manifest, "", "  ")
+	_ = os.WriteFile(manifestPath, data, 0o644)
+
+	t.Logf("[Test 29: DIR_SYNC_FAIL] Invoking ReconcilePendingQuarantines...")
+	_, err = migration.ReconcilePendingQuarantines(context.Background(), dbPath, bufferDir)
+	t.Logf("[Test 29: DIR_SYNC_FAIL] ReconcilePendingQuarantines returned err: %v", err)
+	if err == nil {
+		t.Fatal("expected error when parent directory sync fails, got nil")
+	}
+
+	// Crucial assertion: manifest MUST NOT be deleted if durability check fails!
+	if _, statErr := os.Stat(manifestPath); os.IsNotExist(statErr) {
+		t.Fatal("manifest was deleted despite parent directory sync failure! Durability violated!")
+	}
+	t.Logf("[Test 29: DIR_SYNC_FAIL] Verified fail-closed: manifest retained when parent dir sync fails")
+}
+
