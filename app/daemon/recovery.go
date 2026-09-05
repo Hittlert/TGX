@@ -315,6 +315,15 @@ func ReconcileCommittingRecord(
 				}
 				return fmt.Errorf("target exists with conflicting proof against valid part: %s", finalAbsPath)
 			}
+
+			// Other commit failure (e.g. EIO, EPERM): DO NOT delete valid part! Fail-closed and preserve.
+			logger.Error("failed to commit valid sibling part: preserving valid part file",
+				zap.String("chat_id", rec.ChatID),
+				zap.Int("message_id", rec.MessageID),
+				zap.String("part_path", partAbsPath),
+				zap.Error(commitErr),
+			)
+			return fmt.Errorf("failed to commit valid sibling part: %w", commitErr)
 		}
 	}
 

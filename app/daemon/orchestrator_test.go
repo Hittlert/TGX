@@ -2735,3 +2735,276 @@ func TestRecovery_ReconcileCommittingRecord_InitialConflictingFinal_PreservesPro
 	}
 	t.Logf("[POST-ASSERT] Verified: initial conflict branch preserved both proofs; DB committed durable conflict (not pending)")
 }
+
+// Acceptance Test (Issue #4): In downloadOne, CommitSiblingPart encountering ErrTargetExists re-reads and converges to success if proofs match.
+func TestOrchestrator_Deterministic_DownloadOne_ErrTargetExists_RevalidatesProofAndPromotesSuccess(t *testing.T) {
+	chatID := "-100777"
+	msgID := 201
+	data := make([]byte, 1024)
+	for i := range data {
+		data[i] = byte(i % 199)
+	}
+
+	invoker := invokerFunc(func(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
+		setUploadFile(output, data)
+		return nil
+	})
+
+	access := &mockAccessWithPool{
+		pool: &mockPool{invoker: invoker},
+		resolveFn: func(ctx context.Context, peer string, messageID int) (ResolvedMedia, error) {
+			return ResolvedMedia{
+				File:      &orchMockMediaFile{loc: &tg.InputDocumentFileLocation{ID: 2001, AccessHash: 3002}, sz: 1024, dc: 2},
+				Name:      "download_one_match.mp4",
+				Size:      1024,
+				DCID:      2,
+				MediaType: "video",
+				Date:      1725518400,
+			}, nil
+		},
+	}
+
+	orch, registry, db, saveDir := setupTestOrchestratorWithAccess(t, access)
+	defer db.Close()
+
+	finalRelPath := "RaceChannel/2024_09/201 - download_one_match.mp4"
+	finalAbsPath := filepath.Join(saveDir, filepath.FromSlash(finalRelPath))
+	_ = os.MkdirAll(filepath.Dir(finalAbsPath), 0o755)
+
+	var hookCalled bool
+	orch.SetTestHooks(OrchestratorTestHooks{
+		BeforeRename: func(taskID, cID string, mID int) {
+			hookCalled = true
+			// Create matching final file right before CommitSiblingPart is called
+			if err := os.WriteFile(finalAbsPath, data, 0o644); err != nil {
+				t.Fatalf("write matching final: %v", err)
+			}
+		},
+	})
+
+	req := TaskRequest{
+		ID:          "case_download_one_match",
+		Peer:        chatID,
+		MessageID:   msgID,
+		TargetTitle: "RaceChannel",
+		Date:        1725518400,
+	}
+
+	_, _, _ = registry.Submit(req)
+	task, _ := registry.Next(context.Background())
+
+	orch.downloadOne(context.Background(), task)
+
+	if !hookCalled {
+		t.Fatal("expected BeforeRename hook to be called")
+	}
+
+	snap := task.Snapshot()
+	if snap.State != StateSuccess {
+		t.Fatalf("expected task state success, got %s (err: %s)", snap.State, snap.Error)
+	}
+
+	var dbStatus string
+	err := db.db.QueryRow(`SELECT status FROM download_records WHERE chat_id = ? AND message_id = ?`, chatID, msgID).Scan(&dbStatus)
+	if err != nil || dbStatus != "success" {
+		t.Fatalf("expected DB status success, got %q", dbStatus)
+	}
+
+	// .part file must be cleaned
+	if _, statErr := os.Stat(finalAbsPath + ".part"); !os.IsNotExist(statErr) {
+		t.Fatalf("residual .part file was not cleaned: %v", statErr)
+	}
+	t.Logf("[POST-ASSERT] Verified: downloadOne successfully converged to success upon matching ErrTargetExists")
+}
+
+// Acceptance Test (Issue #4): In downloadOne, CommitSiblingPart encountering ErrTargetExists preserves both proofs and sets durable conflict.
+func TestOrchestrator_Deterministic_DownloadOne_ErrTargetExists_ConflictingFinal_PreservesBothProofs(t *testing.T) {
+	chatID := "-100777"
+	msgID := 202
+	validData := make([]byte, 1024)
+	for i := range validData {
+		validData[i] = byte(i % 173)
+	}
+	conflictingData := make([]byte, 1024)
+	for i := range conflictingData {
+		conflictingData[i] = byte((i + 1) % 173)
+	}
+
+	invoker := invokerFunc(func(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
+		setUploadFile(output, validData)
+		return nil
+	})
+
+	access := &mockAccessWithPool{
+		pool: &mockPool{invoker: invoker},
+		resolveFn: func(ctx context.Context, peer string, messageID int) (ResolvedMedia, error) {
+			return ResolvedMedia{
+				File:      &orchMockMediaFile{loc: &tg.InputDocumentFileLocation{ID: 2002, AccessHash: 3003}, sz: 1024, dc: 2},
+				Name:      "download_one_conflict.mp4",
+				Size:      1024,
+				DCID:      2,
+				MediaType: "video",
+				Date:      1725518400,
+			}, nil
+		},
+	}
+
+	orch, registry, db, saveDir := setupTestOrchestratorWithAccess(t, access)
+	defer db.Close()
+
+	finalRelPath := "RaceChannel/2024_09/202 - download_one_conflict.mp4"
+	finalAbsPath := filepath.Join(saveDir, filepath.FromSlash(finalRelPath))
+	partAbsPath := finalAbsPath + ".part"
+	_ = os.MkdirAll(filepath.Dir(finalAbsPath), 0o755)
+
+	var hookCalled bool
+	orch.SetTestHooks(OrchestratorTestHooks{
+		BeforeRename: func(taskID, cID string, mID int) {
+			hookCalled = true
+			// Create conflicting final file right before CommitSiblingPart is called
+			if err := os.WriteFile(finalAbsPath, conflictingData, 0o644); err != nil {
+				t.Fatalf("write conflicting final: %v", err)
+			}
+		},
+	})
+
+	req := TaskRequest{
+		ID:          "case_download_one_conflict",
+		Peer:        chatID,
+		MessageID:   msgID,
+		TargetTitle: "RaceChannel",
+		Date:        1725518400,
+	}
+
+	_, _, _ = registry.Submit(req)
+	task, _ := registry.Next(context.Background())
+
+	orch.downloadOne(context.Background(), task)
+
+	if !hookCalled {
+		t.Fatal("expected BeforeRename hook to be called")
+	}
+
+	// 1. Task snapshot must be StateFailed with target_conflict
+	snap := task.Snapshot()
+	if snap.State != StateFailed {
+		t.Fatalf("expected task state failed, got %s", snap.State)
+	}
+	if snap.ErrorClass != "target_conflict" {
+		t.Fatalf("expected error class target_conflict, got %s", snap.ErrorClass)
+	}
+
+	// 2. Both physical files MUST be preserved!
+	partContent, err := os.ReadFile(partAbsPath)
+	if err != nil || string(partContent) != string(validData) {
+		t.Fatalf("valid .part file was deleted or corrupted: %v", err)
+	}
+	finContent, err := os.ReadFile(finalAbsPath)
+	if err != nil || string(finContent) != string(conflictingData) {
+		t.Fatalf("conflicting final file was deleted or corrupted: %v", err)
+	}
+
+	// 3. DB status MUST be 'failed' with target_conflict
+	var dbStatus, dbError string
+	err = db.db.QueryRow(`SELECT status, COALESCE(error, '') FROM download_records WHERE chat_id = ? AND message_id = ?`, chatID, msgID).Scan(&dbStatus, &dbError)
+	if err != nil || dbStatus != "failed" {
+		t.Fatalf("expected DB status failed, got %q (err: %v)", dbStatus, err)
+	}
+	if !strings.Contains(dbError, "target_conflict") {
+		t.Fatalf("expected DB error to contain target_conflict, got %q", dbError)
+	}
+	t.Logf("[POST-ASSERT] Verified: downloadOne preserved both .part and final files; durably committed target_conflict")
+}
+
+// Acceptance Test (Issue #4): If CommitSiblingPart fails with non-ErrTargetExists error, recovery fails closed and preserves valid .part.
+func TestRecovery_ReconcileCommittingRecord_NonTargetExistsCommitError_PreservesPartAndFailsClosed(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "state.db")
+	db, err := NewDatabase(dbPath)
+	if err != nil {
+		t.Fatalf("failed to init database: %v", err)
+	}
+	defer db.Close()
+
+	saveDir := filepath.Join(tempDir, "downloads")
+	_ = os.MkdirAll(saveDir, 0o755)
+
+	chatID := "-100999"
+	msgID := 558
+	now := time.Now().Unix()
+	validPayload := []byte("payload to test non-target-exists commit error preservation")
+	hash := sha256.Sum256(validPayload)
+	shaHex := hex.EncodeToString(hash[:])
+	size := int64(len(validPayload))
+	relPath := "ReadOnlyChannel/2026_09/558 - eperm_commit.bin"
+
+	finalAbsPath := filepath.Join(saveDir, filepath.FromSlash(relPath))
+	partAbsPath := finalAbsPath + ".part"
+	parentDir := filepath.Dir(finalAbsPath)
+	_ = os.MkdirAll(parentDir, 0o755)
+
+	_ = os.WriteFile(partAbsPath, validPayload, 0o644)
+
+	// Inject hook to make parent directory read-only right before CommitSiblingPart
+	var hookCalled bool
+	SetRecoveryTestHooks(RecoveryTestHooks{
+		BeforeCommitSiblingPart: func(part, final string) {
+			hookCalled = true
+			_ = os.Chmod(parentDir, 0o555) // read-only directory causes link/rename failure with EACCES
+		},
+	})
+	defer func() {
+		_ = os.Chmod(parentDir, 0o755)
+		SetRecoveryTestHooks(RecoveryTestHooks{})
+	}()
+
+	// Seed DB in committing status
+	_, err = db.Execute(`
+		INSERT INTO download_records (
+			chat_id, message_id, status, file_name, save_path, file_size, sha256,
+			attempt_generation, created_at, updated_at
+		) VALUES (?, ?, 'committing', 'eperm_commit.bin', ?, ?, ?, 'gen_eperm', ?, ?)
+	`, chatID, msgID, relPath, size, shaHex, now, now)
+	if err != nil {
+		t.Fatalf("seed DB: %v", err)
+	}
+
+	rec := DownloadRecord{
+		ChatID:            chatID,
+		MessageID:         msgID,
+		Status:            "committing",
+		FileName:          "eperm_commit.bin",
+		SavePath:          relPath,
+		FileSize:          size,
+		SHA256:            shaHex,
+		AttemptGeneration: "gen_eperm",
+	}
+
+	logger := zap.NewNop()
+	recErr := ReconcileCommittingRecord(context.Background(), db, saveDir, false, rec, nil, logger)
+	if recErr == nil {
+		t.Fatal("expected ReconcileCommittingRecord to fail due to read-only directory, got nil")
+	}
+
+	if !hookCalled {
+		t.Fatal("expected BeforeCommitSiblingPart hook to be called")
+	}
+
+	// 1. Assert .part file is preserved intact! (MUST NOT BE DELETED!)
+	_ = os.Chmod(parentDir, 0o755)
+	partContent, err := os.ReadFile(partAbsPath)
+	if err != nil || string(partContent) != string(validPayload) {
+		t.Fatalf("valid .part file was deleted despite commit error: %v", err)
+	}
+
+	// 2. DB status MUST NOT be pending! (Must remain committing so it can be retried)
+	var dbStatus string
+	err = db.db.QueryRow(`SELECT status FROM download_records WHERE chat_id = ? AND message_id = ?`, chatID, msgID).Scan(&dbStatus)
+	if err != nil {
+		t.Fatalf("query DB: %v", err)
+	}
+	if dbStatus == "pending" {
+		t.Fatalf("illegal status transition: valid .part was reset to pending!")
+	}
+	t.Logf("[POST-ASSERT] Verified: non-target-exists commit error preserved valid .part and failed closed (DB status=%s)", dbStatus)
+}
