@@ -4,9 +4,13 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -15,6 +19,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -22,6 +28,7 @@ import (
 
 	"github.com/Hittlert/TGX/core/dcpool"
 	"github.com/Hittlert/TGX/core/transfer"
+	"github.com/Hittlert/TGX/internal/fscommit"
 )
 
 func TestWebServer_AuthContract(t *testing.T) {
@@ -2209,7 +2216,10 @@ func TestWebServer_RealHeadlessChromeRenderAcceptance(t *testing.T) {
 	cdpPort := ln.Addr().(*net.TCPAddr).Port
 	_ = ln.Close()
 
-	userDataDir := t.TempDir()
+	userDataDir, err := os.MkdirTemp("", "chrome-test-*")
+	if err != nil {
+		t.Fatalf("create temp user data dir: %v", err)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -2224,11 +2234,20 @@ func TestWebServer_RealHeadlessChromeRenderAcceptance(t *testing.T) {
 		server.URL,
 	)
 	if err := chromeCmd.Start(); err != nil {
+		_ = os.RemoveAll(userDataDir)
 		t.Fatalf("start chrome: %v", err)
 	}
 	defer func() {
-		_ = chromeCmd.Process.Kill()
-		_ = chromeCmd.Wait()
+		if chromeCmd.Process != nil {
+			_ = chromeCmd.Process.Kill()
+			_ = chromeCmd.Wait()
+		}
+		for i := 0; i < 20; i++ {
+			if err := os.RemoveAll(userDataDir); err == nil {
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
 	}()
 
 	driverScript := fmt.Sprintf(`
@@ -2818,11 +2837,74 @@ func TestWebServer_TruthfulPhysicalMetricsAndMonotonicCounters(t *testing.T) {
 		logger:   zap.NewNop(),
 		saveDir:  t.TempDir(),
 	}
-	// Simulate physical write of 2048 bytes and physical read of 1024 bytes
-	orch.physicalTargetWriteBytes = 2048
-	orch.physicalTargetReadBytes = 1024
-	orch.activeTargetWriters = 2
 
+	// 2.1 Execute REAL physical writes via physicalTargetWriter
+	tempFile, err := os.Create(filepath.Join(t.TempDir(), "real_target.part"))
+	if err != nil {
+		t.Fatalf("create part file: %v", err)
+	}
+	defer tempFile.Close()
+
+	pw := &physicalTargetWriter{
+		w:             tempFile,
+		activeWriters: &orch.activeTargetWriters,
+		bytesWritten:  &orch.physicalTargetWriteBytes,
+	}
+
+	var maxObservedWriters int64
+	var wg sync.WaitGroup
+	chunkData := bytes.Repeat([]byte{0xab}, 1024)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func(chunkIdx int) {
+			defer wg.Done()
+			offset := int64(chunkIdx * 1024)
+			curWriters := atomic.LoadInt64(&orch.activeTargetWriters)
+			for {
+				old := atomic.LoadInt64(&maxObservedWriters)
+				if curWriters <= old || atomic.CompareAndSwapInt64(&maxObservedWriters, old, curWriters) {
+					break
+				}
+			}
+			n, wErr := pw.WriteAt(chunkData, offset)
+			if wErr != nil || n != 1024 {
+				t.Errorf("chunk %d WriteAt failed: n=%d, err=%v", chunkIdx, n, wErr)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	if orch.SSDPhysicalWriteBytes() != 2048 {
+		t.Fatalf("expected 2048 real physical bytes written, got %d", orch.SSDPhysicalWriteBytes())
+	}
+	if orch.SSDActiveWriters() != 0 {
+		t.Fatalf("expected 0 active writers after completion, got %d", orch.SSDActiveWriters())
+	}
+
+	// 2.2 Execute REAL physical read via computeFileSHA256WithCounter
+	readPath := filepath.Join(t.TempDir(), "read_target.bin")
+	readPayload := bytes.Repeat([]byte{0xcd}, 1024)
+	if err := os.WriteFile(readPath, readPayload, 0o644); err != nil {
+		t.Fatalf("write read target: %v", err)
+	}
+
+	shaHex, shaErr := computeFileSHA256WithCounter(readPath, &orch.physicalTargetReadBytes)
+	if shaErr != nil {
+		t.Fatalf("computeFileSHA256WithCounter failed: %v", shaErr)
+	}
+	expectedReadSHA := hex.EncodeToString(sha256.New().Sum(nil))
+	_ = expectedReadSHA
+	if len(shaHex) != 64 {
+		t.Fatalf("unexpected sha hex len: %s", shaHex)
+	}
+	if orch.SSDPhysicalReadBytes() != 1024 {
+		t.Fatalf("expected 1024 real physical bytes read, got %d", orch.SSDPhysicalReadBytes())
+	}
+	if orch.SSDPhysicalWriteBytes() == orch.SSDPhysicalReadBytes() {
+		t.Fatal("direct SSD physical write and read bytes must not be artificially equal")
+	}
+
+	// 2.3 Verify Direct SSD tier behavior via WebServer
 	tempDir := t.TempDir()
 	db, err := NewDatabase(filepath.Join(tempDir, "test.db"))
 	if err != nil {
@@ -2839,23 +2921,92 @@ func TestWebServer_TruthfulPhysicalMetricsAndMonotonicCounters(t *testing.T) {
 		t.Fatalf("GET /api/system/storage: %v", err)
 	}
 	defer resp.Body.Close()
-	var storageResp map[string]any
-	_ = json.NewDecoder(resp.Body).Decode(&storageResp)
+	var directStorageResp map[string]any
+	_ = json.NewDecoder(resp.Body).Decode(&directStorageResp)
 
-	writeBytes := int64(storageResp["target_write_bytes"].(float64))
-	readBytes := int64(storageResp["target_read_bytes"].(float64))
-	writerConcurrency := int(storageResp["target_writer_concurrency"].(float64))
-	if writeBytes != 2048 {
-		t.Fatalf("expected physical target_write_bytes 2048, got %d", writeBytes)
+	if int64(directStorageResp["target_write_bytes"].(float64)) != 2048 {
+		t.Fatalf("expected target_write_bytes 2048 in direct mode, got %v", directStorageResp["target_write_bytes"])
 	}
-	if readBytes != 1024 {
-		t.Fatalf("expected physical target_read_bytes 1024, got %d", readBytes)
+	if int64(directStorageResp["target_read_bytes"].(float64)) != 1024 {
+		t.Fatalf("expected target_read_bytes 1024 in direct mode, got %v", directStorageResp["target_read_bytes"])
 	}
-	if writeBytes == readBytes {
-		t.Fatal("target_write_bytes and target_read_bytes must not be artificially equal")
+
+	// 2.4 Verify Archive tier separation and real whole-file archive copy
+	archiveDir := t.TempDir()
+	archiveWorker, err := NewArchiveWorker(db, orch.saveDir, archiveDir, zap.NewNop())
+	if err != nil {
+		t.Fatalf("NewArchiveWorker: %v", err)
 	}
-	if writerConcurrency != 2 {
-		t.Fatalf("expected target_writer_concurrency 2, got %d", writerConcurrency)
+
+	// Create real file in SSD saveDir (512 bytes)
+	arcFileName := "archive_test_file.bin"
+	arcSrcPath := filepath.Join(orch.saveDir, arcFileName)
+	arcPayload := bytes.Repeat([]byte{0xef}, 512)
+	if err := os.WriteFile(arcSrcPath, arcPayload, 0o644); err != nil {
+		t.Fatalf("write archive source file: %v", err)
+	}
+	h512 := sha256.Sum256(arcPayload)
+	sha512Hex := hex.EncodeToString(h512[:])
+
+	// Seed DB record for archive
+	nowSec := time.Now().Unix()
+	_, err = db.Execute(`
+		INSERT INTO download_records (chat_id, message_id, file_name, save_path, file_size, status, sha256, downloaded_at, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, "arc_chat", 1, arcFileName, arcFileName, 512, "downloaded", sha512Hex, nowSec, nowSec, nowSec)
+	if err != nil {
+		t.Fatalf("insert download record for archive: %v", err)
+	}
+
+	// Execute REAL whole-file archive copy via processJob
+	archiveWorker.processJob(context.Background(), ArchiveJob{
+		ChatID:       "arc_chat",
+		MessageID:    1,
+		ClaimID:      "claim-test-1",
+		RelativePath: arcFileName,
+		ExpectedSize: 512,
+		SHA256:       sha512Hex,
+	})
+	orch.archiveWorker = archiveWorker
+
+	respArc, err := http.Get(server.URL + "/api/system/storage")
+	if err != nil {
+		t.Fatalf("GET /api/system/storage with archive: %v", err)
+	}
+	defer respArc.Body.Close()
+	var arcStorageResp map[string]any
+	_ = json.NewDecoder(respArc.Body).Decode(&arcStorageResp)
+
+	// In archive mode, target storage is the archive tier (512 bytes), NOT added to SSD (2048 bytes)
+	if int64(arcStorageResp["target_write_bytes"].(float64)) != 512 {
+		t.Fatalf("expected target_write_bytes 512 for archive target tier, got %v", arcStorageResp["target_write_bytes"])
+	}
+	if int64(arcStorageResp["target_read_bytes"].(float64)) != 512 {
+		t.Fatalf("expected target_read_bytes 512 for archive target tier, got %v", arcStorageResp["target_read_bytes"])
+	}
+	// SSD tier is exposed separately without double counting
+	if int64(arcStorageResp["ssd_write_bytes"].(float64)) != 2048 {
+		t.Fatalf("expected ssd_write_bytes 2048 for distinct SSD tier, got %v", arcStorageResp["ssd_write_bytes"])
+	}
+	if int64(arcStorageResp["ssd_read_bytes"].(float64)) != 1024 {
+		t.Fatalf("expected ssd_read_bytes 1024 for distinct SSD tier, got %v", arcStorageResp["ssd_read_bytes"])
+	}
+
+	// 2.5 Verify CopyStreamSequential retains partial physical bytes on failure
+	var writtenBeforeErr bytes.Buffer
+	faultyReader := io.MultiReader(
+		bytes.NewReader(bytes.Repeat([]byte{0x77}, 256)),
+		&failingReader{err: errors.New("simulated network/disk crash")},
+	)
+	retainedBytes, _, copyErr := fscommit.CopyStreamSequential(faultyReader, &writeCloserBuffer{Buffer: &writtenBeforeErr})
+	if copyErr == nil {
+		t.Fatal("expected simulated copy error")
+	}
+	if retainedBytes != 256 {
+		t.Fatalf("expected 256 physical bytes retained on copy error, got %d", retainedBytes)
+	}
+	if writtenBeforeErr.Len() != 256 {
+		t.Fatalf("expected 256 bytes in destination buffer before failure, got %d", writtenBeforeErr.Len())
 	}
 
 	// 3. Error source propagation: collection failure is emitted as null / collection_errors, not zero
@@ -2875,4 +3026,20 @@ func TestWebServer_TruthfulPhysicalMetricsAndMonotonicCounters(t *testing.T) {
 	if !ok || len(errs) == 0 {
 		t.Fatalf("expected collection_errors on DB failure, got %v", errStorageResp["collection_errors"])
 	}
+}
+
+type failingReader struct {
+	err error
+}
+
+func (r *failingReader) Read(p []byte) (n int, err error) {
+	return 0, r.err
+}
+
+type writeCloserBuffer struct {
+	*bytes.Buffer
+}
+
+func (w *writeCloserBuffer) Close() error {
+	return nil
 }

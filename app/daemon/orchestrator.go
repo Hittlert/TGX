@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -472,7 +473,7 @@ func (o *Orchestrator) ReconcileCommitting(ctx context.Context) error {
 			continue
 		}
 
-		if err := ReconcileCommittingRecord(ctx, o.db, o.saveDir, archiveEnabled, rec, o.registry, o.logger); err != nil {
+		if err := ReconcileCommittingRecord(ctx, o.db, o.saveDir, archiveEnabled, rec, o.registry, o.logger, &o.physicalTargetReadBytes); err != nil {
 			o.logger.Warn("reconciliation of committing record encountered error",
 				zap.String("chat_id", rec.ChatID),
 				zap.Int("message_id", rec.MessageID),
@@ -1032,20 +1033,21 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 		LastPhysicalID:  &lastPhysID,
 	})
 
-	atomic.AddInt64(&o.activeTargetWriters, 1)
+	targetWriter := &physicalTargetWriter{
+		w:             partFile,
+		activeWriters: &o.activeTargetWriters,
+		bytesWritten:  &o.physicalTargetWriteBytes,
+	}
+
 	dlResult, dlErr := o.transferMgr.DownloadFileWithResult(
 		taskCtx,
 		client,
 		resolvedMedia.File.Location(),
 		authoritativeSize,
-		partFile,
+		targetWriter,
 		onProgress,
 	)
-	atomic.AddInt64(&o.activeTargetWriters, -1)
 	written := dlResult.Written
-	if written > 0 {
-		atomic.AddInt64(&o.physicalTargetWriteBytes, written)
-	}
 	retries := dlResult.PhysicalRetries
 	wireTotal := dlResult.WireBytes
 	replayBytes := dlResult.ReplayBytes
@@ -1237,7 +1239,7 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 		return
 	}
 
-	shaHex, shaErr := computeFileSHA256(partAbsPath)
+	shaHex, shaErr := computeFileSHA256WithCounter(partAbsPath, &o.physicalTargetReadBytes)
 	if shaErr != nil {
 		_ = os.Remove(partAbsPath)
 		disp := FailureDisposition{
@@ -1523,35 +1525,91 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 	)
 }
 
+// physicalTargetWriter instruments physical chunk writes, capturing exact concurrent WriteAt
+// operations and total physical bytes written (including on error) directly at the I/O boundary.
+type physicalTargetWriter struct {
+	w             io.WriterAt
+	activeWriters *int64
+	bytesWritten  *int64
+}
+
+func (pw *physicalTargetWriter) WriteAt(p []byte, off int64) (int, error) {
+	if pw.activeWriters != nil {
+		atomic.AddInt64(pw.activeWriters, 1)
+		defer atomic.AddInt64(pw.activeWriters, -1)
+	}
+	n, err := pw.w.WriteAt(p, off)
+	if pw.bytesWritten != nil && n > 0 {
+		atomic.AddInt64(pw.bytesWritten, int64(n))
+	}
+	return n, err
+}
+
+func (o *Orchestrator) SSDPhysicalWriteBytes() int64 {
+	if o == nil {
+		return 0
+	}
+	return atomic.LoadInt64(&o.physicalTargetWriteBytes)
+}
+
+func (o *Orchestrator) SSDPhysicalReadBytes() int64 {
+	if o == nil {
+		return 0
+	}
+	return atomic.LoadInt64(&o.physicalTargetReadBytes)
+}
+
+func (o *Orchestrator) SSDActiveWriters() int64 {
+	if o == nil {
+		return 0
+	}
+	return atomic.LoadInt64(&o.activeTargetWriters)
+}
+
+// PhysicalTargetWriteBytes returns the physical bytes written to the authoritative target storage tier.
+// When archive is enabled, target storage is the archive storage tier (ArchiveDir).
+// When archive is disabled (direct mode), target storage is the direct SSD download tier (OutputDir).
+// The tiers are never added together, preventing double-counting and ambiguous write amplification.
 func (o *Orchestrator) PhysicalTargetWriteBytes() int64 {
 	if o == nil {
 		return 0
 	}
-	val := atomic.LoadInt64(&o.physicalTargetWriteBytes)
-	if o.archiveWorker != nil {
-		val += o.archiveWorker.PhysicalWriteBytes()
+	if o.IsArchiveEnabled() && o.archiveWorker != nil {
+		return o.archiveWorker.PhysicalWriteBytes()
 	}
-	return val
+	return atomic.LoadInt64(&o.physicalTargetWriteBytes)
 }
 
+// PhysicalTargetReadBytes returns the physical bytes read from the target storage tier.
+// When archive is enabled, target read bytes measure the source-to-target archive copy reads.
+// When archive is disabled (direct mode), target read bytes measure hash verification and recovery reads.
 func (o *Orchestrator) PhysicalTargetReadBytes() int64 {
 	if o == nil {
 		return 0
 	}
-	val := atomic.LoadInt64(&o.physicalTargetReadBytes)
-	if o.archiveWorker != nil {
-		val += o.archiveWorker.PhysicalReadBytes()
+	if o.IsArchiveEnabled() && o.archiveWorker != nil {
+		return o.archiveWorker.PhysicalReadBytes()
 	}
-	return val
+	return atomic.LoadInt64(&o.physicalTargetReadBytes)
 }
 
+// ActiveTargetWriters returns the count of actively executing physical write operations on target storage.
+// When archive is enabled, it returns the archive worker writer concurrency (0 or 1).
+// When archive is disabled, it returns the concurrent WriteAt operations on direct SSD storage.
 func (o *Orchestrator) ActiveTargetWriters() int64 {
 	if o == nil {
 		return 0
 	}
-	val := atomic.LoadInt64(&o.activeTargetWriters)
-	if o.archiveWorker != nil {
-		val += int64(o.archiveWorker.ActiveWorkers())
+	if o.IsArchiveEnabled() && o.archiveWorker != nil {
+		return int64(o.archiveWorker.ActiveWorkers())
 	}
-	return val
+	return atomic.LoadInt64(&o.activeTargetWriters)
+}
+
+// PhysicalTargetReadBytesPtr returns the pointer to physicalTargetReadBytes counter for atomic increments by recovery/check routines.
+func (o *Orchestrator) PhysicalTargetReadBytesPtr() *int64 {
+	if o == nil {
+		return nil
+	}
+	return &o.physicalTargetReadBytes
 }

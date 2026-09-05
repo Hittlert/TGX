@@ -13,7 +13,7 @@ import (
 )
 
 // ReconcileOnStartup executes the Section 10 crash recovery matrix before new admissions begin.
-func ReconcileOnStartup(ctx context.Context, db *Database, ssdDir, archiveDir string, logger *zap.Logger) error {
+func ReconcileOnStartup(ctx context.Context, db *Database, ssdDir, archiveDir string, logger *zap.Logger, readCounters ...*int64) error {
 	var errs []error
 	archiveEnabled := archiveDir != ""
 
@@ -24,7 +24,7 @@ func ReconcileOnStartup(ctx context.Context, db *Database, ssdDir, archiveDir st
 		errs = append(errs, fmt.Errorf("get pending committing: %w", err))
 	} else {
 		for _, rec := range committingRecs {
-			if recErr := ReconcileCommittingRecord(ctx, db, ssdDir, archiveEnabled, rec, nil, logger); recErr != nil {
+			if recErr := ReconcileCommittingRecord(ctx, db, ssdDir, archiveEnabled, rec, nil, logger, readCounters...); recErr != nil {
 				logger.Error("failed to reconcile committing download during startup recovery",
 					zap.String("chat_id", rec.ChatID),
 					zap.Int("message_id", rec.MessageID),
@@ -111,9 +111,13 @@ func ReconcileOnStartup(ctx context.Context, db *Database, ssdDir, archiveDir st
 				dstMoving := dstFinal + ".moving"
 				srcPath := filepath.Join(ssdDir, filepath.FromSlash(job.RelativePath))
 
+				var readCounter *int64
+				if len(readCounters) > 0 {
+					readCounter = readCounters[0]
+				}
 				// Check if archive final file exists and is verified
 				if finInfo, statErr := os.Stat(dstFinal); statErr == nil && finInfo.Size() == job.ExpectedSize {
-					sha, shaErr := computeFileSHA256(dstFinal)
+					sha, shaErr := computeFileSHA256WithCounter(dstFinal, readCounter)
 					if shaErr == nil && job.SHA256 != "" && sha == job.SHA256 {
 						_ = os.Remove(dstMoving)
 						if completeErr := db.RecoverArchiveJobComplete(job.ChatID, job.MessageID, job.ClaimID, job.SHA256); completeErr != nil {
@@ -254,16 +258,21 @@ func ReconcileCommittingRecord(
 	rec DownloadRecord,
 	registry *Registry,
 	logger *zap.Logger,
+	readCounters ...*int64,
 ) error {
 	if db == nil {
 		return nil
+	}
+	var readCounter *int64
+	if len(readCounters) > 0 {
+		readCounter = readCounters[0]
 	}
 	finalAbsPath := filepath.Join(ssdDir, filepath.FromSlash(rec.SavePath))
 	partAbsPath := finalAbsPath + ".part"
 
 	// 1. Check if final SSD file already exists
 	if finInfo, statErr := os.Stat(finalAbsPath); statErr == nil && !finInfo.IsDir() {
-		finSHA, shaErr := computeFileSHA256(finalAbsPath)
+		finSHA, shaErr := computeFileSHA256WithCounter(finalAbsPath, readCounter)
 		if shaErr == nil && rec.SHA256 != "" && finInfo.Size() == rec.FileSize && finSHA == rec.SHA256 {
 			// Final SSD file already exists and matches committed size and SHA proof
 			_ = os.Remove(partAbsPath)
@@ -289,7 +298,7 @@ func ReconcileCommittingRecord(
 		// Final SSD file exists but does NOT match!
 		// Check if .part file exists and is valid
 		if partInfo, statPartErr := os.Stat(partAbsPath); statPartErr == nil && partInfo.Size() == rec.FileSize {
-			partSHA, shaPartErr := computeFileSHA256(partAbsPath)
+			partSHA, shaPartErr := computeFileSHA256WithCounter(partAbsPath, readCounter)
 			if shaPartErr == nil && rec.SHA256 != "" && partSHA == rec.SHA256 {
 				// Valid part + conflicting final!
 				// Preserve both proofs, do not delete part, record durable conflict!
@@ -322,7 +331,7 @@ func ReconcileCommittingRecord(
 
 	// 2. .part file exists with matching SHA -> commit sibling part and evaluate canonical outcome
 	if partInfo, statErr := os.Stat(partAbsPath); statErr == nil && partInfo.Size() == rec.FileSize {
-		sha, shaErr := computeFileSHA256(partAbsPath)
+		sha, shaErr := computeFileSHA256WithCounter(partAbsPath, readCounter)
 		if shaErr == nil && rec.SHA256 != "" && sha == rec.SHA256 {
 			if recoveryTestHooks.BeforeCommitSiblingPart != nil {
 				recoveryTestHooks.BeforeCommitSiblingPart(partAbsPath, finalAbsPath)

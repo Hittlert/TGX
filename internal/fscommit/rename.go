@@ -50,8 +50,14 @@ func Preallocate(file *os.File, size int64) error {
 	return preallocate(file, size)
 }
 
+// Syncer is an interface for types that can synchronize in-memory data to persistent storage.
+type Syncer interface {
+	Sync() error
+}
+
 // CopyFileSequential copies src to dst using a sequential 4MB buffer,
 // computes SHA-256 simultaneously, fsyncs dst, and returns (writtenBytes, sha256Hex, error).
+// On any error during copy/sync/close, writtenBytes retains the actual physical bytes transferred before failure.
 func CopyFileSequential(srcPath, dstPath string) (int64, string, error) {
 	src, err := os.Open(srcPath)
 	if err != nil {
@@ -68,6 +74,18 @@ func CopyFileSequential(srcPath, dstPath string) (int64, string, error) {
 		return 0, "", fmt.Errorf("open dst: %w", err)
 	}
 
+	written, sha, copyErr := CopyStreamSequential(src, dst)
+	if copyErr != nil {
+		_ = os.Remove(dstPath)
+		return written, "", copyErr
+	}
+	return written, sha, nil
+}
+
+// CopyStreamSequential copies src to dst using a sequential 4MB buffer,
+// computes SHA-256 simultaneously, syncs dst if it implements Syncer, and closes dst.
+// On any error, written returns the actual physical bytes transferred before failure.
+func CopyStreamSequential(src io.Reader, dst io.WriteCloser) (int64, string, error) {
 	h := sha256.New()
 	mw := io.MultiWriter(dst, h)
 
@@ -75,19 +93,18 @@ func CopyFileSequential(srcPath, dstPath string) (int64, string, error) {
 	written, copyErr := io.CopyBuffer(mw, src, buf)
 	if copyErr != nil {
 		_ = dst.Close()
-		_ = os.Remove(dstPath)
-		return 0, "", fmt.Errorf("copy buffer: %w", copyErr)
+		return written, "", fmt.Errorf("copy buffer: %w", copyErr)
 	}
 
-	if syncErr := dst.Sync(); syncErr != nil {
-		_ = dst.Close()
-		_ = os.Remove(dstPath)
-		return 0, "", fmt.Errorf("fsync dst: %w", syncErr)
+	if s, ok := dst.(Syncer); ok {
+		if syncErr := s.Sync(); syncErr != nil {
+			_ = dst.Close()
+			return written, "", fmt.Errorf("fsync dst: %w", syncErr)
+		}
 	}
 
 	if closeErr := dst.Close(); closeErr != nil {
-		_ = os.Remove(dstPath)
-		return 0, "", fmt.Errorf("close dst: %w", closeErr)
+		return written, "", fmt.Errorf("close dst: %w", closeErr)
 	}
 
 	return written, hex.EncodeToString(h.Sum(nil)), nil

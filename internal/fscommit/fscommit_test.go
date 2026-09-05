@@ -1,6 +1,7 @@
 package fscommit
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -145,5 +146,64 @@ func TestSSDAdmission(t *testing.T) {
 	_, err = adm.Reserve("task-huge", int64(free)+1)
 	if !errors.Is(err, ErrInsufficientSSDSpace) {
 		t.Fatalf("expected ErrInsufficientSSDSpace, got: %v", err)
+	}
+}
+
+type faultyReader struct {
+	data      []byte
+	failAfter int
+	readSoFar int
+}
+
+func (r *faultyReader) Read(p []byte) (n int, err error) {
+	if r.readSoFar >= r.failAfter {
+		return 0, errors.New("simulated read failure")
+	}
+	remaining := r.failAfter - r.readSoFar
+	toRead := len(p)
+	if toRead > remaining {
+		toRead = remaining
+	}
+	copy(p, r.data[r.readSoFar:r.readSoFar+toRead])
+	r.readSoFar += toRead
+	if r.readSoFar >= r.failAfter {
+		return toRead, errors.New("simulated read failure")
+	}
+	return toRead, nil
+}
+
+type nopWriteCloser struct {
+	bytes.Buffer
+	syncCalled  bool
+	closeCalled bool
+}
+
+func (n *nopWriteCloser) Sync() error {
+	n.syncCalled = true
+	return nil
+}
+
+func (n *nopWriteCloser) Close() error {
+	n.closeCalled = true
+	return nil
+}
+
+func TestCopyStreamSequential_FailurePreservesWrittenBytes(t *testing.T) {
+	payload := make([]byte, 10240)
+	fr := &faultyReader{data: payload, failAfter: 4096}
+	dst := &nopWriteCloser{}
+
+	written, _, err := CopyStreamSequential(fr, dst)
+	if err == nil {
+		t.Fatal("expected copy error, got nil")
+	}
+	if written != 4096 {
+		t.Fatalf("expected written bytes 4096, got %d", written)
+	}
+	if dst.Len() != 4096 {
+		t.Fatalf("expected dst buffer len 4096, got %d", dst.Len())
+	}
+	if !dst.closeCalled {
+		t.Fatal("dst must be closed even on error")
 	}
 }

@@ -389,7 +389,7 @@ func (w *ArchiveWorker) processJob(ctx context.Context, job ArchiveJob) {
 	)
 }
 
-func computeFileSHA256(filePath string) (string, error) {
+func computeFileSHA256WithCounter(filePath string, readCounter *int64) (string, error) {
 	f, err := os.Open(filePath)
 	if err != nil {
 		return "", err
@@ -398,10 +398,26 @@ func computeFileSHA256(filePath string) (string, error) {
 
 	h := sha256.New()
 	buf := make([]byte, 1024*1024)
-	if _, err := io.CopyBuffer(h, f, buf); err != nil {
-		return "", err
+	for {
+		n, rErr := f.Read(buf)
+		if n > 0 {
+			if readCounter != nil {
+				atomic.AddInt64(readCounter, int64(n))
+			}
+			h.Write(buf[:n])
+		}
+		if rErr != nil {
+			if errors.Is(rErr, io.EOF) {
+				break
+			}
+			return "", rErr
+		}
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func computeFileSHA256(filePath string) (string, error) {
+	return computeFileSHA256WithCounter(filePath, nil)
 }
 
 func (w *ArchiveWorker) PhysicalWriteBytes() int64 {

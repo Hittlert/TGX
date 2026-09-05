@@ -203,13 +203,6 @@ func Run(ctx context.Context, client *telegram.Client, kvd storage.Storage, opts
 		}
 	}
 
-	// 3. Restart Crash Recovery Matrix
-	if db != nil {
-		if recErr := ReconcileOnStartup(ctx, db, opts.OutputDir, opts.ArchiveDir, logctx.From(ctx)); recErr != nil {
-			logctx.From(ctx).Warn("startup crash recovery reported warning", zap.Error(recErr))
-		}
-	}
-
 	registry := NewRegistryWithContext(ctx, opts.QueueCapacity, opts.TerminalLimit, time.Now)
 	registry.SetPaused(opts.StartPaused)
 	registry.SetPool(PoolSnapshot{Size: opts.PoolSize})
@@ -220,14 +213,28 @@ func Run(ctx context.Context, client *telegram.Client, kvd storage.Storage, opts
 	}
 	proxyManager := NewProxyManager(opts.SingboxURL, statsFile)
 
-	group, groupCtx := errgroup.WithContext(ctx)
-
 	var orchestrator *Orchestrator
 	if db != nil {
 		orchestrator = NewOrchestrator(db, transferMgr, ssdAdmission, proxyManager, access, registry, logctx.From(ctx), opts.OutputDir)
 		if archiveWorker != nil {
 			orchestrator.SetArchiveWorker(archiveWorker)
 		}
+	}
+
+	// 3. Restart Crash Recovery Matrix
+	if db != nil {
+		var readCounters []*int64
+		if orchestrator != nil {
+			readCounters = append(readCounters, orchestrator.PhysicalTargetReadBytesPtr())
+		}
+		if recErr := ReconcileOnStartup(ctx, db, opts.OutputDir, opts.ArchiveDir, logctx.From(ctx), readCounters...); recErr != nil {
+			logctx.From(ctx).Warn("startup crash recovery reported warning", zap.Error(recErr))
+		}
+	}
+
+	group, groupCtx := errgroup.WithContext(ctx)
+
+	if orchestrator != nil {
 		orchestrator.Start(groupCtx)
 
 		// Start MTProto Real-Time Push Updates Streaming Engine

@@ -195,6 +195,11 @@ func (s *WebServer) Handler() http.Handler {
 			"percent_used": fmt.Sprintf("%.1f%%", percent),
 		}
 
+		isArchiveEnabled := false
+		if s.orchestrator != nil && s.orchestrator.IsArchiveEnabled() {
+			isArchiveEnabled = true
+		}
+
 		// 1. Target physical write and read bytes from live orchestrator instrumentation
 		var targetWriteBytes int64
 		var targetReadBytes int64
@@ -203,24 +208,19 @@ func (s *WebServer) Handler() http.Handler {
 			targetWriteBytes = s.orchestrator.PhysicalTargetWriteBytes()
 			targetReadBytes = s.orchestrator.PhysicalTargetReadBytes()
 			targetWriterConcurrency = int(s.orchestrator.ActiveTargetWriters())
+			if isArchiveEnabled {
+				resp["ssd_write_bytes"] = s.orchestrator.SSDPhysicalWriteBytes()
+				resp["ssd_read_bytes"] = s.orchestrator.SSDPhysicalReadBytes()
+				resp["ssd_writer_concurrency"] = s.orchestrator.SSDActiveWriters()
+			}
 		} else if s.transferMgr != nil {
 			targetWriterConcurrency = int(s.transferMgr.ActiveFiles())
 		}
 
-		// 2. Authoritative target backlog bytes from Registry queued task sizes (+ archive backlog if enabled)
+		// 2. Authoritative target backlog bytes and durable bytes
 		var targetBacklogBytes int64
-		if s.registry != nil {
-			targetBacklogBytes = s.registry.QueuedBacklogBytes()
-		}
-
-		// 3. Durable bytes and archive subsystem status
 		var targetDurableBytes *int64
 		var collectionErrors []map[string]string
-
-		isArchiveEnabled := false
-		if s.orchestrator != nil && s.orchestrator.IsArchiveEnabled() {
-			isArchiveEnabled = true
-		}
 
 		if isArchiveEnabled {
 			if s.db != nil {
@@ -232,12 +232,15 @@ func (s *WebServer) Handler() http.Handler {
 					})
 				} else {
 					resp["archive"] = arcStats
-					targetBacklogBytes += arcStats.BacklogBytes
+					targetBacklogBytes = arcStats.BacklogBytes
 					d := arcStats.ArchivedBytes
 					targetDurableBytes = &d
 				}
 			}
 		} else {
+			if s.registry != nil {
+				targetBacklogBytes = s.registry.QueuedBacklogBytes()
+			}
 			if s.db != nil {
 				durable, err := s.db.GetDurableTargetBytes()
 				if err != nil {

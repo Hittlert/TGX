@@ -2,9 +2,12 @@
 """Self-tests for the real TGX evaluation manifest, collector, and analyzer."""
 
 import json
+import socket
 import sqlite3
 import tempfile
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from unittest.mock import patch
 
@@ -24,6 +27,45 @@ from harness import (
 )
 from manifest_generator import generate_profile_manifest
 from run_protocol_v1 import build_run_spec, validate_run_spec_shape
+
+
+class MockServerContext:
+    def __init__(self, routes):
+        self.routes = routes
+        self.server = None
+        self.thread = None
+
+    def __enter__(self):
+        routes = self.routes
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                for path_suffix, (code, payload) in routes.items():
+                    if self.path.endswith(path_suffix):
+                        self.send_response(code)
+                        self.send_header("Content-Type", "application/json")
+                        self.end_headers()
+                        if payload is not None:
+                            self.wfile.write(json.dumps(payload).encode("utf-8"))
+                        return
+                self.send_response(404)
+                self.end_headers()
+
+            def log_message(self, format, *args):
+                pass
+
+        self.server = HTTPServer(("127.0.0.1", 0), Handler)
+        port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        return f"http://127.0.0.1:{port}"
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.server:
+            self.server.shutdown()
+            self.server.server_close()
+        if self.thread:
+            self.thread.join(timeout=2.0)
 
 
 def find_policy_path():
@@ -293,37 +335,32 @@ class EvaluationSelfTest(unittest.TestCase):
         validate_run_spec_shape(spec)
 
     def test_collector_maps_current_runtime_endpoints(self):
-        def fake_http(url, **_kwargs):
-            if url.endswith("/api/status"):
-                return {
-                    "rolling_5s_bps": 123,
-                    "queue_depth": 2,
-                    "active_files": [{"id": "one"}],
-                    "pool": {"size": 4, "reconnects": 1},
-                }
-            if url.endswith("/api/gate"):
-                return {
-                    "data_in_flight": 3,
-                    "ssd_reserved_bytes": 10,
-                    "ssd_available_bytes": 20,
-                }
-            if url.endswith("/api/system/storage"):
-                return {
-                    "free_bytes": 30,
-                    "total_bytes": 40,
-                    "used_bytes": 10,
-                    "archive": {
-                        "archive_backlog_files": 1,
-                        "archive_backlog_bytes": 50,
-                        "archive_active_workers": 1,
-                    },
-                }
-            raise AssertionError(url)
+        routes = {
+            "/api/status": (200, {
+                "rolling_5s_bps": 123,
+                "queue_depth": 2,
+                "active_files": [{"id": "one"}],
+                "pool": {"size": 4, "reconnects": 1},
+            }),
+            "/api/gate": (200, {
+                "data_in_flight": 3,
+                "ssd_reserved_bytes": 10,
+                "ssd_available_bytes": 20,
+            }),
+            "/api/system/storage": (200, {
+                "free_bytes": 30,
+                "total_bytes": 40,
+                "used_bytes": 10,
+                "archive": {
+                    "archive_backlog_files": 1,
+                    "archive_backlog_bytes": 50,
+                    "archive_active_workers": 1,
+                },
+            }),
+        }
 
-        with tempfile.TemporaryDirectory() as temp, patch(
-            "harness.http_json", side_effect=fake_http
-        ):
-            sampler = MetricsSampler("http://fixture", Path(temp) / "metrics", "tgx")
+        with MockServerContext(routes) as base_url, tempfile.TemporaryDirectory() as temp:
+            sampler = MetricsSampler(base_url, Path(temp) / "metrics", "tgx")
             sample = sampler.sample()
         self.assertEqual(123, sample["rolling_5s_bps"])
         self.assertEqual(1, sample["active_files"])
@@ -335,51 +372,46 @@ class EvaluationSelfTest(unittest.TestCase):
         self.assertIn("process_rss", missing_sources)
 
     def test_collector_maps_extended_observability_metrics(self):
-        def fake_http(url, timeout=3.0, retries=1):
-            if url.endswith("/api/status"):
-                return {
-                    "rolling_5s_bps": 123,
-                    "queue_depth": 2,
-                    "active_files": [{"id": "one"}],
-                    "pool": {"size": 4, "reconnects": 1},
-                    "wire_rx_bytes": 1048576,
-                    "unique_payload_bytes": 524288,
-                    "retry_count": 3,
-                    "process_rss": 67108864,
-                    "heap_alloc": 33554432,
-                    "heap_inuse": 41943040,
-                    "heap_objects": 12000,
-                    "gc_count": 5,
-                    "gc_pause_total": 1000000,
-                }
-            if url.endswith("/api/gate"):
-                return {
-                    "data_in_flight": 3,
-                    "ssd_reserved_bytes": 10,
-                    "ssd_available_bytes": 20,
-                }
-            if url.endswith("/api/system/storage"):
-                return {
-                    "free_bytes": 30,
-                    "total_bytes": 40,
-                    "used_bytes": 10,
-                    "target_write_bytes": 786432,
-                    "target_read_bytes": 262144,
-                    "target_durable_bytes": 524288,
-                    "target_writer_concurrency": 2,
-                    "target_backlog_bytes": 1048576,
-                    "archive": {
-                        "archive_backlog_files": 0,
-                        "archive_backlog_bytes": 0,
-                        "archive_active_workers": 0,
-                    },
-                }
-            raise AssertionError(url)
+        routes = {
+            "/api/status": (200, {
+                "rolling_5s_bps": 123,
+                "queue_depth": 2,
+                "active_files": [{"id": "one"}],
+                "pool": {"size": 4, "reconnects": 1},
+                "wire_rx_bytes": 1048576,
+                "unique_payload_bytes": 524288,
+                "retry_count": 3,
+                "process_rss": 67108864,
+                "heap_alloc": 33554432,
+                "heap_inuse": 41943040,
+                "heap_objects": 12000,
+                "gc_count": 5,
+                "gc_pause_total": 1000000,
+            }),
+            "/api/gate": (200, {
+                "data_in_flight": 3,
+                "ssd_reserved_bytes": 10,
+                "ssd_available_bytes": 20,
+            }),
+            "/api/system/storage": (200, {
+                "free_bytes": 30,
+                "total_bytes": 40,
+                "used_bytes": 10,
+                "target_write_bytes": 786432,
+                "target_read_bytes": 262144,
+                "target_durable_bytes": 524288,
+                "target_writer_concurrency": 2,
+                "target_backlog_bytes": 1048576,
+                "archive": {
+                    "archive_backlog_files": 0,
+                    "archive_backlog_bytes": 0,
+                    "archive_active_workers": 0,
+                },
+            }),
+        }
 
-        with tempfile.TemporaryDirectory() as temp, patch(
-            "harness.http_json", side_effect=fake_http
-        ):
-            sampler = MetricsSampler("http://fixture", Path(temp) / "metrics", "tgx")
+        with MockServerContext(routes) as base_url, tempfile.TemporaryDirectory() as temp:
+            sampler = MetricsSampler(base_url, Path(temp) / "metrics", "tgx")
             sample = sampler.sample()
         self.assertEqual(1048576, sample["wire_rx_bytes"])
         self.assertEqual(524288, sample["unique_payload_bytes"])
@@ -398,41 +430,40 @@ class EvaluationSelfTest(unittest.TestCase):
         self.assertNotIn("target_write_bytes", missing_sources)
 
     def test_collector_propagates_storage_collection_error_and_null_durable_bytes(self):
-        def fake_http(url, timeout=3.0, retries=1):
-            if url.endswith("/api/status"):
-                return {"rolling_5s_bps": 100, "queue_depth": 0, "active_files": 0}
-            if url.endswith("/api/gate"):
-                return {"data_in_flight": 0, "ssd_reserved_bytes": 0, "ssd_available_bytes": 1000}
-            if url.endswith("/api/system/storage"):
-                return {
-                    "free_bytes": 100,
-                    "total_bytes": 200,
-                    "used_bytes": 100,
-                    "target_write_bytes": 0,
-                    "target_read_bytes": 0,
-                    "target_durable_bytes": None,
-                    "target_writer_concurrency": 0,
-                    "target_backlog_bytes": 0,
-                    "collection_errors": [
-                        {"source": "/api/system/storage:durable_bytes", "error": "db disk I/O error"}
-                    ],
-                }
-            raise AssertionError(url)
+        routes = {
+            "/api/status": (200, {"rolling_5s_bps": 100, "queue_depth": 0, "active_files": 0}),
+            "/api/gate": (200, {"data_in_flight": 0, "ssd_reserved_bytes": 0, "ssd_available_bytes": 1000}),
+            "/api/system/storage": (200, {
+                "free_bytes": 100,
+                "total_bytes": 200,
+                "used_bytes": 100,
+                "target_write_bytes": 0,
+                "target_read_bytes": 0,
+                "target_durable_bytes": None,
+                "target_writer_concurrency": 0,
+                "target_backlog_bytes": 0,
+                "collection_errors": [
+                    {"source": "/api/system/storage:durable_bytes", "error": "db disk I/O error"}
+                ],
+            }),
+        }
 
-        with tempfile.TemporaryDirectory() as temp, patch(
-            "harness.http_json", side_effect=fake_http
-        ):
-            sampler = MetricsSampler("http://fixture", Path(temp) / "metrics", "tgx")
+        with MockServerContext(routes) as base_url, tempfile.TemporaryDirectory() as temp:
+            sampler = MetricsSampler(base_url, Path(temp) / "metrics", "tgx")
             sample = sampler.sample()
         self.assertIsNone(sample["target_durable_bytes"])
         missing_sources = {error["source"] for error in sample["collection_errors"]}
         self.assertIn("target_durable_bytes", missing_sources)
 
     def test_collector_never_turns_collection_failure_into_zero(self):
-        with tempfile.TemporaryDirectory() as temp, patch(
-            "harness.http_json", side_effect=OSError("fixture unavailable")
-        ):
-            sampler = MetricsSampler("http://fixture", Path(temp) / "metrics", "tgx")
+        # Bind and close a TCP socket on 127.0.0.1 to obtain a guaranteed unbound port
+        probe_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        probe_sock.bind(("127.0.0.1", 0))
+        unused_port = probe_sock.getsockname()[1]
+        probe_sock.close()
+
+        with tempfile.TemporaryDirectory() as temp:
+            sampler = MetricsSampler(f"http://127.0.0.1:{unused_port}", Path(temp) / "metrics", "tgx")
             sample = sampler.sample()
         self.assertIsNone(sample["rolling_5s_bps"])
         self.assertIsNone(sample["ssd_free_bytes"])
