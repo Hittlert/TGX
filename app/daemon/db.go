@@ -54,6 +54,30 @@ var (
 	ErrAlreadySuccess = errors.New("download already completed successfully")
 )
 
+// SuccessProof carries the authoritative terminal proof for a successful download record.
+type SuccessProof struct {
+	SavePath string
+	FileSize int64
+	SHA256   string
+}
+
+// AlreadySuccessError is returned by BeginDownload when the record is already completed with valid proof.
+type AlreadySuccessError struct {
+	Proof SuccessProof
+}
+
+func (e *AlreadySuccessError) Error() string {
+	return fmt.Sprintf("%s: path=%s, size=%d, sha=%s", ErrAlreadySuccess.Error(), e.Proof.SavePath, e.Proof.FileSize, e.Proof.SHA256)
+}
+
+func (e *AlreadySuccessError) Unwrap() error {
+	return ErrAlreadySuccess
+}
+
+func (e *AlreadySuccessError) Is(target error) bool {
+	return target == ErrAlreadySuccess
+}
+
 func (d *Database) initSchema() error {
 	queries := []string{
 		`CREATE TABLE IF NOT EXISTS download_records (
@@ -935,8 +959,14 @@ func (d *Database) BeginDownload(chatID string, messageID int, generation string
 	defer d.lock.Unlock()
 
 	now := time.Now().Unix()
-	var currentStatus, currentGen string
-	err := d.db.QueryRow(`SELECT status, COALESCE(attempt_generation, '') FROM download_records WHERE chat_id = ? AND message_id = ?`, chatID, messageID).Scan(&currentStatus, &currentGen)
+	var currentStatus, currentGen, currentPath, currentFileName, currentMediaType, currentSHA string
+	var currentSize int64
+	err := d.db.QueryRow(`
+		SELECT status, COALESCE(attempt_generation, ''), COALESCE(save_path, ''),
+		       COALESCE(file_name, ''), COALESCE(media_type, ''), COALESCE(file_size, 0),
+		       COALESCE(sha256, '')
+		FROM download_records WHERE chat_id = ? AND message_id = ?
+	`, chatID, messageID).Scan(&currentStatus, &currentGen, &currentPath, &currentFileName, &currentMediaType, &currentSize, &currentSHA)
 	if err == sql.ErrNoRows {
 		_, err = d.db.Exec(`
 			INSERT INTO download_records (
@@ -950,7 +980,25 @@ func (d *Database) BeginDownload(chatID string, messageID int, generation string
 	}
 
 	if currentStatus == "success" {
-		return ErrAlreadySuccess
+		if currentSHA == "" || currentPath == "" || currentSize <= 0 {
+			return fmt.Errorf("%w: success record missing required proof (path: %q, size: %d, sha: %q)",
+				ErrStateConflict, currentPath, currentSize, currentSHA)
+		}
+		if savePath != "" && savePath != currentPath {
+			return fmt.Errorf("%w: already success with conflicting path (%q vs %q)",
+				ErrStateConflict, savePath, currentPath)
+		}
+		if fileSize > 0 && fileSize != currentSize {
+			return fmt.Errorf("%w: already success with conflicting size (%d vs %d)",
+				ErrStateConflict, fileSize, currentSize)
+		}
+		return &AlreadySuccessError{
+			Proof: SuccessProof{
+				SavePath: currentPath,
+				FileSize: currentSize,
+				SHA256:   currentSHA,
+			},
+		}
 	}
 	if currentStatus == "unavailable" {
 		return fmt.Errorf("%w: cannot download unavailable message", ErrStateConflict)
@@ -959,10 +1007,27 @@ func (d *Database) BeginDownload(chatID string, messageID int, generation string
 		return fmt.Errorf("%w: message is currently committing", ErrStateConflict)
 	}
 	if currentStatus == "downloading" {
-		if currentGen == generation {
-			return nil // idempotent for same active attempt
+		if currentGen != generation {
+			return fmt.Errorf("%w: concurrent download active with gen %q vs %q", ErrStateConflict, currentGen, generation)
 		}
-		return fmt.Errorf("%w: concurrent download active with gen %q vs %q", ErrStateConflict, currentGen, generation)
+		// Persist planned metadata if new details are provided, rather than silently returning nil!
+		res, err := d.db.Exec(`
+			UPDATE download_records
+			SET file_name = CASE WHEN ? != '' THEN ? ELSE file_name END,
+				save_path = CASE WHEN ? != '' THEN ? ELSE save_path END,
+				media_type = CASE WHEN ? != '' THEN ? ELSE media_type END,
+				file_size = CASE WHEN ? > 0 THEN ? ELSE file_size END,
+				updated_at = ?
+			WHERE chat_id = ? AND message_id = ? AND status = 'downloading' AND attempt_generation = ?
+		`, fileName, fileName, savePath, savePath, mediaType, mediaType, fileSize, fileSize, now, chatID, messageID, generation)
+		if err != nil {
+			return err
+		}
+		n, _ := res.RowsAffected()
+		if n == 0 {
+			return fmt.Errorf("%w: zero rows affected in BeginDownload update", ErrStateConflict)
+		}
+		return nil
 	}
 
 	res, err := d.db.Exec(`
@@ -1015,6 +1080,10 @@ func (d *Database) PrepareDownloadCommit(chatID string, messageID int, generatio
 	}
 	// Idempotency: if already success with matching three-way proof (sha256, path, and size)
 	if currentStatus == "success" {
+		if currentSHA == "" || currentPath == "" || currentSize <= 0 {
+			return fmt.Errorf("%w: success record missing required proof (sha: %q, size: %d, path: %q)",
+				ErrStateConflict, currentSHA, currentSize, currentPath)
+		}
 		if currentSHA == sha256Hex && currentPath == relPath && currentSize == size {
 			return nil
 		}
@@ -1079,6 +1148,10 @@ func (d *Database) CompleteDownloadAndQueueArchive(chatID string, messageID int,
 	}
 
 	if currentStatus == "success" {
+		if currentSHA == "" || currentPath == "" || currentSize <= 0 {
+			return fmt.Errorf("%w: success record missing required proof (sha: %q, size: %d, path: %q)",
+				ErrStateConflict, currentSHA, currentSize, currentPath)
+		}
 		if currentSHA != sha256Hex || currentPath != relPath || currentSize != size {
 			return fmt.Errorf("%w: already success with conflicting proof (sha: %q vs %q, size: %d vs %d, path: %q vs %q)",
 				ErrStateConflict, currentSHA, sha256Hex, currentSize, size, currentPath, relPath)
@@ -1175,12 +1248,15 @@ func (d *Database) CompleteExistingDownload(chatID string, messageID int, genera
 		return err
 	} else {
 		if currentStatus == "success" {
-			if (currentSHA != "" && currentSHA != sha256Hex) ||
-				(currentPath != "" && currentPath != relPath) ||
-				(currentSize > 0 && currentSize != size) {
+			if currentSHA == "" || currentPath == "" || currentSize <= 0 {
+				return fmt.Errorf("%w: existing success record missing required proof (sha: %q, size: %d, path: %q)",
+					ErrStateConflict, currentSHA, currentSize, currentPath)
+			}
+			if currentSHA != sha256Hex || currentPath != relPath || currentSize != size {
 				return fmt.Errorf("%w: already success with conflicting proof (sha: %q vs %q, size: %d vs %d, path: %q vs %q)",
 					ErrStateConflict, currentSHA, sha256Hex, currentSize, size, currentPath, relPath)
 			}
+			return nil
 		} else if currentStatus == "committing" || currentStatus == "downloading" {
 			if currentGen != "" && generation != "" && currentGen != generation {
 				return fmt.Errorf("%w: record has gen %q, attempt has gen %q", ErrStaleAttempt, currentGen, generation)
@@ -1517,7 +1593,7 @@ func (d *Database) FailDownload(chatID string, messageID int, generation string,
 		return err
 	}
 
-	if currentStatus == "success" {
+	if currentStatus == "success" || currentStatus == "failed" || currentStatus == "unavailable" {
 		return nil
 	}
 	if currentGen != "" && generation != "" && currentGen != generation {
@@ -1592,8 +1668,8 @@ func (d *Database) CancelDownload(chatID string, messageID int, generation strin
 			updated_at = ?
 		WHERE chat_id = ? AND message_id = ?
 		  AND status IN ('pending', 'downloading', 'committing')
-		  AND (attempt_generation = ? OR attempt_generation = '')
-	`, reason, now, chatID, messageID, generation)
+		  AND (attempt_generation = ? OR attempt_generation = '' OR ? = '')
+	`, reason, now, chatID, messageID, generation, generation)
 	if err != nil {
 		return err
 	}

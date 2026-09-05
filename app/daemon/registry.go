@@ -794,7 +794,15 @@ func (r *Registry) Cancel(id string, reason string) {
 	r.signalLocked()
 }
 
+// CancelTasksByChatID cancels running and queued tasks for the given chat ID.
 func (r *Registry) CancelTasksByChatID(chatID string) {
+	r.CancelTasksByChatIDWithDecider(chatID, nil)
+}
+
+// CancelTasksByChatIDWithDecider cancels running and queued tasks for the given chat ID,
+// consulting decider (e.g. durable DB transition) before setting StateFailed.
+// If decider returns an error for a task, that task's state is NOT transitioned to canceled.
+func (r *Registry) CancelTasksByChatIDWithDecider(chatID string, decider func(peer string, messageID int, gen string) error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -803,6 +811,12 @@ func (r *Registry) CancelTasksByChatID(chatID string) {
 	for _, state := range r.queue {
 		peer := strings.TrimPrefix(state.request.Peer, "@")
 		if peer == cleanChatID || peer == chatID {
+			if decider != nil {
+				if err := decider(state.request.Peer, state.request.MessageID, state.attemptGen); err != nil {
+					newQueue = append(newQueue, state)
+					continue
+				}
+			}
 			state.state = StateFailed
 			state.errorClass = "canceled"
 			state.errorText = "target disabled by user"
@@ -820,6 +834,11 @@ func (r *Registry) CancelTasksByChatID(chatID string) {
 		if !isTerminal(state.state) {
 			peer := strings.TrimPrefix(state.request.Peer, "@")
 			if peer == cleanChatID || peer == chatID {
+				if decider != nil {
+					if err := decider(state.request.Peer, state.request.MessageID, state.attemptGen); err != nil {
+						continue
+					}
+				}
 				state.state = StateFailed
 				state.errorClass = "canceled"
 				state.errorText = "target disabled by user"

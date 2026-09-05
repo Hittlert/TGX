@@ -243,9 +243,16 @@ func (o *Orchestrator) SetRunning(running bool) {
 	o.running = running
 }
 
-// CancelTasksByChatID cancels running tasks for the given chat ID.
+// CancelTasksByChatID cancels running tasks for the given chat ID, coordinating with durable DB transitions.
 func (o *Orchestrator) CancelTasksByChatID(chatID string) {
-	if o.registry != nil {
+	if o.registry == nil {
+		return
+	}
+	if o.db != nil {
+		o.registry.CancelTasksByChatIDWithDecider(chatID, func(peer string, messageID int, gen string) error {
+			return o.db.CancelDownload(peer, messageID, gen, "target disabled by user")
+		})
+	} else {
 		o.registry.CancelTasksByChatID(chatID)
 	}
 }
@@ -370,8 +377,36 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 		beginErr := o.db.BeginDownload(chatID, msgID, gen, req.FileName, req.FinalPath, req.MediaType, req.ExpectedSize)
 		if beginErr != nil {
 			if errors.Is(beginErr, ErrAlreadySuccess) {
-				o.logger.Info("task already completed successfully in DB", zap.String("task_id", taskID))
-				task.Succeed(req.FinalPath, true)
+				var alreadyErr *AlreadySuccessError
+				successProof := SuccessProof{SavePath: req.FinalPath, FileSize: req.ExpectedSize}
+				if errors.As(beginErr, &alreadyErr) {
+					successProof = alreadyErr.Proof
+				}
+				finalAbsPath := filepath.Join(o.OutputDir(), filepath.FromSlash(successProof.SavePath))
+				fi, statErr := os.Stat(finalAbsPath)
+				if statErr != nil || fi.Size() != successProof.FileSize {
+					o.logger.Warn("already success in DB but physical file missing or invalid on disk",
+						zap.String("task_id", taskID),
+						zap.String("expected_path", finalAbsPath),
+					)
+					disp := FailureDisposition{
+						Stage:       "admission",
+						Op:          "db_begin_download",
+						Class:       "missing_file",
+						Unavailable: false,
+						Retryable:   false,
+						RetryOwner:  "none",
+						Message:     fmt.Sprintf("record is success in DB but file missing or invalid on disk (%s)", successProof.SavePath),
+						Cause:       statErr,
+					}
+					task.FailDisposition(disp)
+					return
+				}
+				o.logger.Info("task already completed successfully in DB and verified on disk",
+					zap.String("task_id", taskID),
+					zap.String("path", successProof.SavePath),
+				)
+				task.Succeed(successProof.SavePath, true)
 				return
 			}
 			o.logger.Warn("cannot begin download: DB state rejected",
@@ -605,8 +640,36 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 	if o.db != nil {
 		if err := o.db.BeginDownload(chatID, msgID, gen, fileName, finalRelPath, mediaType, authoritativeSize); err != nil {
 			if errors.Is(err, ErrAlreadySuccess) {
-				o.logger.Info("task already completed successfully in DB with planned path", zap.String("task_id", taskID))
-				task.Succeed(finalRelPath, true)
+				var alreadyErr *AlreadySuccessError
+				successProof := SuccessProof{SavePath: finalRelPath, FileSize: authoritativeSize}
+				if errors.As(err, &alreadyErr) {
+					successProof = alreadyErr.Proof
+				}
+				finalAbsPath := filepath.Join(o.OutputDir(), filepath.FromSlash(successProof.SavePath))
+				fi, statErr := os.Stat(finalAbsPath)
+				if statErr != nil || fi.Size() != successProof.FileSize {
+					o.logger.Warn("already success in DB but physical file missing or invalid on disk with planned path",
+						zap.String("task_id", taskID),
+						zap.String("expected_path", finalAbsPath),
+					)
+					disp := FailureDisposition{
+						Stage:       "admission",
+						Op:          "db_begin_download",
+						Class:       "missing_file",
+						Unavailable: false,
+						Retryable:   false,
+						RetryOwner:  "none",
+						Message:     fmt.Sprintf("record is success in DB with planned path but file missing on disk (%s)", successProof.SavePath),
+						Cause:       statErr,
+					}
+					task.FailDisposition(disp)
+					return
+				}
+				o.logger.Info("task already completed successfully in DB with planned path and verified on disk",
+					zap.String("task_id", taskID),
+					zap.String("path", successProof.SavePath),
+				)
+				task.Succeed(successProof.SavePath, true)
 				return
 			}
 			o.logger.Error("failed to begin download in DB with planned path",
@@ -767,6 +830,25 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 	if dlErr != nil {
 		_ = partFile.Close()
 		_ = os.Remove(partAbsPath)
+
+		if task.IsTerminal() || taskCtx.Err() != nil || errors.Is(dlErr, context.Canceled) {
+			if o.db != nil {
+				_ = o.db.CancelDownload(chatID, msgID, gen, "task canceled during transfer")
+			}
+			disp := FailureDisposition{
+				Stage:             "transfer",
+				Op:                "download_file",
+				Class:             "canceled",
+				Unavailable:       false,
+				Retryable:         false,
+				RetryOwner:        "none",
+				PhysicalAttemptID: physAttemptID,
+				Message:           "task canceled during transfer",
+				Cause:             dlErr,
+			}
+			task.FailDisposition(disp)
+			return
+		}
 
 		var tErr *transfer.TransferError
 		var disp FailureDisposition
@@ -945,6 +1027,25 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 	}
 
 	// 10. Durable commit intent in DB
+	if task.IsTerminal() || taskCtx.Err() != nil {
+		_ = os.Remove(partAbsPath)
+		if o.db != nil {
+			_ = o.db.CancelDownload(chatID, msgID, gen, "canceled before commit")
+		}
+		if !task.IsTerminal() {
+			task.FailDisposition(FailureDisposition{
+				Stage:       "commit",
+				Op:          "check_cancellation",
+				Class:       "canceled",
+				Unavailable: false,
+				Retryable:   false,
+				RetryOwner:  "none",
+				Message:     "task canceled before commit",
+			})
+		}
+		return
+	}
+
 	if o.db != nil {
 		if err := o.db.PrepareDownloadCommit(chatID, msgID, gen, finalRelPath, stat.Size(), shaHex); err != nil {
 			_ = os.Remove(partAbsPath)
@@ -992,7 +1093,24 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 	}
 
 	// 12. Atomic sibling rename .part -> final
-	task.SetPublishing()
+	if task.IsTerminal() || taskCtx.Err() != nil || !task.SetPublishing() {
+		_ = os.Remove(partAbsPath)
+		if o.db != nil {
+			_ = o.db.CancelDownload(chatID, msgID, gen, "canceled before publish")
+		}
+		if !task.IsTerminal() {
+			task.FailDisposition(FailureDisposition{
+				Stage:       "commit",
+				Op:          "set_publishing",
+				Class:       "canceled",
+				Unavailable: false,
+				Retryable:   false,
+				RetryOwner:  "none",
+				Message:     "task canceled before publish",
+			})
+		}
+		return
+	}
 	if err := fscommit.CommitSiblingPart(partAbsPath, finalAbsPath); err != nil {
 		_ = os.Remove(partAbsPath)
 		o.logger.Error("atomic commit failed", zap.Error(err))

@@ -1350,3 +1350,302 @@ func TestOrchestrator_BeginDownloadRejectionFailsAdmissionImmediately(t *testing
 		t.Fatal("TelegramAccess.Resolve was called despite BeginDownload rejection at admission!")
 	}
 }
+
+func TestOrchestrator_PlannedPathPersistedBeforeFilesystem_RecoveryHandlesRealPart(t *testing.T) {
+	data := make([]byte, 1024)
+	for i := range data {
+		data[i] = byte(i % 256)
+	}
+
+	transferActive := make(chan struct{}, 1)
+	unblockTransfer := make(chan struct{})
+
+	invoker := invokerFunc(func(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
+		select {
+		case transferActive <- struct{}{}:
+		default:
+		}
+		select {
+		case <-unblockTransfer:
+			setUploadFile(output, data)
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	})
+
+	access := &mockAccessWithPool{
+		pool: &mockPool{invoker: invoker},
+		resolveFn: func(ctx context.Context, peer string, messageID int) (ResolvedMedia, error) {
+			return ResolvedMedia{
+				File:      &orchMockMediaFile{loc: &tg.InputDocumentFileLocation{ID: 1001, AccessHash: 2002}, sz: 1024, dc: 2},
+				Name:      "test_video.mp4",
+				Size:      1024,
+				DCID:      2,
+				MediaType: "video",
+				Date:      1725518400, // 2024-09-05 UTC
+			}, nil
+		},
+	}
+
+	orch, registry, db, saveDir := setupTestOrchestratorWithAccess(t, access)
+	defer db.Close()
+
+	chatID := "-1008888"
+	msgID := 777
+	req := TaskRequest{
+		ID:          "case_planned_path_recovery",
+		Peer:        chatID,
+		MessageID:   msgID,
+		TargetTitle: "AlphaChannel",
+		Date:        1725518400,
+	}
+
+	_, _, err := registry.Submit(req)
+	if err != nil {
+		t.Fatalf("submit failed: %v", err)
+	}
+	task, _ := registry.Next(context.Background())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		orch.downloadOne(ctx, task)
+	}()
+
+	// Wait until transfer is active
+	select {
+	case <-transferActive:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for transfer to become active")
+	}
+
+	// 1. Assert canonical path is expected: "AlphaChannel/2024_09/777 - test_video.mp4"
+	expectedCanonicalRelPath := "AlphaChannel/2024_09/777 - test_video.mp4"
+	expectedPartPath := filepath.Join(saveDir, filepath.FromSlash(expectedCanonicalRelPath)+".part")
+
+	// 2. Verify that while transfer is active, DB already contains the exact canonical path (not empty!)
+	rec, err := db.GetDownloadRecord(chatID, msgID)
+	if err != nil || rec == nil {
+		t.Fatalf("failed to query DB record: %v", err)
+	}
+	if rec.SavePath != expectedCanonicalRelPath {
+		t.Fatalf("DB save_path not updated before transfer: got %q, want %q", rec.SavePath, expectedCanonicalRelPath)
+	}
+	if rec.Status != "downloading" {
+		t.Fatalf("expected DB status 'downloading', got %q", rec.Status)
+	}
+
+	// 3. Verify .part file physically exists on disk
+	if _, err := os.Stat(expectedPartPath); err != nil {
+		t.Fatalf("expected .part file to exist at %q, err: %v", expectedPartPath, err)
+	}
+
+	// 4. Simulate crash / cancellation
+	cancel()
+	<-done
+
+	// Re-create the .part file to simulate an interrupted process leaving the .part file on disk before restart
+	if err := os.WriteFile(expectedPartPath, []byte("interrupted data"), 0o644); err != nil {
+		t.Fatalf("failed to write simulated crash part file: %v", err)
+	}
+	// And ensure DB status is 'downloading' (as it would be during a sudden crash)
+	_, _ = db.Execute(`UPDATE download_records SET status = 'downloading' WHERE chat_id = ? AND message_id = ?`, chatID, msgID)
+
+	// 5. Execute ReconcileOnStartup
+	recErr := ReconcileOnStartup(context.Background(), db, saveDir, "", zap.NewNop())
+	if recErr != nil {
+		t.Fatalf("ReconcileOnStartup failed: %v", recErr)
+	}
+
+	// 6. Assert real .part file was found and cleaned up, NOT orphaned!
+	if _, err := os.Stat(expectedPartPath); !os.IsNotExist(err) {
+		t.Fatalf("expected real .part file to be removed by recovery, but it still exists: %v", err)
+	}
+
+	// 7. Assert DB record was reset to pending with canonical save_path preserved
+	recAfter, err := db.GetDownloadRecord(chatID, msgID)
+	if err != nil || recAfter == nil {
+		t.Fatalf("failed to query DB record after recovery: %v", err)
+	}
+	if recAfter.Status != "pending" {
+		t.Fatalf("expected status 'pending' after recovery, got %q", recAfter.Status)
+	}
+	if recAfter.SavePath != expectedCanonicalRelPath {
+		t.Fatalf("expected canonical path preserved after recovery, got %q", recAfter.SavePath)
+	}
+}
+
+func TestOrchestrator_CancelDuringFsyncHashRename_CleansPartAndDoesNotPublish(t *testing.T) {
+	data := make([]byte, 1024)
+	for i := range data {
+		data[i] = byte(i % 256)
+	}
+
+	transferDone := make(chan struct{})
+	var orchRef *Orchestrator
+	var chatID = "-1007777"
+	var msgID = 888
+
+	invoker := invokerFunc(func(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
+		setUploadFile(output, data)
+		// Cancel target as soon as transfer finishes (entering fsync/hash/rename window)
+		if orchRef != nil {
+			orchRef.CancelTasksByChatID(chatID)
+		}
+		close(transferDone)
+		return nil
+	})
+
+	access := &mockAccessWithPool{
+		pool: &mockPool{invoker: invoker},
+		resolveFn: func(ctx context.Context, peer string, messageID int) (ResolvedMedia, error) {
+			return ResolvedMedia{
+				File:      &orchMockMediaFile{loc: &tg.InputDocumentFileLocation{ID: 1001, AccessHash: 2002}, sz: 1024, dc: 2},
+				Name:      "cancel_test.mp4",
+				Size:      1024,
+				DCID:      2,
+				MediaType: "video",
+				Date:      1725518400,
+			}, nil
+		},
+	}
+
+	orch, registry, db, saveDir := setupTestOrchestratorWithAccess(t, access)
+	orchRef = orch
+	defer db.Close()
+
+	req := TaskRequest{
+		ID:          "case_cancel_production_path",
+		Peer:        chatID,
+		MessageID:   msgID,
+		TargetTitle: "CancelChannel",
+		Date:        1725518400,
+	}
+
+	_, _, _ = registry.Submit(req)
+	task, _ := registry.Next(context.Background())
+
+	orch.downloadOne(context.Background(), task)
+	<-transferDone
+
+	finalRelPath := "CancelChannel/2024_09/888 - cancel_test.mp4"
+	finalAbsPath := filepath.Join(saveDir, filepath.FromSlash(finalRelPath))
+	partAbsPath := finalAbsPath + ".part"
+
+	// 1. Final file must NOT be published
+	if _, err := os.Stat(finalAbsPath); !os.IsNotExist(err) {
+		t.Fatalf("final file should not exist after cancellation, but was found: %v", err)
+	}
+
+	// 2. .part file must NOT remain on disk
+	if _, err := os.Stat(partAbsPath); !os.IsNotExist(err) {
+		t.Fatalf(".part file should be removed after cancellation, but was found: %v", err)
+	}
+
+	// 3. DB status must be 'failed' (canceled), NEVER 'success'
+	rec, err := db.GetDownloadRecord(chatID, msgID)
+	if err != nil || rec == nil {
+		t.Fatalf("failed to query DB record: %v", err)
+	}
+	if rec.Status != "failed" {
+		t.Fatalf("expected DB status 'failed', got: %q", rec.Status)
+	}
+
+	// 4. Registry task state must be StateFailed with canceled class
+	snap := task.Snapshot()
+	if snap.State != StateFailed {
+		t.Fatalf("expected Registry StateFailed, got: %s", snap.State)
+	}
+	if snap.ErrorClass != "canceled" {
+		t.Fatalf("expected ErrorClass 'canceled', got: %s", snap.ErrorClass)
+	}
+}
+
+func TestOrchestrator_AlreadySuccessVerifiesPhysicalFileOnDisk(t *testing.T) {
+	orch, registry, db, saveDir := setupTestOrchestrator(t, nil, nil)
+	defer db.Close()
+
+	chatID := "-1006666"
+	msgID := 333
+	now := time.Now().Unix()
+	relPath := "Vault/2026_09/333 - doc.bin"
+	absPath := filepath.Join(saveDir, filepath.FromSlash(relPath))
+
+	// Pre-seed DB with success
+	_, err := db.Execute(`
+		INSERT INTO download_records (chat_id, message_id, status, file_name, save_path, media_type, file_size, sha256, attempt_generation, created_at, updated_at)
+		VALUES (?, ?, 'success', 'doc.bin', ?, 'document', 512, 'sha_512', 'gen_done', ?, ?)
+	`, chatID, msgID, relPath, now, now)
+	if err != nil {
+		t.Fatalf("seed DB failed: %v", err)
+	}
+
+	// 1. Physical file is MISSING on disk: downloadOne must fail with missing_file
+	reqMissing := TaskRequest{
+		ID:           "case_already_success_missing",
+		Peer:         chatID,
+		MessageID:    msgID,
+		FinalPath:    relPath,
+		ExpectedSize: 512,
+	}
+	_, _, _ = registry.Submit(reqMissing)
+	task1, _ := registry.Next(context.Background())
+	orch.downloadOne(context.Background(), task1)
+
+	snap1 := task1.Snapshot()
+	if snap1.State != StateFailed {
+		t.Fatalf("expected StateFailed when physical file is missing, got: %s", snap1.State)
+	}
+	if snap1.ErrorClass != "missing_file" {
+		t.Fatalf("expected ErrorClass 'missing_file', got: %s", snap1.ErrorClass)
+	}
+
+	// 2. Physical file EXISTS with matching size: downloadOne must succeed
+	if err := os.MkdirAll(filepath.Dir(absPath), 0o755); err != nil {
+		t.Fatalf("mkdir failed: %v", err)
+	}
+	if err := os.WriteFile(absPath, make([]byte, 512), 0o644); err != nil {
+		t.Fatalf("write file failed: %v", err)
+	}
+
+	reqPresent := TaskRequest{
+		ID:           "case_already_success_present",
+		Peer:         chatID,
+		MessageID:    msgID,
+		FinalPath:    relPath,
+		ExpectedSize: 512,
+	}
+	_, _, _ = registry.Submit(reqPresent)
+	task2, _ := registry.Next(context.Background())
+	orch.downloadOne(context.Background(), task2)
+
+	snap2 := task2.Snapshot()
+	if snap2.State != StateSuccess {
+		t.Fatalf("expected StateSuccess when physical file is verified, got: %s", snap2.State)
+	}
+	if snap2.FinalPath != relPath {
+		t.Fatalf("expected FinalPath %q, got %q", relPath, snap2.FinalPath)
+	}
+
+	// 3. Conflicting request path with DB success proof: admission rejected
+	reqConflict := TaskRequest{
+		ID:           "case_already_success_conflict",
+		Peer:         chatID,
+		MessageID:    msgID,
+		FinalPath:    "Different/Path/333 - doc.bin",
+		ExpectedSize: 512,
+	}
+	_, _, _ = registry.Submit(reqConflict)
+	task3, _ := registry.Next(context.Background())
+	orch.downloadOne(context.Background(), task3)
+
+	snap3 := task3.Snapshot()
+	if snap3.State != StateFailed {
+		t.Fatalf("expected StateFailed on conflicting path, got: %s", snap3.State)
+	}
+	if snap3.ErrorClass != "db_conflict" {
+		t.Fatalf("expected ErrorClass 'db_conflict', got: %s", snap3.ErrorClass)
+	}
+}

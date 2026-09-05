@@ -31,13 +31,14 @@ const (
 
 // MigrationOptions specifies parameters for the offline Spool migration tool.
 type MigrationOptions struct {
-	DBPath           string
-	TargetDir        string
-	ArchiveDir       string
-	BufferDir        string
-	DryRun           bool
-	CreateBackup     bool
-	DropLegacyTables bool
+	DBPath                string
+	TargetDir             string
+	ArchiveDir            string
+	BufferDir             string
+	DryRun                bool
+	CreateBackup          bool
+	DropLegacyTables      bool
+	HookPostCommitCleanup func(quarantineDir string) error // optional test injection hook
 }
 
 // QuarantineFileEntry records metadata of a file placed in quarantine staging.
@@ -453,6 +454,7 @@ func Run(ctx context.Context, opts MigrationOptions) (*MigrationReport, error) {
 	// 12. Stage buffer files to recoverable quarantine before database mutation
 	var staged []QuarantineFileEntry
 	var quarantineDir string
+	committed := false
 	migrationID := fmt.Sprintf("mig_%d_%d", now, os.Getpid())
 
 	if len(report.PlannedCleanFiles) > 0 && opts.BufferDir != "" {
@@ -466,11 +468,14 @@ func Run(ctx context.Context, opts MigrationOptions) (*MigrationReport, error) {
 			stagedName := fmt.Sprintf("staged_%d_%s", idx, filepath.Base(p))
 			stagedPath := filepath.Join(quarantineDir, stagedName)
 
-			var size int64
-			var hashStr string
-			if fi, err := os.Stat(p); err == nil {
-				size = fi.Size()
-				hashStr, _ = computeFileSHA256(p)
+			fi, err := os.Stat(p)
+			if err != nil {
+				return report, fmt.Errorf("stat planned buffer file %s: %w", p, err)
+			}
+			size := fi.Size()
+			hashStr, err := computeFileSHA256(p)
+			if err != nil {
+				return report, fmt.Errorf("hash planned buffer file %s: %w", p, err)
 			}
 			staged = append(staged, QuarantineFileEntry{
 				OriginalPath: p,
@@ -522,9 +527,10 @@ func Run(ctx context.Context, opts MigrationOptions) (*MigrationReport, error) {
 			return report, fmt.Errorf("close quarantine directory: %w", err)
 		}
 
-		// In case of error during staging or database operations, fail-closed restore staged files
+		// In case of error during staging or database operations, fail-closed restore staged files.
+		// Immediately disarmed upon successful tx.Commit()!
 		defer func() {
-			if quarantineDir != "" {
+			if !committed && quarantineDir != "" {
 				allRestored := true
 				for _, sf := range staged {
 					if _, err := os.Stat(sf.StagedPath); err == nil {
@@ -547,17 +553,37 @@ func Run(ctx context.Context, opts MigrationOptions) (*MigrationReport, error) {
 
 		// Perform physical rename of planned buffer files into quarantine staging
 		for _, sf := range staged {
-			if _, err := os.Stat(sf.OriginalPath); err == nil {
-				if err := os.Rename(sf.OriginalPath, sf.StagedPath); err != nil {
-					return report, fmt.Errorf("stage buffer file %s to quarantine: %w", sf.OriginalPath, err)
+			if _, err := os.Stat(sf.OriginalPath); err != nil {
+				return report, fmt.Errorf("stat buffer file before staging %s: %w", sf.OriginalPath, err)
+			}
+			if err := os.Rename(sf.OriginalPath, sf.StagedPath); err != nil {
+				return report, fmt.Errorf("stage buffer file %s to quarantine: %w", sf.OriginalPath, err)
+			}
+			// Sync source parent directory to guarantee rename durability
+			if srcDir, err := os.Open(filepath.Dir(sf.OriginalPath)); err == nil {
+				if err := srcDir.Sync(); err != nil {
+					_ = srcDir.Close()
+					return report, fmt.Errorf("sync source directory %s: %w", filepath.Dir(sf.OriginalPath), err)
 				}
+				if err := srcDir.Close(); err != nil {
+					return report, fmt.Errorf("close source directory %s: %w", filepath.Dir(sf.OriginalPath), err)
+				}
+			} else {
+				return report, fmt.Errorf("open source directory %s: %w", filepath.Dir(sf.OriginalPath), err)
 			}
 		}
 
-		// Sync directory after file renames
-		if df, err := os.Open(quarantineDir); err == nil {
-			_ = df.Sync()
-			_ = df.Close()
+		// Sync quarantine directory after file renames
+		dfAfter, err := os.Open(quarantineDir)
+		if err != nil {
+			return report, fmt.Errorf("open quarantine directory after renames: %w", err)
+		}
+		if err := dfAfter.Sync(); err != nil {
+			_ = dfAfter.Close()
+			return report, fmt.Errorf("sync quarantine directory after renames: %w", err)
+		}
+		if err := dfAfter.Close(); err != nil {
+			return report, fmt.Errorf("close quarantine directory after renames: %w", err)
 		}
 	}
 
@@ -596,6 +622,13 @@ func Run(ctx context.Context, opts MigrationOptions) (*MigrationReport, error) {
 
 	if err := tx.Commit(); err != nil {
 		return report, fmt.Errorf("commit migration transaction: %w", err)
+	}
+	committed = true
+
+	if opts.HookPostCommitCleanup != nil {
+		if hookErr := opts.HookPostCommitCleanup(quarantineDir); hookErr != nil {
+			return report, fmt.Errorf("post-commit cleanup hook failure: %w", hookErr)
+		}
 	}
 
 	// 14. Finalize deletion: ONLY after database transaction is durably committed! Fail-closed on errors.
@@ -842,18 +875,22 @@ func ReconcilePendingQuarantines(ctx context.Context, dbPath string, bufferDir s
 					}
 					report.RestoredFiles = append(report.RestoredFiles, f.OriginalPath)
 				} else if os.IsNotExist(err) {
-					// Staged file does not exist. Verify if it's already in OriginalPath
-					if _, origErr := os.Stat(f.OriginalPath); origErr == nil {
-						// File was not moved before crash, safe!
+					// Staged file does not exist. Verify that it is present in OriginalPath!
+					if _, origErr := os.Stat(f.OriginalPath); origErr != nil {
+						return nil, fmt.Errorf("reconcile restore: file missing from both staged (%s) and original (%s): %w (fail-closed)", f.StagedPath, f.OriginalPath, origErr)
 					}
+					// File was not moved before crash, verified safe in OriginalPath!
 				} else {
 					return nil, fmt.Errorf("stat staged file %s: %w (fail-closed)", f.StagedPath, err)
 				}
 			}
-			// Verify that no staged files remain before purging manifest or directory
+			// Verify that no staged files remain AND that every original file exists before purging manifest or directory
 			for _, f := range manifest.Files {
 				if _, err := os.Stat(f.StagedPath); err == nil {
 					return nil, fmt.Errorf("staged file %s still present after restore (fail-closed)", f.StagedPath)
+				}
+				if _, err := os.Stat(f.OriginalPath); err != nil {
+					return nil, fmt.Errorf("reconcile restore: original file %s does not exist after restore: %w (fail-closed)", f.OriginalPath, err)
 				}
 			}
 			if err := os.Remove(manifestPath); err != nil && !os.IsNotExist(err) {

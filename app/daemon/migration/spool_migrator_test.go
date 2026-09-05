@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1290,5 +1291,167 @@ func TestMigration_QuarantineManifest_VerdictLookupFailureFailsClosedAndLeavesFi
 	}
 	if _, statErr := os.Stat(manifestPath); os.IsNotExist(statErr) {
 		t.Fatal("manifest deleted when dbPath is inaccessible!")
+	}
+}
+
+// 19. Acceptance Test: Post-commit cleanup failure preserves COMMITTED manifest and never restores originals.
+func TestMigration_PostCommitCleanupFailure_LeavesCommittedManifestUntouchedAndNeverRestoresOriginals(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "post_commit_failure.sqlite3")
+	bufferDir := filepath.Join(tempDir, "buffer")
+	targetDir := filepath.Join(tempDir, "target")
+	_ = os.MkdirAll(bufferDir, 0o755)
+	_ = os.MkdirAll(targetDir, 0o755)
+
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	// Create legacy schema and legacy records
+	_, _ = db.Exec(`
+		CREATE TABLE download_records (
+			chat_id TEXT NOT NULL,
+			message_id INTEGER NOT NULL,
+			status TEXT NOT NULL,
+			file_name TEXT,
+			save_path TEXT,
+			file_size INTEGER,
+			sha256 TEXT,
+			created_at INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL,
+			PRIMARY KEY (chat_id, message_id)
+		);
+		CREATE TABLE target_commits (commit_id TEXT PRIMARY KEY, chat_id TEXT, message_id INTEGER, save_path TEXT, file_size INTEGER, sha256 TEXT, committed_at INTEGER);
+	`)
+	db.Close()
+
+	// Place an uncommitted buffer file
+	spoolFile := filepath.Join(bufferDir, "in_flight.spool")
+	spoolContent := []byte("spool in flight data to be cleaned")
+	if err := os.WriteFile(spoolFile, spoolContent, 0o644); err != nil {
+		t.Fatalf("write spool file: %v", err)
+	}
+
+	var capturedQDir string
+	opts := migration.MigrationOptions{
+		DBPath:           dbPath,
+		TargetDir:        targetDir,
+		BufferDir:        bufferDir,
+		DryRun:           false,
+		DropLegacyTables: true,
+		HookPostCommitCleanup: func(qDir string) error {
+			capturedQDir = qDir
+			return errors.New("injected post-commit cleanup failure (e.g. disk read-only or permission error)")
+		},
+	}
+
+	_, err = migration.Run(context.Background(), opts)
+	if err == nil {
+		t.Fatal("expected error from migration.Run on post-commit cleanup failure, got nil")
+	}
+	t.Logf("migration returned error: %v", err)
+
+	// 1. Assert DB transaction was durably COMMITTED!
+	verifyDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open verify db: %v", err)
+	}
+	defer verifyDB.Close()
+
+	var verdictStatus string
+	err = verifyDB.QueryRow("SELECT status FROM _tgx_migration_verdicts").Scan(&verdictStatus)
+	if err != nil || verdictStatus != "COMMITTED" {
+		t.Fatalf("expected COMMITTED verdict in DB, got status=%q, err=%v", verdictStatus, err)
+	}
+
+	// 2. Assert quarantine manifest STILL EXISTS (not deleted by post-commit failure!)
+	manifestPath := filepath.Join(capturedQDir, "quarantine_manifest.json")
+	if _, statErr := os.Stat(manifestPath); os.IsNotExist(statErr) {
+		t.Fatal("quarantine manifest was deleted after post-commit cleanup error! Disarm failure!")
+	}
+
+	// 3. Assert original file was NOT restored back! (It committed, so original should remain absent!)
+	if _, statErr := os.Stat(spoolFile); !os.IsNotExist(statErr) {
+		t.Fatal("original file was mistakenly restored after DB committed! Pre-commit rollback was not disarmed!")
+	}
+
+	// 4. Assert staged file exists in quarantine!
+	entries, _ := os.ReadDir(capturedQDir)
+	foundStaged := false
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "staged_") {
+			foundStaged = true
+			break
+		}
+	}
+	if !foundStaged {
+		t.Fatal("no staged files found in quarantine directory!")
+	}
+
+	// 5. Now execute ReconcilePendingQuarantines across restart:
+	// It must see the COMMITTED verdict and complete the deletion cleanly!
+	reconcileReport, err := migration.ReconcilePendingQuarantines(context.Background(), dbPath, bufferDir)
+	if err != nil {
+		t.Fatalf("reconciliation failed to finalize committed quarantine: %v", err)
+	}
+	if len(reconcileReport.CleanedFiles) == 0 {
+		t.Fatal("expected reconcile to clean staged files for COMMITTED migration")
+	}
+	if len(reconcileReport.RestoredFiles) != 0 {
+		t.Fatalf("expected 0 restored files for COMMITTED migration, got %d", len(reconcileReport.RestoredFiles))
+	}
+	if _, statErr := os.Stat(capturedQDir); !os.IsNotExist(statErr) {
+		t.Fatal("quarantine directory was not cleaned up after reconcile!")
+	}
+}
+
+// 20. Acceptance Test: Reconcile restore fails closed if file is missing from both staged and original path.
+func TestMigration_StagedAndOriginalBothMissing_FailsClosedAndRetainsManifest(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "double_missing.sqlite3")
+	bufferDir := filepath.Join(tempDir, "buffer")
+	_ = os.MkdirAll(bufferDir, 0o755)
+
+	// DB without verdict
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	_, _ = db.Exec("CREATE TABLE dummy (id INTEGER)")
+	db.Close()
+
+	// Create quarantine dir with manifest pointing to non-existent staged AND original file
+	qDir := filepath.Join(bufferDir, ".migrator_quarantine_999999")
+	_ = os.MkdirAll(qDir, 0o755)
+	manifestPath := filepath.Join(qDir, "quarantine_manifest.json")
+
+	manifest := migration.QuarantineManifest{
+		MigrationID:   "mig_double_missing",
+		QuarantineDir: qDir,
+		CreatedAt:     999999,
+		Files: []migration.QuarantineFileEntry{
+			{
+				OriginalPath: filepath.Join(bufferDir, "non_existent_original.spool"),
+				StagedName:   "staged_0_non_existent.spool",
+				StagedPath:   filepath.Join(qDir, "staged_0_non_existent.spool"),
+				Size:         100,
+			},
+		},
+	}
+	data, _ := json.MarshalIndent(manifest, "", "  ")
+	_ = os.WriteFile(manifestPath, data, 0o644)
+
+	// Call ReconcilePendingQuarantines: must fail-closed because file is missing from both locations!
+	_, err = migration.ReconcilePendingQuarantines(context.Background(), dbPath, bufferDir)
+	if err == nil {
+		t.Fatal("expected error when file is missing from both staged and original, got nil")
+	}
+
+	// Manifest and quarantine directory MUST NOT be deleted!
+	if _, statErr := os.Stat(manifestPath); os.IsNotExist(statErr) {
+		t.Fatal("manifest was deleted despite double missing file! Fail-closed violated!")
+	}
+	if _, statErr := os.Stat(qDir); os.IsNotExist(statErr) {
+		t.Fatal("quarantine directory was deleted despite double missing file! Fail-closed violated!")
 	}
 }
