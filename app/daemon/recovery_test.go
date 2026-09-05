@@ -96,8 +96,9 @@ func TestReconcileOnStartup_Matrix(t *testing.T) {
 	`, case5Rel, int64(len(case5Payload)), case5SHA, now, now)
 	require.NoError(t, err)
 
-	// Run startup reconciliation
-	err = ReconcileOnStartup(context.Background(), db, ssdDir, archiveDir, logger)
+	// Run startup reconciliation with typed storage meter
+	meter := NewStorageIOMeter()
+	err = ReconcileOnStartup(context.Background(), db, ssdDir, archiveDir, logger, meter)
 	require.NoError(t, err)
 
 	// Verify Case 1: .part deleted, status is pending
@@ -134,4 +135,10 @@ func TestReconcileOnStartup_Matrix(t *testing.T) {
 	assert.Equal(t, "archived", state5)
 	_, err = os.Stat(case5SSDFinal)
 	assert.True(t, os.IsNotExist(err), "case 5 SSD duplicate must be deleted after archive verified")
+
+	// Verify strict two-tier storage meter separation during recovery
+	assert.Equal(t, int64(len(case3Payload)), meter.SSDReadBytes(), "SSD recovery reads must strictly match SSD part file size")
+	assert.Equal(t, int64(len(case5Payload)), meter.ArchiveReadBytes(), "Archive recovery reads must strictly match Archive final file size")
+	assert.Equal(t, int64(0), meter.SSDWriteBytes(), "SSD recovery must not incur physical writes")
+	assert.Equal(t, int64(0), meter.ArchiveWriteBytes(), "Archive recovery must not incur physical writes")
 }

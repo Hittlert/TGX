@@ -51,10 +51,10 @@ The following SHA256 hashes are frozen for all Phase B–E executions:
 
 | File | SHA256 Hash |
 |---|---|
-| `docs/evaluation/TGX_EVALUATION_PROTOCOL_V1.md` | `17a829372cffeb6ccdd2a591117219d70885c431f0b5bc83f53c2ca0e64daeda` |
+| `docs/evaluation/TGX_EVALUATION_PROTOCOL_V1.md` | `c3382f624fb8a19a89b007f5d2c858e1d1c8b9225a51973b9383f8ca64f9574d` |
 | `docs/evaluation/profiles-v1.json` | `6e0c0f38cde7f51aed3b4828c374611a9cda94d0258240abcd109b7164442438` |
 | `docs/evaluation/run-spec.schema.json` | `5117e7521686b5dbf8bd56b965d45ffcfdb83e7650b59cf63125d3ecb8b74f13` |
-| `docs/evaluation/analysis-policy/baseline-v1.json` | `2cbf7acd46168b4d59ef8ee6baa989c27f8c698295fab1fd747abaa33d93a9ee` |
+| `docs/evaluation/analysis-policy/baseline-v1.json` | `e31083f8ed48ae7d1beda1b2b9e8a6926a1ae00595f8439d9ec5c6a7d5b19ca2` |
 
 ---
 

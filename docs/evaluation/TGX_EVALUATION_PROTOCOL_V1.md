@@ -209,6 +209,10 @@ ssd_free_bytes
 ssd_used_bytes
 ssd_reserved_bytes
 ssd_available_bytes
+ssd_write_bytes
+ssd_read_bytes
+ssd_writer_concurrency
+ssd_backlog_bytes
 sync_count
 sync_latency
 ```
@@ -221,6 +225,9 @@ archive_backlog_bytes
 archive_active_workers
 archive_archived_files
 archive_conflict_count
+archive_write_bytes
+archive_read_bytes
+archive_writer_concurrency
 target_write_bytes
 target_read_bytes
 target_durable_bytes

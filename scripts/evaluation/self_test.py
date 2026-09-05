@@ -397,6 +397,14 @@ class EvaluationSelfTest(unittest.TestCase):
                 "free_bytes": 30,
                 "total_bytes": 40,
                 "used_bytes": 10,
+                "ssd_write_bytes": 524288,
+                "ssd_read_bytes": 131072,
+                "ssd_writer_concurrency": 1,
+                "ssd_backlog_bytes": 262144,
+                "archive_write_bytes": 786432,
+                "archive_read_bytes": 262144,
+                "archive_writer_concurrency": 1,
+                "archive_backlog_bytes": 1048576,
                 "target_write_bytes": 786432,
                 "target_read_bytes": 262144,
                 "target_durable_bytes": 524288,
@@ -418,9 +426,17 @@ class EvaluationSelfTest(unittest.TestCase):
         self.assertEqual(3, sample["retry_count"])
         self.assertEqual(67108864, sample["process_rss"])
         self.assertEqual(33554432, sample["heap_alloc"])
+        self.assertEqual(524288, sample["ssd_write_bytes"])
+        self.assertEqual(131072, sample["ssd_read_bytes"])
+        self.assertEqual(1, sample["ssd_writer_concurrency"])
+        self.assertEqual(262144, sample["ssd_backlog_bytes"])
+        self.assertEqual(786432, sample["archive_write_bytes"])
+        self.assertEqual(262144, sample["archive_read_bytes"])
+        self.assertEqual(1, sample["archive_writer_concurrency"])
         self.assertEqual(786432, sample["target_write_bytes"])
         self.assertEqual(262144, sample["target_read_bytes"])
         self.assertEqual(524288, sample["target_durable_bytes"])
+        self.assertNotEqual(sample["ssd_write_bytes"], sample["archive_write_bytes"])
         self.assertNotEqual(sample["target_write_bytes"], sample["target_read_bytes"])
         self.assertEqual(2, sample["target_writer_concurrency"])
         self.assertEqual(1048576, sample["target_backlog_bytes"])
@@ -428,6 +444,8 @@ class EvaluationSelfTest(unittest.TestCase):
         self.assertNotIn("wire_rx_bytes", missing_sources)
         self.assertNotIn("process_rss", missing_sources)
         self.assertNotIn("target_write_bytes", missing_sources)
+        self.assertNotIn("ssd_write_bytes", missing_sources)
+        self.assertNotIn("archive_write_bytes", missing_sources)
 
     def test_collector_propagates_storage_collection_error_and_null_durable_bytes(self):
         routes = {

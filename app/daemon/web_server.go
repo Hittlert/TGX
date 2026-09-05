@@ -200,28 +200,49 @@ func (s *WebServer) Handler() http.Handler {
 			isArchiveEnabled = true
 		}
 
-		// 1. Target physical write and read bytes from live orchestrator instrumentation
+		// 1. Stable tier metrics: SSD storage
+		var ssdWriteBytes int64
+		var ssdReadBytes int64
+		var ssdWriterConcurrency int64
+		var ssdBacklogBytes *int64
+
+		// 2. Stable tier metrics: Archive HDD storage
+		var archiveWriteBytes int64
+		var archiveReadBytes int64
+		var archiveWriterConcurrency int64
+		var archiveBacklogBytes *int64
+
+		// 3. Authoritative target metrics
 		var targetWriteBytes int64
 		var targetReadBytes int64
 		var targetWriterConcurrency int
+		var targetBacklogBytes *int64
+		var targetDurableBytes *int64
+		var collectionErrors []map[string]string
+
 		if s.orchestrator != nil {
+			ssdWriteBytes = s.orchestrator.SSDPhysicalWriteBytes()
+			ssdReadBytes = s.orchestrator.SSDPhysicalReadBytes()
+			ssdWriterConcurrency = s.orchestrator.SSDActiveWriters()
+
+			archiveWriteBytes = s.orchestrator.ArchivePhysicalWriteBytes()
+			archiveReadBytes = s.orchestrator.ArchivePhysicalReadBytes()
+			archiveWriterConcurrency = s.orchestrator.ArchiveActiveWriters()
+
 			targetWriteBytes = s.orchestrator.PhysicalTargetWriteBytes()
 			targetReadBytes = s.orchestrator.PhysicalTargetReadBytes()
 			targetWriterConcurrency = int(s.orchestrator.ActiveTargetWriters())
-			if isArchiveEnabled {
-				resp["ssd_write_bytes"] = s.orchestrator.SSDPhysicalWriteBytes()
-				resp["ssd_read_bytes"] = s.orchestrator.SSDPhysicalReadBytes()
-				resp["ssd_writer_concurrency"] = s.orchestrator.SSDActiveWriters()
-			}
 		} else if s.transferMgr != nil {
 			targetWriterConcurrency = int(s.transferMgr.ActiveFiles())
 		}
 
-		// 2. Authoritative target backlog bytes and durable bytes
-		var targetBacklogBytes int64
-		var targetDurableBytes *int64
-		var collectionErrors []map[string]string
+		// SSD backlog from authoritative Registry
+		if s.registry != nil {
+			b := s.registry.QueuedBacklogBytes()
+			ssdBacklogBytes = &b
+		}
 
+		// Archive stats and durable bytes from DB
 		if isArchiveEnabled {
 			if s.db != nil {
 				arcStats, err := s.db.GetArchiveStats()
@@ -230,17 +251,18 @@ func (s *WebServer) Handler() http.Handler {
 						"source": "/api/system/storage:archive_stats",
 						"error":  err.Error(),
 					})
+					// On DB error, leave archiveBacklogBytes, targetBacklogBytes, and targetDurableBytes as nil (null)
 				} else {
 					resp["archive"] = arcStats
-					targetBacklogBytes = arcStats.BacklogBytes
+					ab := arcStats.BacklogBytes
+					archiveBacklogBytes = &ab
+					targetBacklogBytes = &ab
 					d := arcStats.ArchivedBytes
 					targetDurableBytes = &d
 				}
 			}
 		} else {
-			if s.registry != nil {
-				targetBacklogBytes = s.registry.QueuedBacklogBytes()
-			}
+			targetBacklogBytes = ssdBacklogBytes
 			if s.db != nil {
 				durable, err := s.db.GetDurableTargetBytes()
 				if err != nil {
@@ -254,15 +276,40 @@ func (s *WebServer) Handler() http.Handler {
 			}
 		}
 
+		// Expose stable tier metrics
+		resp["ssd_write_bytes"] = ssdWriteBytes
+		resp["ssd_read_bytes"] = ssdReadBytes
+		resp["ssd_writer_concurrency"] = ssdWriterConcurrency
+		if ssdBacklogBytes != nil {
+			resp["ssd_backlog_bytes"] = *ssdBacklogBytes
+		} else {
+			resp["ssd_backlog_bytes"] = nil
+		}
+
+		resp["archive_write_bytes"] = archiveWriteBytes
+		resp["archive_read_bytes"] = archiveReadBytes
+		resp["archive_writer_concurrency"] = archiveWriterConcurrency
+		if archiveBacklogBytes != nil {
+			resp["archive_backlog_bytes"] = *archiveBacklogBytes
+		} else {
+			resp["archive_backlog_bytes"] = nil
+		}
+
+		// Expose authoritative target tier metrics
 		resp["target_write_bytes"] = targetWriteBytes
 		resp["target_read_bytes"] = targetReadBytes
+		resp["target_writer_concurrency"] = targetWriterConcurrency
+		if targetBacklogBytes != nil {
+			resp["target_backlog_bytes"] = *targetBacklogBytes
+		} else {
+			resp["target_backlog_bytes"] = nil
+		}
 		if targetDurableBytes != nil {
 			resp["target_durable_bytes"] = *targetDurableBytes
 		} else {
 			resp["target_durable_bytes"] = nil
 		}
-		resp["target_writer_concurrency"] = targetWriterConcurrency
-		resp["target_backlog_bytes"] = targetBacklogBytes
+
 		if len(collectionErrors) > 0 {
 			resp["collection_errors"] = collectionErrors
 		}

@@ -223,11 +223,11 @@ func Run(ctx context.Context, client *telegram.Client, kvd storage.Storage, opts
 
 	// 3. Restart Crash Recovery Matrix
 	if db != nil {
-		var readCounters []*int64
+		var meter *StorageIOMeter
 		if orchestrator != nil {
-			readCounters = append(readCounters, orchestrator.PhysicalTargetReadBytesPtr())
+			meter = orchestrator.Meter()
 		}
-		if recErr := ReconcileOnStartup(ctx, db, opts.OutputDir, opts.ArchiveDir, logctx.From(ctx), readCounters...); recErr != nil {
+		if recErr := ReconcileOnStartup(ctx, db, opts.OutputDir, opts.ArchiveDir, logctx.From(ctx), meter); recErr != nil {
 			logctx.From(ctx).Warn("startup crash recovery reported warning", zap.Error(recErr))
 		}
 	}

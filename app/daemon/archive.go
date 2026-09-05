@@ -2,11 +2,8 @@ package daemon
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -29,9 +26,7 @@ type ArchiveWorker struct {
 	runningMu sync.Mutex
 	running   bool
 
-	writeBytes   int64 // atomic: cumulative physical bytes written to HDD archive
-	readBytes    int64 // atomic: cumulative physical bytes read from SSD
-	activeWriter int64 // atomic: 1 while actively copying, 0 otherwise
+	meter *StorageIOMeter
 }
 
 // NewArchiveWorker creates the single archive worker.
@@ -68,6 +63,7 @@ func NewArchiveWorker(db *Database, downloadDir, archiveDir string, logger *zap.
 		archiveDir:  cleanArchive,
 		logger:      logger,
 		wakeCh:      make(chan struct{}, 1),
+		meter:       NewStorageIOMeter(),
 	}, nil
 }
 
@@ -228,7 +224,7 @@ func (w *ArchiveWorker) processJob(ctx context.Context, job ArchiveJob) {
 	if dstInfo, err := os.Stat(dstPath); err == nil {
 		// Existing target check: verify size and SHA
 		if dstInfo.Size() == job.ExpectedSize {
-			actualDstSHA, shaErr := computeFileSHA256(dstPath)
+			actualDstSHA, shaErr := w.meter.ComputeArchiveFileSHA256(dstPath)
 			if shaErr == nil && actualDstSHA == job.SHA256 {
 				// Idempotent archive success
 				w.logger.Info("archive target already exists and verified, completing job",
@@ -305,13 +301,32 @@ func (w *ArchiveWorker) processJob(ctx context.Context, job ArchiveJob) {
 
 	// 4. Perform whole-file archive copy via .moving sibling on destination filesystem
 	movingPath := dstPath + ".moving"
-	atomic.StoreInt64(&w.activeWriter, 1)
-	written, actualSHA, copyErr := fscommit.CopyFileSequential(srcPath, movingPath)
-	atomic.StoreInt64(&w.activeWriter, 0)
-	if written > 0 {
-		atomic.AddInt64(&w.writeBytes, written)
-		atomic.AddInt64(&w.readBytes, written)
+	srcFile, err := os.Open(srcPath)
+	if err != nil {
+		w.logger.Error("open SSD source file for archive failed", zap.Error(err))
+		if fErr := w.db.FailArchiveJob(job.ChatID, job.MessageID, job.ClaimID, fmt.Sprintf("open SSD source: %v", err)); fErr != nil {
+			w.logger.Error("failed to fail archive job for open source error", zap.Error(fErr))
+		}
+		return
 	}
+	defer srcFile.Close()
+
+	dstFile, err := os.OpenFile(movingPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		w.logger.Error("open archive destination file failed", zap.Error(err))
+		if fErr := w.db.FailArchiveJob(job.ChatID, job.MessageID, job.ClaimID, fmt.Sprintf("open archive destination: %v", err)); fErr != nil {
+			w.logger.Error("failed to fail archive job for open dst error", zap.Error(fErr))
+		}
+		return
+	}
+
+	meteredSrc := w.meter.WrapSSDStreamReader(srcFile)
+	meteredDst := w.meter.WrapArchiveStreamWriter(dstFile)
+
+	atomic.AddInt64(&w.meter.archiveActiveWriters, 1)
+	written, actualSHA, copyErr := fscommit.CopyStreamSequential(meteredSrc, meteredDst)
+	atomic.AddInt64(&w.meter.archiveActiveWriters, -1)
+
 	if copyErr != nil {
 		w.logger.Warn("archive copy failed", zap.Error(copyErr))
 		_ = os.Remove(movingPath)
@@ -389,54 +404,36 @@ func (w *ArchiveWorker) processJob(ctx context.Context, job ArchiveJob) {
 	)
 }
 
-func computeFileSHA256WithCounter(filePath string, readCounter *int64) (string, error) {
-	f, err := os.Open(filePath)
-	if err != nil {
-		return "", err
+func (w *ArchiveWorker) Meter() *StorageIOMeter {
+	if w == nil {
+		return nil
 	}
-	defer f.Close()
-
-	h := sha256.New()
-	buf := make([]byte, 1024*1024)
-	for {
-		n, rErr := f.Read(buf)
-		if n > 0 {
-			if readCounter != nil {
-				atomic.AddInt64(readCounter, int64(n))
-			}
-			h.Write(buf[:n])
-		}
-		if rErr != nil {
-			if errors.Is(rErr, io.EOF) {
-				break
-			}
-			return "", rErr
-		}
-	}
-	return hex.EncodeToString(h.Sum(nil)), nil
+	return w.meter
 }
 
-func computeFileSHA256(filePath string) (string, error) {
-	return computeFileSHA256WithCounter(filePath, nil)
+func (w *ArchiveWorker) SetStorageIOMeter(meter *StorageIOMeter) {
+	if w != nil && meter != nil {
+		w.meter = meter
+	}
 }
 
 func (w *ArchiveWorker) PhysicalWriteBytes() int64 {
-	if w == nil {
+	if w == nil || w.meter == nil {
 		return 0
 	}
-	return atomic.LoadInt64(&w.writeBytes)
+	return w.meter.ArchiveWriteBytes()
 }
 
 func (w *ArchiveWorker) PhysicalReadBytes() int64 {
-	if w == nil {
+	if w == nil || w.meter == nil {
 		return 0
 	}
-	return atomic.LoadInt64(&w.readBytes)
+	return w.meter.ArchiveReadBytes()
 }
 
 func (w *ArchiveWorker) ActiveWorkers() int {
-	if w == nil {
+	if w == nil || w.meter == nil {
 		return 0
 	}
-	return int(atomic.LoadInt64(&w.activeWriter))
+	return int(w.meter.ArchiveActiveWriters())
 }

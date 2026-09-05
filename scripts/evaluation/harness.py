@@ -17,7 +17,7 @@ from analyze import seal_raw_directory
 
 
 PROTOCOL_VERSION = "1.0"
-PROTOCOL_SHA256 = "17a829372cffeb6ccdd2a591117219d70885c431f0b5bc83f53c2ca0e64daeda"
+PROTOCOL_SHA256 = "c3382f624fb8a19a89b007f5d2c858e1d1c8b9225a51973b9383f8ca64f9574d"
 METRIC_METADATA_FIELDS = {
     "timestamp",
     "monotonic_elapsed_sec",
@@ -32,11 +32,18 @@ TGX_INTERNAL_METRICS = {
     "ssd_used_bytes",
     "ssd_reserved_bytes",
     "ssd_available_bytes",
+    "ssd_write_bytes",
+    "ssd_read_bytes",
+    "ssd_writer_concurrency",
+    "ssd_backlog_bytes",
     "archive_backlog_files",
     "archive_backlog_bytes",
     "archive_active_workers",
     "archive_archived_files",
     "archive_conflict_count",
+    "archive_write_bytes",
+    "archive_read_bytes",
+    "archive_writer_concurrency",
     "target_write_bytes",
     "target_read_bytes",
     "target_durable_bytes",
@@ -367,11 +374,18 @@ class MetricsSampler(threading.Thread):
             "ssd_used_bytes": None,
             "ssd_reserved_bytes": None,
             "ssd_available_bytes": None,
+            "ssd_write_bytes": None,
+            "ssd_read_bytes": None,
+            "ssd_writer_concurrency": None,
+            "ssd_backlog_bytes": None,
             "archive_backlog_files": None,
             "archive_backlog_bytes": None,
             "archive_active_workers": None,
             "archive_archived_files": None,
             "archive_conflict_count": None,
+            "archive_write_bytes": None,
+            "archive_read_bytes": None,
+            "archive_writer_concurrency": None,
             "target_write_bytes": None,
             "target_read_bytes": None,
             "target_durable_bytes": None,
@@ -437,13 +451,20 @@ class MetricsSampler(threading.Thread):
                 record["ssd_total_bytes"] = storage.get("total_bytes")
                 record["ssd_used_bytes"] = storage.get("used_bytes")
                 for field in (
+                    "ssd_write_bytes",
+                    "ssd_read_bytes",
+                    "ssd_writer_concurrency",
+                    "ssd_backlog_bytes",
+                    "archive_write_bytes",
+                    "archive_read_bytes",
+                    "archive_writer_concurrency",
                     "target_write_bytes",
                     "target_read_bytes",
                     "target_durable_bytes",
                     "target_writer_concurrency",
                     "target_backlog_bytes",
                 ):
-                    if storage.get(field) is not None:
+                    if field in storage and storage.get(field) is not None:
                         record[field] = storage.get(field)
                 archive = storage.get("archive")
                 if isinstance(archive, dict):

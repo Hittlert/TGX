@@ -13,9 +13,14 @@ import (
 )
 
 // ReconcileOnStartup executes the Section 10 crash recovery matrix before new admissions begin.
-func ReconcileOnStartup(ctx context.Context, db *Database, ssdDir, archiveDir string, logger *zap.Logger, readCounters ...*int64) error {
+func ReconcileOnStartup(ctx context.Context, db *Database, ssdDir, archiveDir string, logger *zap.Logger, meters ...*StorageIOMeter) error {
 	var errs []error
 	archiveEnabled := archiveDir != ""
+
+	var meter *StorageIOMeter
+	if len(meters) > 0 {
+		meter = meters[0]
+	}
 
 	// 1. Reconcile 'committing' download_records: only promote if matching proof exists
 	committingRecs, err := db.GetPendingCommittingDownloads()
@@ -24,7 +29,7 @@ func ReconcileOnStartup(ctx context.Context, db *Database, ssdDir, archiveDir st
 		errs = append(errs, fmt.Errorf("get pending committing: %w", err))
 	} else {
 		for _, rec := range committingRecs {
-			if recErr := ReconcileCommittingRecord(ctx, db, ssdDir, archiveEnabled, rec, nil, logger, readCounters...); recErr != nil {
+			if recErr := ReconcileCommittingRecord(ctx, db, ssdDir, archiveEnabled, rec, nil, logger, meter); recErr != nil {
 				logger.Error("failed to reconcile committing download during startup recovery",
 					zap.String("chat_id", rec.ChatID),
 					zap.Int("message_id", rec.MessageID),
@@ -111,13 +116,9 @@ func ReconcileOnStartup(ctx context.Context, db *Database, ssdDir, archiveDir st
 				dstMoving := dstFinal + ".moving"
 				srcPath := filepath.Join(ssdDir, filepath.FromSlash(job.RelativePath))
 
-				var readCounter *int64
-				if len(readCounters) > 0 {
-					readCounter = readCounters[0]
-				}
 				// Check if archive final file exists and is verified
 				if finInfo, statErr := os.Stat(dstFinal); statErr == nil && finInfo.Size() == job.ExpectedSize {
-					sha, shaErr := computeFileSHA256WithCounter(dstFinal, readCounter)
+					sha, shaErr := meter.ComputeArchiveFileSHA256(dstFinal)
 					if shaErr == nil && job.SHA256 != "" && sha == job.SHA256 {
 						_ = os.Remove(dstMoving)
 						if completeErr := db.RecoverArchiveJobComplete(job.ChatID, job.MessageID, job.ClaimID, job.SHA256); completeErr != nil {
@@ -190,7 +191,7 @@ type CommitDecision struct {
 // 2. ErrTargetExists with matching size & SHA-256 -> CommitDecisionSuccess with part cleanup.
 // 3. ErrTargetExists with conflicting size/SHA -> CommitDecisionTargetConflict preserving both proofs.
 // 4. Other commit failures (EIO, EPERM, IsDir) -> CommitDecisionIOError preserving valid part.
-func EvaluateCommitSiblingPart(partAbsPath, finalAbsPath string, authoritativeSize int64, expectedSHA string, commitErr error) CommitDecision {
+func EvaluateCommitSiblingPart(partAbsPath, finalAbsPath string, authoritativeSize int64, expectedSHA string, commitErr error, meters ...*StorageIOMeter) CommitDecision {
 	if commitErr == nil {
 		return CommitDecision{
 			Type:     CommitDecisionSuccess,
@@ -198,10 +199,15 @@ func EvaluateCommitSiblingPart(partAbsPath, finalAbsPath string, authoritativeSi
 		}
 	}
 
+	var meter *StorageIOMeter
+	if len(meters) > 0 {
+		meter = meters[0]
+	}
+
 	if errors.Is(commitErr, fscommit.ErrTargetExists) || errors.Is(commitErr, os.ErrExist) {
 		if finInfo, statErr := os.Stat(finalAbsPath); statErr == nil && !finInfo.IsDir() {
 			if finInfo.Size() == authoritativeSize {
-				finSHA, finSHAErr := computeFileSHA256(finalAbsPath)
+				finSHA, finSHAErr := meter.ComputeSSDFileSHA256(finalAbsPath)
 				if finSHAErr == nil && finSHA == expectedSHA {
 					_ = os.Remove(partAbsPath)
 					return CommitDecision{
@@ -258,21 +264,21 @@ func ReconcileCommittingRecord(
 	rec DownloadRecord,
 	registry *Registry,
 	logger *zap.Logger,
-	readCounters ...*int64,
+	meters ...*StorageIOMeter,
 ) error {
 	if db == nil {
 		return nil
 	}
-	var readCounter *int64
-	if len(readCounters) > 0 {
-		readCounter = readCounters[0]
+	var meter *StorageIOMeter
+	if len(meters) > 0 {
+		meter = meters[0]
 	}
 	finalAbsPath := filepath.Join(ssdDir, filepath.FromSlash(rec.SavePath))
 	partAbsPath := finalAbsPath + ".part"
 
 	// 1. Check if final SSD file already exists
 	if finInfo, statErr := os.Stat(finalAbsPath); statErr == nil && !finInfo.IsDir() {
-		finSHA, shaErr := computeFileSHA256WithCounter(finalAbsPath, readCounter)
+		finSHA, shaErr := meter.ComputeSSDFileSHA256(finalAbsPath)
 		if shaErr == nil && rec.SHA256 != "" && finInfo.Size() == rec.FileSize && finSHA == rec.SHA256 {
 			// Final SSD file already exists and matches committed size and SHA proof
 			_ = os.Remove(partAbsPath)
@@ -298,7 +304,7 @@ func ReconcileCommittingRecord(
 		// Final SSD file exists but does NOT match!
 		// Check if .part file exists and is valid
 		if partInfo, statPartErr := os.Stat(partAbsPath); statPartErr == nil && partInfo.Size() == rec.FileSize {
-			partSHA, shaPartErr := computeFileSHA256WithCounter(partAbsPath, readCounter)
+			partSHA, shaPartErr := meter.ComputeSSDFileSHA256(partAbsPath)
 			if shaPartErr == nil && rec.SHA256 != "" && partSHA == rec.SHA256 {
 				// Valid part + conflicting final!
 				// Preserve both proofs, do not delete part, record durable conflict!
@@ -331,13 +337,13 @@ func ReconcileCommittingRecord(
 
 	// 2. .part file exists with matching SHA -> commit sibling part and evaluate canonical outcome
 	if partInfo, statErr := os.Stat(partAbsPath); statErr == nil && partInfo.Size() == rec.FileSize {
-		sha, shaErr := computeFileSHA256WithCounter(partAbsPath, readCounter)
+		sha, shaErr := meter.ComputeSSDFileSHA256(partAbsPath)
 		if shaErr == nil && rec.SHA256 != "" && sha == rec.SHA256 {
 			if recoveryTestHooks.BeforeCommitSiblingPart != nil {
 				recoveryTestHooks.BeforeCommitSiblingPart(partAbsPath, finalAbsPath)
 			}
 			commitErr := fscommit.CommitSiblingPart(partAbsPath, finalAbsPath)
-			decision := EvaluateCommitSiblingPart(partAbsPath, finalAbsPath, rec.FileSize, sha, commitErr)
+			decision := EvaluateCommitSiblingPart(partAbsPath, finalAbsPath, rec.FileSize, sha, commitErr, meter)
 			switch decision.Type {
 			case CommitDecisionSuccess:
 				completeErr := db.CompleteDownloadAndQueueArchive(rec.ChatID, rec.MessageID, rec.AttemptGeneration, rec.SavePath, rec.FileSize, decision.FinalSHA, archiveEnabled)

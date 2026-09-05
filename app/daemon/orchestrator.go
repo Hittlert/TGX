@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -39,10 +38,7 @@ type Orchestrator struct {
 	taskSlotFreed    chan struct{}
 	activePublishers sync.Map // map[string]string: "chatID:msgID" -> attemptGeneration
 	finalizerWakeCh  chan struct{}
-
-	physicalTargetWriteBytes int64 // atomic: cumulative physical bytes written to storage
-	physicalTargetReadBytes  int64 // atomic: cumulative physical bytes read from storage
-	activeTargetWriters      int64 // atomic: currently active physical writer goroutines
+	meter            *StorageIOMeter
 
 	testHooks OrchestratorTestHooks
 }
@@ -85,12 +81,16 @@ func NewOrchestrator(
 		running:         true,
 		taskSlotFreed:   make(chan struct{}, 64),
 		finalizerWakeCh: make(chan struct{}, 1),
+		meter:           NewStorageIOMeter(),
 	}
 }
 
 // SetArchiveWorker binds the single asynchronous archive worker.
 func (o *Orchestrator) SetArchiveWorker(w *ArchiveWorker) {
 	o.archiveWorker = w
+	if w != nil && o.meter != nil {
+		w.SetStorageIOMeter(o.meter)
+	}
 }
 
 // ArchiveWorker returns the bound archive worker if any.
@@ -473,7 +473,7 @@ func (o *Orchestrator) ReconcileCommitting(ctx context.Context) error {
 			continue
 		}
 
-		if err := ReconcileCommittingRecord(ctx, o.db, o.saveDir, archiveEnabled, rec, o.registry, o.logger, &o.physicalTargetReadBytes); err != nil {
+		if err := ReconcileCommittingRecord(ctx, o.db, o.saveDir, archiveEnabled, rec, o.registry, o.logger, o.meter); err != nil {
 			o.logger.Warn("reconciliation of committing record encountered error",
 				zap.String("chat_id", rec.ChatID),
 				zap.Int("message_id", rec.MessageID),
@@ -586,7 +586,7 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 					task.FailDisposition(disp)
 					return
 				}
-				actualSHA, shaErr := computeFileSHA256(finalAbsPath)
+				actualSHA, shaErr := o.meter.ComputeSSDFileSHA256(finalAbsPath)
 				if shaErr != nil || actualSHA != successProof.SHA256 {
 					o.logger.Warn("already success in DB but physical file hash mismatch on disk",
 						zap.String("task_id", taskID),
@@ -774,7 +774,7 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 			if rec, recErr := o.db.GetDownloadRecord(chatID, msgID); recErr == nil && rec != nil {
 				if (rec.Status == "committing" || rec.Status == "success" || rec.Status == "archived") &&
 					rec.SavePath == finalRelPath && rec.FileSize == finInfo.Size() && rec.SHA256 != "" {
-					actualSHA, shaErr := computeFileSHA256(finalAbsPath)
+					actualSHA, shaErr := o.meter.ComputeSSDFileSHA256(finalAbsPath)
 					if shaErr == nil && actualSHA == rec.SHA256 {
 						isVerified = true
 						if err := o.db.CompleteExistingDownload(
@@ -870,7 +870,7 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 					task.FailDisposition(disp)
 					return
 				}
-				actualSHA, shaErr := computeFileSHA256(finalAbsPath)
+				actualSHA, shaErr := o.meter.ComputeSSDFileSHA256(finalAbsPath)
 				if shaErr != nil || actualSHA != successProof.SHA256 {
 					o.logger.Warn("already success in DB but physical file hash mismatch on disk with planned path",
 						zap.String("task_id", taskID),
@@ -1033,11 +1033,7 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 		LastPhysicalID:  &lastPhysID,
 	})
 
-	targetWriter := &physicalTargetWriter{
-		w:             partFile,
-		activeWriters: &o.activeTargetWriters,
-		bytesWritten:  &o.physicalTargetWriteBytes,
-	}
+	targetWriter := o.meter.WrapSSDWriterAt(partFile)
 
 	dlResult, dlErr := o.transferMgr.DownloadFileWithResult(
 		taskCtx,
@@ -1239,7 +1235,7 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 		return
 	}
 
-	shaHex, shaErr := computeFileSHA256WithCounter(partAbsPath, &o.physicalTargetReadBytes)
+	shaHex, shaErr := o.meter.ComputeSSDFileSHA256(partAbsPath)
 	if shaErr != nil {
 		_ = os.Remove(partAbsPath)
 		disp := FailureDisposition{
@@ -1525,45 +1521,62 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 	)
 }
 
-// physicalTargetWriter instruments physical chunk writes, capturing exact concurrent WriteAt
-// operations and total physical bytes written (including on error) directly at the I/O boundary.
-type physicalTargetWriter struct {
-	w             io.WriterAt
-	activeWriters *int64
-	bytesWritten  *int64
+func (o *Orchestrator) Meter() *StorageIOMeter {
+	if o == nil {
+		return nil
+	}
+	return o.meter
 }
 
-func (pw *physicalTargetWriter) WriteAt(p []byte, off int64) (int, error) {
-	if pw.activeWriters != nil {
-		atomic.AddInt64(pw.activeWriters, 1)
-		defer atomic.AddInt64(pw.activeWriters, -1)
+func (o *Orchestrator) SetStorageIOMeter(m *StorageIOMeter) {
+	if o != nil && m != nil {
+		o.meter = m
+		if o.archiveWorker != nil {
+			o.archiveWorker.SetStorageIOMeter(m)
+		}
 	}
-	n, err := pw.w.WriteAt(p, off)
-	if pw.bytesWritten != nil && n > 0 {
-		atomic.AddInt64(pw.bytesWritten, int64(n))
-	}
-	return n, err
 }
 
 func (o *Orchestrator) SSDPhysicalWriteBytes() int64 {
-	if o == nil {
+	if o == nil || o.meter == nil {
 		return 0
 	}
-	return atomic.LoadInt64(&o.physicalTargetWriteBytes)
+	return o.meter.SSDWriteBytes()
 }
 
 func (o *Orchestrator) SSDPhysicalReadBytes() int64 {
-	if o == nil {
+	if o == nil || o.meter == nil {
 		return 0
 	}
-	return atomic.LoadInt64(&o.physicalTargetReadBytes)
+	return o.meter.SSDReadBytes()
 }
 
 func (o *Orchestrator) SSDActiveWriters() int64 {
-	if o == nil {
+	if o == nil || o.meter == nil {
 		return 0
 	}
-	return atomic.LoadInt64(&o.activeTargetWriters)
+	return o.meter.SSDActiveWriters()
+}
+
+func (o *Orchestrator) ArchivePhysicalWriteBytes() int64 {
+	if o == nil || o.meter == nil {
+		return 0
+	}
+	return o.meter.ArchiveWriteBytes()
+}
+
+func (o *Orchestrator) ArchivePhysicalReadBytes() int64 {
+	if o == nil || o.meter == nil {
+		return 0
+	}
+	return o.meter.ArchiveReadBytes()
+}
+
+func (o *Orchestrator) ArchiveActiveWriters() int64 {
+	if o == nil || o.meter == nil {
+		return 0
+	}
+	return o.meter.ArchiveActiveWriters()
 }
 
 // PhysicalTargetWriteBytes returns the physical bytes written to the authoritative target storage tier.
@@ -1571,45 +1584,37 @@ func (o *Orchestrator) SSDActiveWriters() int64 {
 // When archive is disabled (direct mode), target storage is the direct SSD download tier (OutputDir).
 // The tiers are never added together, preventing double-counting and ambiguous write amplification.
 func (o *Orchestrator) PhysicalTargetWriteBytes() int64 {
-	if o == nil {
+	if o == nil || o.meter == nil {
 		return 0
 	}
-	if o.IsArchiveEnabled() && o.archiveWorker != nil {
-		return o.archiveWorker.PhysicalWriteBytes()
+	if o.IsArchiveEnabled() {
+		return o.meter.ArchiveWriteBytes()
 	}
-	return atomic.LoadInt64(&o.physicalTargetWriteBytes)
+	return o.meter.SSDWriteBytes()
 }
 
 // PhysicalTargetReadBytes returns the physical bytes read from the target storage tier.
-// When archive is enabled, target read bytes measure the source-to-target archive copy reads.
-// When archive is disabled (direct mode), target read bytes measure hash verification and recovery reads.
+// When archive is enabled, target read bytes measure archive target reads (e.g. existing-target verification).
+// When archive is disabled (direct mode), target read bytes measure direct SSD hash verification and recovery reads.
 func (o *Orchestrator) PhysicalTargetReadBytes() int64 {
-	if o == nil {
+	if o == nil || o.meter == nil {
 		return 0
 	}
-	if o.IsArchiveEnabled() && o.archiveWorker != nil {
-		return o.archiveWorker.PhysicalReadBytes()
+	if o.IsArchiveEnabled() {
+		return o.meter.ArchiveReadBytes()
 	}
-	return atomic.LoadInt64(&o.physicalTargetReadBytes)
+	return o.meter.SSDReadBytes()
 }
 
 // ActiveTargetWriters returns the count of actively executing physical write operations on target storage.
 // When archive is enabled, it returns the archive worker writer concurrency (0 or 1).
 // When archive is disabled, it returns the concurrent WriteAt operations on direct SSD storage.
 func (o *Orchestrator) ActiveTargetWriters() int64 {
-	if o == nil {
+	if o == nil || o.meter == nil {
 		return 0
 	}
-	if o.IsArchiveEnabled() && o.archiveWorker != nil {
-		return int64(o.archiveWorker.ActiveWorkers())
+	if o.IsArchiveEnabled() {
+		return o.meter.ArchiveActiveWriters()
 	}
-	return atomic.LoadInt64(&o.activeTargetWriters)
-}
-
-// PhysicalTargetReadBytesPtr returns the pointer to physicalTargetReadBytes counter for atomic increments by recovery/check routines.
-func (o *Orchestrator) PhysicalTargetReadBytesPtr() *int64 {
-	if o == nil {
-		return nil
-	}
-	return &o.physicalTargetReadBytes
+	return o.meter.SSDActiveWriters()
 }

@@ -2836,22 +2836,25 @@ func TestWebServer_TruthfulPhysicalMetricsAndMonotonicCounters(t *testing.T) {
 		registry: reg,
 		logger:   zap.NewNop(),
 		saveDir:  t.TempDir(),
+		meter:    NewStorageIOMeter(),
 	}
 
-	// 2.1 Execute REAL physical writes via physicalTargetWriter
+	// 2.1 Execute REAL physical writes via meteredSSDWriterAt with deterministic blocking barrier
 	tempFile, err := os.Create(filepath.Join(t.TempDir(), "real_target.part"))
 	if err != nil {
 		t.Fatalf("create part file: %v", err)
 	}
 	defer tempFile.Close()
 
-	pw := &physicalTargetWriter{
-		w:             tempFile,
-		activeWriters: &orch.activeTargetWriters,
-		bytesWritten:  &orch.physicalTargetWriteBytes,
+	startedCh := make(chan struct{}, 2)
+	releaseCh := make(chan struct{})
+	bw := &blockingWriterAt{
+		w:         tempFile,
+		startedCh: startedCh,
+		releaseCh: releaseCh,
 	}
+	meteredWriter := orch.meter.WrapSSDWriterAt(bw)
 
-	var maxObservedWriters int64
 	var wg sync.WaitGroup
 	chunkData := bytes.Repeat([]byte{0xab}, 1024)
 	for i := 0; i < 2; i++ {
@@ -2859,43 +2862,49 @@ func TestWebServer_TruthfulPhysicalMetricsAndMonotonicCounters(t *testing.T) {
 		go func(chunkIdx int) {
 			defer wg.Done()
 			offset := int64(chunkIdx * 1024)
-			curWriters := atomic.LoadInt64(&orch.activeTargetWriters)
-			for {
-				old := atomic.LoadInt64(&maxObservedWriters)
-				if curWriters <= old || atomic.CompareAndSwapInt64(&maxObservedWriters, old, curWriters) {
-					break
-				}
-			}
-			n, wErr := pw.WriteAt(chunkData, offset)
+			n, wErr := meteredWriter.WriteAt(chunkData, offset)
 			if wErr != nil || n != 1024 {
 				t.Errorf("chunk %d WriteAt failed: n=%d, err=%v", chunkIdx, n, wErr)
 			}
 		}(i)
 	}
+
+	// Deterministically wait for BOTH writers to enter WriteAt simultaneously
+	<-startedCh
+	<-startedCh
+
+	// Assert active writers is deterministically 2
+	activeWriters := orch.SSDActiveWriters()
+	if activeWriters != 2 {
+		t.Fatalf("expected 2 active SSD writers concurrently inside WriteAt, got %d", activeWriters)
+	}
+
+	// Release both goroutines
+	close(releaseCh)
 	wg.Wait()
 
+	if orch.SSDActiveWriters() != 0 {
+		t.Fatalf("expected 0 active SSD writers after completion, got %d", orch.SSDActiveWriters())
+	}
 	if orch.SSDPhysicalWriteBytes() != 2048 {
 		t.Fatalf("expected 2048 real physical bytes written, got %d", orch.SSDPhysicalWriteBytes())
 	}
-	if orch.SSDActiveWriters() != 0 {
-		t.Fatalf("expected 0 active writers after completion, got %d", orch.SSDActiveWriters())
-	}
 
-	// 2.2 Execute REAL physical read via computeFileSHA256WithCounter
+	// 2.2 Execute REAL physical read via ComputeSSDFileSHA256
 	readPath := filepath.Join(t.TempDir(), "read_target.bin")
 	readPayload := bytes.Repeat([]byte{0xcd}, 1024)
 	if err := os.WriteFile(readPath, readPayload, 0o644); err != nil {
 		t.Fatalf("write read target: %v", err)
 	}
+	hRead := sha256.Sum256(readPayload)
+	expectedReadSHA := hex.EncodeToString(hRead[:])
 
-	shaHex, shaErr := computeFileSHA256WithCounter(readPath, &orch.physicalTargetReadBytes)
+	shaHex, shaErr := orch.meter.ComputeSSDFileSHA256(readPath)
 	if shaErr != nil {
-		t.Fatalf("computeFileSHA256WithCounter failed: %v", shaErr)
+		t.Fatalf("ComputeSSDFileSHA256 failed: %v", shaErr)
 	}
-	expectedReadSHA := hex.EncodeToString(sha256.New().Sum(nil))
-	_ = expectedReadSHA
-	if len(shaHex) != 64 {
-		t.Fatalf("unexpected sha hex len: %s", shaHex)
+	if shaHex != expectedReadSHA {
+		t.Fatalf("expected sha %s, got %s", expectedReadSHA, shaHex)
 	}
 	if orch.SSDPhysicalReadBytes() != 1024 {
 		t.Fatalf("expected 1024 real physical bytes read, got %d", orch.SSDPhysicalReadBytes())
@@ -2930,13 +2939,20 @@ func TestWebServer_TruthfulPhysicalMetricsAndMonotonicCounters(t *testing.T) {
 	if int64(directStorageResp["target_read_bytes"].(float64)) != 1024 {
 		t.Fatalf("expected target_read_bytes 1024 in direct mode, got %v", directStorageResp["target_read_bytes"])
 	}
+	if int64(directStorageResp["ssd_write_bytes"].(float64)) != 2048 {
+		t.Fatalf("expected ssd_write_bytes 2048 in direct mode, got %v", directStorageResp["ssd_write_bytes"])
+	}
+	if int64(directStorageResp["ssd_read_bytes"].(float64)) != 1024 {
+		t.Fatalf("expected ssd_read_bytes 1024 in direct mode, got %v", directStorageResp["ssd_read_bytes"])
+	}
 
-	// 2.4 Verify Archive tier separation and real whole-file archive copy
+	// 2.4 Verify Archive tier separation, full lifecycle, final-file proof, and source removal
 	archiveDir := t.TempDir()
 	archiveWorker, err := NewArchiveWorker(db, orch.saveDir, archiveDir, zap.NewNop())
 	if err != nil {
 		t.Fatalf("NewArchiveWorker: %v", err)
 	}
+	orch.SetArchiveWorker(archiveWorker)
 
 	// Create real file in SSD saveDir (512 bytes)
 	arcFileName := "archive_test_file.bin"
@@ -2948,7 +2964,7 @@ func TestWebServer_TruthfulPhysicalMetricsAndMonotonicCounters(t *testing.T) {
 	h512 := sha256.Sum256(arcPayload)
 	sha512Hex := hex.EncodeToString(h512[:])
 
-	// Seed DB record for archive
+	// Seed DB: BOTH download_records AND archive_jobs
 	nowSec := time.Now().Unix()
 	_, err = db.Execute(`
 		INSERT INTO download_records (chat_id, message_id, file_name, save_path, file_size, status, sha256, downloaded_at, created_at, updated_at)
@@ -2958,17 +2974,63 @@ func TestWebServer_TruthfulPhysicalMetricsAndMonotonicCounters(t *testing.T) {
 		t.Fatalf("insert download record for archive: %v", err)
 	}
 
+	claimID := "claim-test-1"
+	_, err = db.Execute(`
+		INSERT INTO archive_jobs (chat_id, message_id, relative_path, expected_size, sha256, state, claim_id, attempts, next_retry_at, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, 'copying', ?, 1, 0, ?, ?)
+	`, "arc_chat", 1, arcFileName, 512, sha512Hex, claimID, nowSec, nowSec)
+	if err != nil {
+		t.Fatalf("insert archive job: %v", err)
+	}
+
 	// Execute REAL whole-file archive copy via processJob
 	archiveWorker.processJob(context.Background(), ArchiveJob{
 		ChatID:       "arc_chat",
 		MessageID:    1,
-		ClaimID:      "claim-test-1",
+		ClaimID:      claimID,
 		RelativePath: arcFileName,
 		ExpectedSize: 512,
 		SHA256:       sha512Hex,
+		State:        "copying",
 	})
-	orch.archiveWorker = archiveWorker
 
+	// Assert DB terminal state in archive_jobs and archive stats
+	arcStats, statsErr := db.GetArchiveStats()
+	if statsErr != nil {
+		t.Fatalf("GetArchiveStats: %v", statsErr)
+	}
+	if arcStats.ArchivedFiles != 1 || arcStats.ArchivedBytes != 512 {
+		t.Fatalf("expected 1 archived file with 512 bytes, got files=%d bytes=%d", arcStats.ArchivedFiles, arcStats.ArchivedBytes)
+	}
+
+	// Assert DB terminal state in archive_jobs
+	var jobState string
+	err = db.db.QueryRow(`SELECT state FROM archive_jobs WHERE chat_id = ? AND message_id = ?`, "arc_chat", 1).Scan(&jobState)
+	if err != nil || jobState != "archived" {
+		t.Fatalf("expected archive_jobs state 'archived', got %q (err=%v)", jobState, err)
+	}
+
+	// Assert Archive destination file exists, matches size and sha256
+	dstFinalPath := filepath.Join(archiveDir, arcFileName)
+	finBytes, err := os.ReadFile(dstFinalPath)
+	if err != nil {
+		t.Fatalf("read archive final file: %v", err)
+	}
+	if len(finBytes) != 512 {
+		t.Fatalf("expected 512 bytes in final file, got %d", len(finBytes))
+	}
+	hFin := sha256.Sum256(finBytes)
+	finSHAHex := hex.EncodeToString(hFin[:])
+	if finSHAHex != sha512Hex {
+		t.Fatalf("archive final file sha mismatch: got %s, want %s", finSHAHex, sha512Hex)
+	}
+
+	// Assert SSD source file has been deleted
+	if _, statErr := os.Stat(arcSrcPath); !os.IsNotExist(statErr) {
+		t.Fatalf("expected SSD source file to be deleted, got err: %v", statErr)
+	}
+
+	// Query /api/system/storage in archive mode
 	respArc, err := http.Get(server.URL + "/api/system/storage")
 	if err != nil {
 		t.Fatalf("GET /api/system/storage with archive: %v", err)
@@ -2977,36 +3039,269 @@ func TestWebServer_TruthfulPhysicalMetricsAndMonotonicCounters(t *testing.T) {
 	var arcStorageResp map[string]any
 	_ = json.NewDecoder(respArc.Body).Decode(&arcStorageResp)
 
-	// In archive mode, target storage is the archive tier (512 bytes), NOT added to SSD (2048 bytes)
+	// Target tier writes: 512 bytes (archive tier)
 	if int64(arcStorageResp["target_write_bytes"].(float64)) != 512 {
 		t.Fatalf("expected target_write_bytes 512 for archive target tier, got %v", arcStorageResp["target_write_bytes"])
 	}
-	if int64(arcStorageResp["target_read_bytes"].(float64)) != 512 {
-		t.Fatalf("expected target_read_bytes 512 for archive target tier, got %v", arcStorageResp["target_read_bytes"])
+	// Target tier reads: 0 bytes (archive tier HDD was NOT read during copy!)
+	if int64(arcStorageResp["target_read_bytes"].(float64)) != 0 {
+		t.Fatalf("expected target_read_bytes 0 for archive target tier, got %v", arcStorageResp["target_read_bytes"])
 	}
-	// SSD tier is exposed separately without double counting
+	// SSD tier writes: 2048 bytes
 	if int64(arcStorageResp["ssd_write_bytes"].(float64)) != 2048 {
 		t.Fatalf("expected ssd_write_bytes 2048 for distinct SSD tier, got %v", arcStorageResp["ssd_write_bytes"])
 	}
-	if int64(arcStorageResp["ssd_read_bytes"].(float64)) != 1024 {
-		t.Fatalf("expected ssd_read_bytes 1024 for distinct SSD tier, got %v", arcStorageResp["ssd_read_bytes"])
+	// SSD tier reads: 1024 (from read target hash) + 512 (from reading SSD source for archive copy) = 1536 bytes!
+	if int64(arcStorageResp["ssd_read_bytes"].(float64)) != 1536 {
+		t.Fatalf("expected ssd_read_bytes 1536 (including SSD source read during archive), got %v", arcStorageResp["ssd_read_bytes"])
+	}
+	// Archive tier writes: 512 bytes
+	if int64(arcStorageResp["archive_write_bytes"].(float64)) != 512 {
+		t.Fatalf("expected archive_write_bytes 512, got %v", arcStorageResp["archive_write_bytes"])
+	}
+	// Archive tier reads: 0 bytes
+	if int64(arcStorageResp["archive_read_bytes"].(float64)) != 0 {
+		t.Fatalf("expected archive_read_bytes 0, got %v", arcStorageResp["archive_read_bytes"])
 	}
 
-	// 2.5 Verify CopyStreamSequential retains partial physical bytes on failure
-	var writtenBeforeErr bytes.Buffer
-	faultyReader := io.MultiReader(
-		bytes.NewReader(bytes.Repeat([]byte{0x77}, 256)),
-		&failingReader{err: errors.New("simulated network/disk crash")},
+	// 2.5 Verify HTTP sampling while archive copy is in progress (live concurrency & live chunk bytes)
+	liveFileName := "live_copy_test.bin"
+	liveSrcPath := filepath.Join(orch.saveDir, liveFileName)
+	livePayload := bytes.Repeat([]byte{0x7a}, 1024)
+	if err := os.WriteFile(liveSrcPath, livePayload, 0o644); err != nil {
+		t.Fatalf("write live src: %v", err)
+	}
+
+	pausedCh := make(chan struct{})
+	resumeCh := make(chan struct{})
+	liveSrcFile, err := os.Open(liveSrcPath)
+	if err != nil {
+		t.Fatalf("open live src: %v", err)
+	}
+	defer liveSrcFile.Close()
+
+	liveDstPath := filepath.Join(archiveDir, liveFileName+".moving")
+	liveDstFile, err := os.OpenFile(liveDstPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		t.Fatalf("create live dst: %v", err)
+	}
+	defer liveDstFile.Close()
+
+	meteredLiveSrc := orch.meter.WrapSSDStreamReader(liveSrcFile)
+	meteredLiveDst := orch.meter.WrapArchiveStreamWriter(liveDstFile)
+	pw := &pausingWriter{
+		w:        meteredLiveDst,
+		pausedCh: pausedCh,
+		resumeCh: resumeCh,
+	}
+
+	var copyWritten int64
+	var copyErr error
+	var liveWg sync.WaitGroup
+	liveWg.Add(1)
+	go func() {
+		defer liveWg.Done()
+		atomic.AddInt64(&orch.meter.archiveActiveWriters, 1)
+		copyWritten, _, copyErr = fscommit.CopyStreamSequential(meteredLiveSrc, pw)
+		atomic.AddInt64(&orch.meter.archiveActiveWriters, -1)
+	}()
+
+	// Wait until the first chunk has been read/written
+	<-pausedCh
+
+	// SAMPLE HTTP ENDPOINT WHILE COPY IS ACTIVELY PAUSED IN FLIGHT
+	respLive, err := http.Get(server.URL + "/api/system/storage")
+	if err != nil {
+		t.Fatalf("GET /api/system/storage during live copy: %v", err)
+	}
+	defer respLive.Body.Close()
+	var liveResp map[string]any
+	_ = json.NewDecoder(respLive.Body).Decode(&liveResp)
+
+	// Concurrency must be 1 while copy is in progress
+	if int64(liveResp["archive_writer_concurrency"].(float64)) != 1 {
+		t.Fatalf("expected archive_writer_concurrency 1 during live copy, got %v", liveResp["archive_writer_concurrency"])
+	}
+	// Live bytes must have advanced during copy!
+	liveArchiveWrite := int64(liveResp["archive_write_bytes"].(float64))
+	if liveArchiveWrite <= 512 {
+		t.Fatalf("expected archive_write_bytes > 512 during mid-flight copy, got %d", liveArchiveWrite)
+	}
+
+	// Resume copy and let it finish
+	close(resumeCh)
+	liveWg.Wait()
+	if copyErr != nil {
+		t.Fatalf("live copy failed: %v", copyErr)
+	}
+	if copyWritten != 1024 {
+		t.Fatalf("expected 1024 bytes copied, got %d", copyWritten)
+	}
+
+	// Sample HTTP endpoint again after completion
+	respAfter, err := http.Get(server.URL + "/api/system/storage")
+	if err != nil {
+		t.Fatalf("GET /api/system/storage after copy: %v", err)
+	}
+	defer respAfter.Body.Close()
+	var afterResp map[string]any
+	_ = json.NewDecoder(respAfter.Body).Decode(&afterResp)
+
+	// Concurrency returns to 0
+	if int64(afterResp["archive_writer_concurrency"].(float64)) != 0 {
+		t.Fatalf("expected archive_writer_concurrency 0 after copy, got %v", afterResp["archive_writer_concurrency"])
+	}
+	if int64(afterResp["archive_write_bytes"].(float64)) != 512+1024 {
+		t.Fatalf("expected archive_write_bytes %d, got %v", 512+1024, afterResp["archive_write_bytes"])
+	}
+
+	// 2.6 Asymmetric failure modes: short write, failing source, sync failure, close failure
+	// 2.6.1 Short destination write preserves divergent counters
+	asymMeter := NewStorageIOMeter()
+	asymSrc := bytes.NewReader(bytes.Repeat([]byte{0x11}, 512))
+	asymDst := &shortWriter{limit: 256}
+	mSrc := asymMeter.WrapSSDStreamReader(asymSrc)
+	mDst := asymMeter.WrapArchiveStreamWriter(asymDst)
+	retBytes, _, cErr := fscommit.CopyStreamSequential(mSrc, mDst)
+	if cErr == nil {
+		t.Fatal("expected short write error")
+	}
+	if retBytes != 256 {
+		t.Fatalf("expected 256 returned bytes, got %d", retBytes)
+	}
+	if asymMeter.SSDReadBytes() != 512 {
+		t.Fatalf("expected 512 SSD read bytes, got %d", asymMeter.SSDReadBytes())
+	}
+	if asymMeter.ArchiveWriteBytes() != 256 {
+		t.Fatalf("expected 256 Archive write bytes, got %d", asymMeter.ArchiveWriteBytes())
+	}
+	if asymMeter.SSDReadBytes() == asymMeter.ArchiveWriteBytes() {
+		t.Fatal("asymmetric failure must preserve divergent read and write counters")
+	}
+
+	// 2.6.2 Failing source read preserves transferred bytes
+	failSrcMeter := NewStorageIOMeter()
+	failingSrc := io.MultiReader(
+		bytes.NewReader(bytes.Repeat([]byte{0x22}, 128)),
+		&failingReader{err: errors.New("failing disk source")},
 	)
-	retainedBytes, _, copyErr := fscommit.CopyStreamSequential(faultyReader, &writeCloserBuffer{Buffer: &writtenBeforeErr})
-	if copyErr == nil {
-		t.Fatal("expected simulated copy error")
+	var dstBuf bytes.Buffer
+	mFailSrc := failSrcMeter.WrapSSDStreamReader(failingSrc)
+	mDstBuf := failSrcMeter.WrapArchiveStreamWriter(&writeCloserBuffer{Buffer: &dstBuf})
+	retFailBytes, _, fErr := fscommit.CopyStreamSequential(mFailSrc, mDstBuf)
+	if fErr == nil {
+		t.Fatal("expected failing reader error")
 	}
-	if retainedBytes != 256 {
-		t.Fatalf("expected 256 physical bytes retained on copy error, got %d", retainedBytes)
+	if retFailBytes != 128 {
+		t.Fatalf("expected 128 bytes retained on source failure, got %d", retFailBytes)
 	}
-	if writtenBeforeErr.Len() != 256 {
-		t.Fatalf("expected 256 bytes in destination buffer before failure, got %d", writtenBeforeErr.Len())
+	if failSrcMeter.SSDReadBytes() != 128 || failSrcMeter.ArchiveWriteBytes() != 128 {
+		t.Fatalf("expected 128 for both counters, got read=%d write=%d", failSrcMeter.SSDReadBytes(), failSrcMeter.ArchiveWriteBytes())
+	}
+
+	// 2.6.3 Sync failure retains written bytes
+	syncMeter := NewStorageIOMeter()
+	syncSrc := bytes.NewReader(bytes.Repeat([]byte{0x33}, 512))
+	var syncBuf bytes.Buffer
+	failingSyncDst := &failingSyncerWriter{
+		w:       &writeCloserBuffer{Buffer: &syncBuf},
+		syncErr: errors.New("fsync failed: disk I/O error"),
+	}
+	mSyncSrc := syncMeter.WrapSSDStreamReader(syncSrc)
+	mSyncDst := syncMeter.WrapArchiveStreamWriter(failingSyncDst)
+	retSyncBytes, _, sErr := fscommit.CopyStreamSequential(mSyncSrc, mSyncDst)
+	if sErr == nil || !strings.Contains(sErr.Error(), "fsync dst") {
+		t.Fatalf("expected fsync error, got %v", sErr)
+	}
+	if retSyncBytes != 512 {
+		t.Fatalf("expected 512 bytes retained on sync error, got %d", retSyncBytes)
+	}
+	if syncMeter.ArchiveWriteBytes() != 512 {
+		t.Fatalf("expected 512 Archive write bytes on sync error, got %d", syncMeter.ArchiveWriteBytes())
+	}
+
+	// 2.6.4 Close failure retains written bytes
+	closeMeter := NewStorageIOMeter()
+	closeSrc := bytes.NewReader(bytes.Repeat([]byte{0x44}, 512))
+	var closeBuf bytes.Buffer
+	failingCloseDst := &failingCloseWriter{
+		w:        &closeBuf,
+		closeErr: errors.New("close failed: disk full"),
+	}
+	mCloseSrc := closeMeter.WrapSSDStreamReader(closeSrc)
+	mCloseDst := closeMeter.WrapArchiveStreamWriter(failingCloseDst)
+	retCloseBytes, _, clErr := fscommit.CopyStreamSequential(mCloseSrc, mCloseDst)
+	if clErr == nil || !strings.Contains(clErr.Error(), "close dst") {
+		t.Fatalf("expected close error, got %v", clErr)
+	}
+	if retCloseBytes != 512 {
+		t.Fatalf("expected 512 bytes retained on close error, got %d", retCloseBytes)
+	}
+	if closeMeter.ArchiveWriteBytes() != 512 {
+		t.Fatalf("expected 512 Archive write bytes on close error, got %d", closeMeter.ArchiveWriteBytes())
+	}
+
+	// 2.7 Startup crash recovery separates SSD and Archive reads deterministically
+	recMeter := NewStorageIOMeter()
+	recSSDDir := t.TempDir()
+	recArcDir := t.TempDir()
+	recDB, err := NewDatabase(filepath.Join(t.TempDir(), "rec_test.db"))
+	if err != nil {
+		t.Fatalf("NewDatabase for recovery: %v", err)
+	}
+	defer recDB.Close()
+
+	// 1. SSD committing file
+	ssdRecFile := "ssd_rec.bin"
+	ssdRecAbs := filepath.Join(recSSDDir, ssdRecFile)
+	ssdRecPayload := bytes.Repeat([]byte{0x55}, 300)
+	if err := os.WriteFile(ssdRecAbs, ssdRecPayload, 0o644); err != nil {
+		t.Fatalf("write ssd rec file: %v", err)
+	}
+	ssdRecSHA := hex.EncodeToString(func() []byte { h := sha256.Sum256(ssdRecPayload); return h[:] }())
+	_, err = recDB.Execute(`
+		INSERT INTO download_records (chat_id, message_id, status, save_path, file_size, sha256, created_at, updated_at)
+		VALUES ('rec_c1', 1, 'committing', ?, 300, ?, ?, ?)
+	`, ssdRecFile, ssdRecSHA, nowSec, nowSec)
+	if err != nil {
+		t.Fatalf("insert committing download record: %v", err)
+	}
+
+	// 2. Archive copying file in archiveDir
+	arcRecFile := "arc_rec.bin"
+	arcRecAbs := filepath.Join(recArcDir, arcRecFile)
+	arcRecPayload := bytes.Repeat([]byte{0x66}, 400)
+	if err := os.WriteFile(arcRecAbs, arcRecPayload, 0o644); err != nil {
+		t.Fatalf("write arc rec file: %v", err)
+	}
+	arcRecSHA := hex.EncodeToString(func() []byte { h := sha256.Sum256(arcRecPayload); return h[:] }())
+	_, err = recDB.Execute(`
+		INSERT INTO archive_jobs (chat_id, message_id, relative_path, expected_size, sha256, state, claim_id, attempts, next_retry_at, created_at, updated_at)
+		VALUES ('rec_c2', 2, ?, 400, ?, 'copying', 'claim-rec', 1, 0, ?, ?)
+	`, arcRecFile, arcRecSHA, nowSec, nowSec)
+	if err != nil {
+		t.Fatalf("insert copying archive job: %v", err)
+	}
+
+	// Put SSD duplicate to be cleaned up
+	arcSSDRecAbs := filepath.Join(recSSDDir, arcRecFile)
+	_ = os.WriteFile(arcSSDRecAbs, arcRecPayload, 0o644)
+
+	// Execute ReconcileOnStartup with typed meter
+	recErr := ReconcileOnStartup(context.Background(), recDB, recSSDDir, recArcDir, zap.NewNop(), recMeter)
+	if recErr != nil {
+		t.Fatalf("ReconcileOnStartup failed: %v", recErr)
+	}
+
+	// Assert SSD read counted ONLY SSD file (300 bytes), Archive read counted ONLY Archive HDD file (400 bytes)!
+	if recMeter.SSDReadBytes() != 300 {
+		t.Fatalf("expected 300 SSD recovery read bytes, got %d", recMeter.SSDReadBytes())
+	}
+	if recMeter.ArchiveReadBytes() != 400 {
+		t.Fatalf("expected 400 Archive recovery read bytes, got %d", recMeter.ArchiveReadBytes())
+	}
+	if recMeter.SSDWriteBytes() != 0 || recMeter.ArchiveWriteBytes() != 0 {
+		t.Fatalf("expected 0 writes during hash verification recovery, got ssd=%d arc=%d", recMeter.SSDWriteBytes(), recMeter.ArchiveWriteBytes())
 	}
 
 	// 3. Error source propagation: collection failure is emitted as null / collection_errors, not zero
@@ -3022,10 +3317,28 @@ func TestWebServer_TruthfulPhysicalMetricsAndMonotonicCounters(t *testing.T) {
 	if errStorageResp["target_durable_bytes"] != nil {
 		t.Fatalf("expected target_durable_bytes to be null on DB failure, got %v", errStorageResp["target_durable_bytes"])
 	}
+	if errStorageResp["target_backlog_bytes"] != nil {
+		t.Fatalf("expected target_backlog_bytes to be null on DB failure, got %v", errStorageResp["target_backlog_bytes"])
+	}
+	if errStorageResp["archive_backlog_bytes"] != nil {
+		t.Fatalf("expected archive_backlog_bytes to be null on DB failure, got %v", errStorageResp["archive_backlog_bytes"])
+	}
 	errs, ok := errStorageResp["collection_errors"].([]any)
 	if !ok || len(errs) == 0 {
 		t.Fatalf("expected collection_errors on DB failure, got %v", errStorageResp["collection_errors"])
 	}
+}
+
+type blockingWriterAt struct {
+	w         io.WriterAt
+	startedCh chan struct{}
+	releaseCh chan struct{}
+}
+
+func (b *blockingWriterAt) WriteAt(p []byte, off int64) (int, error) {
+	b.startedCh <- struct{}{}
+	<-b.releaseCh
+	return b.w.WriteAt(p, off)
 }
 
 type failingReader struct {
@@ -3034,6 +3347,89 @@ type failingReader struct {
 
 func (r *failingReader) Read(p []byte) (n int, err error) {
 	return 0, r.err
+}
+
+type shortWriter struct {
+	limit int
+	count int
+}
+
+func (w *shortWriter) Write(p []byte) (int, error) {
+	rem := w.limit - w.count
+	if rem <= 0 {
+		return 0, io.ErrShortWrite
+	}
+	toWrite := len(p)
+	if toWrite > rem {
+		toWrite = rem
+		w.count += toWrite
+		return toWrite, io.ErrShortWrite
+	}
+	w.count += toWrite
+	return toWrite, nil
+}
+
+func (w *shortWriter) Close() error {
+	return nil
+}
+
+type failingSyncerWriter struct {
+	w       io.WriteCloser
+	syncErr error
+}
+
+func (sw *failingSyncerWriter) Write(p []byte) (int, error) {
+	return sw.w.Write(p)
+}
+
+func (sw *failingSyncerWriter) Close() error {
+	return sw.w.Close()
+}
+
+func (sw *failingSyncerWriter) Sync() error {
+	return sw.syncErr
+}
+
+type failingCloseWriter struct {
+	w        io.Writer
+	closeErr error
+}
+
+func (cw *failingCloseWriter) Write(p []byte) (int, error) {
+	return cw.w.Write(p)
+}
+
+func (cw *failingCloseWriter) Close() error {
+	return cw.closeErr
+}
+
+type pausingWriter struct {
+	w         io.WriteCloser
+	pauseOnce sync.Once
+	pausedCh  chan struct{}
+	resumeCh  chan struct{}
+}
+
+func (pw *pausingWriter) Write(p []byte) (int, error) {
+	n, err := pw.w.Write(p)
+	if n > 0 {
+		pw.pauseOnce.Do(func() {
+			close(pw.pausedCh)
+			<-pw.resumeCh
+		})
+	}
+	return n, err
+}
+
+func (pw *pausingWriter) Close() error {
+	return pw.w.Close()
+}
+
+func (pw *pausingWriter) Sync() error {
+	if s, ok := pw.w.(fscommit.Syncer); ok {
+		return s.Sync()
+	}
+	return nil
 }
 
 type writeCloserBuffer struct {
