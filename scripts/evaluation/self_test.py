@@ -334,6 +334,65 @@ class EvaluationSelfTest(unittest.TestCase):
         self.assertIn("wire_rx_bytes", missing_sources)
         self.assertIn("process_rss", missing_sources)
 
+    def test_collector_maps_extended_observability_metrics(self):
+        def fake_http(url, timeout=3.0, retries=1):
+            if url.endswith("/api/status"):
+                return {
+                    "rolling_5s_bps": 123,
+                    "queue_depth": 2,
+                    "active_files": [{"id": "one"}],
+                    "pool": {"size": 4, "reconnects": 1},
+                    "wire_rx_bytes": 1048576,
+                    "unique_payload_bytes": 524288,
+                    "retry_count": 3,
+                    "process_rss": 67108864,
+                    "heap_alloc": 33554432,
+                    "heap_inuse": 41943040,
+                    "heap_objects": 12000,
+                    "gc_count": 5,
+                    "gc_pause_total": 1000000,
+                }
+            if url.endswith("/api/gate"):
+                return {
+                    "data_in_flight": 3,
+                    "ssd_reserved_bytes": 10,
+                    "ssd_available_bytes": 20,
+                }
+            if url.endswith("/api/system/storage"):
+                return {
+                    "free_bytes": 30,
+                    "total_bytes": 40,
+                    "used_bytes": 10,
+                    "target_write_bytes": 524288,
+                    "target_read_bytes": 524288,
+                    "target_durable_bytes": 524288,
+                    "target_writer_concurrency": 1,
+                    "target_backlog_bytes": 0,
+                    "archive": {
+                        "archive_backlog_files": 0,
+                        "archive_backlog_bytes": 0,
+                        "archive_active_workers": 0,
+                    },
+                }
+            raise AssertionError(url)
+
+        with tempfile.TemporaryDirectory() as temp, patch(
+            "harness.http_json", side_effect=fake_http
+        ):
+            sampler = MetricsSampler("http://fixture", Path(temp) / "metrics", "tgx")
+            sample = sampler.sample()
+        self.assertEqual(1048576, sample["wire_rx_bytes"])
+        self.assertEqual(524288, sample["unique_payload_bytes"])
+        self.assertEqual(3, sample["retry_count"])
+        self.assertEqual(67108864, sample["process_rss"])
+        self.assertEqual(33554432, sample["heap_alloc"])
+        self.assertEqual(524288, sample["target_write_bytes"])
+        self.assertEqual(524288, sample["target_durable_bytes"])
+        missing_sources = {error["source"] for error in sample["collection_errors"]}
+        self.assertNotIn("wire_rx_bytes", missing_sources)
+        self.assertNotIn("process_rss", missing_sources)
+        self.assertNotIn("target_write_bytes", missing_sources)
+
     def test_collector_never_turns_collection_failure_into_zero(self):
         with tempfile.TemporaryDirectory() as temp, patch(
             "harness.http_json", side_effect=OSError("fixture unavailable")

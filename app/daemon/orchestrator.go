@@ -88,6 +88,22 @@ func (o *Orchestrator) SetArchiveWorker(w *ArchiveWorker) {
 	o.archiveWorker = w
 }
 
+// ArchiveWorker returns the bound archive worker if any.
+func (o *Orchestrator) ArchiveWorker() *ArchiveWorker {
+	if o == nil {
+		return nil
+	}
+	return o.archiveWorker
+}
+
+// IsArchiveEnabled reports whether archive is configured and enabled.
+func (o *Orchestrator) IsArchiveEnabled() bool {
+	if o == nil || o.archiveWorker == nil {
+		return false
+	}
+	return o.archiveWorker.IsEnabled()
+}
+
 // PathPlanner derives canonical relative file paths within the download root.
 type PathPlanner struct{}
 
@@ -333,6 +349,58 @@ func (o *Orchestrator) TriggerStreamDispatch(ctx context.Context, record Downloa
 			zap.Error(err),
 		)
 	}
+}
+
+// ResolveTargetConflict resolves a download in target conflict state, resetting its status in DB to pending
+// and re-dispatching a fresh attempt generation in the Registry without requiring daemon restart.
+func (o *Orchestrator) ResolveTargetConflict(chatID string, messageID int) error {
+	if o == nil || o.db == nil {
+		return errors.New("orchestrator or database is nil")
+	}
+
+	// 1. Durably update DB state from conflict to pending
+	if err := o.db.ResolveTargetConflict(chatID, messageID); err != nil {
+		return err
+	}
+
+	// 2. Fetch the updated record
+	rec, err := o.db.GetDownloadRecord(chatID, messageID)
+	if err != nil {
+		return err
+	}
+	if rec == nil {
+		return errors.New("download record not found after resolving conflict")
+	}
+
+	// 3. Coordinate in-memory Registry: dispatch new attempt generation
+	taskID := fmt.Sprintf("%s:%d", chatID, messageID)
+	if o.registry != nil {
+		if _, retryErr := o.registry.RetryTask(taskID); retryErr != nil {
+			// If not currently in registry (e.g. evicted after terminal limit or daemon restart),
+			// submit as retry=true:
+			req := TaskRequest{
+				ID:           taskID,
+				Peer:         rec.ChatID,
+				MessageID:    rec.MessageID,
+				TargetTitle:  rec.TargetTitle,
+				MediaType:    rec.MediaType,
+				FileName:     rec.FileName,
+				Date:         rec.CreatedAt,
+				FinalPath:    rec.SavePath,
+				ExpectedSize: rec.FileSize,
+				Retry:        true,
+			}
+			if _, _, submitErr := o.registry.Submit(req); submitErr != nil {
+				return submitErr
+			}
+		}
+	}
+
+	o.logger.Info("resolved target conflict and re-queued download with fresh generation",
+		zap.String("chat_id", chatID),
+		zap.Int("message_id", messageID),
+	)
+	return nil
 }
 
 // finalizerLoop runs the single managed online finalizer loop under the daemon context.
@@ -735,7 +803,7 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 			disp := FailureDisposition{
 				Stage:       "admission",
 				Op:          "check_file",
-				Class:       "collision",
+				Class:       "target_conflict",
 				Unavailable: false,
 				Retryable:   false,
 				RetryOwner:  "none",

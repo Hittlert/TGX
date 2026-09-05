@@ -773,6 +773,7 @@ type TargetProgressStat struct {
 	PendingFiles    int    `json:"pending_files"`
 	ProcessingFiles int    `json:"processing_files"`
 	FailedFiles     int    `json:"failed_files"`
+	ConflictFiles   int    `json:"conflict_files"`
 	SkippedFiles    int    `json:"skipped_files"`
 	DownloadedBytes int64  `json:"downloaded_bytes"`
 }
@@ -814,12 +815,54 @@ func (d *Database) GetTargetProgressStats() (map[string]TargetProgressStat, erro
 			stat.ProcessingFiles += count
 		case "failed":
 			stat.FailedFiles += count
+		case "conflict":
+			stat.ConflictFiles += count
 		case "skipped":
 			stat.SkippedFiles += count
 		}
 		res[chatID] = stat
 	}
 	return res, nil
+}
+
+// GetConflictedDownloads retrieves all download records currently in 'conflict' state.
+func (d *Database) GetConflictedDownloads() ([]DownloadRecord, error) {
+	d.lock.RLock()
+	defer d.lock.RUnlock()
+
+	rows, err := d.db.Query(`
+		SELECT chat_id, message_id, status, COALESCE(file_name, ''), COALESCE(save_path, ''),
+		       COALESCE(media_type, ''), COALESCE(file_size, 0), COALESCE(sha256, ''),
+		       created_at, updated_at, attempts, next_retry_at, COALESCE(attempt_generation, ''),
+		       COALESCE(error, '')
+		FROM download_records
+		WHERE status = 'conflict'
+		ORDER BY updated_at DESC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var records []DownloadRecord
+	for rows.Next() {
+		var rec DownloadRecord
+		if err := rows.Scan(
+			&rec.ChatID, &rec.MessageID, &rec.Status, &rec.FileName, &rec.SavePath,
+			&rec.MediaType, &rec.FileSize, &rec.SHA256,
+			&rec.CreatedAt, &rec.UpdatedAt, &rec.Attempts, &rec.NextRetryAt, &rec.AttemptGeneration,
+			&rec.Error,
+		); err != nil {
+			return nil, err
+		}
+		rec.ErrorClass = "target_conflict"
+		rec.ErrorStage = "commit"
+		rec.ErrorOp = "target_check"
+		rec.Retryable = false
+		rec.RetryOwner = "operator"
+		records = append(records, rec)
+	}
+	return records, nil
 }
 
 func (d *Database) Get24hSuccessBytes() int64 {
@@ -1790,10 +1833,25 @@ func (d *Database) GetArchiveStats() (ArchiveStats, error) {
 			COALESCE(SUM(CASE WHEN state = 'pending' OR state = 'copying' THEN expected_size ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN state = 'copying' THEN 1 ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN state = 'archived' THEN 1 ELSE 0 END), 0),
-			COALESCE(SUM(CASE WHEN state = 'conflict' THEN 1 ELSE 0 END), 0)
+			COALESCE(SUM(CASE WHEN state = 'conflict' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN state = 'archived' THEN expected_size ELSE 0 END), 0)
 		FROM archive_jobs
-	`).Scan(&s.BacklogFiles, &s.BacklogBytes, &s.ActiveWorkers, &s.ArchivedFiles, &s.ConflictCount)
+	`).Scan(&s.BacklogFiles, &s.BacklogBytes, &s.ActiveWorkers, &s.ArchivedFiles, &s.ConflictCount, &s.ArchivedBytes)
 	return s, err
+}
+
+// GetDurableTargetBytes returns the total size in bytes of all successfully completed downloads.
+func (d *Database) GetDurableTargetBytes() (int64, error) {
+	d.lock.RLock()
+	defer d.lock.RUnlock()
+
+	var total int64
+	err := d.db.QueryRow(`
+		SELECT COALESCE(SUM(file_size), 0)
+		FROM download_records
+		WHERE status = 'success'
+	`).Scan(&total)
+	return total, err
 }
 
 // GetPendingCommittingDownloads returns records in 'committing' status for restart recovery.

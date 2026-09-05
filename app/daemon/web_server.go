@@ -194,11 +194,43 @@ func (s *WebServer) Handler() http.Handler {
 			"used_human":   formatBytes(int64(usedBytes)),
 			"percent_used": fmt.Sprintf("%.1f%%", percent),
 		}
-		if s.db != nil {
+		var targetWriteBytes, targetReadBytes, targetDurableBytes, targetBacklogBytes int64
+		var targetWriterConcurrency int
+
+		isArchiveEnabled := false
+		if s.orchestrator != nil && s.orchestrator.IsArchiveEnabled() {
+			isArchiveEnabled = true
+		}
+
+		if isArchiveEnabled && s.db != nil {
 			if arcStats, err := s.db.GetArchiveStats(); err == nil {
 				resp["archive"] = arcStats
+				targetBacklogBytes = arcStats.BacklogBytes
+				targetWriterConcurrency = arcStats.ActiveWorkers
+				targetDurableBytes = arcStats.ArchivedBytes
+				targetWriteBytes = arcStats.ArchivedBytes
+				targetReadBytes = arcStats.ArchivedBytes
 			}
+		} else {
+			if s.db != nil {
+				if durable, err := s.db.GetDurableTargetBytes(); err == nil {
+					targetDurableBytes = durable
+					targetWriteBytes = durable
+					targetReadBytes = durable
+				}
+			}
+			if s.transferMgr != nil {
+				targetWriterConcurrency = int(s.transferMgr.ActiveFiles())
+			}
+			targetBacklogBytes = 0
 		}
+
+		resp["target_write_bytes"] = targetWriteBytes
+		resp["target_read_bytes"] = targetReadBytes
+		resp["target_durable_bytes"] = targetDurableBytes
+		resp["target_writer_concurrency"] = targetWriterConcurrency
+		resp["target_backlog_bytes"] = targetBacklogBytes
+
 		writeJSON(w, http.StatusOK, resp)
 	}).Methods(http.MethodGet)
 
@@ -243,6 +275,49 @@ func (s *WebServer) Handler() http.Handler {
 		}
 		writeJSON(w, http.StatusOK, task)
 	}).Methods(http.MethodGet)
+
+	// Conflict management API
+	r.HandleFunc("/api/conflicts", s.requireAuth(func(w http.ResponseWriter, r *http.Request) {
+		if s.db == nil {
+			writeJSON(w, http.StatusOK, []any{})
+			return
+		}
+		conflicts, err := s.db.GetConflictedDownloads()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if conflicts == nil {
+			conflicts = []DownloadRecord{}
+		}
+		writeJSON(w, http.StatusOK, conflicts)
+	})).Methods(http.MethodGet)
+
+	r.HandleFunc("/api/conflicts/resolve", s.requireAuth(func(w http.ResponseWriter, r *http.Request) {
+		if s.orchestrator == nil {
+			writeError(w, http.StatusInternalServerError, "orchestrator not available")
+			return
+		}
+		var req struct {
+			ChatID    string `json:"chat_id"`
+			MessageID int    `json:"message_id"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16*1024)).Decode(&req); err != nil {
+			req.ChatID = r.URL.Query().Get("chat_id")
+			if msgIDStr := r.URL.Query().Get("message_id"); msgIDStr != "" {
+				req.MessageID, _ = strconv.Atoi(msgIDStr)
+			}
+		}
+		if req.ChatID == "" || req.MessageID == 0 {
+			writeError(w, http.StatusBadRequest, "chat_id and message_id are required")
+			return
+		}
+		if err := s.orchestrator.ResolveTargetConflict(req.ChatID, req.MessageID); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "status": "pending"})
+	})).Methods(http.MethodPost)
 
 	r.HandleFunc("/api/chat/history", func(w http.ResponseWriter, r *http.Request) {
 		if s.access == nil {

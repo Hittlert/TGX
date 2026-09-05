@@ -45,6 +45,11 @@ type DownloadRecord struct {
 	FileSize            int64  `json:"file_size"`
 	SHA256              string `json:"sha256,omitempty"`
 	Error               string `json:"error,omitempty"`
+	ErrorStage          string `json:"error_stage,omitempty"`
+	ErrorOp             string `json:"error_op,omitempty"`
+	ErrorClass          string `json:"error_class,omitempty"`
+	Retryable           bool   `json:"retryable,omitempty"`
+	RetryOwner          string `json:"retry_owner,omitempty"`
 	CreatedAt           int64  `json:"created_at"`
 	UpdatedAt           int64  `json:"updated_at"`
 	DownloadedAt        int64  `json:"downloaded_at,omitempty"`
@@ -77,6 +82,7 @@ type ArchiveStats struct {
 	ActiveWorkers int   `json:"archive_active_workers"`
 	ArchivedFiles int   `json:"archive_archived_files"`
 	ConflictCount int   `json:"archive_conflict_count"`
+	ArchivedBytes int64 `json:"archive_archived_bytes"`
 }
 
 type PublishResult struct {

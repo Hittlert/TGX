@@ -5,8 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path"
+	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -79,15 +82,38 @@ type PoolSnapshot struct {
 	Reconnects  int64 `json:"reconnects"`
 }
 
+func readProcessRSS() int64 {
+	if data, err := os.ReadFile("/proc/self/statm"); err == nil {
+		fields := strings.Fields(string(data))
+		if len(fields) >= 2 {
+			if pages, err := strconv.ParseInt(fields[1], 10, 64); err == nil {
+				return pages * int64(os.Getpagesize())
+			}
+		}
+	}
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	return int64(m.Sys)
+}
+
 type StatusSnapshot struct {
-	Backend      string         `json:"backend"`
-	Paused       bool           `json:"paused"`
-	Rolling5sBPS int64          `json:"rolling_5s_bps"`
-	ActiveFiles  []TaskSnapshot `json:"active_files"`
-	QueueDepth   int            `json:"queue_depth"`
-	Pool         PoolSnapshot   `json:"pool"`
-	LastError    string         `json:"last_error"`
-	UpdatedAt    int64          `json:"updated_at"`
+	Backend            string         `json:"backend"`
+	Paused             bool           `json:"paused"`
+	Rolling5sBPS       int64          `json:"rolling_5s_bps"`
+	ActiveFiles        []TaskSnapshot `json:"active_files"`
+	QueueDepth         int            `json:"queue_depth"`
+	Pool               PoolSnapshot   `json:"pool"`
+	LastError          string         `json:"last_error"`
+	UpdatedAt          int64          `json:"updated_at"`
+	WireRxBytes        int64          `json:"wire_rx_bytes"`
+	UniquePayloadBytes int64          `json:"unique_payload_bytes"`
+	RetryCount         int64          `json:"retry_count"`
+	ProcessRSS         int64          `json:"process_rss"`
+	HeapAlloc          int64          `json:"heap_alloc"`
+	HeapInuse          int64          `json:"heap_inuse"`
+	HeapObjects        int64          `json:"heap_objects"`
+	GCCount            int64          `json:"gc_count"`
+	GCPauseTotal       int64          `json:"gc_pause_total"`
 }
 
 func (s StatusSnapshot) MarshalJSON() ([]byte, error) {
@@ -146,22 +172,25 @@ type taskState struct {
 }
 
 type Registry struct {
-	mu            sync.Mutex
-	parentCtx     context.Context
-	queueCapacity int
-	terminalLimit int
-	now           func() time.Time
-	tasks         map[string]*taskState
-	queue         []*taskState
-	terminalOrder []string
-	wake          chan struct{}
-	paused        bool
-	events        []byteEvent
-	firstByte     time.Time
-	lastByte      time.Time
-	lastError     string
-	pool          PoolSnapshot
-	smoothedSpeed float64
+	mu                     sync.Mutex
+	parentCtx              context.Context
+	queueCapacity          int
+	terminalLimit          int
+	now                    func() time.Time
+	tasks                  map[string]*taskState
+	queue                  []*taskState
+	terminalOrder          []string
+	wake                   chan struct{}
+	paused                 bool
+	events                 []byteEvent
+	firstByte              time.Time
+	lastByte               time.Time
+	lastError              string
+	pool                   PoolSnapshot
+	smoothedSpeed          float64
+	cumulativeWireBytes    int64
+	cumulativePayloadBytes int64
+	cumulativeRetries      int64
 }
 
 type Task struct {
@@ -270,6 +299,45 @@ func (r *Registry) removeTerminalLocked(id string) {
 	}
 }
 
+// RetryTask forces a retry of an existing terminal task with a brand new attempt generation,
+// transitioning it back into the active queue without requiring daemon restart.
+func (r *Registry) RetryTask(id string) (TaskSnapshot, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	existing, ok := r.tasks[id]
+	if !ok || existing == nil {
+		return TaskSnapshot{}, errors.New("task not found in registry")
+	}
+	if !isTerminal(existing.state) {
+		return TaskSnapshot{}, errors.New("task is not in terminal state")
+	}
+	if len(r.queue) >= r.queueCapacity {
+		return TaskSnapshot{}, ErrQueueFull
+	}
+	now := r.now()
+	pCtx := r.parentCtx
+	if pCtx == nil {
+		pCtx = context.Background()
+	}
+	taskCtx, taskCancel := context.WithCancel(pCtx)
+	newState := &taskState{
+		request:      existing.request,
+		state:        StateQueued,
+		totalSize:    existing.totalSize,
+		createdAt:    now,
+		attemptGen:   fmt.Sprintf("retry_%d", now.UnixNano()),
+		attemptCount: existing.attemptCount + 1,
+		ctx:          taskCtx,
+		cancel:       taskCancel,
+	}
+	r.tasks[id] = newState
+	r.removeTerminalLocked(id)
+	r.queue = append(r.queue, newState)
+	r.signalLocked()
+	return r.snapshotTaskLocked(newState, now), nil
+}
+
 func (r *Registry) Next(ctx context.Context) (*Task, error) {
 	for {
 		r.mu.Lock()
@@ -372,11 +440,36 @@ func (r *Registry) Status() StatusSnapshot {
 		r.smoothedSpeed = 0.4*float64(currentBPS) + 0.6*r.smoothedSpeed
 	}
 
+	totalWire := r.cumulativeWireBytes
+	totalPayload := r.cumulativePayloadBytes
+	totalRetries := r.cumulativeRetries
+	for _, state := range r.tasks {
+		totalWire += state.wireBytes
+		totalPayload += state.downloaded
+		totalRetries += state.physicalRetries
+	}
+
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	rss := readProcessRSS()
+
 	return StatusSnapshot{
 		Backend: "tgx", Paused: r.paused,
-		Rolling5sBPS: int64(r.smoothedSpeed),
-		ActiveFiles:  active, QueueDepth: len(r.queue), Pool: pool,
-		LastError: r.lastError, UpdatedAt: now.Unix(),
+		Rolling5sBPS:       int64(r.smoothedSpeed),
+		ActiveFiles:        active,
+		QueueDepth:         len(r.queue),
+		Pool:               pool,
+		LastError:          r.lastError,
+		UpdatedAt:          now.Unix(),
+		WireRxBytes:        totalWire,
+		UniquePayloadBytes: totalPayload,
+		RetryCount:         totalRetries,
+		ProcessRSS:         rss,
+		HeapAlloc:          int64(m.Alloc),
+		HeapInuse:          int64(m.HeapInuse),
+		HeapObjects:        int64(m.HeapObjects),
+		GCCount:            int64(m.NumGC),
+		GCPauseTotal:       int64(m.PauseTotalNs),
 	}
 }
 
@@ -643,6 +736,19 @@ func (t *Task) update(update func(*taskState)) {
 	}
 }
 
+func (r *Registry) pruneTerminalOrderLocked() {
+	for len(r.terminalOrder) > r.terminalLimit {
+		oldest := r.terminalOrder[0]
+		r.terminalOrder = r.terminalOrder[1:]
+		if old, exists := r.tasks[oldest]; exists {
+			r.cumulativeWireBytes += old.wireBytes
+			r.cumulativePayloadBytes += old.downloaded
+			r.cumulativeRetries += old.physicalRetries
+			delete(r.tasks, oldest)
+		}
+	}
+}
+
 func (r *Registry) finishWithGen(state *taskState, gen string, status TaskState, stage, op, class, message string, retryable bool, retryOwner string, finalPath string, already bool, sha256 string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -672,11 +778,7 @@ func (r *Registry) finishWithGen(state *taskState, gen string, status TaskState,
 		r.lastError = message
 	}
 	r.terminalOrder = append(r.terminalOrder, state.request.ID)
-	for len(r.terminalOrder) > r.terminalLimit {
-		oldest := r.terminalOrder[0]
-		r.terminalOrder = r.terminalOrder[1:]
-		delete(r.tasks, oldest)
-	}
+	r.pruneTerminalOrderLocked()
 	return true
 }
 
@@ -720,11 +822,7 @@ func (r *Registry) FinishTask(id, gen string, status TaskState, class, message, 
 		r.lastError = message
 	}
 	r.terminalOrder = append(r.terminalOrder, state.request.ID)
-	for len(r.terminalOrder) > r.terminalLimit {
-		oldest := r.terminalOrder[0]
-		r.terminalOrder = r.terminalOrder[1:]
-		delete(r.tasks, oldest)
-	}
+	r.pruneTerminalOrderLocked()
 	return FinishAcceptedNewTerminal
 }
 
@@ -762,11 +860,7 @@ func (r *Registry) FinishTaskByMessage(chatID string, messageID int, gen string,
 				r.lastError = message
 			}
 			r.terminalOrder = append(r.terminalOrder, state.request.ID)
-			for len(r.terminalOrder) > r.terminalLimit {
-				oldest := r.terminalOrder[0]
-				r.terminalOrder = r.terminalOrder[1:]
-				delete(r.tasks, oldest)
-			}
+			r.pruneTerminalOrderLocked()
 			return FinishAcceptedNewTerminal
 		}
 	}

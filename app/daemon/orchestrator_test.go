@@ -5,9 +5,12 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -3181,4 +3184,192 @@ func TestDatabase_TargetConflict_DurablePermanentExclusionFromPendingScan(t *tes
 		t.Fatalf("expected resolved record %d to be picked up by GetPendingDownloads, but was not", msgIDConflict)
 	}
 	t.Logf("[POST-ASSERT] Verified: deliberate manual resolution successfully re-admitted record to pending")
+}
+
+// Production Path Test (Issue #4 finite closure):
+// Worker creates target conflict -> operator endpoint lists it -> filesystem conflict is resolved
+// -> endpoint retries -> Registry dispatches a new generation without daemon restart -> worker succeeds.
+func TestOrchestrator_TargetConflict_FullProductionLifecycle_ListingAndRetryWithoutRestart(t *testing.T) {
+	chatID := "-100888"
+	msgID := 303
+	validData := make([]byte, 1024)
+	for i := range validData {
+		validData[i] = byte(i % 191)
+	}
+	conflictingData := make([]byte, 1024)
+	for i := range conflictingData {
+		conflictingData[i] = byte((i + 5) % 191)
+	}
+
+	invoker := invokerFunc(func(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
+		setUploadFile(output, validData)
+		return nil
+	})
+
+	access := &mockAccessWithPool{
+		pool: &mockPool{invoker: invoker},
+		resolveFn: func(ctx context.Context, peer string, messageID int) (ResolvedMedia, error) {
+			return ResolvedMedia{
+				File:      &orchMockMediaFile{loc: &tg.InputDocumentFileLocation{ID: 3003, AccessHash: 4004}, sz: 1024, dc: 2},
+				Name:      "prod_lifecycle_conflict.mp4",
+				Size:      1024,
+				DCID:      2,
+				MediaType: "video",
+				Date:      1725518400,
+			}, nil
+		},
+	}
+
+	orch, registry, db, saveDir := setupTestOrchestratorWithAccess(t, access)
+	ws := NewWebServer(db, nil, nil, nil, orch, access, registry, zap.NewNop(), "")
+	server := httptest.NewServer(ws.Handler())
+	defer server.Close()
+
+	relPath := "TestChannel/2026_09/303 - prod_lifecycle_conflict.mp4"
+	finalAbsPath := filepath.Join(saveDir, filepath.FromSlash(relPath))
+	_ = os.MkdirAll(filepath.Dir(finalAbsPath), 0o755)
+
+	// Step 0: Pre-create conflicting final file on disk
+	if err := os.WriteFile(finalAbsPath, conflictingData, 0o644); err != nil {
+		t.Fatalf("write conflicting file: %v", err)
+	}
+
+	req := TaskRequest{
+		ID:           fmt.Sprintf("%s:%d", chatID, msgID),
+		Peer:         chatID,
+		MessageID:    msgID,
+		TargetTitle:  "TestChannel",
+		FileName:     "prod_lifecycle_conflict.mp4",
+		ExpectedSize: 1024,
+		FinalPath:    relPath,
+	}
+
+	// Seed DB in pending
+	_ = db.EnsureDownloadRecord(chatID, msgID, relPath, 1024)
+
+	// Submit task and let worker process it
+	_, _, err := registry.Submit(req)
+	if err != nil {
+		t.Fatalf("Submit task: %v", err)
+	}
+	task, err := registry.Next(context.Background())
+	if err != nil {
+		t.Fatalf("Next task: %v", err)
+	}
+	firstGen := task.AttemptGen()
+
+	// Worker runs downloadOne: encounters conflicting target
+	orch.downloadOne(context.Background(), task)
+
+	// Assert task failed in registry and DB is conflict
+	snap := task.Snapshot()
+	if snap.State != StateFailed || snap.ErrorClass != "target_conflict" {
+		t.Fatalf("expected task StateFailed with target_conflict, got state=%s, class=%s", snap.State, snap.ErrorClass)
+	}
+	var dbStatus string
+	_ = db.db.QueryRow(`SELECT status FROM download_records WHERE chat_id = ? AND message_id = ?`, chatID, msgID).Scan(&dbStatus)
+	if dbStatus != "conflict" {
+		t.Fatalf("expected DB status conflict, got %s", dbStatus)
+	}
+
+	// Step 1: Operator endpoint lists conflict (GET /api/conflicts)
+	respList, err := http.Get(server.URL + "/api/conflicts")
+	if err != nil {
+		t.Fatalf("GET /api/conflicts failed: %v", err)
+	}
+	defer respList.Body.Close()
+	if respList.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 from /api/conflicts, got %d", respList.StatusCode)
+	}
+	var conflictList []DownloadRecord
+	if err := json.NewDecoder(respList.Body).Decode(&conflictList); err != nil {
+		t.Fatalf("decode /api/conflicts: %v", err)
+	}
+	if len(conflictList) != 1 || conflictList[0].ChatID != chatID || conflictList[0].MessageID != msgID {
+		t.Fatalf("expected 1 conflict record for %s:%d, got %+v", chatID, msgID, conflictList)
+	}
+	if conflictList[0].Status != "conflict" || conflictList[0].ErrorClass != "target_conflict" {
+		t.Fatalf("expected status=conflict and error_class=target_conflict, got %+v", conflictList[0])
+	}
+	t.Logf("[POST-ASSERT] Verified: Operator endpoint GET /api/conflicts correctly listed conflicted task")
+
+	// Verify TargetProgressStat has ConflictFiles == 1
+	stats, err := db.GetTargetProgressStats()
+	if err != nil || stats[chatID].ConflictFiles != 1 {
+		t.Fatalf("expected ConflictFiles == 1 in TargetProgressStat, got %d (err: %v)", stats[chatID].ConflictFiles, err)
+	}
+
+	// Step 2: Filesystem conflict is resolved (operator cleans or moves the conflicting target)
+	if err := os.Remove(finalAbsPath); err != nil {
+		t.Fatalf("remove conflicting final: %v", err)
+	}
+
+	// Step 3: Operator endpoint retries the conflict (POST /api/conflicts/resolve)
+	resolveBody := fmt.Sprintf(`{"chat_id":%q,"message_id":%d}`, chatID, msgID)
+	respResolve, err := http.Post(server.URL+"/api/conflicts/resolve", "application/json", strings.NewReader(resolveBody))
+	if err != nil {
+		t.Fatalf("POST /api/conflicts/resolve failed: %v", err)
+	}
+	defer respResolve.Body.Close()
+	if respResolve.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 from /api/conflicts/resolve, got %d", respResolve.StatusCode)
+	}
+	var resolveResp map[string]any
+	if err := json.NewDecoder(respResolve.Body).Decode(&resolveResp); err != nil {
+		t.Fatalf("decode resolve response: %v", err)
+	}
+	if resolveResp["ok"] != true || resolveResp["status"] != "pending" {
+		t.Fatalf("unexpected resolve response: %+v", resolveResp)
+	}
+
+	// Verify DB status is now 'pending'
+	_ = db.db.QueryRow(`SELECT status FROM download_records WHERE chat_id = ? AND message_id = ?`, chatID, msgID).Scan(&dbStatus)
+	if dbStatus != "pending" {
+		t.Fatalf("expected DB status pending after resolve, got %s", dbStatus)
+	}
+
+	// Step 4: Registry dispatches fresh generation WITHOUT DAEMON RESTART!
+	retriedTask, err := registry.Next(context.Background())
+	if err != nil {
+		t.Fatalf("expected Registry.Next to yield retried task without restart, got error: %v", err)
+	}
+	if retriedTask.AttemptGen() == firstGen {
+		t.Fatalf("expected fresh attempt generation on retry, got same generation: %s", retriedTask.AttemptGen())
+	}
+	if !strings.HasPrefix(retriedTask.AttemptGen(), "retry_") {
+		t.Fatalf("expected retry generation prefix 'retry_', got %s", retriedTask.AttemptGen())
+	}
+
+	// Worker processes retried task: now that filesystem conflict is resolved, it completes!
+	orch.downloadOne(context.Background(), retriedTask)
+
+	retriedSnap := retriedTask.Snapshot()
+	if retriedSnap.State != StateSuccess {
+		t.Fatalf("expected retried task to succeed, got %s (err: %s)", retriedSnap.State, retriedSnap.Error)
+	}
+
+	// Verify DB status is now 'success'
+	_ = db.db.QueryRow(`SELECT status FROM download_records WHERE chat_id = ? AND message_id = ?`, chatID, msgID).Scan(&dbStatus)
+	if dbStatus != "success" {
+		t.Fatalf("expected DB status success, got %s", dbStatus)
+	}
+
+	// Verify final file is created with valid data
+	finalContent, err := os.ReadFile(finalAbsPath)
+	if err != nil || string(finalContent) != string(validData) {
+		t.Fatalf("final file missing or content mismatch: %v", err)
+	}
+
+	// Verify conflict list is now empty
+	respListAfter, err := http.Get(server.URL + "/api/conflicts")
+	if err != nil {
+		t.Fatalf("GET /api/conflicts after resolution: %v", err)
+	}
+	defer respListAfter.Body.Close()
+	var conflictListAfter []DownloadRecord
+	_ = json.NewDecoder(respListAfter.Body).Decode(&conflictListAfter)
+	if len(conflictListAfter) != 0 {
+		t.Fatalf("expected 0 conflicts after resolution, got %d", len(conflictListAfter))
+	}
+	t.Logf("[POST-ASSERT] Verified: Complete production path for conflict listing, manual resolution, and new generation dispatch without daemon restart succeeded!")
 }

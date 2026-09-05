@@ -2583,3 +2583,72 @@ func TestWebServer_SSEStalledClientBackpressure(t *testing.T) {
 		t.Fatalf("server took too long to enforce write deadline: %v (expected < 450ms, well below 2s)", elapsed)
 	}
 }
+
+func TestWebServer_ObservabilityEndpointsContract(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "test.db")
+	db, err := NewDatabase(dbPath)
+	if err != nil {
+		t.Fatalf("NewDatabase: %v", err)
+	}
+	defer db.Close()
+
+	reg := NewRegistry(100, 100, time.Now)
+	ws := NewWebServer(db, nil, nil, nil, nil, nil, reg, zap.NewNop(), "")
+	server := httptest.NewServer(ws.Handler())
+	defer server.Close()
+
+	// 1. Contract test GET /api/status
+	respStatus, err := http.Get(server.URL + "/api/status")
+	if err != nil {
+		t.Fatalf("GET /api/status failed: %v", err)
+	}
+	defer respStatus.Body.Close()
+	if respStatus.StatusCode != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", respStatus.StatusCode)
+	}
+	var statusData map[string]any
+	if err := json.NewDecoder(respStatus.Body).Decode(&statusData); err != nil {
+		t.Fatalf("decode /api/status: %v", err)
+	}
+	for _, field := range []string{
+		"wire_rx_bytes", "unique_payload_bytes", "retry_count",
+		"process_rss", "heap_alloc", "heap_inuse", "heap_objects",
+		"gc_count", "gc_pause_total",
+	} {
+		val, exists := statusData[field]
+		if !exists || val == nil {
+			t.Errorf("expected non-null field %q in /api/status, got %v", field, val)
+		}
+	}
+	// Verify process_rss and heap_alloc are positive
+	if rss, ok := statusData["process_rss"].(float64); !ok || rss <= 0 {
+		t.Errorf("expected positive process_rss, got %v", statusData["process_rss"])
+	}
+	if alloc, ok := statusData["heap_alloc"].(float64); !ok || alloc <= 0 {
+		t.Errorf("expected positive heap_alloc, got %v", statusData["heap_alloc"])
+	}
+
+	// 2. Contract test GET /api/system/storage
+	respStorage, err := http.Get(server.URL + "/api/system/storage")
+	if err != nil {
+		t.Fatalf("GET /api/system/storage failed: %v", err)
+	}
+	defer respStorage.Body.Close()
+	if respStorage.StatusCode != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", respStorage.StatusCode)
+	}
+	var storageData map[string]any
+	if err := json.NewDecoder(respStorage.Body).Decode(&storageData); err != nil {
+		t.Fatalf("decode /api/system/storage: %v", err)
+	}
+	for _, field := range []string{
+		"target_write_bytes", "target_read_bytes", "target_durable_bytes",
+		"target_writer_concurrency", "target_backlog_bytes",
+	} {
+		val, exists := storageData[field]
+		if !exists || val == nil {
+			t.Errorf("expected non-null field %q in /api/system/storage, got %v", field, val)
+		}
+	}
+}

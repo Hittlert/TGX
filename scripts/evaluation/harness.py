@@ -37,6 +37,16 @@ TGX_INTERNAL_METRICS = {
     "archive_active_workers",
     "archive_archived_files",
     "archive_conflict_count",
+    "target_write_bytes",
+    "target_read_bytes",
+    "target_durable_bytes",
+    "target_writer_concurrency",
+    "target_backlog_bytes",
+    "heap_alloc",
+    "heap_inuse",
+    "heap_objects",
+    "gc_count",
+    "gc_pause_total",
 }
 
 
@@ -391,6 +401,19 @@ class MetricsSampler(threading.Thread):
             else:
                 record["connection_count"] = None
                 record["connection_failures"] = None
+            for field in (
+                "wire_rx_bytes",
+                "unique_payload_bytes",
+                "retry_count",
+                "process_rss",
+                "heap_alloc",
+                "heap_inuse",
+                "heap_objects",
+                "gc_count",
+                "gc_pause_total",
+            ):
+                if status.get(field) is not None:
+                    record[field] = status.get(field)
         except Exception as error:
             record["collection_errors"].append(
                 {"source": "/api/status", "error": str(error)}
@@ -413,6 +436,15 @@ class MetricsSampler(threading.Thread):
                 record["ssd_free_bytes"] = storage.get("free_bytes")
                 record["ssd_total_bytes"] = storage.get("total_bytes")
                 record["ssd_used_bytes"] = storage.get("used_bytes")
+                for field in (
+                    "target_write_bytes",
+                    "target_read_bytes",
+                    "target_durable_bytes",
+                    "target_writer_concurrency",
+                    "target_backlog_bytes",
+                ):
+                    if storage.get(field) is not None:
+                        record[field] = storage.get(field)
                 archive = storage.get("archive")
                 if isinstance(archive, dict):
                     for field in (
