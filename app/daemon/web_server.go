@@ -194,42 +194,75 @@ func (s *WebServer) Handler() http.Handler {
 			"used_human":   formatBytes(int64(usedBytes)),
 			"percent_used": fmt.Sprintf("%.1f%%", percent),
 		}
-		var targetWriteBytes, targetReadBytes, targetDurableBytes, targetBacklogBytes int64
+
+		// 1. Target physical write and read bytes from live orchestrator instrumentation
+		var targetWriteBytes int64
+		var targetReadBytes int64
 		var targetWriterConcurrency int
+		if s.orchestrator != nil {
+			targetWriteBytes = s.orchestrator.PhysicalTargetWriteBytes()
+			targetReadBytes = s.orchestrator.PhysicalTargetReadBytes()
+			targetWriterConcurrency = int(s.orchestrator.ActiveTargetWriters())
+		} else if s.transferMgr != nil {
+			targetWriterConcurrency = int(s.transferMgr.ActiveFiles())
+		}
+
+		// 2. Authoritative target backlog bytes from Registry queued task sizes (+ archive backlog if enabled)
+		var targetBacklogBytes int64
+		if s.registry != nil {
+			targetBacklogBytes = s.registry.QueuedBacklogBytes()
+		}
+
+		// 3. Durable bytes and archive subsystem status
+		var targetDurableBytes *int64
+		var collectionErrors []map[string]string
 
 		isArchiveEnabled := false
 		if s.orchestrator != nil && s.orchestrator.IsArchiveEnabled() {
 			isArchiveEnabled = true
 		}
 
-		if isArchiveEnabled && s.db != nil {
-			if arcStats, err := s.db.GetArchiveStats(); err == nil {
-				resp["archive"] = arcStats
-				targetBacklogBytes = arcStats.BacklogBytes
-				targetWriterConcurrency = arcStats.ActiveWorkers
-				targetDurableBytes = arcStats.ArchivedBytes
-				targetWriteBytes = arcStats.ArchivedBytes
-				targetReadBytes = arcStats.ArchivedBytes
+		if isArchiveEnabled {
+			if s.db != nil {
+				arcStats, err := s.db.GetArchiveStats()
+				if err != nil {
+					collectionErrors = append(collectionErrors, map[string]string{
+						"source": "/api/system/storage:archive_stats",
+						"error":  err.Error(),
+					})
+				} else {
+					resp["archive"] = arcStats
+					targetBacklogBytes += arcStats.BacklogBytes
+					d := arcStats.ArchivedBytes
+					targetDurableBytes = &d
+				}
 			}
 		} else {
 			if s.db != nil {
-				if durable, err := s.db.GetDurableTargetBytes(); err == nil {
-					targetDurableBytes = durable
-					targetWriteBytes = durable
-					targetReadBytes = durable
+				durable, err := s.db.GetDurableTargetBytes()
+				if err != nil {
+					collectionErrors = append(collectionErrors, map[string]string{
+						"source": "/api/system/storage:durable_bytes",
+						"error":  err.Error(),
+					})
+				} else {
+					targetDurableBytes = &durable
 				}
 			}
-			if s.transferMgr != nil {
-				targetWriterConcurrency = int(s.transferMgr.ActiveFiles())
-			}
-			targetBacklogBytes = 0
 		}
 
 		resp["target_write_bytes"] = targetWriteBytes
 		resp["target_read_bytes"] = targetReadBytes
-		resp["target_durable_bytes"] = targetDurableBytes
+		if targetDurableBytes != nil {
+			resp["target_durable_bytes"] = *targetDurableBytes
+		} else {
+			resp["target_durable_bytes"] = nil
+		}
 		resp["target_writer_concurrency"] = targetWriterConcurrency
 		resp["target_backlog_bytes"] = targetBacklogBytes
+		if len(collectionErrors) > 0 {
+			resp["collection_errors"] = collectionErrors
+		}
 
 		writeJSON(w, http.StatusOK, resp)
 	}).Methods(http.MethodGet)
@@ -313,7 +346,16 @@ func (s *WebServer) Handler() http.Handler {
 			return
 		}
 		if err := s.orchestrator.ResolveTargetConflict(req.ChatID, req.MessageID); err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
+			switch {
+			case errors.Is(err, ErrQueueFull):
+				writeError(w, http.StatusTooManyRequests, "task queue is full")
+			case errors.Is(err, ErrTaskActive):
+				writeError(w, http.StatusConflict, "task is currently active")
+			case errors.Is(err, ErrConflictRecordNotFound):
+				writeError(w, http.StatusNotFound, "conflict record not found")
+			default:
+				writeError(w, http.StatusInternalServerError, err.Error())
+			}
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "status": "pending"})

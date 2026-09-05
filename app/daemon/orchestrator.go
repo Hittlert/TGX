@@ -39,6 +39,10 @@ type Orchestrator struct {
 	activePublishers sync.Map // map[string]string: "chatID:msgID" -> attemptGeneration
 	finalizerWakeCh  chan struct{}
 
+	physicalTargetWriteBytes int64 // atomic: cumulative physical bytes written to storage
+	physicalTargetReadBytes  int64 // atomic: cumulative physical bytes read from storage
+	activeTargetWriters      int64 // atomic: currently active physical writer goroutines
+
 	testHooks OrchestratorTestHooks
 }
 
@@ -351,49 +355,55 @@ func (o *Orchestrator) TriggerStreamDispatch(ctx context.Context, record Downloa
 	}
 }
 
-// ResolveTargetConflict resolves a download in target conflict state, resetting its status in DB to pending
-// and re-dispatching a fresh attempt generation in the Registry without requiring daemon restart.
+// ResolveTargetConflict resolves a download in target conflict state, coordinating DB and Registry
+// with failure-atomicity: capacity is checked, task state checked, and DB conflict->pending transition is
+// executed as a decider before admitting the new generation into the Registry.
+// If queue is full, task is active, or DB fails, durable conflict is preserved.
 func (o *Orchestrator) ResolveTargetConflict(chatID string, messageID int) error {
-	if o == nil || o.db == nil {
-		return errors.New("orchestrator or database is nil")
+	if o == nil {
+		return errors.New("orchestrator is nil")
 	}
-
-	// 1. Durably update DB state from conflict to pending
-	if err := o.db.ResolveTargetConflict(chatID, messageID); err != nil {
-		return err
-	}
-
-	// 2. Fetch the updated record
-	rec, err := o.db.GetDownloadRecord(chatID, messageID)
-	if err != nil {
-		return err
-	}
-	if rec == nil {
-		return errors.New("download record not found after resolving conflict")
-	}
-
-	// 3. Coordinate in-memory Registry: dispatch new attempt generation
 	taskID := fmt.Sprintf("%s:%d", chatID, messageID)
-	if o.registry != nil {
-		if _, retryErr := o.registry.RetryTask(taskID); retryErr != nil {
-			// If not currently in registry (e.g. evicted after terminal limit or daemon restart),
-			// submit as retry=true:
-			req := TaskRequest{
-				ID:           taskID,
-				Peer:         rec.ChatID,
-				MessageID:    rec.MessageID,
-				TargetTitle:  rec.TargetTitle,
-				MediaType:    rec.MediaType,
-				FileName:     rec.FileName,
-				Date:         rec.CreatedAt,
-				FinalPath:    rec.SavePath,
-				ExpectedSize: rec.FileSize,
-				Retry:        true,
-			}
-			if _, _, submitErr := o.registry.Submit(req); submitErr != nil {
-				return submitErr
-			}
+
+	var fallbackReq *TaskRequest
+	if o.db != nil {
+		rec, err := o.db.GetDownloadRecord(chatID, messageID)
+		if err != nil {
+			return err
 		}
+		if rec == nil || rec.Status != "conflict" {
+			return ErrConflictRecordNotFound
+		}
+		fallbackReq = &TaskRequest{
+			ID:           taskID,
+			Peer:         rec.ChatID,
+			MessageID:    rec.MessageID,
+			TargetTitle:  rec.TargetTitle,
+			MediaType:    rec.MediaType,
+			FileName:     rec.FileName,
+			Date:         rec.CreatedAt,
+			FinalPath:    rec.SavePath,
+			ExpectedSize: rec.FileSize,
+			Retry:        true,
+		}
+	}
+
+	if o.registry == nil {
+		if o.db != nil {
+			return o.db.ResolveTargetConflict(chatID, messageID)
+		}
+		return nil
+	}
+
+	decider := func(newGen string) error {
+		if o.db != nil {
+			return o.db.ResolveTargetConflict(chatID, messageID, newGen)
+		}
+		return nil
+	}
+
+	if _, err := o.registry.RetryTaskWithDecider(taskID, fallbackReq, decider); err != nil {
+		return err
 	}
 
 	o.logger.Info("resolved target conflict and re-queued download with fresh generation",
@@ -1022,6 +1032,7 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 		LastPhysicalID:  &lastPhysID,
 	})
 
+	atomic.AddInt64(&o.activeTargetWriters, 1)
 	dlResult, dlErr := o.transferMgr.DownloadFileWithResult(
 		taskCtx,
 		client,
@@ -1030,7 +1041,11 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 		partFile,
 		onProgress,
 	)
+	atomic.AddInt64(&o.activeTargetWriters, -1)
 	written := dlResult.Written
+	if written > 0 {
+		atomic.AddInt64(&o.physicalTargetWriteBytes, written)
+	}
 	retries := dlResult.PhysicalRetries
 	wireTotal := dlResult.WireBytes
 	replayBytes := dlResult.ReplayBytes
@@ -1506,4 +1521,37 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 		zap.Int64("replay_bytes", replayBytes),
 		zap.Int64("request_budget", budget),
 	)
+}
+
+func (o *Orchestrator) PhysicalTargetWriteBytes() int64 {
+	if o == nil {
+		return 0
+	}
+	val := atomic.LoadInt64(&o.physicalTargetWriteBytes)
+	if o.archiveWorker != nil {
+		val += o.archiveWorker.PhysicalWriteBytes()
+	}
+	return val
+}
+
+func (o *Orchestrator) PhysicalTargetReadBytes() int64 {
+	if o == nil {
+		return 0
+	}
+	val := atomic.LoadInt64(&o.physicalTargetReadBytes)
+	if o.archiveWorker != nil {
+		val += o.archiveWorker.PhysicalReadBytes()
+	}
+	return val
+}
+
+func (o *Orchestrator) ActiveTargetWriters() int64 {
+	if o == nil {
+		return 0
+	}
+	val := atomic.LoadInt64(&o.activeTargetWriters)
+	if o.archiveWorker != nil {
+		val += int64(o.archiveWorker.ActiveWorkers())
+	}
+	return val
 }

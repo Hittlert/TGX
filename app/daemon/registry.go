@@ -16,8 +16,10 @@ import (
 )
 
 var (
-	ErrQueueFull  = errors.New("task queue is full")
-	ErrIDConflict = errors.New("task id already exists with different input")
+	ErrQueueFull    = errors.New("task queue is full")
+	ErrIDConflict   = errors.New("task id already exists with different input")
+	ErrTaskActive   = errors.New("task is currently active")
+	ErrTaskNotFound = errors.New("task not found")
 )
 
 type TaskState string
@@ -264,6 +266,7 @@ func (r *Registry) Submit(request TaskRequest) (TaskSnapshot, bool, error) {
 				attemptCount: existing.attemptCount + 1,
 				ctx:          taskCtx, cancel: taskCancel,
 			}
+			r.archiveOldTaskMetricsLocked(existing)
 			r.tasks[request.ID] = newState
 			r.removeTerminalLocked(request.ID)
 			r.queue = append(r.queue, newState)
@@ -289,6 +292,15 @@ func (r *Registry) Submit(request TaskRequest) (TaskSnapshot, bool, error) {
 	return r.snapshotTaskLocked(state, now), true, nil
 }
 
+func (r *Registry) archiveOldTaskMetricsLocked(old *taskState) {
+	if old == nil {
+		return
+	}
+	r.cumulativeWireBytes += old.wireBytes
+	r.cumulativePayloadBytes += old.downloaded
+	r.cumulativeRetries += old.physicalRetries
+}
+
 func (r *Registry) removeTerminalLocked(id string) {
 	for index, value := range r.terminalOrder {
 		if value != id {
@@ -299,40 +311,104 @@ func (r *Registry) removeTerminalLocked(id string) {
 	}
 }
 
-// RetryTask forces a retry of an existing terminal task with a brand new attempt generation,
-// transitioning it back into the active queue without requiring daemon restart.
+// QueuedBacklogBytes returns the sum of expected bytes for all currently queued, non-terminal tasks.
+func (r *Registry) QueuedBacklogBytes() int64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var total int64
+	for _, t := range r.queue {
+		if t != nil && !isTerminal(t.state) {
+			total += t.totalSize
+		}
+	}
+	return total
+}
+
+// RetryTask forces a retry of an existing terminal task with a brand new attempt generation.
 func (r *Registry) RetryTask(id string) (TaskSnapshot, error) {
+	return r.RetryTaskWithDecider(id, nil, func(string) error { return nil })
+}
+
+// RetryTaskWithDecider atomically evaluates queue capacity, verifies that any existing task
+// is in terminal state, and executes decider (which mutates durable state from conflict to pending)
+// before queuing the new generation. If capacity is full, task is active, or decider fails,
+// no mutation occurs and durable conflict is preserved.
+func (r *Registry) RetryTaskWithDecider(
+	id string,
+	fallbackReq *TaskRequest,
+	decider func(newGen string) error,
+) (TaskSnapshot, error) {
+	r.mu.Lock()
+
+	// 1. Capacity check
+	if len(r.queue) >= r.queueCapacity {
+		r.mu.Unlock()
+		return TaskSnapshot{}, ErrQueueFull
+	}
+
+	// 2. State check: task must not be actively running
+	existing, exists := r.tasks[id]
+	if exists && !isTerminal(existing.state) {
+		r.mu.Unlock()
+		return TaskSnapshot{}, ErrTaskActive
+	}
+
+	if !exists && fallbackReq == nil {
+		r.mu.Unlock()
+		return TaskSnapshot{}, ErrTaskNotFound
+	}
+
+	now := r.now()
+	newGen := fmt.Sprintf("retry_%d", now.UnixNano())
+
+	var req TaskRequest
+	var totalSize int64
+	var attemptCount int
+	if exists {
+		req = existing.request
+		totalSize = existing.totalSize
+		attemptCount = existing.attemptCount + 1
+	} else {
+		req = *fallbackReq
+		totalSize = fallbackReq.ExpectedSize
+		attemptCount = 1
+	}
+
+	r.mu.Unlock()
+
+	// 3. Execute external durable state transition (e.g. DB conflict -> pending)
+	if decider != nil {
+		if err := decider(newGen); err != nil {
+			return TaskSnapshot{}, err
+		}
+	}
+
+	// 4. DB transition succeeded -> commit to Registry
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	existing, ok := r.tasks[id]
-	if !ok || existing == nil {
-		return TaskSnapshot{}, errors.New("task not found in registry")
+	// Archive old attempt metrics to keep cumulative network/retry counters monotonic
+	if existing != nil {
+		r.archiveOldTaskMetricsLocked(existing)
+		r.removeTerminalLocked(id)
 	}
-	if !isTerminal(existing.state) {
-		return TaskSnapshot{}, errors.New("task is not in terminal state")
-	}
-	if len(r.queue) >= r.queueCapacity {
-		return TaskSnapshot{}, ErrQueueFull
-	}
-	now := r.now()
+
 	pCtx := r.parentCtx
 	if pCtx == nil {
 		pCtx = context.Background()
 	}
 	taskCtx, taskCancel := context.WithCancel(pCtx)
 	newState := &taskState{
-		request:      existing.request,
+		request:      req,
 		state:        StateQueued,
-		totalSize:    existing.totalSize,
+		totalSize:    totalSize,
 		createdAt:    now,
-		attemptGen:   fmt.Sprintf("retry_%d", now.UnixNano()),
-		attemptCount: existing.attemptCount + 1,
+		attemptGen:   newGen,
+		attemptCount: attemptCount,
 		ctx:          taskCtx,
 		cancel:       taskCancel,
 	}
 	r.tasks[id] = newState
-	r.removeTerminalLocked(id)
 	r.queue = append(r.queue, newState)
 	r.signalLocked()
 	return r.snapshotTaskLocked(newState, now), nil
@@ -741,9 +817,7 @@ func (r *Registry) pruneTerminalOrderLocked() {
 		oldest := r.terminalOrder[0]
 		r.terminalOrder = r.terminalOrder[1:]
 		if old, exists := r.tasks[oldest]; exists {
-			r.cumulativeWireBytes += old.wireBytes
-			r.cumulativePayloadBytes += old.downloaded
-			r.cumulativeRetries += old.physicalRetries
+			r.archiveOldTaskMetricsLocked(old)
 			delete(r.tasks, oldest)
 		}
 	}

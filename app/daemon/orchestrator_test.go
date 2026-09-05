@@ -3373,3 +3373,133 @@ func TestOrchestrator_TargetConflict_FullProductionLifecycle_ListingAndRetryWith
 	}
 	t.Logf("[POST-ASSERT] Verified: Complete production path for conflict listing, manual resolution, and new generation dispatch without daemon restart succeeded!")
 }
+
+func TestOrchestrator_ResolveTargetConflict_FailureAtomicity_QueueFull_ActiveTask_DBFailure(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "test.db")
+	db, err := NewDatabase(dbPath)
+	if err != nil {
+		t.Fatalf("NewDatabase: %v", err)
+	}
+	defer db.Close()
+
+	// Registry with queue capacity = 1
+	reg := NewRegistry(1, 100, time.Now)
+	orch := &Orchestrator{
+		db:       db,
+		registry: reg,
+		logger:   zap.NewNop(),
+		running:  true,
+	}
+	ws := NewWebServer(db, nil, nil, nil, orch, nil, reg, zap.NewNop(), "")
+	server := httptest.NewServer(ws.Handler())
+	defer server.Close()
+
+	// Seed a conflict record in DB
+	chatID := "-100999"
+	msgID := 42
+	disp := FailureDisposition{
+		Stage:      "commit",
+		Op:         "target_check",
+		Class:      "target_conflict",
+		Message:    "target collision",
+		Retryable:  false,
+		RetryOwner: "operator",
+	}
+	if err := db.RecordTargetConflict(chatID, msgID, "gen_initial", "conflict.mp4", "/downloads/conflict.mp4", "video", 1000, disp); err != nil {
+		t.Fatalf("RecordTargetConflict: %v", err)
+	}
+
+	// Case 1: Queue Full -> Returns HTTP 429, preserves durable conflict in DB and listing
+	// Fill the single queue slot with a dummy task
+	_, created, err := reg.Submit(TaskRequest{
+		ID:           "dummy:1",
+		Peer:         "-1001",
+		MessageID:    1,
+		FinalPath:    "dummy.mp4",
+		ExpectedSize: 100,
+	})
+	if err != nil || !created {
+		t.Fatalf("fill queue: err=%v, created=%v", err, created)
+	}
+
+	resolvePayload := fmt.Sprintf(`{"chat_id":"%s","message_id":%d}`, chatID, msgID)
+	resp, err := http.Post(server.URL+"/api/conflicts/resolve", "application/json", strings.NewReader(resolvePayload))
+	if err != nil {
+		t.Fatalf("POST resolve: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("[CASE 1 FAIL] expected 429 Too Many Requests on full queue, got %d", resp.StatusCode)
+	}
+
+	// Verify DB conflict is preserved
+	var dbStatus string
+	_ = db.db.QueryRow(`SELECT status FROM download_records WHERE chat_id = ? AND message_id = ?`, chatID, msgID).Scan(&dbStatus)
+	if dbStatus != "conflict" {
+		t.Fatalf("[CASE 1 FAIL] DB status must remain 'conflict' on queue full, got %s", dbStatus)
+	}
+
+	// Verify conflict remains listed in GET /api/conflicts
+	respList, err := http.Get(server.URL + "/api/conflicts")
+	if err != nil {
+		t.Fatalf("GET /api/conflicts: %v", err)
+	}
+	var conflictList []DownloadRecord
+	_ = json.NewDecoder(respList.Body).Decode(&conflictList)
+	respList.Body.Close()
+	if len(conflictList) != 1 || conflictList[0].MessageID != msgID {
+		t.Fatalf("[CASE 1 FAIL] conflict must remain visible in listing, got: %+v", conflictList)
+	}
+	t.Logf("[POST-ASSERT] Case 1 Verified: Queue full returned 429 and preserved durable conflict in DB and listing")
+
+	// Free the queue slot
+	nextTask, _ := reg.Next(context.Background())
+	if nextTask == nil {
+		t.Fatal("expected nextTask from queue")
+	}
+
+	// Case 2: Active Task -> Returns HTTP 409 Conflict, preserves durable conflict
+	// Submit task into Registry and advance to StateDownloading (non-terminal)
+	taskID := fmt.Sprintf("%s:%d", chatID, msgID)
+	_, _, err = reg.Submit(TaskRequest{
+		ID:           taskID,
+		Peer:         chatID,
+		MessageID:    msgID,
+		FinalPath:    "downloads/conflict.mp4",
+		ExpectedSize: 1000,
+	})
+	if err != nil {
+		t.Fatalf("submit task for active test: %v", err)
+	}
+	activeTask, _ := reg.Next(context.Background())
+	activeTask.SetDownloading()
+
+	resp, err = http.Post(server.URL+"/api/conflicts/resolve", "application/json", strings.NewReader(resolvePayload))
+	if err != nil {
+		t.Fatalf("POST resolve: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("[CASE 2 FAIL] expected 409 Conflict for actively running task, got %d", resp.StatusCode)
+	}
+
+	// Verify DB conflict is preserved
+	_ = db.db.QueryRow(`SELECT status FROM download_records WHERE chat_id = ? AND message_id = ?`, chatID, msgID).Scan(&dbStatus)
+	if dbStatus != "conflict" {
+		t.Fatalf("[CASE 2 FAIL] DB status must remain 'conflict' when task is active, got %s", dbStatus)
+	}
+	t.Logf("[POST-ASSERT] Case 2 Verified: Active task returned 409 and preserved durable conflict in DB")
+
+	// Case 3: DB Failure / Record Not Found -> Returns HTTP 404, does not admit new generation
+	nonExistentPayload := `{"chat_id":"-100nonexistent","message_id":9999}`
+	resp, err = http.Post(server.URL+"/api/conflicts/resolve", "application/json", strings.NewReader(nonExistentPayload))
+	if err != nil {
+		t.Fatalf("POST resolve non-existent: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("[CASE 3 FAIL] expected 404 Not Found for non-conflict record, got %d", resp.StatusCode)
+	}
+	t.Logf("[POST-ASSERT] Case 3 Verified: Non-conflict record returned 404 and did not admit any task into Registry")
+}

@@ -363,11 +363,11 @@ class EvaluationSelfTest(unittest.TestCase):
                     "free_bytes": 30,
                     "total_bytes": 40,
                     "used_bytes": 10,
-                    "target_write_bytes": 524288,
-                    "target_read_bytes": 524288,
+                    "target_write_bytes": 786432,
+                    "target_read_bytes": 262144,
                     "target_durable_bytes": 524288,
-                    "target_writer_concurrency": 1,
-                    "target_backlog_bytes": 0,
+                    "target_writer_concurrency": 2,
+                    "target_backlog_bytes": 1048576,
                     "archive": {
                         "archive_backlog_files": 0,
                         "archive_backlog_bytes": 0,
@@ -386,12 +386,47 @@ class EvaluationSelfTest(unittest.TestCase):
         self.assertEqual(3, sample["retry_count"])
         self.assertEqual(67108864, sample["process_rss"])
         self.assertEqual(33554432, sample["heap_alloc"])
-        self.assertEqual(524288, sample["target_write_bytes"])
+        self.assertEqual(786432, sample["target_write_bytes"])
+        self.assertEqual(262144, sample["target_read_bytes"])
         self.assertEqual(524288, sample["target_durable_bytes"])
+        self.assertNotEqual(sample["target_write_bytes"], sample["target_read_bytes"])
+        self.assertEqual(2, sample["target_writer_concurrency"])
+        self.assertEqual(1048576, sample["target_backlog_bytes"])
         missing_sources = {error["source"] for error in sample["collection_errors"]}
         self.assertNotIn("wire_rx_bytes", missing_sources)
         self.assertNotIn("process_rss", missing_sources)
         self.assertNotIn("target_write_bytes", missing_sources)
+
+    def test_collector_propagates_storage_collection_error_and_null_durable_bytes(self):
+        def fake_http(url, timeout=3.0, retries=1):
+            if url.endswith("/api/status"):
+                return {"rolling_5s_bps": 100, "queue_depth": 0, "active_files": 0}
+            if url.endswith("/api/gate"):
+                return {"data_in_flight": 0, "ssd_reserved_bytes": 0, "ssd_available_bytes": 1000}
+            if url.endswith("/api/system/storage"):
+                return {
+                    "free_bytes": 100,
+                    "total_bytes": 200,
+                    "used_bytes": 100,
+                    "target_write_bytes": 0,
+                    "target_read_bytes": 0,
+                    "target_durable_bytes": None,
+                    "target_writer_concurrency": 0,
+                    "target_backlog_bytes": 0,
+                    "collection_errors": [
+                        {"source": "/api/system/storage:durable_bytes", "error": "db disk I/O error"}
+                    ],
+                }
+            raise AssertionError(url)
+
+        with tempfile.TemporaryDirectory() as temp, patch(
+            "harness.http_json", side_effect=fake_http
+        ):
+            sampler = MetricsSampler("http://fixture", Path(temp) / "metrics", "tgx")
+            sample = sampler.sample()
+        self.assertIsNone(sample["target_durable_bytes"])
+        missing_sources = {error["source"] for error in sample["collection_errors"]}
+        self.assertIn("target_durable_bytes", missing_sources)
 
     def test_collector_never_turns_collection_failure_into_zero(self):
         with tempfile.TemporaryDirectory() as temp, patch(

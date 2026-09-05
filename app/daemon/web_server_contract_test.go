@@ -2756,3 +2756,123 @@ func TestWebServer_ConflictEndpoints_ContractAndBearerAuth(t *testing.T) {
 		t.Fatalf("expected 400 for empty resolve request, got %d", resp.StatusCode)
 	}
 }
+
+func TestWebServer_TruthfulPhysicalMetricsAndMonotonicCounters(t *testing.T) {
+	// 1. Monotonic network and retry counters across task retries
+	reg := NewRegistry(10, 10, time.Now)
+	taskReq := TaskRequest{
+		ID:           "chan1:100",
+		Peer:         "chan1",
+		MessageID:    100,
+		FinalPath:    "chan1/file.mp4",
+		ExpectedSize: 1000,
+	}
+	_, _, err := reg.Submit(taskReq)
+	if err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	task, _ := reg.Next(context.Background())
+	// Record attempt 1 telemetry
+	task.RecordTransferTelemetry(300, 500, 0, 1, 1, "gen1-p1")
+	task.Fail("timeout", "simulated timeout", false)
+
+	// Check status after attempt 1
+	status1 := reg.Status()
+	if status1.WireRxBytes != 500 || status1.UniquePayloadBytes != 300 || status1.RetryCount != 1 {
+		t.Fatalf("attempt 1 status mismatch: wire=%d, payload=%d, retries=%d",
+			status1.WireRxBytes, status1.UniquePayloadBytes, status1.RetryCount)
+	}
+
+	// Trigger retry (creates attempt 2)
+	_, err = reg.RetryTask("chan1:100")
+	if err != nil {
+		t.Fatalf("RetryTask: %v", err)
+	}
+
+	// Verify counters did not regress upon retry
+	statusAfterRetry := reg.Status()
+	if statusAfterRetry.WireRxBytes < 500 {
+		t.Fatalf("wire_rx_bytes regressed across retry: got %d, want >= 500", statusAfterRetry.WireRxBytes)
+	}
+	if statusAfterRetry.UniquePayloadBytes < 300 {
+		t.Fatalf("unique_payload_bytes regressed across retry: got %d, want >= 300", statusAfterRetry.UniquePayloadBytes)
+	}
+	if statusAfterRetry.RetryCount < 1 {
+		t.Fatalf("retry_count regressed across retry: got %d, want >= 1", statusAfterRetry.RetryCount)
+	}
+
+	// Attempt 2 produces additional 600 wire bytes and 400 payload bytes
+	task2, _ := reg.Next(context.Background())
+	task2.RecordTransferTelemetry(400, 600, 0, 1, 0, "gen2-p0")
+	status2 := reg.Status()
+	if status2.WireRxBytes != 1100 {
+		t.Fatalf("expected 1100 cumulative wire bytes, got %d", status2.WireRxBytes)
+	}
+	if status2.UniquePayloadBytes != 700 {
+		t.Fatalf("expected 700 cumulative payload bytes, got %d", status2.UniquePayloadBytes)
+	}
+
+	// 2. Truthful physical metrics deltas: distinct write, read, and backlog measurements
+	orch := &Orchestrator{
+		registry: reg,
+		logger:   zap.NewNop(),
+		saveDir:  t.TempDir(),
+	}
+	// Simulate physical write of 2048 bytes and physical read of 1024 bytes
+	orch.physicalTargetWriteBytes = 2048
+	orch.physicalTargetReadBytes = 1024
+	orch.activeTargetWriters = 2
+
+	tempDir := t.TempDir()
+	db, err := NewDatabase(filepath.Join(tempDir, "test.db"))
+	if err != nil {
+		t.Fatalf("NewDatabase: %v", err)
+	}
+	defer db.Close()
+
+	ws := NewWebServer(db, nil, nil, nil, orch, nil, reg, zap.NewNop(), "")
+	server := httptest.NewServer(ws.Handler())
+	defer server.Close()
+
+	resp, err := http.Get(server.URL + "/api/system/storage")
+	if err != nil {
+		t.Fatalf("GET /api/system/storage: %v", err)
+	}
+	defer resp.Body.Close()
+	var storageResp map[string]any
+	_ = json.NewDecoder(resp.Body).Decode(&storageResp)
+
+	writeBytes := int64(storageResp["target_write_bytes"].(float64))
+	readBytes := int64(storageResp["target_read_bytes"].(float64))
+	writerConcurrency := int(storageResp["target_writer_concurrency"].(float64))
+	if writeBytes != 2048 {
+		t.Fatalf("expected physical target_write_bytes 2048, got %d", writeBytes)
+	}
+	if readBytes != 1024 {
+		t.Fatalf("expected physical target_read_bytes 1024, got %d", readBytes)
+	}
+	if writeBytes == readBytes {
+		t.Fatal("target_write_bytes and target_read_bytes must not be artificially equal")
+	}
+	if writerConcurrency != 2 {
+		t.Fatalf("expected target_writer_concurrency 2, got %d", writerConcurrency)
+	}
+
+	// 3. Error source propagation: collection failure is emitted as null / collection_errors, not zero
+	db.Close() // Force DB failure
+	respErr, err := http.Get(server.URL + "/api/system/storage")
+	if err != nil {
+		t.Fatalf("GET /api/system/storage with closed DB: %v", err)
+	}
+	defer respErr.Body.Close()
+	var errStorageResp map[string]any
+	_ = json.NewDecoder(respErr.Body).Decode(&errStorageResp)
+
+	if errStorageResp["target_durable_bytes"] != nil {
+		t.Fatalf("expected target_durable_bytes to be null on DB failure, got %v", errStorageResp["target_durable_bytes"])
+	}
+	errs, ok := errStorageResp["collection_errors"].([]any)
+	if !ok || len(errs) == 0 {
+		t.Fatalf("expected collection_errors on DB failure, got %v", errStorageResp["collection_errors"])
+	}
+}

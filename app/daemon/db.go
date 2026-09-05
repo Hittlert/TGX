@@ -49,10 +49,11 @@ func (d *Database) Close() error {
 }
 
 var (
-	ErrStateConflict   = errors.New("state conflict: invalid state transition")
-	ErrStaleAttempt    = errors.New("stale attempt: generation mismatch")
-	ErrAlreadySuccess  = errors.New("download already completed successfully")
-	ErrArchiveConflict = fmt.Errorf("%w: archive identity mismatch on duplicate completion", ErrStateConflict)
+	ErrStateConflict          = errors.New("state conflict: invalid state transition")
+	ErrStaleAttempt           = errors.New("stale attempt: generation mismatch")
+	ErrAlreadySuccess         = errors.New("download already completed successfully")
+	ErrArchiveConflict        = fmt.Errorf("%w: archive identity mismatch on duplicate completion", ErrStateConflict)
+	ErrConflictRecordNotFound = errors.New("conflict record not found")
 )
 
 // SuccessProof carries the authoritative terminal proof for a successful download record.
@@ -1668,25 +1669,32 @@ func (d *Database) RecordTargetConflict(
 }
 
 // ResolveTargetConflict provides a deliberate manual resolution path, resetting a conflict record to pending.
-func (d *Database) ResolveTargetConflict(chatID string, messageID int) error {
+func (d *Database) ResolveTargetConflict(chatID string, messageID int, newGenOpt ...string) error {
 	d.lock.Lock()
 	defer d.lock.Unlock()
 
 	now := time.Now().Unix()
+	newGen := fmt.Sprintf("retry_%d", time.Now().UnixNano())
+	if len(newGenOpt) > 0 && newGenOpt[0] != "" {
+		newGen = newGenOpt[0]
+	}
+
 	res, err := d.db.Exec(`
 		UPDATE download_records
 		SET status = 'pending',
+			attempts = 0,
+			attempt_generation = ?,
 			error = '',
 			next_retry_at = 0,
 			updated_at = ?
 		WHERE chat_id = ? AND message_id = ? AND status = 'conflict'
-	`, now, chatID, messageID)
+	`, newGen, now, chatID, messageID)
 	if err != nil {
 		return err
 	}
 	n, _ := res.RowsAffected()
 	if n == 0 {
-		return fmt.Errorf("no conflict record found for chat %s message %d", chatID, messageID)
+		return ErrConflictRecordNotFound
 	}
 	return nil
 }

@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Hittlert/TGX/internal/fscommit"
@@ -27,6 +28,10 @@ type ArchiveWorker struct {
 	wakeCh    chan struct{}
 	runningMu sync.Mutex
 	running   bool
+
+	writeBytes   int64 // atomic: cumulative physical bytes written to HDD archive
+	readBytes    int64 // atomic: cumulative physical bytes read from SSD
+	activeWriter int64 // atomic: 1 while actively copying, 0 otherwise
 }
 
 // NewArchiveWorker creates the single archive worker.
@@ -300,7 +305,13 @@ func (w *ArchiveWorker) processJob(ctx context.Context, job ArchiveJob) {
 
 	// 4. Perform whole-file archive copy via .moving sibling on destination filesystem
 	movingPath := dstPath + ".moving"
+	atomic.StoreInt64(&w.activeWriter, 1)
 	written, actualSHA, copyErr := fscommit.CopyFileSequential(srcPath, movingPath)
+	atomic.StoreInt64(&w.activeWriter, 0)
+	if written > 0 {
+		atomic.AddInt64(&w.writeBytes, written)
+		atomic.AddInt64(&w.readBytes, written)
+	}
 	if copyErr != nil {
 		w.logger.Warn("archive copy failed", zap.Error(copyErr))
 		_ = os.Remove(movingPath)
@@ -391,4 +402,25 @@ func computeFileSHA256(filePath string) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func (w *ArchiveWorker) PhysicalWriteBytes() int64 {
+	if w == nil {
+		return 0
+	}
+	return atomic.LoadInt64(&w.writeBytes)
+}
+
+func (w *ArchiveWorker) PhysicalReadBytes() int64 {
+	if w == nil {
+		return 0
+	}
+	return atomic.LoadInt64(&w.readBytes)
+}
+
+func (w *ArchiveWorker) ActiveWorkers() int {
+	if w == nil {
+		return 0
+	}
+	return int(atomic.LoadInt64(&w.activeWriter))
 }
