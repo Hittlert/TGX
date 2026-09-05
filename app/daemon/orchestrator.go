@@ -1201,6 +1201,16 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 		activePubHandedOff bool
 	)
 	if o.db != nil {
+		// Active publisher exclusion: register exclusive ownership BEFORE DB marks committing,
+		// guaranteeing zero unowned window between DB committing visibility and exclusion.
+		pubKey = fmt.Sprintf("%s:%d", chatID, msgID)
+		o.activePublishers.Store(pubKey, gen)
+		defer func() {
+			if !activePubHandedOff && pubKey != "" {
+				o.activePublishers.Delete(pubKey)
+			}
+		}()
+
 		if err := o.db.PrepareDownloadCommit(chatID, msgID, gen, finalRelPath, stat.Size(), shaHex); err != nil {
 			_ = os.Remove(partAbsPath)
 			disp := FailureDisposition{
@@ -1216,14 +1226,6 @@ func (o *Orchestrator) downloadOne(ctx context.Context, task *Task) {
 			task.FailDisposition(disp)
 			return
 		}
-		// Active publisher exclusion: worker holds exclusive publishing ownership until terminal completion or explicit handoff
-		pubKey = fmt.Sprintf("%s:%d", chatID, msgID)
-		o.activePublishers.Store(pubKey, gen)
-		defer func() {
-			if !activePubHandedOff && pubKey != "" {
-				o.activePublishers.Delete(pubKey)
-			}
-		}()
 		EmitLifecycle(o.logger, LifecycleEvent{
 			Event:           EventSSDCommitPrepared,
 			TaskID:          taskID,

@@ -151,6 +151,18 @@ func ReconcileOnStartup(ctx context.Context, db *Database, ssdDir, archiveDir st
 	return nil
 }
 
+// RecoveryTestHooks provides deterministic interception points for crash recovery testing.
+type RecoveryTestHooks struct {
+	BeforeCommitSiblingPart func(partPath, finalPath string)
+}
+
+var recoveryTestHooks RecoveryTestHooks
+
+// SetRecoveryTestHooks sets global test hooks for recovery package.
+func SetRecoveryTestHooks(hooks RecoveryTestHooks) {
+	recoveryTestHooks = hooks
+}
+
 // ReconcileCommittingRecord executes the authoritative recovery state machine for a single committing record.
 // Both startup crash recovery and the online finalizer loop MUST share this exact primitive.
 func ReconcileCommittingRecord(
@@ -168,19 +180,20 @@ func ReconcileCommittingRecord(
 	finalAbsPath := filepath.Join(ssdDir, filepath.FromSlash(rec.SavePath))
 	partAbsPath := finalAbsPath + ".part"
 
-	// 1. Final SSD file already exists and matches committed size and SHA proof
-	if finInfo, statErr := os.Stat(finalAbsPath); statErr == nil && finInfo.Size() == rec.FileSize {
-		sha, shaErr := computeFileSHA256(finalAbsPath)
-		if shaErr == nil && rec.SHA256 != "" && sha == rec.SHA256 {
+	// 1. Check if final SSD file already exists
+	if finInfo, statErr := os.Stat(finalAbsPath); statErr == nil {
+		finSHA, shaErr := computeFileSHA256(finalAbsPath)
+		if shaErr == nil && rec.SHA256 != "" && finInfo.Size() == rec.FileSize && finSHA == rec.SHA256 {
+			// Final SSD file already exists and matches committed size and SHA proof
 			_ = os.Remove(partAbsPath)
-			completeErr := db.CompleteDownloadAndQueueArchive(rec.ChatID, rec.MessageID, rec.AttemptGeneration, rec.SavePath, rec.FileSize, sha, archiveEnabled)
+			completeErr := db.CompleteDownloadAndQueueArchive(rec.ChatID, rec.MessageID, rec.AttemptGeneration, rec.SavePath, rec.FileSize, finSHA, archiveEnabled)
 			if completeErr == nil || errors.Is(completeErr, ErrArchiveConflict) {
 				logger.Info("reconciled committing record to success from final file",
 					zap.String("chat_id", rec.ChatID),
 					zap.Int("message_id", rec.MessageID),
 				)
 				if registry != nil {
-					registry.FinishTaskByMessage(rec.ChatID, rec.MessageID, rec.AttemptGeneration, StateSuccess, "", "", rec.SavePath, false, sha)
+					registry.FinishTaskByMessage(rec.ChatID, rec.MessageID, rec.AttemptGeneration, StateSuccess, "", "", rec.SavePath, false, finSHA)
 				}
 				return nil
 			}
@@ -191,12 +204,48 @@ func ReconcileCommittingRecord(
 			)
 			return completeErr
 		}
+
+		// Final SSD file exists but does NOT match!
+		// Check if .part file exists and is valid
+		if partInfo, statPartErr := os.Stat(partAbsPath); statPartErr == nil && partInfo.Size() == rec.FileSize {
+			partSHA, shaPartErr := computeFileSHA256(partAbsPath)
+			if shaPartErr == nil && rec.SHA256 != "" && partSHA == rec.SHA256 {
+				// Valid part + conflicting final!
+				// Preserve both proofs, do not delete part, do not reset pending!
+				logger.Error("target exists with conflicting proof against valid part: preserving both",
+					zap.String("chat_id", rec.ChatID),
+					zap.Int("message_id", rec.MessageID),
+					zap.String("part_path", partAbsPath),
+					zap.String("final_path", finalAbsPath),
+				)
+				disp := FailureDisposition{
+					Stage:       "commit",
+					Op:          "target_exists",
+					Class:       "target_conflict",
+					Unavailable: false,
+					Retryable:   false,
+					RetryOwner:  "none",
+					Message:     fmt.Sprintf("target exists with conflicting proof against valid part (%s)", finalAbsPath),
+				}
+				if failErr := db.FailDownloadDisposition(rec.ChatID, rec.MessageID, rec.AttemptGeneration, rec.FileName, rec.SavePath, rec.MediaType, rec.FileSize, disp); failErr != nil {
+					logger.Error("failed to record target conflict disposition in DB", zap.Error(failErr))
+					return failErr
+				}
+				if registry != nil {
+					registry.FinishTaskByMessage(rec.ChatID, rec.MessageID, rec.AttemptGeneration, StateFailed, disp.Class, disp.Error(), rec.SavePath, false, "")
+				}
+				return fmt.Errorf("target exists with conflicting proof against valid part: %s", finalAbsPath)
+			}
+		}
 	}
 
 	// 2. .part file exists with matching SHA -> commit sibling part and complete
 	if partInfo, statErr := os.Stat(partAbsPath); statErr == nil && partInfo.Size() == rec.FileSize {
 		sha, shaErr := computeFileSHA256(partAbsPath)
 		if shaErr == nil && rec.SHA256 != "" && sha == rec.SHA256 {
+			if recoveryTestHooks.BeforeCommitSiblingPart != nil {
+				recoveryTestHooks.BeforeCommitSiblingPart(partAbsPath, finalAbsPath)
+			}
 			commitErr := fscommit.CommitSiblingPart(partAbsPath, finalAbsPath)
 			if commitErr == nil {
 				completeErr := db.CompleteDownloadAndQueueArchive(rec.ChatID, rec.MessageID, rec.AttemptGeneration, rec.SavePath, rec.FileSize, sha, archiveEnabled)
@@ -238,6 +287,33 @@ func ReconcileCommittingRecord(
 						return completeErr
 					}
 				}
+
+				// TARGET EXISTS WITH CONFLICTING PROOF:
+				// .part is valid, but final exists with different proof!
+				// PRESERVE BOTH PROOFS, DO NOT DELETE PART, DO NOT RESET PENDING!
+				logger.Error("target exists with conflicting proof during recovery: preserving both part and final",
+					zap.String("chat_id", rec.ChatID),
+					zap.Int("message_id", rec.MessageID),
+					zap.String("part_path", partAbsPath),
+					zap.String("final_path", finalAbsPath),
+				)
+				disp := FailureDisposition{
+					Stage:       "commit",
+					Op:          "target_exists",
+					Class:       "target_conflict",
+					Unavailable: false,
+					Retryable:   false,
+					RetryOwner:  "none",
+					Message:     fmt.Sprintf("target exists with conflicting proof against valid part (%s)", finalAbsPath),
+				}
+				if failErr := db.FailDownloadDisposition(rec.ChatID, rec.MessageID, rec.AttemptGeneration, rec.FileName, rec.SavePath, rec.MediaType, rec.FileSize, disp); failErr != nil {
+					logger.Error("failed to record target conflict disposition in DB", zap.Error(failErr))
+					return failErr
+				}
+				if registry != nil {
+					registry.FinishTaskByMessage(rec.ChatID, rec.MessageID, rec.AttemptGeneration, StateFailed, disp.Class, disp.Error(), rec.SavePath, false, "")
+				}
+				return fmt.Errorf("target exists with conflicting proof against valid part: %s", finalAbsPath)
 			}
 		}
 	}

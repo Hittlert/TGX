@@ -2263,11 +2263,11 @@ func TestOrchestrator_Deterministic_ActivePublisherExclusion_FinalizerSkipsInFli
 	resumeWorker := make(chan struct{})
 
 	orch.SetTestHooks(OrchestratorTestHooks{
-		BeforeRename: func(taskID, cID string, mID int) {
-			t.Logf("[HOOK: BeforeRename] Worker reached rename phase; signaling pause...")
+		AfterPrepareCommit: func(taskID, cID string, mID int) {
+			t.Logf("[HOOK: AfterPrepareCommit] Worker immediately after PrepareDownloadCommit (DB now committing); signaling pause...")
 			close(workerPaused)
 			<-resumeWorker
-			t.Logf("[HOOK: BeforeRename] Resuming worker rename...")
+			t.Logf("[HOOK: AfterPrepareCommit] Resuming worker...")
 		},
 	})
 
@@ -2297,6 +2297,14 @@ func TestOrchestrator_Deterministic_ActivePublisherExclusion_FinalizerSkipsInFli
 	err := db.db.QueryRow(`SELECT status FROM download_records WHERE chat_id = ? AND message_id = ?`, chatID, msgID).Scan(&dbStatus)
 	if err != nil || dbStatus != "committing" {
 		t.Fatalf("expected committing DB status, got %q (err: %v)", dbStatus, err)
+	}
+
+	// Active publisher registration MUST exist concurrently with committing state!
+	pubKey := fmt.Sprintf("%s:%d", chatID, msgID)
+	val, exists := orch.activePublishers.Load(pubKey)
+	snapGen := task.Snapshot().AttemptGeneration
+	if !exists || val != snapGen {
+		t.Fatalf("expected activePublishers to hold generation %s, got exists=%t val=%v", snapGen, exists, val)
 	}
 
 	// 2. .part file MUST exist
@@ -2335,7 +2343,12 @@ func TestOrchestrator_Deterministic_ActivePublisherExclusion_FinalizerSkipsInFli
 	if err != nil || dbStatus != "success" {
 		t.Fatalf("expected final DB status success, got %q", dbStatus)
 	}
-	t.Logf("[POST-ASSERT] Verified: Active publisher exclusion protected in-flight worker; completed to success!")
+
+	// Active publisher registration MUST be deleted after completion!
+	if _, exists := orch.activePublishers.Load(pubKey); exists {
+		t.Fatalf("expected activePublishers to be cleaned up after completion, but key still exists")
+	}
+	t.Logf("[POST-ASSERT] Verified: Active publisher exclusion protected in-flight worker; completed to success and deregistered!")
 }
 
 // Acceptance Test (Issue #4): Concurrent wakeFinalizer calls execute single-flight without race or blocking.
@@ -2399,9 +2412,22 @@ func TestRecovery_ReconcileCommittingRecord_TargetExists_RevalidatesProofAndProm
 	partAbsPath := finalAbsPath + ".part"
 	_ = os.MkdirAll(filepath.Dir(finalAbsPath), 0o755)
 
-	// Both final file and part file exist on disk
-	_ = os.WriteFile(finalAbsPath, payload, 0o644)
-	_ = os.WriteFile(partAbsPath, []byte("stale residual part content"), 0o644)
+	// CRUCIAL: finalAbsPath DOES NOT exist initially! Only partAbsPath exists.
+	// This ensures Phase 1 (initial final check) fails, forcing Phase 2 to execute.
+	_ = os.WriteFile(partAbsPath, payload, 0o644)
+
+	// Inject hook to create final file right before CommitSiblingPart is called
+	var hookCalled bool
+	SetRecoveryTestHooks(RecoveryTestHooks{
+		BeforeCommitSiblingPart: func(part, final string) {
+			hookCalled = true
+			// Create concurrent final file with matching valid proof to trigger ErrTargetExists
+			if err := os.WriteFile(final, payload, 0o644); err != nil {
+				t.Fatalf("write concurrent final file: %v", err)
+			}
+		},
+	})
+	defer SetRecoveryTestHooks(RecoveryTestHooks{})
 
 	// Seed DB in committing status
 	_, err = db.Execute(`
@@ -2431,22 +2457,281 @@ func TestRecovery_ReconcileCommittingRecord_TargetExists_RevalidatesProofAndProm
 		t.Fatalf("ReconcileCommittingRecord returned error: %v", recErr)
 	}
 
-	// 1. Assert DB status is now 'success' (NOT reset to pending!)
+	// 1. Assert hook was called proving CommitSiblingPart branch was reached
+	if !hookCalled {
+		t.Fatal("expected BeforeCommitSiblingPart hook to be called; ErrTargetExists branch was not exercised!")
+	}
+
+	// 2. Assert DB status is now 'success' (NOT reset to pending!)
 	var status string
 	err = db.db.QueryRow(`SELECT status FROM download_records WHERE chat_id = ? AND message_id = ?`, chatID, msgID).Scan(&status)
 	if err != nil || status != "success" {
 		t.Fatalf("expected status promoted to 'success', got %q (err: %v)", status, err)
 	}
 
-	// 2. Residual .part file must have been cleaned
+	// 3. Residual .part file must have been cleaned
 	if _, statErr := os.Stat(partAbsPath); !os.IsNotExist(statErr) {
 		t.Fatalf("residual .part file was not cleaned: %v", statErr)
 	}
 
-	// 3. Final file intact
+	// 4. Final file intact
 	content, readErr := os.ReadFile(finalAbsPath)
 	if readErr != nil || string(content) != string(payload) {
 		t.Fatalf("final file was corrupted or missing: %v", readErr)
 	}
-	t.Logf("[POST-ASSERT] Verified: ReconcileCommittingRecord safely re-read matching target file and converged to success")
+	t.Logf("[POST-ASSERT] Verified: ReconcileCommittingRecord exercised ErrTargetExists branch, re-read matching target file and converged to success")
+}
+
+// Acceptance Test (Issue #4): Valid part + conflicting final must preserve both proofs and produce a durable conflict, never delete part/reset pending.
+func TestRecovery_ReconcileCommittingRecord_ConflictingFinal_PreservesProofsAndSetsDurableConflict(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "state.db")
+	db, err := NewDatabase(dbPath)
+	if err != nil {
+		t.Fatalf("failed to init database: %v", err)
+	}
+	defer db.Close()
+
+	saveDir := filepath.Join(tempDir, "downloads")
+	_ = os.MkdirAll(saveDir, 0o755)
+
+	chatID := "-100999"
+	msgID := 556
+	now := time.Now().Unix()
+	validPayload := []byte("authentic valid part payload for conflict test")
+	conflictingPayload := []byte("completely different concurrent final payload 99999999")
+	hash := sha256.Sum256(validPayload)
+	shaHex := hex.EncodeToString(hash[:])
+	size := int64(len(validPayload))
+	relPath := "Channel/2026_09/556 - target_conflict.bin"
+
+	finalAbsPath := filepath.Join(saveDir, filepath.FromSlash(relPath))
+	partAbsPath := finalAbsPath + ".part"
+	_ = os.MkdirAll(filepath.Dir(finalAbsPath), 0o755)
+
+	// Valid .part file exists on disk
+	_ = os.WriteFile(partAbsPath, validPayload, 0o644)
+
+	// Inject hook to create conflicting final file right before CommitSiblingPart
+	var hookCalled bool
+	SetRecoveryTestHooks(RecoveryTestHooks{
+		BeforeCommitSiblingPart: func(part, final string) {
+			hookCalled = true
+			if err := os.WriteFile(final, conflictingPayload, 0o644); err != nil {
+				t.Fatalf("write conflicting final: %v", err)
+			}
+		},
+	})
+	defer SetRecoveryTestHooks(RecoveryTestHooks{})
+
+	// Seed DB in committing status
+	_, err = db.Execute(`
+		INSERT INTO download_records (
+			chat_id, message_id, status, file_name, save_path, file_size, sha256,
+			attempt_generation, created_at, updated_at
+		) VALUES (?, ?, 'committing', 'target_conflict.bin', ?, ?, ?, 'gen_tc', ?, ?)
+	`, chatID, msgID, relPath, size, shaHex, now, now)
+	if err != nil {
+		t.Fatalf("seed DB: %v", err)
+	}
+
+	rec := DownloadRecord{
+		ChatID:            chatID,
+		MessageID:         msgID,
+		Status:            "committing",
+		FileName:          "target_conflict.bin",
+		SavePath:          relPath,
+		FileSize:          size,
+		SHA256:            shaHex,
+		AttemptGeneration: "gen_tc",
+	}
+
+	logger := zap.NewNop()
+	recErr := ReconcileCommittingRecord(context.Background(), db, saveDir, false, rec, nil, logger)
+	if recErr == nil {
+		t.Fatal("expected ReconcileCommittingRecord to return error on target conflict, got nil")
+	}
+
+	if !hookCalled {
+		t.Fatal("expected hook to be called before CommitSiblingPart")
+	}
+
+	// 1. Assert .part file is preserved intact! (MUST NOT BE DELETED!)
+	partContent, err := os.ReadFile(partAbsPath)
+	if err != nil || string(partContent) != string(validPayload) {
+		t.Fatalf("valid .part file was deleted or corrupted: %v", err)
+	}
+
+	// 2. Assert conflicting final file is preserved intact! (MUST NOT BE OVERWRITTEN/DELETED!)
+	finContent, err := os.ReadFile(finalAbsPath)
+	if err != nil || string(finContent) != string(conflictingPayload) {
+		t.Fatalf("conflicting final file was deleted or corrupted: %v", err)
+	}
+
+	// 3. Assert DB record is failed with target_conflict (MUST NOT BE PENDING!)
+	var dbStatus, dbError string
+	err = db.db.QueryRow(`SELECT status, COALESCE(error, '') FROM download_records WHERE chat_id = ? AND message_id = ?`, chatID, msgID).Scan(&dbStatus, &dbError)
+	if err != nil {
+		t.Fatalf("query DB: %v", err)
+	}
+	if dbStatus != "failed" {
+		t.Fatalf("expected durable status 'failed', got %q (must not be reset to pending)", dbStatus)
+	}
+	if !strings.Contains(dbError, "target_conflict") {
+		t.Fatalf("expected error to contain 'target_conflict', got %q", dbError)
+	}
+	t.Logf("[POST-ASSERT] Verified: valid .part and conflicting final both preserved; DB committed durable conflict (not pending)")
+}
+
+// Acceptance Test (Issue #4): If PrepareDownloadCommit fails, active publisher exclusion is immediately cleaned up.
+func TestOrchestrator_Deterministic_ActivePublisherCleanupOnPrepareFailure(t *testing.T) {
+	chatID := "-100888"
+	msgID := 102
+	data := make([]byte, 1024)
+	for i := range data {
+		data[i] = byte(i % 251)
+	}
+
+	invoker := invokerFunc(func(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
+		setUploadFile(output, data)
+		return nil
+	})
+
+	access := &mockAccessWithPool{
+		pool: &mockPool{invoker: invoker},
+		resolveFn: func(ctx context.Context, peer string, messageID int) (ResolvedMedia, error) {
+			return ResolvedMedia{
+				File:      &orchMockMediaFile{loc: &tg.InputDocumentFileLocation{ID: 1001, AccessHash: 2002}, sz: 1024, dc: 2},
+				Name:      "cleanup_test.mp4",
+				Size:      1024,
+				DCID:      2,
+				MediaType: "video",
+				Date:      1725518400,
+			}, nil
+		},
+	}
+
+	orch, registry, db, _ := setupTestOrchestratorWithAccess(t, access)
+	defer db.Close()
+
+	pubKey := fmt.Sprintf("%s:%d", chatID, msgID)
+
+	// In BeforePrepareCommit hook, close the DB to guarantee PrepareDownloadCommit fails!
+	orch.SetTestHooks(OrchestratorTestHooks{
+		BeforePrepareCommit: func(taskID, cID string, mID int) {
+			t.Logf("[HOOK: BeforePrepareCommit] Closing DB to induce PrepareDownloadCommit failure...")
+			_ = db.Close()
+		},
+	})
+
+	req := TaskRequest{
+		ID:          "case_active_pub_cleanup",
+		Peer:        chatID,
+		MessageID:   msgID,
+		TargetTitle: "RaceChannel",
+		Date:        1725518400,
+	}
+
+	_, _, _ = registry.Submit(req)
+	task, _ := registry.Next(context.Background())
+
+	orch.downloadOne(context.Background(), task)
+
+	// Assert task failed
+	snap := task.Snapshot()
+	if snap.State != StateFailed {
+		t.Fatalf("expected task state failed, got %s", snap.State)
+	}
+
+	// Crucial invariant: activePublishers MUST be cleaned up by defer, no leftover key!
+	if _, exists := orch.activePublishers.Load(pubKey); exists {
+		t.Fatalf("expected activePublishers to be cleaned up after prepare failure, but key still exists!")
+	}
+	t.Logf("[POST-ASSERT] Verified: activePublishers cleanly deleted on PrepareDownloadCommit failure")
+}
+
+// Acceptance Test (Issue #4): Initial check with conflicting final and valid part preserves both and fails durably.
+func TestRecovery_ReconcileCommittingRecord_InitialConflictingFinal_PreservesProofsAndSetsDurableConflict(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "state.db")
+	db, err := NewDatabase(dbPath)
+	if err != nil {
+		t.Fatalf("failed to init database: %v", err)
+	}
+	defer db.Close()
+
+	saveDir := filepath.Join(tempDir, "downloads")
+	_ = os.MkdirAll(saveDir, 0o755)
+
+	chatID := "-100999"
+	msgID := 557
+	now := time.Now().Unix()
+	validPayload := []byte("authentic valid part payload for initial conflict test")
+	conflictingPayload := []byte("pre-existing conflicting final payload 88888888")
+	hash := sha256.Sum256(validPayload)
+	shaHex := hex.EncodeToString(hash[:])
+	size := int64(len(validPayload))
+	relPath := "Channel/2026_09/557 - initial_conflict.bin"
+
+	finalAbsPath := filepath.Join(saveDir, filepath.FromSlash(relPath))
+	partAbsPath := finalAbsPath + ".part"
+	_ = os.MkdirAll(filepath.Dir(finalAbsPath), 0o755)
+
+	// BOTH exist prior to ReconcileCommittingRecord: final is conflicting, part is valid!
+	_ = os.WriteFile(partAbsPath, validPayload, 0o644)
+	_ = os.WriteFile(finalAbsPath, conflictingPayload, 0o644)
+
+	// Seed DB in committing status
+	_, err = db.Execute(`
+		INSERT INTO download_records (
+			chat_id, message_id, status, file_name, save_path, file_size, sha256,
+			attempt_generation, created_at, updated_at
+		) VALUES (?, ?, 'committing', 'initial_conflict.bin', ?, ?, ?, 'gen_ic', ?, ?)
+	`, chatID, msgID, relPath, size, shaHex, now, now)
+	if err != nil {
+		t.Fatalf("seed DB: %v", err)
+	}
+
+	rec := DownloadRecord{
+		ChatID:            chatID,
+		MessageID:         msgID,
+		Status:            "committing",
+		FileName:          "initial_conflict.bin",
+		SavePath:          relPath,
+		FileSize:          size,
+		SHA256:            shaHex,
+		AttemptGeneration: "gen_ic",
+	}
+
+	logger := zap.NewNop()
+	recErr := ReconcileCommittingRecord(context.Background(), db, saveDir, false, rec, nil, logger)
+	if recErr == nil {
+		t.Fatal("expected ReconcileCommittingRecord to return error on initial target conflict, got nil")
+	}
+
+	// 1. Assert .part file is preserved intact! (MUST NOT BE DELETED!)
+	partContent, err := os.ReadFile(partAbsPath)
+	if err != nil || string(partContent) != string(validPayload) {
+		t.Fatalf("valid .part file was deleted or corrupted: %v", err)
+	}
+
+	// 2. Assert conflicting final file is preserved intact! (MUST NOT BE OVERWRITTEN/DELETED!)
+	finContent, err := os.ReadFile(finalAbsPath)
+	if err != nil || string(finContent) != string(conflictingPayload) {
+		t.Fatalf("conflicting final file was deleted or corrupted: %v", err)
+	}
+
+	// 3. Assert DB record is failed with target_conflict (MUST NOT BE PENDING!)
+	var dbStatus, dbError string
+	err = db.db.QueryRow(`SELECT status, COALESCE(error, '') FROM download_records WHERE chat_id = ? AND message_id = ?`, chatID, msgID).Scan(&dbStatus, &dbError)
+	if err != nil {
+		t.Fatalf("query DB: %v", err)
+	}
+	if dbStatus != "failed" {
+		t.Fatalf("expected durable status 'failed', got %q (must not be reset to pending)", dbStatus)
+	}
+	if !strings.Contains(dbError, "target_conflict") {
+		t.Fatalf("expected error to contain 'target_conflict', got %q", dbError)
+	}
+	t.Logf("[POST-ASSERT] Verified: initial conflict branch preserved both proofs; DB committed durable conflict (not pending)")
 }
